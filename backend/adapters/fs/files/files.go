@@ -3,6 +3,7 @@ package files
 import (
 	"bufio"
 	"context"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"os"
@@ -892,7 +893,7 @@ func WriteDirectory(opts utils.FileOptions) error {
 	return nil
 }
 
-func WriteFile(source, path string, in io.Reader) error {
+func WriteFile(source, path string, in io.Reader) (returnErr error) {
 	idx := indexing.GetIndex(source)
 	if idx == nil {
 		return fmt.Errorf("could not get index: %v ", source)
@@ -918,27 +919,60 @@ func WriteFile(source, path string, in io.Reader) error {
 		return fmt.Errorf("%w: %q", errors.ErrIsDirectory, path)
 	}
 
-	// Open the file for writing (create if it doesn't exist, truncate if it does)
-	// For new files: permissions are set to fileutils.PermFile (subject to umask, then Chmod bypasses umask)
-	// For existing regular files: do not Chmod so saves preserve mode and special bits
-	file, err := os.OpenFile(realPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, fileutils.PermFile)
+	// Create the temporary file beside the target so the final rename stays on the same filesystem.
+	tempFile, err := os.CreateTemp(parentDir, ".filebrowser-write-*")
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	tempPath := tempFile.Name()
+	committed := false
+	defer func() {
+		if tempFile != nil {
+			if closeErr := tempFile.Close(); closeErr != nil {
+				returnErr = stderrors.Join(returnErr, fmt.Errorf("close temporary file: %w", closeErr))
+			}
+		}
+		if !committed {
+			if removeErr := os.Remove(tempPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				returnErr = stderrors.Join(returnErr, fmt.Errorf("remove temporary file: %w", removeErr))
+			}
+		}
+	}()
 
-	// Copy the contents from the reader to the file
-	_, err = io.Copy(file, in)
+	written, err := io.Copy(tempFile, in)
 	if err != nil {
-		return err
+		return fmt.Errorf("copy %d bytes to temporary file: %w", written, err)
+	}
+	tempStat, err := tempFile.Stat()
+	if err != nil {
+		return fmt.Errorf("stat temporary file: %w", err)
+	}
+	if tempStat.Size() != written {
+		return fmt.Errorf("%w: copied %d bytes but temporary file size is %d", io.ErrShortWrite, written, tempStat.Size())
 	}
 
 	if applyDefaultFilePerm {
-		err = os.Chmod(realPath, fileutils.PermFile)
+		err = tempFile.Chmod(fileutils.PermFile)
 		if err != nil {
 			logger.Debugf("Could not set file permissions for %s (this may be expected in restricted environments): %v", realPath, err)
 		}
+	} else if err := tempFile.Chmod(stat.Mode()); err != nil {
+		return fmt.Errorf("preserve file permissions: %w", err)
 	}
+
+	if err := tempFile.Sync(); err != nil {
+		return fmt.Errorf("sync temporary file: %w", err)
+	}
+	closeErr := tempFile.Close()
+	tempFile = nil
+	if closeErr != nil {
+		return fmt.Errorf("close temporary file: %w", closeErr)
+	}
+
+	if err := os.Rename(tempPath, realPath); err != nil {
+		return fmt.Errorf("replace file: %w", err)
+	}
+	committed = true
 
 	// Refresh the file itself
 	err = RefreshIndex(source, path, false, false)
