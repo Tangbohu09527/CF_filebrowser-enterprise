@@ -1,0 +1,4 @@
+interface:
+  display_name: "FileBrowser Minimal Patch"
+  short_description: "Make minimal, upstream-compatible FileBrowser changes"
+  default_prompt: "Use $filebrowser-minimal-patch to implement this FileBrowser change with the smallest verified patch."

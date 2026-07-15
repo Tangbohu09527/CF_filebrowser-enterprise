@@ -1,0 +1,4 @@
+interface:
+  display_name: "FileBrowser Security Review"
+  short_description: "Review file, authentication, token, and permission security"
+  default_prompt: "Use $filebrowser-security-review to review this FileBrowser security-sensitive change and reproduce findings."
