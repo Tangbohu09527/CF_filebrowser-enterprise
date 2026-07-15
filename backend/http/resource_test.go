@@ -850,8 +850,8 @@ func createAPITokenForTest(t *testing.T, user *users.User, name string, permissi
 	}
 
 	var response HttpResponse
-	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
-		t.Fatalf("decode API token response: %v", err)
+	if decodeErr := json.NewDecoder(w.Body).Decode(&response); decodeErr != nil {
+		t.Fatalf("decode API token response: %v", decodeErr)
 	}
 	if response.Token == "" {
 		t.Fatal("create API token returned an empty token")
@@ -941,8 +941,8 @@ func setupResourcePutTestEnv(t *testing.T) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("close test database: %v", err)
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("close test database: %v", closeErr)
 		}
 	})
 
