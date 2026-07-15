@@ -174,7 +174,7 @@ func TestResourcePostPermissions(t *testing.T) {
 			status:          http.StatusForbidden,
 			content:         "unauthorized overwrite",
 			expectedExists:  true,
-			expectedContent: "unauthorized overwrite",
+			expectedContent: originalContent,
 		},
 		{
 			name:            "modify only overrides an existing file",
