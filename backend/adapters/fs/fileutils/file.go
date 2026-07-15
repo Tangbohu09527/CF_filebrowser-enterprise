@@ -1,10 +1,13 @@
 package fileutils
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
+	"syscall"
 
 	"github.com/gtsteffaniak/go-logger/logger"
 )
@@ -57,26 +60,169 @@ func unixModeToFileMode(u uint32) os.FileMode {
 // By default, the rename system call is used. If src and dst point to different volumes,
 // the file copy is used as a fallback.
 func MoveFile(src, dst string) error {
-	err := os.Rename(src, dst)
+	return moveFileWithOps(src, dst, moveFileOps{
+		rename:    os.Rename,
+		copy:      io.Copy,
+		removeAll: os.RemoveAll,
+	})
+}
+
+type moveFileOps struct {
+	rename    func(string, string) error
+	copy      func(io.Writer, io.Reader) (int64, error)
+	removeAll func(string) error
+}
+
+func moveFileWithOps(src, dst string, ops moveFileOps) error {
+	err := ops.rename(src, dst)
 	if err == nil {
 		return nil
 	}
-
-	// fallback
-	err = CopyFile(src, dst)
-	if err != nil {
-		logger.Errorf("CopyFile failed %v", err)
+	if !isCrossDeviceError(err) {
 		return err
 	}
 
-	go func() {
-		err = os.RemoveAll(src)
-		if err != nil {
-			logger.Errorf("os.Remove failed %v", err)
-		}
-	}()
+	tempPath, err := copyToMoveTemp(src, dst, ops.copy)
+	if err != nil {
+		return err
+	}
+
+	if err := ops.rename(tempPath, dst); err != nil {
+		return errors.Join(err, cleanupMoveTemp(tempPath))
+	}
+
+	if err := ops.removeAll(src); err != nil {
+		return err
+	}
 
 	return nil
+}
+
+const windowsErrorNotSameDevice = syscall.Errno(17)
+
+func isCrossDeviceError(err error) bool {
+	if errors.Is(err, syscall.EXDEV) {
+		return true
+	}
+
+	// Windows returns ERROR_NOT_SAME_DEVICE instead of Go's synthesized EXDEV.
+	return runtime.GOOS == "windows" && errors.Is(err, windowsErrorNotSameDevice)
+}
+
+func copyToMoveTemp(source, dest string, copyFn func(io.Writer, io.Reader) (int64, error)) (string, error) {
+	info, err := os.Stat(source)
+	if err != nil {
+		return "", err
+	}
+
+	if info.IsDir() {
+		return copyDirectoryToMoveTemp(source, dest, info, copyFn)
+	}
+
+	return copyRegularFileToMoveTemp(source, dest, info, copyFn)
+}
+
+func copyRegularFileToMoveTemp(source, dest string, info os.FileInfo, copyFn func(io.Writer, io.Reader) (int64, error)) (string, error) {
+	temp, err := os.CreateTemp(filepath.Dir(dest), moveTempPattern(dest))
+	if err != nil {
+		return "", err
+	}
+	tempPath := temp.Name()
+
+	if err := copyRegularFileForMove(source, temp, info, copyFn); err != nil {
+		return "", errors.Join(err, cleanupMoveTemp(tempPath))
+	}
+
+	return tempPath, nil
+}
+
+func copyDirectoryToMoveTemp(source, dest string, info os.FileInfo, copyFn func(io.Writer, io.Reader) (int64, error)) (string, error) {
+	tempPath, err := os.MkdirTemp(filepath.Dir(dest), moveTempPattern(dest))
+	if err != nil {
+		return "", err
+	}
+
+	if err := copyDirectoryForMove(source, tempPath, copyFn); err != nil {
+		return "", errors.Join(err, cleanupMoveTemp(tempPath))
+	}
+	if err := os.Chmod(tempPath, info.Mode().Perm()); err != nil {
+		logger.Debugf("Could not set directory permissions for %s: %v", tempPath, err)
+	}
+
+	return tempPath, nil
+}
+
+func copyDirectoryForMove(source, dest string, copyFn func(io.Writer, io.Reader) (int64, error)) error {
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		srcPath := filepath.Join(source, entry.Name())
+		destPath := filepath.Join(dest, entry.Name())
+		info, err := os.Stat(srcPath)
+		if err != nil {
+			return err
+		}
+
+		if entry.IsDir() {
+			if err := os.Mkdir(destPath, info.Mode().Perm()|0o700); err != nil {
+				return err
+			}
+			if err := copyDirectoryForMove(srcPath, destPath, copyFn); err != nil {
+				return err
+			}
+			if err := os.Chmod(destPath, info.Mode().Perm()); err != nil {
+				logger.Debugf("Could not set directory permissions for %s: %v", destPath, err)
+			}
+			continue
+		}
+
+		destFile, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+		if err != nil {
+			return err
+		}
+		if err := copyRegularFileForMove(srcPath, destFile, info, copyFn); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func copyRegularFileForMove(source string, dest *os.File, info os.FileInfo, copyFn func(io.Writer, io.Reader) (int64, error)) error {
+	src, err := os.Open(source)
+	if err != nil {
+		return errors.Join(err, dest.Close())
+	}
+
+	written, copyErr := copyFn(dest, src)
+	srcCloseErr := src.Close()
+	if copyErr == nil && info.Mode().IsRegular() && written != info.Size() {
+		copyErr = io.ErrUnexpectedEOF
+	}
+	if copyErr == nil {
+		if err := dest.Chmod(info.Mode().Perm()); err != nil {
+			logger.Debugf("Could not set file permissions for %s: %v", dest.Name(), err)
+		}
+	}
+
+	var syncErr error
+	if copyErr == nil {
+		syncErr = dest.Sync()
+	}
+	destCloseErr := dest.Close()
+
+	return errors.Join(copyErr, srcCloseErr, syncErr, destCloseErr)
+}
+
+func moveTempPattern(dest string) string {
+	return "." + filepath.Base(dest) + ".move-*"
+}
+
+func cleanupMoveTemp(tempPath string) error {
+	return os.RemoveAll(tempPath)
 }
 
 // CopyFile copies a file or directory from source to dest and returns an error if any.
