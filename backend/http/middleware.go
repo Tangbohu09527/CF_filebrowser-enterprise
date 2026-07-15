@@ -405,7 +405,8 @@ func withUserHelper(fn handleFunc) handleFunc {
 			w.Header().Add("X-Renew-Token", "true")
 		}
 		// Check if token is minimal/stateful (no BelongsTo in claim)
-		if tk.BelongsTo == 0 {
+		minimalToken := tk.BelongsTo == 0
+		if minimalToken {
 			// Hash the token and look up user ID in access storage
 			userID, found := store.Access.GetUserIDFromToken(data.token)
 			if !found {
@@ -417,6 +418,30 @@ func withUserHelper(fn handleFunc) handleFunc {
 		if err != nil {
 			logger.Errorf("Failed to get user with ID %v: %v", tk.BelongsTo, err)
 			return http.StatusInternalServerError, err
+		}
+		if !minimalToken {
+			isAPIToken := func(tokens map[string]users.AuthToken) bool {
+				for _, apiToken := range tokens {
+					if apiToken.Token == data.token || apiToken.Key == data.token {
+						return true
+					}
+				}
+				return false
+			}
+			if isAPIToken(data.user.Tokens) || isAPIToken(data.user.ApiKeys) {
+				requestUser := *data.user
+				requestUser.Permissions = users.Permissions{
+					Api:      data.user.Permissions.Api && tk.Permissions.Api,
+					Admin:    data.user.Permissions.Admin && tk.Permissions.Admin,
+					Modify:   data.user.Permissions.Modify && tk.Permissions.Modify,
+					Share:    data.user.Permissions.Share && tk.Permissions.Share,
+					Realtime: data.user.Permissions.Realtime && tk.Permissions.Realtime,
+					Delete:   data.user.Permissions.Delete && tk.Permissions.Delete,
+					Create:   data.user.Permissions.Create && tk.Permissions.Create,
+					Download: data.user.Permissions.Download && tk.Permissions.Download,
+				}
+				data.user = &requestUser
+			}
 		}
 
 		// Set cookie. Some clients like gvfs relies on it for concurrent uploads

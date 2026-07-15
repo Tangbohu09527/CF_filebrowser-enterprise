@@ -533,10 +533,6 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 	}
 	path = cleanPath
 
-	if d.share == nil && !d.user.Permissions.Create {
-		return http.StatusForbidden, fmt.Errorf("user is not allowed to create or modify")
-	}
-
 	idx := indexing.GetIndex(source)
 	if idx == nil {
 		logger.Debugf("source %s not found", source)
@@ -576,8 +572,12 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 		return http.StatusForbidden, fmt.Errorf("access denied to path %s", path)
 	}
 
-	// Check for file/folder conflicts before creation
+	// Check permissions and file/folder conflicts before any write.
 	if stat, statErr := os.Stat(realPath); statErr == nil {
+		if d.share == nil && !d.user.Permissions.Modify {
+			return http.StatusForbidden, fmt.Errorf("user is not allowed to modify")
+		}
+
 		// Path exists, check for type conflicts
 		existingIsDir := stat.IsDir()
 		requestingDir := isDir
@@ -591,6 +591,12 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 			logger.Debugf("Type conflict detected in chunked: existing is dir=%v, requesting dir=%v at path=%v", existingIsDir, requestingDir, realPath)
 			return http.StatusConflict, nil
 		}
+	} else if os.IsNotExist(statErr) {
+		if d.share == nil && !d.user.Permissions.Create {
+			return http.StatusForbidden, fmt.Errorf("user is not allowed to create")
+		}
+	} else {
+		return errToStatus(statErr), statErr
 	}
 
 	// Directories creation on POST.
@@ -627,18 +633,6 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 		}
 		// On the first chunk, check for conflicts or handle override
 		if offset == 0 {
-			// Check for file/folder conflicts for chunked uploads
-			if stat, statErr := os.Stat(realPath); statErr == nil {
-				existingIsDir := stat.IsDir()
-				requestingDir := false // Files are never directories
-
-				// If type mismatch (existing dir vs requesting file) and not overriding
-				if existingIsDir != requestingDir && r.URL.Query().Get("override") != "true" {
-					logger.Debugf("Type conflict detected in chunked: existing is dir=%v, requesting dir=%v at path=%v", existingIsDir, requestingDir, realPath)
-					return http.StatusConflict, nil
-				}
-			}
-
 			var fileInfo *iteminfo.ExtendedFileInfo
 			fileInfo, err = files.FileInfoFaster(fileOpts, store.Access, filePermUser, store.Share)
 			if err == nil { // File exists
@@ -779,11 +773,21 @@ func resourcePutHandler(w http.ResponseWriter, r *http.Request, d *requestContex
 		return http.StatusForbidden, fmt.Errorf("access denied to path %s", path)
 	}
 
-	// check if destination is a directory
-	stat, err := os.Stat(filepath.Join(idx.Path + fullIndexPath))
-	if err == nil && stat.IsDir() {
-		// if directory return StatusMethodNotAllowed
-		return http.StatusMethodNotAllowed, fmt.Errorf("path is a directory")
+	// Check target permissions before WriteFile can create or truncate it.
+	stat, statErr := os.Stat(filepath.Join(idx.Path + fullIndexPath))
+	if statErr == nil {
+		if !d.user.Permissions.Modify {
+			return http.StatusForbidden, fmt.Errorf("user is not allowed to modify")
+		}
+		if stat.IsDir() {
+			return http.StatusMethodNotAllowed, fmt.Errorf("path is a directory")
+		}
+	} else if os.IsNotExist(statErr) {
+		if !d.user.Permissions.Create {
+			return http.StatusForbidden, fmt.Errorf("user is not allowed to create")
+		}
+	} else {
+		return errToStatus(statErr), statErr
 	}
 
 	err = files.WriteFile(source, fullIndexPath, r.Body)

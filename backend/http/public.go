@@ -156,7 +156,8 @@ func publicUploadHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 	if d.share.ShareType != "upload" && !d.share.AllowCreate {
 		return http.StatusForbidden, fmt.Errorf("uploading is disabled for this share")
 	}
-	if !d.share.AllowReplacements && r.URL.Query().Get("action") == "override" {
+	if !d.share.AllowReplacements &&
+		(r.URL.Query().Get("action") == "override" || r.URL.Query().Get("override") == "true") {
 		return http.StatusForbidden, fmt.Errorf("cannot overwrite files for this share")
 	}
 	// Go automatically decodes query params
