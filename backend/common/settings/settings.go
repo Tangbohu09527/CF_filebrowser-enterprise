@@ -30,6 +30,8 @@ func ConvertPermissionsToUsers(p UserDefaultsAccountPermissions) users.Permissio
 		Realtime: p.Realtime,
 		Delete:   p.Delete,
 		Create:   p.Create,
+		Browse:   boolValueOrDefault(p.Browse, true),
+		Preview:  boolValueOrDefault(p.Preview, true),
 		Download: boolValueOrDefault(p.Download, true),
 	}
 }
@@ -61,6 +63,8 @@ func AdminPerms() users.Permissions {
 		Share:    true,
 		Admin:    true,
 		Api:      true,
+		Browse:   true,
+		Preview:  true,
 		Download: true,
 		Delete:   true,
 		Create:   true,
@@ -145,6 +149,8 @@ func ApplyUserDefaults(u *users.User) {
 	u.Permissions.Realtime = d.Account.Permissions.Realtime
 	u.Permissions.Delete = d.Account.Permissions.Delete
 	u.Permissions.Create = d.Account.Permissions.Create
+	u.Permissions.Browse = boolValueOrDefault(d.Account.Permissions.Browse, true)
+	u.Permissions.Preview = boolValueOrDefault(d.Account.Permissions.Preview, true)
 	u.Permissions.Download = boolValueOrDefault(d.Account.Permissions.Download, true)
 
 	if u.LoginMethod == "" && d.Account.LoginMethod != "" {

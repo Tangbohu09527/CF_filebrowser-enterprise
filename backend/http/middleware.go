@@ -420,26 +420,42 @@ func withUserHelper(fn handleFunc) handleFunc {
 			return http.StatusInternalServerError, err
 		}
 		if !minimalToken {
-			isAPIToken := func(tokens map[string]users.AuthToken) bool {
+			findAPIToken := func(tokens map[string]users.AuthToken) (users.AuthToken, bool) {
 				for _, apiToken := range tokens {
 					if apiToken.Token == data.token || apiToken.Key == data.token {
-						return true
+						return apiToken, true
 					}
 				}
-				return false
+				return users.AuthToken{}, false
 			}
-			if isAPIToken(data.user.Tokens) || isAPIToken(data.user.ApiKeys) {
-				requestUser := *data.user
-				requestUser.Permissions = users.Permissions{
-					Api:      data.user.Permissions.Api && tk.Permissions.Api,
-					Admin:    data.user.Permissions.Admin && tk.Permissions.Admin,
-					Modify:   data.user.Permissions.Modify && tk.Permissions.Modify,
-					Share:    data.user.Permissions.Share && tk.Permissions.Share,
-					Realtime: data.user.Permissions.Realtime && tk.Permissions.Realtime,
-					Delete:   data.user.Permissions.Delete && tk.Permissions.Delete,
-					Create:   data.user.Permissions.Create && tk.Permissions.Create,
-					Download: data.user.Permissions.Download && tk.Permissions.Download,
+			storedToken, stored := findAPIToken(data.user.Tokens)
+			if !stored {
+				storedToken, stored = findAPIToken(data.user.ApiKeys)
+			}
+
+			var tokenPermissions users.Permissions
+			applyTokenPermissions := false
+			switch {
+			case tk.Name != "":
+				if tk.PermissionsVersion != users.CurrentPermissionsVersion ||
+					(stored && storedToken.PermissionsVersion != users.CurrentPermissionsVersion) {
+					return http.StatusUnauthorized, fmt.Errorf("invalid API token permissions version")
 				}
+				tokenPermissions = tk.Permissions
+				applyTokenPermissions = true
+			case stored:
+				if tk.PermissionsVersion != 0 || storedToken.PermissionsVersion != 0 {
+					return http.StatusUnauthorized, fmt.Errorf("invalid API token permissions version")
+				}
+				tokenPermissions = users.NormalizeLegacyPermissions(tk.Permissions)
+				applyTokenPermissions = true
+			case tk.PermissionsVersion != 0:
+				return http.StatusUnauthorized, fmt.Errorf("invalid API token permissions version")
+			}
+
+			if applyTokenPermissions {
+				requestUser := *data.user
+				requestUser.Permissions = users.IntersectPermissions(data.user.Permissions, tokenPermissions)
 				data.user = &requestUser
 			}
 		}

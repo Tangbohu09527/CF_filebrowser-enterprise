@@ -1083,6 +1083,8 @@ func SetDefaults(generate bool) Settings {
 					Realtime: false,
 					Delete:   false,
 					Create:   false,
+					Browse:   boolPtr(true),
+					Preview:  boolPtr(true),
 					Download: boolPtr(true), // defaults to true
 				},
 				LockPassword:               false,

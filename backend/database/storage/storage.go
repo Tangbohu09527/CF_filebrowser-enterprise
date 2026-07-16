@@ -93,9 +93,7 @@ func quickSetup(store *bolt.BoltStore) {
 		}
 		user.Password = settings.Config.Auth.AdminPassword
 		user.LockPassword = false
-		download := user.Permissions.Download
 		user.Permissions = settings.AdminPerms()
-		user.Permissions.Download = download
 		user.ShowFirstLogin = settings.Env.IsFirstLoad && user.Permissions.Admin
 		logger.Debugf("Creating user as admin: %v %v", user.Username, user.Password)
 		err = store.Users.Save(user, true, true)

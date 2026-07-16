@@ -247,6 +247,8 @@ func setUser(dbConfig string, asAdmin bool) error {
 		fmt.Printf("successfully created user")
 		return nil
 	}
+	migrateUser(user)
+	updateLoginType(user)
 	if user.LoginMethod != users.LoginMethodPassword {
 		return fmt.Errorf("user %s is not allowed to login with password authentication, cannot set password", username)
 	}
@@ -256,10 +258,6 @@ func setUser(dbConfig string, asAdmin bool) error {
 	user.LoginMethod = users.LoginMethodPassword
 	if asAdmin {
 		user.Permissions.Admin = true
-	}
-	// Ensure version is set for existing users being updated
-	if user.Version == 0 {
-		user.Version = users.CurrentUserMigrationVersion
 	}
 	err = store.Users.Save(user, true, false)
 	if err != nil {

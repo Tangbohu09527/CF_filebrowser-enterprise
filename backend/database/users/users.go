@@ -8,7 +8,10 @@ import (
 )
 
 // CurrentUserMigrationVersion is persisted for newly created accounts and after legacy migrations finish.
-const CurrentUserMigrationVersion = 3
+const CurrentUserMigrationVersion = 4
+
+// CurrentPermissionsVersion identifies permission snapshots that include Browse, Preview, and Download.
+const CurrentPermissionsVersion = 4
 
 type LoginMethod string
 
@@ -51,13 +54,14 @@ type WebAuthnCredential struct {
 
 type AuthToken struct {
 	MinimalAuthToken
-	Key         string      `json:"key,omitempty"` // for backward compatibility
-	Token       string      `json:"token,omitempty"`
-	Name        string      `json:"name,omitempty"`
-	BelongsTo   uint        `json:"belongsTo,omitempty"`
-	IssuedAt    int64       `json:"issuedAt,omitempty"`
-	ExpiresAt   int64       `json:"expiresAt,omitempty"`
-	Permissions Permissions `json:"Permissions,omitempty"`
+	Key                string      `json:"key,omitempty"` // for backward compatibility
+	Token              string      `json:"token,omitempty"`
+	Name               string      `json:"name,omitempty"`
+	BelongsTo          uint        `json:"belongsTo,omitempty"`
+	IssuedAt           int64       `json:"issuedAt,omitempty"`
+	ExpiresAt          int64       `json:"expiresAt,omitempty"`
+	PermissionsVersion int         `json:"permissionsVersion,omitempty"`
+	Permissions        Permissions `json:"Permissions,omitempty"`
 }
 
 // MinimalAuthToken is used for tokens that only include JWT standard claims
@@ -73,7 +77,32 @@ type Permissions struct {
 	Realtime bool `json:"realtime"` // allow realtime updates
 	Delete   bool `json:"delete"`   // allow deleting files
 	Create   bool `json:"create"`   // allow creating or uploading files
+	Browse   bool `json:"browse"`   // allow browsing files and directories
+	Preview  bool `json:"preview"`  // allow previewing file contents
 	Download bool `json:"download"` // allow downloading files
+}
+
+// NormalizeLegacyPermissions applies the read permissions that predate versioned permission snapshots.
+func NormalizeLegacyPermissions(permissions Permissions) Permissions {
+	permissions.Browse = true
+	permissions.Preview = true
+	return permissions
+}
+
+// IntersectPermissions caps granted permissions by the account's current permissions.
+func IntersectPermissions(current, granted Permissions) Permissions {
+	return Permissions{
+		Api:      current.Api && granted.Api,
+		Admin:    current.Admin && granted.Admin,
+		Modify:   current.Modify && granted.Modify,
+		Share:    current.Share && granted.Share,
+		Realtime: current.Realtime && granted.Realtime,
+		Delete:   current.Delete && granted.Delete,
+		Create:   current.Create && granted.Create,
+		Browse:   current.Browse && granted.Browse,
+		Preview:  current.Preview && granted.Preview,
+		Download: current.Download && granted.Download,
+	}
 }
 
 // SortingSettings represents the sorting settings.

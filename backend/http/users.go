@@ -14,6 +14,7 @@ import (
 
 	"github.com/gtsteffaniak/filebrowser/backend/auth"
 	"github.com/gtsteffaniak/filebrowser/backend/common/errors"
+	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	"github.com/gtsteffaniak/filebrowser/backend/database/storage"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
@@ -21,8 +22,64 @@ import (
 )
 
 type UserRequest struct {
-	Which []string   `json:"which"`
-	User  users.User `json:"data"`
+	Which              []string   `json:"which"`
+	User               users.User `json:"data"`
+	permissionPresence userPermissionPresence
+}
+
+type userPermissionPresence struct {
+	Browse   *bool `json:"browse"`
+	Preview  *bool `json:"preview"`
+	Download *bool `json:"download"`
+}
+
+func (request *UserRequest) UnmarshalJSON(data []byte) error {
+	type requestPayload struct {
+		Which []string   `json:"which"`
+		User  users.User `json:"data"`
+	}
+	var payload requestPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return err
+	}
+
+	var presencePayload struct {
+		User struct {
+			Permissions userPermissionPresence `json:"permissions"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &presencePayload); err != nil {
+		return err
+	}
+
+	request.Which = payload.Which
+	request.User = payload.User
+	request.permissionPresence = presencePayload.User.Permissions
+	return nil
+}
+
+func applyPermissionPresence(requested, fallback users.Permissions, presence userPermissionPresence) users.Permissions {
+	if presence.Browse == nil {
+		requested.Browse = fallback.Browse
+	} else {
+		requested.Browse = *presence.Browse
+	}
+	if presence.Preview == nil {
+		requested.Preview = fallback.Preview
+	} else {
+		requested.Preview = *presence.Preview
+	}
+	return requested
+}
+
+func applyNewUserPermissionDefaults(requested, defaults users.Permissions, presence userPermissionPresence) users.Permissions {
+	requested = applyPermissionPresence(requested, defaults, presence)
+	if presence.Download == nil {
+		requested.Download = defaults.Download
+	} else {
+		requested.Download = *presence.Download
+	}
+	return requested
 }
 
 // userGetHandler retrieves a user by ID.
@@ -297,6 +354,11 @@ func usersPostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 		return http.StatusBadRequest, err
 	}
 	r.Body.Close()
+	req.User.Permissions = applyNewUserPermissionDefaults(
+		req.User.Permissions,
+		settings.ConvertPermissionsToUsers(config.UserDefaults.Account.Permissions),
+		req.permissionPresence,
+	)
 
 	if req.User.Username == "" {
 		return http.StatusBadRequest, errors.ErrEmptyUsername
@@ -445,6 +507,7 @@ func userPutHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (
 	if err != nil {
 		return http.StatusBadRequest, fmt.Errorf("failed to get user: %w", err)
 	}
+	req.User.Permissions = applyPermissionPresence(req.User.Permissions, oldUser.Permissions, req.permissionPresence)
 
 	if d.user.LoginMethod == users.LoginMethodPassword && !userPutOnlyNonAdminEditableFields(req.Which) {
 		var status int

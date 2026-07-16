@@ -416,6 +416,8 @@ type UserDefaultsAccountPermissions struct {
 	Realtime bool  `json:"realtime"` // allow realtime updates
 	Delete   bool  `json:"delete"`   // allow deleting files
 	Create   bool  `json:"create"`   // allow creating or uploading files
+	Browse   *bool `json:"browse"`   // allow browsing files and directories
+	Preview  *bool `json:"preview"`  // allow previewing file contents
 	Download *bool `json:"download"` // allow downloading files
 }
 

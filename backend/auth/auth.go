@@ -3,6 +3,7 @@ package auth
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v4"
@@ -54,6 +55,10 @@ func MakeSignedTokenAPI(user *users.User, name string, duration time.Duration, p
 	if !minimal {
 		claim.Permissions = perms
 		claim.BelongsTo = user.ID
+		if !strings.HasPrefix(name, "WEB_TOKEN") {
+			claim.PermissionsVersion = users.CurrentPermissionsVersion
+			claim.Name = name
+		}
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claim)
 	tokenString, err := token.SignedString([]byte(settings.Config.Auth.Key))

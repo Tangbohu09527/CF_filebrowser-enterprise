@@ -26,7 +26,7 @@ func validateUserInfo(newDB bool) {
 		if updateUserScopes(user) {
 			updateUser = true
 		}
-		if updatePermissions(user) {
+		if migrateUser(user) {
 			updateUser = true
 		}
 		if updatePreviewSettings(user) {
@@ -39,12 +39,6 @@ func validateUserInfo(newDB bool) {
 			updateUser = true
 		}
 		if updateSidebarLinks(user) {
-			updateUser = true
-		}
-		if updateTokens(user) {
-			updateUser = true
-		}
-		if updateShowToolsInSidebar(user) {
 			updateUser = true
 		}
 		adminUser := settings.Config.Auth.AdminUsername
@@ -65,7 +59,7 @@ func validateUserInfo(newDB bool) {
 					logger.Fatalf("Unable to create automatic backup of database due to error: %v", err)
 				}
 			}
-			fields := []string{"Scopes", "SidebarLinks", "Tokens", "Permissions", "Preview", "ShowFirstLogin", "LoginMethod", "Version", "ShowToolsInSidebar"}
+			fields := []string{"Scopes", "SidebarLinks", "Tokens", "Permissions", "Preview", "ShowFirstLogin", "LoginMethod", "ShowToolsInSidebar", "Version"}
 			if changePass {
 				fields = append(fields, "Password")
 			}
@@ -123,14 +117,45 @@ func updateUserScopes(user *users.User) bool {
 	return changed
 }
 
-// updateShowToolsInSidebar one-time defaults for legacy users (Version < CurrentUserMigrationVersion) from configured userDefaults.
+// updateShowToolsInSidebar applies the v2-to-v3 sidebar default.
 func updateShowToolsInSidebar(user *users.User) bool {
 	if user.Version >= 3 {
 		return false
 	}
 	user.ShowToolsInSidebar = true
-	user.Version = users.CurrentUserMigrationVersion
+	user.Version = 3
 	return true
+}
+
+func updateReadPermissions(user *users.User) bool {
+	if user.Version >= 4 {
+		return false
+	}
+	user.Permissions = users.NormalizeLegacyPermissions(user.Permissions)
+	user.Version = 4
+	return true
+}
+
+func migrateUser(user *users.User) bool {
+	updated := false
+	for user.Version < users.CurrentUserMigrationVersion {
+		previousVersion := user.Version
+		switch {
+		case user.Version < 1:
+			updatePermissions(user)
+		case user.Version < 2:
+			updateTokens(user)
+		case user.Version < 3:
+			updateShowToolsInSidebar(user)
+		case user.Version < 4:
+			updateReadPermissions(user)
+		}
+		if user.Version == previousVersion {
+			break
+		}
+		updated = true
+	}
+	return updated
 }
 
 func updateShowFirstLogin(user *users.User) bool {
@@ -146,53 +171,22 @@ func updatePermissions(user *users.User) bool {
 	if user.Version >= 1 {
 		return false
 	}
-	updateUser := true
-	// if any keys are true, set the permissions to true
-	if user.Perm.Api {
-		user.Permissions.Api = true
-		user.Perm.Api = false
-		updateUser = true
-	}
-	if user.Perm.Admin {
-		user.Permissions.Admin = true
-		user.Perm.Admin = false
-		updateUser = true
-	}
-	if user.Perm.Modify {
-		user.Permissions.Modify = true
-		user.Perm.Modify = false
-		updateUser = true
-	}
-	if user.Perm.Share {
-		user.Permissions.Share = true
-		user.Perm.Share = false
-		updateUser = true
-	}
-	if user.Perm.Create {
-		user.Permissions.Create = true
-		user.Perm.Create = false
-		updateUser = true
-	}
-	if user.Perm.Create {
-		user.Permissions.Create = true
-		user.Perm.Create = false
-		updateUser = true
-	}
-	if user.Perm.Download {
-		user.Permissions.Download = true
-		user.Perm.Download = false
-		updateUser = true
-	}
+	user.Permissions.Api = user.Permissions.Api || user.Perm.Api
+	user.Permissions.Admin = user.Permissions.Admin || user.Perm.Admin
+	user.Permissions.Modify = user.Permissions.Modify || user.Perm.Modify
+	user.Permissions.Share = user.Permissions.Share || user.Perm.Share
+	user.Permissions.Realtime = user.Permissions.Realtime || user.Perm.Realtime
+	user.Permissions.Delete = user.Permissions.Delete || user.Perm.Delete
+	user.Permissions.Create = user.Permissions.Create || user.Perm.Create
+	user.Permissions.Download = user.Permissions.Download || user.Perm.Download
+	user.Perm = users.Permissions{}
 	if user.Permissions.Modify {
 		user.Permissions.Create = true
 		user.Permissions.Delete = true
-		updateUser = true
 	}
-	user.Version = users.CurrentUserMigrationVersion
-	if updateUser {
-		createBackup = true
-	}
-	return updateUser
+	user.Version = 1
+	createBackup = true
+	return true
 }
 
 func updateLoginType(user *users.User) bool {
@@ -272,12 +266,19 @@ func updateTokens(user *users.User) bool {
 		return false
 	}
 	if user.ApiKeys != nil {
-		user.Tokens = make(map[string]users.AuthToken)
+		if user.Tokens == nil {
+			user.Tokens = make(map[string]users.AuthToken)
+		}
 		for name, token := range user.ApiKeys {
-			token.Token = token.Key
+			if _, exists := user.Tokens[name]; exists {
+				continue
+			}
+			if token.Token == "" {
+				token.Token = token.Key
+			}
 			user.Tokens[name] = token
 		}
 	}
-	user.Version = users.CurrentUserMigrationVersion
+	user.Version = 2
 	return true
 }
