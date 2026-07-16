@@ -2,11 +2,8 @@ package http
 
 import (
 	"context"
-	"crypto/md5"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path"
@@ -16,7 +13,6 @@ import (
 	"time"
 
 	"github.com/gtsteffaniak/filebrowser/backend/adapters/fs/files"
-	"github.com/gtsteffaniak/filebrowser/backend/adapters/fs/fileutils"
 	"github.com/gtsteffaniak/filebrowser/backend/common/errors"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing"
@@ -28,17 +24,6 @@ import (
 
 var pauseCache = cache.NewCache[string](1 * time.Minute)
 var publicPauseCache = cache.NewCache[string](1 * time.Minute)
-
-// pauseCacheKeySep separates segments in pause cache keys (not used in source names/paths).
-const pauseCacheKeySep = "\x1e"
-
-func pauseUploadCacheKey(source, path string) string {
-	return source + pauseCacheKeySep + path
-}
-
-func publicPauseUploadCacheKey(shareHash, source, indexPath string) string {
-	return shareHash + pauseCacheKeySep + source + pauseCacheKeySep + indexPath
-}
 
 // validateMoveOperation checks if a move/rename operation is valid at the HTTP level
 // It prevents moving a directory into itself or its subdirectories
@@ -477,7 +462,7 @@ func resourcePauseHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 	if !store.Access.Permitted(idx.Path, path, d.user.Username) {
 		return http.StatusForbidden, fmt.Errorf("access denied to path %s", path)
 	}
-	pauseCache.Set(pauseUploadCacheKey(source, path), "1")
+	pauseCache.Set(chunkUploadPauseKey(d, source, path), "1")
 	return http.StatusOK, nil
 }
 
@@ -502,7 +487,7 @@ func publicPauseHandler(w http.ResponseWriter, r *http.Request, d *requestContex
 		return http.StatusNotFound, fmt.Errorf("source not found")
 	}
 	sourceName := src.Name
-	publicPauseCache.Set(publicPauseUploadCacheKey(d.share.Hash, sourceName, d.IndexPath), "1")
+	publicPauseCache.Set(chunkUploadPauseKey(d, sourceName, d.IndexPath), "1")
 	return http.StatusOK, nil
 }
 
@@ -532,10 +517,6 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 		return http.StatusBadRequest, err
 	}
 	path = cleanPath
-
-	if d.share == nil && !d.user.Permissions.Create {
-		return http.StatusForbidden, fmt.Errorf("user is not allowed to create or modify")
-	}
 
 	idx := indexing.GetIndex(source)
 	if idx == nil {
@@ -576,8 +557,19 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 		return http.StatusForbidden, fmt.Errorf("access denied to path %s", path)
 	}
 
-	// Check for file/folder conflicts before creation
+	chunkOffsetStr := r.Header.Get("X-File-Chunk-Offset")
+	unlockTarget, locked := tryLockChunkUploadTarget(realPath)
+	if !locked {
+		return http.StatusConflict, fmt.Errorf("another upload request is active for this target")
+	}
+	defer unlockTarget()
+
+	// Check permissions and file/folder conflicts before any write.
 	if stat, statErr := os.Stat(realPath); statErr == nil {
+		if d.share == nil && !d.user.Permissions.Modify {
+			return http.StatusForbidden, fmt.Errorf("user is not allowed to modify")
+		}
+
 		// Path exists, check for type conflicts
 		existingIsDir := stat.IsDir()
 		requestingDir := isDir
@@ -591,6 +583,15 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 			logger.Debugf("Type conflict detected in chunked: existing is dir=%v, requesting dir=%v at path=%v", existingIsDir, requestingDir, realPath)
 			return http.StatusConflict, nil
 		}
+	} else if os.IsNotExist(statErr) {
+		if d.share == nil && !d.user.Permissions.Create {
+			return http.StatusForbidden, fmt.Errorf("user is not allowed to create")
+		}
+	} else {
+		return errToStatus(statErr), statErr
+	}
+	if chunkOffsetStr != "" {
+		cleanupStaleChunkUploadTemps(filepath.Dir(realPath), realPath)
 	}
 
 	// Directories creation on POST.
@@ -609,36 +610,36 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 	}
 
 	// Handle Chunked Uploads
-	chunkOffsetStr := r.Header.Get("X-File-Chunk-Offset")
 	if chunkOffsetStr != "" {
-		var offset int64
-		offset, err = strconv.ParseInt(chunkOffsetStr, 10, 64)
-		if err != nil {
-			logger.Debugf("invalid chunk offset: %v", err)
-			return http.StatusBadRequest, fmt.Errorf("invalid chunk offset: %v", err)
+		offset, parseErr := strconv.ParseInt(chunkOffsetStr, 10, 64)
+		if parseErr != nil {
+			logger.Debugf("invalid chunk offset: %v", parseErr)
+			return http.StatusBadRequest, fmt.Errorf("invalid chunk offset: %v", parseErr)
+		}
+		if offset < 0 {
+			return http.StatusBadRequest, fmt.Errorf("invalid chunk offset: must not be negative")
 		}
 
-		var totalSize int64
 		totalSizeStr := r.Header.Get("X-File-Total-Size")
-		totalSize, err = strconv.ParseInt(totalSizeStr, 10, 64)
-		if err != nil {
-			logger.Debugf("invalid total size: %v", err)
-			return http.StatusBadRequest, fmt.Errorf("invalid total size: %v", err)
+		totalSize, parseErr := strconv.ParseInt(totalSizeStr, 10, 64)
+		if parseErr != nil {
+			logger.Debugf("invalid total size: %v", parseErr)
+			return http.StatusBadRequest, fmt.Errorf("invalid total size: %v", parseErr)
 		}
-		// On the first chunk, check for conflicts or handle override
+		if totalSize < 0 {
+			return http.StatusBadRequest, fmt.Errorf("invalid total size: must not be negative")
+		}
+		if offset > totalSize {
+			return http.StatusBadRequest, fmt.Errorf("chunk offset exceeds total size")
+		}
+
+		remaining := totalSize - offset
+		if r.ContentLength >= 0 && r.ContentLength > remaining {
+			return http.StatusBadRequest, fmt.Errorf("chunk exceeds declared total size")
+		}
+
+		// On the first chunk, check for conflicts or handle override.
 		if offset == 0 {
-			// Check for file/folder conflicts for chunked uploads
-			if stat, statErr := os.Stat(realPath); statErr == nil {
-				existingIsDir := stat.IsDir()
-				requestingDir := false // Files are never directories
-
-				// If type mismatch (existing dir vs requesting file) and not overriding
-				if existingIsDir != requestingDir && r.URL.Query().Get("override") != "true" {
-					logger.Debugf("Type conflict detected in chunked: existing is dir=%v, requesting dir=%v at path=%v", existingIsDir, requestingDir, realPath)
-					return http.StatusConflict, nil
-				}
-			}
-
 			var fileInfo *iteminfo.ExtendedFileInfo
 			fileInfo, err = files.FileInfoFaster(fileOpts, store.Access, filePermUser, store.Share)
 			if err == nil { // File exists
@@ -651,46 +652,46 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 			}
 		}
 
-		// Use a temporary file in the cache directory for chunks.
-		// Create a unique name for the temporary file to avoid collisions.
-		hasher := md5.New()
-		hasher.Write([]byte(realPath))
-		tempFilePath := fmt.Sprintf("%s.%s.uploading.tmp", realPath, hex.EncodeToString(hasher.Sum(nil)))
-		// Create or open the temporary file
-		var outFile *os.File
-		outFile, err = os.OpenFile(tempFilePath, os.O_CREATE|os.O_WRONLY, fileutils.PermFile)
-		if err != nil {
-			logger.Debugf("could not open temp file: %v", err)
-			return http.StatusInternalServerError, fmt.Errorf("could not open temp file: %v", err)
+		outFile, tempFilePath, created, status, openErr := openChunkUploadFile(
+			realPath,
+			chunkUploadPrincipal(d),
+			offset,
+			totalSize,
+		)
+		if openErr != nil {
+			return status, openErr
 		}
-		defer outFile.Close()
-
-		// Seek to the correct offset to write the chunk
-		_, err = outFile.Seek(offset, 0)
-		if err != nil {
-			logger.Debugf("could not seek in temp file: %v", err)
-			return http.StatusInternalServerError, fmt.Errorf("could not seek in temp file: %v", err)
-		}
-
-		// Write the request body (the chunk) to the file
-		var chunkSize int64
-		chunkSize, err = io.Copy(outFile, r.Body)
-		if err != nil {
-			logger.Debugf("could not write chunk to temp file: %v", err)
-			if truncErr := outFile.Truncate(offset); truncErr != nil {
-				logger.Debugf("could not truncate temp file after failed chunk (offset=%d): %v", offset, truncErr)
+		fileClosed := false
+		closeOutFile := func() error {
+			if fileClosed {
+				return nil
 			}
-			_ = outFile.Sync()
+			fileClosed = true
+			return outFile.Close()
+		}
+		defer func() {
+			_ = closeOutFile()
+		}()
+
+		chunkSize, tooLarge, copyErr := copyChunkUploadBody(outFile, r.Body, remaining)
+		if copyErr != nil {
+			logger.Debugf("could not write chunk to temp file: %v", copyErr)
+			resetErr := resetChunkUploadFile(outFile, offset)
+			closeErr := closeOutFile()
+			if resetErr != nil || closeErr != nil {
+				removeChunkUploadTemp(tempFilePath)
+				return http.StatusInternalServerError, fmt.Errorf("could not restore chunk upload after a failed write")
+			}
 
 			gracefulPause := false
 			if d.share != nil {
-				k := publicPauseUploadCacheKey(d.share.Hash, source, path)
+				k := chunkUploadPauseKey(d, source, path)
 				if _, ok := publicPauseCache.Get(k); ok {
 					gracefulPause = true
 					publicPauseCache.Delete(k)
 				}
 			} else {
-				k := pauseUploadCacheKey(source, path)
+				k := chunkUploadPauseKey(d, source, path)
 				if _, ok := pauseCache.Get(k); ok {
 					gracefulPause = true
 					pauseCache.Delete(k)
@@ -698,23 +699,106 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 			}
 
 			if gracefulPause {
-				logger.Debugf("chunk upload ended after graceful pause; keeping partial file (source=%s path=%s)", source, path)
+				if offset == 0 {
+					removeChunkUploadTemp(tempFilePath)
+					logger.Debugf("chunk upload ended after graceful pause; removed empty session (source=%s path=%s)", source, path)
+				} else {
+					scheduleChunkUploadTempCleanup(realPath, tempFilePath)
+					logger.Debugf("chunk upload ended after graceful pause; keeping partial file (source=%s path=%s)", source, path)
+				}
 				return 499, nil
 			}
-			_ = os.Remove(tempFilePath)
-			return http.StatusInternalServerError, fmt.Errorf("could not write chunk to temp file: %v", err)
+			removeChunkUploadTemp(tempFilePath)
+			return http.StatusInternalServerError, fmt.Errorf("could not write chunk to temp file: %v", copyErr)
 		}
-		// check if the file is complete
-		if (offset + chunkSize) >= totalSize {
-			// close file before moving
-			outFile.Close()
-			// Move the completed file from the temp location to the final destination
-			err = files.MoveResource(false, source, source, tempFilePath, realPath, store.Share, store.Access)
-			if err != nil {
-				logger.Debugf("could not move file from %v to %v: %v", tempFilePath, realPath, err)
-				return http.StatusInternalServerError, fmt.Errorf("could not move file from chunked folder to destination: %v", err)
+
+		if tooLarge {
+			resetErr := resetChunkUploadFile(outFile, offset)
+			closeErr := closeOutFile()
+			if created || resetErr != nil || closeErr != nil {
+				removeChunkUploadTemp(tempFilePath)
+			} else {
+				scheduleChunkUploadTempCleanup(realPath, tempFilePath)
 			}
+			if resetErr != nil || closeErr != nil {
+				return http.StatusInternalServerError, fmt.Errorf("could not restore chunk upload after an oversized chunk")
+			}
+			return http.StatusBadRequest, fmt.Errorf("chunk exceeds declared total size")
 		}
+
+		expectedSize := offset + chunkSize
+		fileInfo, statErr := outFile.Stat()
+		if statErr != nil || !fileInfo.Mode().IsRegular() || fileInfo.Size() != expectedSize {
+			_ = closeOutFile()
+			removeChunkUploadTemp(tempFilePath)
+			return http.StatusConflict, fmt.Errorf("chunk upload length changed unexpectedly")
+		}
+
+		if chunkSize == 0 && expectedSize < totalSize {
+			closeErr := closeOutFile()
+			if created || closeErr != nil {
+				removeChunkUploadTemp(tempFilePath)
+			} else {
+				scheduleChunkUploadTempCleanup(realPath, tempFilePath)
+			}
+			if closeErr != nil {
+				return http.StatusInternalServerError, fmt.Errorf("could not close empty chunk upload: %v", closeErr)
+			}
+			return http.StatusBadRequest, fmt.Errorf("chunk must advance the upload offset")
+		}
+
+		if expectedSize < totalSize {
+			if closeErr := closeOutFile(); closeErr != nil {
+				removeChunkUploadTemp(tempFilePath)
+				return http.StatusInternalServerError, fmt.Errorf("could not close chunk upload file: %v", closeErr)
+			}
+			scheduleChunkUploadTempCleanup(realPath, tempFilePath)
+			return http.StatusOK, nil
+		}
+
+		if syncErr := outFile.Sync(); syncErr != nil {
+			_ = closeOutFile()
+			removeChunkUploadTemp(tempFilePath)
+			return http.StatusInternalServerError, fmt.Errorf("could not sync completed chunk upload: %v", syncErr)
+		}
+		fileInfo, statErr = outFile.Stat()
+		if statErr != nil || !fileInfo.Mode().IsRegular() || fileInfo.Size() != totalSize {
+			_ = closeOutFile()
+			removeChunkUploadTemp(tempFilePath)
+			return http.StatusConflict, fmt.Errorf("completed chunk upload size does not match declared total size")
+		}
+		if closeErr := closeOutFile(); closeErr != nil {
+			removeChunkUploadTemp(tempFilePath)
+			return http.StatusInternalServerError, fmt.Errorf("could not close completed chunk upload: %v", closeErr)
+		}
+
+		// The target can change while the final request body is being read.
+		if _, statErr := os.Stat(realPath); statErr == nil {
+			if d.share == nil && !d.user.Permissions.Modify {
+				removeChunkUploadTemp(tempFilePath)
+				return http.StatusForbidden, fmt.Errorf("user is not allowed to modify")
+			}
+			if r.URL.Query().Get("override") != "true" {
+				removeChunkUploadTemp(tempFilePath)
+				return http.StatusConflict, fmt.Errorf("resource appeared before chunk upload commit")
+			}
+		} else if os.IsNotExist(statErr) {
+			if d.share == nil && !d.user.Permissions.Create {
+				removeChunkUploadTemp(tempFilePath)
+				return http.StatusForbidden, fmt.Errorf("user is not allowed to create")
+			}
+		} else {
+			removeChunkUploadTemp(tempFilePath)
+			return errToStatus(statErr), statErr
+		}
+
+		err = files.MoveResource(false, source, source, tempFilePath, realPath, store.Share, store.Access)
+		if err != nil {
+			logger.Debugf("could not move file from %v to %v: %v", tempFilePath, realPath, err)
+			removeChunkUploadTemp(tempFilePath)
+			return http.StatusInternalServerError, fmt.Errorf("could not move file from chunked folder to destination: %v", err)
+		}
+		stopChunkUploadTempCleanup(tempFilePath)
 		return http.StatusOK, nil
 	}
 
@@ -779,11 +863,21 @@ func resourcePutHandler(w http.ResponseWriter, r *http.Request, d *requestContex
 		return http.StatusForbidden, fmt.Errorf("access denied to path %s", path)
 	}
 
-	// check if destination is a directory
-	stat, err := os.Stat(filepath.Join(idx.Path + fullIndexPath))
-	if err == nil && stat.IsDir() {
-		// if directory return StatusMethodNotAllowed
-		return http.StatusMethodNotAllowed, fmt.Errorf("path is a directory")
+	// Check target permissions before WriteFile can create or truncate it.
+	stat, statErr := os.Stat(filepath.Join(idx.Path + fullIndexPath))
+	if statErr == nil {
+		if !d.user.Permissions.Modify {
+			return http.StatusForbidden, fmt.Errorf("user is not allowed to modify")
+		}
+		if stat.IsDir() {
+			return http.StatusMethodNotAllowed, fmt.Errorf("path is a directory")
+		}
+	} else if os.IsNotExist(statErr) {
+		if !d.user.Permissions.Create {
+			return http.StatusForbidden, fmt.Errorf("user is not allowed to create")
+		}
+	} else {
+		return errToStatus(statErr), statErr
 	}
 
 	err = files.WriteFile(source, fullIndexPath, r.Body)

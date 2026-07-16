@@ -156,7 +156,8 @@ func publicUploadHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 	if d.share.ShareType != "upload" && !d.share.AllowCreate {
 		return http.StatusForbidden, fmt.Errorf("uploading is disabled for this share")
 	}
-	if !d.share.AllowReplacements && r.URL.Query().Get("action") == "override" {
+	if !d.share.AllowReplacements &&
+		(r.URL.Query().Get("action") == "override" || r.URL.Query().Get("override") == "true") {
 		return http.StatusForbidden, fmt.Errorf("cannot overwrite files for this share")
 	}
 	// Go automatically decodes query params
@@ -169,7 +170,7 @@ func publicUploadHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 	status, err := resourcePostHandler(w, r, d)
 	if err != nil {
 		logger.Errorf("public upload handler: error uploading with error %v", err)
-		return http.StatusInternalServerError, fmt.Errorf("upload failure occured on backend")
+		return status, fmt.Errorf("upload failure occured on backend")
 	}
 	return status, nil
 }

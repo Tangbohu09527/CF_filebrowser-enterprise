@@ -1,0 +1,4 @@
+interface:
+  display_name: "FileBrowser Upstream Review"
+  short_description: "Compare upstream changes without modifying Git history"
+  default_prompt: "Use $filebrowser-upstream-review to compare upstream and local FileBrowser changes without merging."

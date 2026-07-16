@@ -70,6 +70,11 @@ func setupWebDAVTestEnv(t *testing.T) (string, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("close WebDAV test database: %v", closeErr)
+		}
+	})
 	store, err = bolt.NewStorage(db)
 	if err != nil {
 		t.Fatal(err)

@@ -24,6 +24,11 @@ func setupTestEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("close test database: %v", closeErr)
+		}
+	})
 	store, err = bolt.NewStorage(db)
 	if err != nil {
 		t.Fatal(err)

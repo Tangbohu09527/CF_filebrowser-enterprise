@@ -1,0 +1,4 @@
+interface:
+  display_name: "FileBrowser Permission Change"
+  short_description: "Change FileBrowser permissions across all write entry points"
+  default_prompt: "Use $filebrowser-permission-change to make and verify this permission change across relevant entry points."

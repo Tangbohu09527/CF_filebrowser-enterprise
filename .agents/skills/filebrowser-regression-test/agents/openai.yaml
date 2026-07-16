@@ -1,0 +1,4 @@
+interface:
+  display_name: "FileBrowser Regression Test"
+  short_description: "Select and report repository-defined regression checks"
+  default_prompt: "Use $filebrowser-regression-test to run the repository checks appropriate to this change."
