@@ -170,7 +170,7 @@ func publicUploadHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 	status, err := resourcePostHandler(w, r, d)
 	if err != nil {
 		logger.Errorf("public upload handler: error uploading with error %v", err)
-		return http.StatusInternalServerError, fmt.Errorf("upload failure occured on backend")
+		return status, fmt.Errorf("upload failure occured on backend")
 	}
 	return status, nil
 }

@@ -292,6 +292,7 @@ func newChunkUploadSecurityHarness(t *testing.T) *chunkUploadSecurityHarness {
 	t.Helper()
 
 	sourcePath := setupResourcePutTestEnv(t)
+	config.Auth.Key = "chunk-upload-security-test-key"
 	if preview.GetService() == nil {
 		if err := preview.StartPreviewGenerator(1, filepath.Join(filepath.Dir(sourcePath), "chunk-upload-security-preview")); err != nil {
 			t.Fatalf("start preview service: %v", err)
