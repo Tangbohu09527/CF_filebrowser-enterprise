@@ -71,43 +71,71 @@ func validateMoveOperation(src, dst string, isSrcDir bool) error {
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /api/resources [get]
 func resourceGetHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
-	path := r.URL.Query().Get("path")
+	if !d.user.Permissions.Browse {
+		return http.StatusForbidden, fmt.Errorf("user is not allowed to browse resources")
+	}
+
+	path, err := sanitizeAuthenticatedReadPath(r.URL.Query().Get("path"))
+	if err != nil {
+		return http.StatusBadRequest, fmt.Errorf("invalid resource path: %v", err)
+	}
 	source := r.URL.Query().Get("source")
 	getContent := r.URL.Query().Get("content") == "true"
+	checksumAlgo := r.URL.Query().Get("checksum")
 	getMetadata := r.URL.Query().Get("metadata") == "true"
+	if (getContent || checksumAlgo != "") && !d.user.Permissions.Download {
+		return http.StatusForbidden, fmt.Errorf("user is not allowed to read resource contents")
+	}
 	skipExtendedAttrs := r.URL.Query().Get("skipExtendedAttrs") == "true"
-	fileInfo, err := files.FileInfoFaster(utils.FileOptions{
+	fileOpts := utils.FileOptions{
 		FollowSymlinks:           true,
 		Path:                     path,
 		Source:                   source,
 		Expand:                   true,
 		Content:                  getContent,
-		Metadata:                 getMetadata,
 		ExtractEmbeddedSubtitles: config.Integrations.Media.ExtractEmbeddedSubtitles,
 		ShowHidden:               d.user.ShowHidden,
 		HideFileExt:              d.user.HideFileExt,
 		SkipExtendedAttrs:        skipExtendedAttrs,
 		ShowSharedAttr:           true,
 		ShowPinnedItems:          true,
-	}, store.Access, d.user, store.Share)
+	}
+	fileInfo, err := files.FileInfoFaster(fileOpts, store.Access, d.user, store.Share)
 	if err != nil {
 		return errToStatus(err), err
 	}
-	if !d.user.Permissions.Download && fileInfo.Content != "" {
-		return http.StatusForbidden, fmt.Errorf("user is not allowed to get content, requires download permission")
+
+	canReadMetadata := getMetadata && d.user.Permissions.Preview
+	metadataTarget := fileInfo.Type == "directory" || strings.HasPrefix(fileInfo.Type, "audio") || strings.HasPrefix(fileInfo.Type, "video")
+	if canReadMetadata && metadataTarget {
+		fileOpts.Metadata = true
+		fileInfo, err = files.FileInfoFaster(fileOpts, store.Access, d.user, store.Share)
+		if err != nil {
+			return errToStatus(err), err
+		}
+	}
+	if !d.user.Permissions.Preview {
+		fileInfo.Metadata = nil
+		fileInfo.Subtitles = nil
+		for i := range fileInfo.Files {
+			fileInfo.Files[i].Metadata = nil
+		}
+	}
+	if !getContent {
+		fileInfo.Content = ""
 	}
 	if fileInfo.Type == "directory" {
 		return renderJSON(w, r, fileInfo)
 	}
-	if algo := r.URL.Query().Get("checksum"); algo != "" {
-		checksum, err := utils.GetChecksum(fileInfo.RealPath, algo)
+	if checksumAlgo != "" {
+		checksum, err := utils.GetChecksum(fileInfo.RealPath, checksumAlgo)
 		if err == errors.ErrInvalidOption {
 			return http.StatusBadRequest, nil
 		} else if err != nil {
 			return http.StatusInternalServerError, err
 		}
 		fileInfo.Checksums = make(map[string]string)
-		fileInfo.Checksums[algo] = checksum
+		fileInfo.Checksums[checksumAlgo] = checksum
 	}
 	return renderJSON(w, r, fileInfo)
 
@@ -1273,9 +1301,18 @@ func mockData(w http.ResponseWriter, r *http.Request) {
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /api/resources/items [get]
 func itemsGetHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+	if !d.user.Permissions.Browse {
+		return http.StatusForbidden, fmt.Errorf("user is not allowed to browse resources")
+	}
+
+	path, err := sanitizeAuthenticatedReadPath(r.URL.Query().Get("path"))
+	if err != nil {
+		return http.StatusBadRequest, fmt.Errorf("invalid resource path: %v", err)
+	}
+
 	items, err := files.GetDirItems(utils.FileOptions{
 		FollowSymlinks: true,
-		Path:           r.URL.Query().Get("path"),
+		Path:           path,
 		Source:         r.URL.Query().Get("source"),
 		ShowHidden:     d.user.ShowHidden,
 		Only:           r.URL.Query().Get("only"),

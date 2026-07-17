@@ -13,6 +13,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,55 +34,230 @@ import (
 // the spooled file is removed (abandoned chunked download). Each chunk request extends this window.
 const archiveMultiRequestIdle = 5 * time.Minute
 
-// archiveSpoolPathCache maps archiveToken -> temp file path on disk for chunked archive downloads.
-var archiveSpoolPathCache = cache.NewCache[string](archiveMultiRequestIdle)
+const archiveSpoolActiveCacheTTL = 24 * time.Hour
 
-// archiveSpoolIdleTimers implements a sliding idle deadline per token so temp files are deleted
-// after abandonment; the in-process cache alone does not remove on-disk spool files.
-var (
-	archiveSpoolIdleMu     sync.Mutex
-	archiveSpoolIdleTimers = make(map[string]*time.Timer) // guarded by archiveSpoolIdleMu
-)
+var archiveSpoolAfterFunc = time.AfterFunc
+var archiveSpoolRemoveFile = settings.RemoveDownloadArchiveSpool
+var archiveSpoolTokenFunc = randomArchiveToken
+
+type archiveSpoolSession struct {
+	tmpPath          string
+	spoolInfo        os.FileInfo
+	originalFileName string
+	userID           uint
+	username         string
+	source           string
+	sourcePath       string
+	requestFileList  []string
+	memberPaths      []string
+	lifecycle        *archiveSpoolLifecycle
+}
+
+type archiveSpoolLifecycle struct {
+	mu            sync.Mutex
+	timer         *time.Timer
+	generation    uint64
+	active        int
+	removePending bool
+	removed       bool
+}
+
+type archiveMemberTracker struct {
+	paths []string
+}
+
+func (t *archiveMemberTracker) add(path string) {
+	if t != nil {
+		t.paths = append(t.paths, path)
+	}
+}
+
+// archiveSpoolCache maps archiveToken to the scoped read session used to build the spool.
+var archiveSpoolCache = cache.NewCache[archiveSpoolSession](archiveMultiRequestIdle)
 
 func randomArchiveToken() (string, error) {
 	return utils.RandomHex(16)
 }
 
-func stopArchiveSpoolIdleTimer(token string) {
-	archiveSpoolIdleMu.Lock()
-	t, ok := archiveSpoolIdleTimers[token]
-	if ok {
-		delete(archiveSpoolIdleTimers, token)
-	}
-	archiveSpoolIdleMu.Unlock()
-	if !ok {
-		return
-	}
-	if !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
+func stopArchiveSpoolTimerLocked(lifecycle *archiveSpoolLifecycle) {
+	if lifecycle.timer != nil {
+		lifecycle.timer.Stop()
+		lifecycle.timer = nil
 	}
 }
 
-// removeSpooledArchiveNow drops token state and deletes the temp file (idle timeout or final chunk served).
-func removeSpooledArchiveNow(token, tmpPath string) {
-	stopArchiveSpoolIdleTimer(token)
-	archiveSpoolPathCache.Delete(token)
-	if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+func removeArchiveSpoolFile(tmpPath string, spoolInfo os.FileInfo) {
+	if err := archiveSpoolRemoveFile(tmpPath, spoolInfo); err != nil && !os.IsNotExist(err) {
 		logger.Debugf("archive spool remove %s: %v", tmpPath, err)
 	}
 }
 
-func rescheduleArchiveSpoolIdleCleanup(token, tmpPath string) {
-	stopArchiveSpoolIdleTimer(token)
-	timer := time.AfterFunc(archiveMultiRequestIdle, func() {
-		removeSpooledArchiveNow(token, tmpPath)
+func expireArchiveSpool(token string, session archiveSpoolSession, generation uint64) {
+	lifecycle := session.lifecycle
+	if lifecycle == nil {
+		return
+	}
+
+	lifecycle.mu.Lock()
+	if lifecycle.generation != generation || lifecycle.active != 0 || lifecycle.removePending || lifecycle.removed {
+		lifecycle.mu.Unlock()
+		return
+	}
+	current, ok := archiveSpoolCache.Get(token)
+	if ok && (current.lifecycle != lifecycle || current.tmpPath != session.tmpPath) {
+		lifecycle.mu.Unlock()
+		return
+	}
+	lifecycle.timer = nil
+	lifecycle.removePending = true
+	lifecycle.removed = true
+	if ok {
+		archiveSpoolCache.Delete(token)
+	}
+	lifecycle.mu.Unlock()
+
+	removeArchiveSpoolFile(session.tmpPath, session.spoolInfo)
+}
+
+func scheduleArchiveSpoolIdleCleanupLocked(token string, session archiveSpoolSession) {
+	lifecycle := session.lifecycle
+	stopArchiveSpoolTimerLocked(lifecycle)
+	lifecycle.generation++
+	generation := lifecycle.generation
+	archiveSpoolCache.SetWithExp(token, session, archiveMultiRequestIdle)
+	lifecycle.timer = archiveSpoolAfterFunc(archiveMultiRequestIdle, func() {
+		expireArchiveSpool(token, session, generation)
 	})
-	archiveSpoolIdleMu.Lock()
-	archiveSpoolIdleTimers[token] = timer
-	archiveSpoolIdleMu.Unlock()
+}
+
+// rescheduleArchiveSpoolIdleCleanup is retained for focused lifecycle tests and cleanup callers.
+func rescheduleArchiveSpoolIdleCleanup(token, tmpPath string) {
+	session, ok := archiveSpoolCache.Get(token)
+	if !ok || session.tmpPath != tmpPath {
+		return
+	}
+	if session.lifecycle == nil {
+		session.lifecycle = &archiveSpoolLifecycle{}
+	}
+	lifecycle := session.lifecycle
+	lifecycle.mu.Lock()
+	if !lifecycle.removePending && !lifecycle.removed && lifecycle.active == 0 {
+		scheduleArchiveSpoolIdleCleanupLocked(token, session)
+	}
+	lifecycle.mu.Unlock()
+}
+
+func acquireArchiveSpool(token string, session archiveSpoolSession) (archiveSpoolSession, bool) {
+	if session.lifecycle == nil {
+		session.lifecycle = &archiveSpoolLifecycle{}
+	}
+	lifecycle := session.lifecycle
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+
+	current, ok := archiveSpoolCache.Get(token)
+	if !ok || current.tmpPath != session.tmpPath {
+		return archiveSpoolSession{}, false
+	}
+	if current.lifecycle != nil && current.lifecycle != lifecycle {
+		return archiveSpoolSession{}, false
+	}
+	if lifecycle.removePending || lifecycle.removed {
+		return archiveSpoolSession{}, false
+	}
+	if current.lifecycle == nil {
+		current.lifecycle = lifecycle
+	}
+	stopArchiveSpoolTimerLocked(lifecycle)
+	lifecycle.generation++
+	lifecycle.active++
+	archiveSpoolCache.SetWithExp(token, current, archiveSpoolActiveCacheTTL)
+	return current, true
+}
+
+func releaseArchiveSpool(token string, session archiveSpoolSession, remove bool) {
+	lifecycle := session.lifecycle
+	if lifecycle == nil {
+		if remove {
+			archiveSpoolCache.Delete(token)
+			removeArchiveSpoolFile(session.tmpPath, session.spoolInfo)
+		} else {
+			rescheduleArchiveSpoolIdleCleanup(token, session.tmpPath)
+		}
+		return
+	}
+
+	deleteFile := false
+	lifecycle.mu.Lock()
+	if lifecycle.active > 0 {
+		lifecycle.active--
+	}
+	if remove && !lifecycle.removePending {
+		lifecycle.removePending = true
+		lifecycle.generation++
+		stopArchiveSpoolTimerLocked(lifecycle)
+		archiveSpoolCache.Delete(token)
+	}
+	if lifecycle.active == 0 {
+		if lifecycle.removePending {
+			if !lifecycle.removed {
+				lifecycle.removed = true
+				deleteFile = true
+			}
+		} else {
+			current, ok := archiveSpoolCache.Get(token)
+			if ok && current.lifecycle == lifecycle && current.tmpPath == session.tmpPath {
+				scheduleArchiveSpoolIdleCleanupLocked(token, session)
+			} else {
+				lifecycle.removePending = true
+				lifecycle.generation++
+				stopArchiveSpoolTimerLocked(lifecycle)
+				lifecycle.removed = true
+				deleteFile = true
+			}
+		}
+	}
+	lifecycle.mu.Unlock()
+
+	if deleteFile {
+		removeArchiveSpoolFile(session.tmpPath, session.spoolInfo)
+	}
+}
+
+// removeSpooledArchiveNow revokes token state immediately and deletes after active readers close.
+func removeSpooledArchiveNow(token, tmpPath string) {
+	session, ok := archiveSpoolCache.Get(token)
+	if !ok {
+		removeArchiveSpoolFile(tmpPath, nil)
+		return
+	}
+	if session.tmpPath != tmpPath {
+		return
+	}
+	if session.lifecycle == nil {
+		archiveSpoolCache.Delete(token)
+		removeArchiveSpoolFile(tmpPath, session.spoolInfo)
+		return
+	}
+
+	lifecycle := session.lifecycle
+	deleteFile := false
+	lifecycle.mu.Lock()
+	if !lifecycle.removePending {
+		lifecycle.removePending = true
+		lifecycle.generation++
+		stopArchiveSpoolTimerLocked(lifecycle)
+		archiveSpoolCache.Delete(token)
+	}
+	if lifecycle.active == 0 && !lifecycle.removed {
+		lifecycle.removed = true
+		deleteFile = true
+	}
+	lifecycle.mu.Unlock()
+
+	if deleteFile {
+		removeArchiveSpoolFile(tmpPath, session.spoolInfo)
+	}
 }
 
 // archiveGetDeliversThroughEOF reports whether this GET serves through the last byte (full body or Range that ends at size-1).
@@ -196,6 +372,9 @@ func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 	if d.share != nil {
 		return http.StatusForbidden, fmt.Errorf("archive create not allowed for shares")
 	}
+	if !d.user.Permissions.Browse || !d.user.Permissions.Download {
+		return http.StatusForbidden, fmt.Errorf("user is not allowed to browse and download archive members")
+	}
 	if !d.user.Permissions.Create {
 		return http.StatusForbidden, fmt.Errorf("user is not allowed to create resources")
 	}
@@ -208,7 +387,7 @@ func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 		return http.StatusBadRequest, fmt.Errorf("fromSource, paths, and destination are required")
 	}
 
-	destClean, err := utils.SanitizeUserPath(req.Destination)
+	destClean, err := sanitizeAuthenticatedReadPath(req.Destination)
 	if err != nil {
 		return http.StatusBadRequest, fmt.Errorf("invalid destination path: %v", err)
 	}
@@ -216,7 +395,7 @@ func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 	pathsClean := make([]string, 0, len(req.Paths))
 	for _, p := range req.Paths {
 		var clean string
-		clean, err = utils.SanitizeUserPath(p)
+		clean, err = sanitizeAuthenticatedReadPath(p)
 		if err != nil {
 			return http.StatusBadRequest, fmt.Errorf("invalid path %q: %v", p, err)
 		}
@@ -498,7 +677,7 @@ func unarchiveHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 
 // addFile adds a file or directory to a tar or zip archive, respecting access rules.
 // For shares, path is already resolved; for users, access is checked via store.Access.
-func addFile(source string, path string, d *requestContext, tarWriter *tar.Writer, zipWriter *zip.Writer, flatten bool) error {
+func addFile(source string, path string, d *requestContext, tarWriter *tar.Writer, zipWriter *zip.Writer, flatten bool, tracker *archiveMemberTracker) error {
 	idx := indexing.GetIndex(source)
 	if idx == nil {
 		return fmt.Errorf("source %s is not available", source)
@@ -507,6 +686,9 @@ func addFile(source string, path string, d *requestContext, tarWriter *tar.Write
 	// Check access control directly for each file and silently skip if access is denied
 	if !store.Access.Permitted(idx.Path, path, d.user.Username) {
 		return nil // Silently skip this file/folder
+	}
+	if d.share == nil {
+		tracker.add(path)
 	}
 
 	realPath, _, _ := idx.GetRealPath(path)
@@ -549,6 +731,7 @@ func addFile(source string, path string, d *requestContext, tarWriter *tar.Write
 					}
 					return nil
 				}
+				tracker.add(indexRelPath)
 			}
 
 			// Prepend base folder name unless flatten is true
@@ -637,10 +820,14 @@ func addSingleFile(realPath, archivePath string, zipWriter *zip.Writer, tarWrite
 
 // createZip writes a ZIP archive into w containing the given paths; access rules apply.
 func createZip(d *requestContext, source string, w io.Writer, filenames ...string) error {
+	return createZipTracked(d, source, w, nil, filenames...)
+}
+
+func createZipTracked(d *requestContext, source string, w io.Writer, tracker *archiveMemberTracker, filenames ...string) error {
 	zipWriter := zip.NewWriter(w)
 
 	for _, filepath := range filenames {
-		err := addFile(source, filepath, d, nil, zipWriter, false)
+		err := addFile(source, filepath, d, nil, zipWriter, false, tracker)
 		if err != nil {
 			logger.Errorf("Failed to add %s to ZIP: %v", filepath, err)
 			return err
@@ -655,11 +842,15 @@ func createZip(d *requestContext, source string, w io.Writer, filenames ...strin
 
 // createTarGz writes a tar.gz archive into w containing the given paths; access rules apply.
 func createTarGz(d *requestContext, source string, w io.Writer, filenames ...string) error {
+	return createTarGzTracked(d, source, w, nil, filenames...)
+}
+
+func createTarGzTracked(d *requestContext, source string, w io.Writer, tracker *archiveMemberTracker, filenames ...string) error {
 	gzWriter := gzip.NewWriter(w)
 	tarWriter := tar.NewWriter(gzWriter)
 
 	for _, filepath := range filenames {
-		err := addFile(source, filepath, d, tarWriter, nil, false)
+		err := addFile(source, filepath, d, tarWriter, nil, false, tracker)
 		if err != nil {
 			logger.Errorf("Failed to add %s to TAR.GZ: %v", filepath, err)
 			return err
@@ -692,7 +883,7 @@ func createTarGzWithLevel(d *requestContext, source string, w io.Writer, level i
 	defer tarWriter.Close()
 
 	for _, filepath := range filenames {
-		err := addFile(source, filepath, d, tarWriter, nil, false)
+		err := addFile(source, filepath, d, tarWriter, nil, false, nil)
 		if err != nil {
 			logger.Errorf("Failed to add %s to TAR.GZ: %v", filepath, err)
 			return err
@@ -713,15 +904,6 @@ func createTarGzWithLevel(d *requestContext, source string, w io.Writer, level i
 //
 // server.maxArchiveSizeGB is enforced only for the HEAD/Range spool path.
 func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestContext, source string, fileList []string) (int, error) {
-	idx := indexing.GetIndex(source)
-	if idx == nil {
-		return http.StatusInternalServerError, fmt.Errorf("source %s is not available", source)
-	}
-	realPath, _, err := idx.GetRealPath(fileList[0])
-	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("failed to get real path for %s: %v", fileList[0], err)
-	}
-
 	algo := r.URL.Query().Get("algo")
 	var extension string
 	switch algo {
@@ -733,40 +915,77 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 		return http.StatusInternalServerError, errors.New("format not implemented")
 	}
 
-	originalFileName := archiveAttachmentStem(fileList, realPath) + extension
-
 	token := r.URL.Query().Get("archiveToken")
 	if token != "" {
-		tmpPath, ok := archiveSpoolPathCache.Get(token)
+		session, ok := archiveSpoolCache.Get(token)
 		if !ok {
 			return http.StatusGone, fmt.Errorf("invalid or expired archiveToken")
 		}
-		archiveSpoolPathCache.SetWithExp(token, tmpPath, archiveMultiRequestIdle)
-		rescheduleArchiveSpoolIdleCleanup(token, tmpPath)
-		if _, err = os.Stat(tmpPath); err != nil {
-			archiveSpoolPathCache.Delete(token)
+		if d.share == nil {
+			if session.username == "" || session.userID != d.user.ID || session.username != d.user.Username || session.source != source || !slices.Equal(session.requestFileList, fileList) {
+				return http.StatusForbidden, fmt.Errorf("archive resume session is not valid for the current user scope")
+			}
+			idx := indexing.GetIndex(session.source)
+			if idx == nil || session.sourcePath == "" || idx.Path != session.sourcePath {
+				return http.StatusForbidden, fmt.Errorf("archive resume source is not available")
+			}
+			if store.Access != nil {
+				for _, memberPath := range session.memberPaths {
+					if !store.Access.Permitted(idx.Path, memberPath, d.user.Username) {
+						return http.StatusForbidden, fmt.Errorf("archive member access has changed")
+					}
+				}
+			}
+		}
+
+		session, ok = acquireArchiveSpool(token, session)
+		if !ok {
 			return http.StatusGone, fmt.Errorf("archive no longer available")
 		}
-		var fd *os.File
-		fd, err = os.Open(tmpPath)
+		fd, fi, err := settings.OpenDownloadArchiveSpool(session.tmpPath, session.spoolInfo)
 		if err != nil {
+			releaseArchiveSpool(token, session, true)
 			return http.StatusGone, err
 		}
-		var fi os.FileInfo
-		fi, err = fd.Stat()
-		if err != nil {
-			_ = fd.Close()
-			return http.StatusInternalServerError, err
-		}
-		code, srvErr := serveArchiveWithServeContent(w, r, d, fd, fi, originalFileName)
+		released := false
+		defer func() {
+			if !released {
+				_ = fd.Close()
+				releaseArchiveSpool(token, session, true)
+			}
+		}()
+		code, srvErr := serveArchiveWithServeContent(w, r, d, fd, fi, session.originalFileName)
 		if closeErr := fd.Close(); closeErr != nil && srvErr == nil {
 			srvErr = closeErr
 		}
-		if srvErr == nil && archiveGetDeliversThroughEOF(r, fi.Size()) {
-			removeSpooledArchiveNow(token, tmpPath)
-		}
+		complete := srvErr == nil && archiveGetDeliversThroughEOF(r, fi.Size())
+		releaseArchiveSpool(token, session, srvErr != nil || complete)
+		released = true
 		return code, srvErr
 	}
+
+	idx := indexing.GetIndex(source)
+	if idx == nil {
+		return http.StatusInternalServerError, fmt.Errorf("source %s is not available", source)
+	}
+	requestFileList := append([]string(nil), fileList...)
+	if d.share == nil && store.Access != nil {
+		permitted := make([]string, 0, len(fileList))
+		for _, filePath := range fileList {
+			if store.Access.Permitted(idx.Path, filePath, d.user.Username) {
+				permitted = append(permitted, filePath)
+			}
+		}
+		fileList = permitted
+		if len(fileList) == 0 {
+			return http.StatusForbidden, fmt.Errorf("no archive members are accessible")
+		}
+	}
+	realPath, _, err := idx.GetRealPath(fileList[0])
+	if err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("failed to get real path for %s: %v", fileList[0], err)
+	}
+	originalFileName := archiveAttachmentStem(fileList, realPath) + extension
 
 	// HEAD or Range: same condition as chunked archive probing / retained spool (X-Archive-Token).
 	needMultiRequestSession := r.Method == http.MethodHead || r.Header.Get("Range") != ""
@@ -810,33 +1029,34 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 		return 0, nil
 	}
 
-	dlDir := settings.DownloadCacheDir()
-	tmpF, err := os.CreateTemp(dlDir, "dl-archive-*"+extension)
+	tmpF, spoolInfo, err := settings.CreateDownloadArchiveSpool(extension)
 	if err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("create temp archive: %w", err)
 	}
 	tmpPath := tmpF.Name()
+	tempOwned := true
+	defer func() {
+		if tempOwned {
+			_ = tmpF.Close()
+			removeArchiveSpoolFile(tmpPath, spoolInfo)
+		}
+	}()
+	memberTracker := &archiveMemberTracker{}
 
 	if extension == ".zip" {
-		err = createZip(d, source, tmpF, fileList...)
+		err = createZipTracked(d, source, tmpF, memberTracker, fileList...)
 	} else {
-		err = createTarGz(d, source, tmpF, fileList...)
+		err = createTarGzTracked(d, source, tmpF, memberTracker, fileList...)
 	}
 	if err != nil {
-		_ = tmpF.Close()
-		_ = os.Remove(tmpPath)
 		return http.StatusInternalServerError, err
 	}
 
 	if _, err = tmpF.Seek(0, 0); err != nil {
-		_ = tmpF.Close()
-		_ = os.Remove(tmpPath)
 		return http.StatusInternalServerError, fmt.Errorf("seek temp archive: %w", err)
 	}
 	fi, err := tmpF.Stat()
 	if err != nil {
-		_ = tmpF.Close()
-		_ = os.Remove(tmpPath)
 		return http.StatusInternalServerError, err
 	}
 
@@ -847,28 +1067,56 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 
 	// needMultiRequestSession: HEAD or Range — always spool and use ServeContent (+ token for follow-ups).
 	if err = tmpF.Close(); err != nil {
-		_ = os.Remove(tmpPath)
 		return http.StatusInternalServerError, err
 	}
-	newTok, err := randomArchiveToken()
+	newTok, err := archiveSpoolTokenFunc()
 	if err != nil {
-		_ = os.Remove(tmpPath)
 		return http.StatusInternalServerError, err
 	}
-	archiveSpoolPathCache.SetWithExp(newTok, tmpPath, archiveMultiRequestIdle)
-	rescheduleArchiveSpoolIdleCleanup(newTok, tmpPath)
+	fd, fi2, err := settings.OpenDownloadArchiveSpool(tmpPath, spoolInfo)
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	fdOwned := true
+	defer func() {
+		if fdOwned {
+			_ = fd.Close()
+		}
+	}()
+	session := archiveSpoolSession{
+		tmpPath:          tmpPath,
+		spoolInfo:        spoolInfo,
+		originalFileName: originalFileName,
+		source:           source,
+		sourcePath:       idx.Path,
+		requestFileList:  requestFileList,
+		memberPaths:      append([]string(nil), memberTracker.paths...),
+		lifecycle:        &archiveSpoolLifecycle{active: 1},
+	}
+	if d.share == nil {
+		session.userID = d.user.ID
+		session.username = d.user.Username
+	}
+	archiveSpoolCache.SetWithExp(newTok, session, archiveSpoolActiveCacheTTL)
+	released := false
+	defer func() {
+		if !released {
+			_ = fd.Close()
+			releaseArchiveSpool(newTok, session, true)
+		}
+	}()
+	fdOwned = false
+	tempOwned = false
 	w.Header().Set("X-Archive-Token", newTok)
 
-	fd, err := os.Open(tmpPath)
-	if err != nil {
-		return http.StatusInternalServerError, err
+	code, srvErr := serveArchiveWithServeContent(w, r, d, fd, fi2, originalFileName)
+	if closeErr := fd.Close(); closeErr != nil && srvErr == nil {
+		srvErr = closeErr
 	}
-	defer fd.Close()
-	fi2, err := fd.Stat()
-	if err != nil {
-		return http.StatusInternalServerError, err
-	}
-	return serveArchiveWithServeContent(w, r, d, fd, fi2, originalFileName)
+	complete := srvErr == nil && archiveGetDeliversThroughEOF(r, fi2.Size())
+	releaseArchiveSpool(newTok, session, srvErr != nil || complete)
+	released = true
+	return code, srvErr
 }
 
 // archiveCreateRequest is the body for POST /resources/archive (server-side create).

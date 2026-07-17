@@ -2,6 +2,7 @@ package settings
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -1179,12 +1180,226 @@ func DownloadCacheDir() string {
 	return filepath.Join(Config.Server.CacheDir, "downloads")
 }
 
-// PrepareDownloadSpoolDir creates the download spool directory and removes any leftover dl-archive-*
-func PrepareDownloadSpoolDir() error {
-	if err := os.MkdirAll(DownloadCacheDir(), fileutils.PermDir); err != nil {
+func isDownloadArchiveSpoolName(name string) bool {
+	var randomPart string
+	switch {
+	case strings.HasSuffix(name, ".tar.gz"):
+		randomPart = strings.TrimSuffix(name, ".tar.gz")
+	case strings.HasSuffix(name, ".zip"):
+		randomPart = strings.TrimSuffix(name, ".zip")
+	default:
+		return false
+	}
+	if !strings.HasPrefix(randomPart, "dl-archive-") {
+		return false
+	}
+	randomPart = strings.TrimPrefix(randomPart, "dl-archive-")
+	if randomPart == "" {
+		return false
+	}
+	for _, char := range randomPart {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func hasParentPathSegment(path string) bool {
+	for _, segment := range strings.Split(strings.ReplaceAll(path, "\\", "/"), "/") {
+		if segment == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func downloadArchiveSpoolDir(create bool) (string, error) {
+	dir, err := filepath.Abs(DownloadCacheDir())
+	if err != nil {
+		return "", fmt.Errorf("resolve download spool directory: %w", err)
+	}
+	if create {
+		if err = os.MkdirAll(dir, fileutils.PermDir); err != nil {
+			return "", err
+		}
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", fmt.Errorf("download spool directory must be a real directory")
+	}
+	return dir, nil
+}
+
+func directDownloadArchiveSpoolPath(spoolPath string) (string, error) {
+	if spoolPath == "" || hasParentPathSegment(spoolPath) {
+		return "", fmt.Errorf("invalid archive spool path")
+	}
+	dir, err := downloadArchiveSpoolDir(false)
+	if err != nil {
+		return "", err
+	}
+	candidate, err := filepath.Abs(spoolPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve archive spool path: %w", err)
+	}
+	rel, err := filepath.Rel(dir, candidate)
+	if err != nil || rel == "." || filepath.IsAbs(rel) || filepath.Dir(rel) != "." || !isDownloadArchiveSpoolName(filepath.Base(rel)) {
+		return "", fmt.Errorf("archive spool path is not a generated file in the download directory")
+	}
+	return candidate, nil
+}
+
+func validateDownloadArchiveSpool(spoolPath string, expected os.FileInfo) (string, os.FileInfo, error) {
+	candidate, err := directDownloadArchiveSpoolPath(spoolPath)
+	if err != nil {
+		return "", nil, err
+	}
+	info, err := os.Lstat(candidate)
+	if err != nil {
+		return "", nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return "", nil, fmt.Errorf("archive spool must be a regular non-symlink file")
+	}
+	if expected != nil && !os.SameFile(expected, info) {
+		return "", nil, fmt.Errorf("archive spool file identity changed")
+	}
+
+	dir, err := downloadArchiveSpoolDir(false)
+	if err != nil {
+		return "", nil, err
+	}
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve download spool directory links: %w", err)
+	}
+	resolvedCandidate, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve archive spool links: %w", err)
+	}
+	resolvedRel, err := filepath.Rel(resolvedDir, resolvedCandidate)
+	if err != nil || resolvedRel == "." || filepath.IsAbs(resolvedRel) || filepath.Dir(resolvedRel) != "." {
+		return "", nil, fmt.Errorf("archive spool resolves outside the download directory")
+	}
+	return candidate, info, nil
+}
+
+// CreateDownloadArchiveSpool creates a FileBrowser-owned archive spool in the dedicated directory.
+func CreateDownloadArchiveSpool(extension string) (*os.File, os.FileInfo, error) {
+	if extension != ".zip" && extension != ".tar.gz" {
+		return nil, nil, fmt.Errorf("unsupported archive spool extension")
+	}
+	dir, err := downloadArchiveSpoolDir(true)
+	if err != nil {
+		return nil, nil, err
+	}
+	file, err := os.CreateTemp(dir, "dl-archive-*"+extension)
+	if err != nil {
+		return nil, nil, err
+	}
+	info, err := file.Stat()
+	if err == nil {
+		var validatedInfo os.FileInfo
+		_, validatedInfo, err = validateDownloadArchiveSpool(file.Name(), info)
+		if err == nil {
+			info = validatedInfo
+		}
+	}
+	if err != nil {
+		_ = file.Close()
+		if info != nil {
+			_ = RemoveDownloadArchiveSpool(file.Name(), info)
+		}
+		return nil, nil, err
+	}
+	return file, info, nil
+}
+
+// OpenDownloadArchiveSpool opens an unchanged FileBrowser-owned archive spool without following links.
+func OpenDownloadArchiveSpool(spoolPath string, expected os.FileInfo) (*os.File, os.FileInfo, error) {
+	candidate, before, err := validateDownloadArchiveSpool(spoolPath, expected)
+	if err != nil {
+		return nil, nil, err
+	}
+	file, err := os.Open(candidate)
+	if err != nil {
+		return nil, nil, err
+	}
+	opened, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	after, err := os.Lstat(candidate)
+	if err != nil || !os.SameFile(before, opened) || !os.SameFile(opened, after) || (expected != nil && !os.SameFile(expected, opened)) {
+		_ = file.Close()
+		return nil, nil, fmt.Errorf("archive spool file changed while opening")
+	}
+	return file, opened, nil
+}
+
+// RemoveDownloadArchiveSpool removes only a direct, unchanged FileBrowser archive spool file.
+func RemoveDownloadArchiveSpool(spoolPath string, expected os.FileInfo) error {
+	candidate, info, err := validateDownloadArchiveSpool(spoolPath, expected)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
-	return fileutils.ClearDirectoryContents(DownloadCacheDir())
+	current, err := os.Lstat(candidate)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || !os.SameFile(info, current) {
+		return fmt.Errorf("archive spool file changed before removal")
+	}
+	return os.Remove(candidate)
+}
+
+// ClearDownloadArchiveSpools removes only generated regular archive spools, preserving other cache files.
+func ClearDownloadArchiveSpools() error {
+	dir, err := downloadArchiveSpoolDir(true)
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	var cleanupErrors []error
+	for _, entry := range entries {
+		if !isDownloadArchiveSpoolName(entry.Name()) {
+			continue
+		}
+		spoolPath := filepath.Join(dir, entry.Name())
+		info, statErr := os.Lstat(spoolPath)
+		if statErr != nil {
+			if !os.IsNotExist(statErr) {
+				cleanupErrors = append(cleanupErrors, statErr)
+			}
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			continue
+		}
+		if removeErr := RemoveDownloadArchiveSpool(spoolPath, info); removeErr != nil && !os.IsNotExist(removeErr) {
+			cleanupErrors = append(cleanupErrors, removeErr)
+		}
+	}
+	return errors.Join(cleanupErrors...)
+}
+
+// PrepareDownloadSpoolDir creates the download spool directory and removes leftover archive spools.
+func PrepareDownloadSpoolDir() error {
+	return ClearDownloadArchiveSpools()
 }
 
 func loadLoginIcon() {
