@@ -362,8 +362,26 @@ func (ffs *filteredFileSystem) Stat(ctx context.Context, requestPath string) (os
 
 // webDAVHandler serves WebDAV requests.
 func webDAVHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
-	if !d.user.Permissions.Download {
-		return http.StatusForbidden, fmt.Errorf("download permission required")
+	requestPath := utils.AddTrailingSlashIfNotExists(r.PathValue("path"))
+	source := r.PathValue("source")
+	if !strings.HasPrefix(requestPath, "/") {
+		requestPath = "/" + requestPath
+	}
+
+	switch r.Method {
+	case "PROPFIND", http.MethodOptions:
+		if !d.user.Permissions.Browse {
+			return http.StatusForbidden, nil
+		}
+	case http.MethodGet, http.MethodHead, http.MethodPost:
+		if !d.user.Permissions.Browse || !d.user.Permissions.Download {
+			// Avoid error bodies so denied HEAD requests cannot gain a Content-Length.
+			return http.StatusForbidden, nil
+		}
+	default:
+		if !d.user.Permissions.Download {
+			return http.StatusForbidden, fmt.Errorf("download permission required")
+		}
 	}
 	if r.Method == "DELETE" && !d.user.Permissions.Delete {
 		return http.StatusForbidden, fmt.Errorf("delete permission required")
@@ -371,11 +389,6 @@ func webDAVHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 	isWrite := r.Method == http.MethodPut || r.Method == "MKCOL"
 	if isWrite && !userCanWrite(d.user.Permissions) {
 		return http.StatusForbidden, fmt.Errorf("user has no permission to modify")
-	}
-	requestPath := utils.AddTrailingSlashIfNotExists(r.PathValue("path"))
-	source := r.PathValue("source")
-	if !strings.HasPrefix(requestPath, "/") {
-		requestPath = "/" + requestPath
 	}
 	logger.Debugf("webdav: method=%s, request=%s, source=%s, requestPath=%s", r.Method, r.URL.Path, source, requestPath)
 	_, userScope, err := files.CheckPermissions(utils.FileOptions{
