@@ -90,6 +90,9 @@ type OnlyOfficeJWTPayload struct {
 // @Router /api/office/config [get]
 // @Security ApiKeyAuth
 func onlyofficeClientConfigGetHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+	if d.share == nil && (d.user == nil || !d.user.Permissions.Browse || !d.user.Permissions.Download) {
+		return http.StatusForbidden, errors.New("browse and download permissions are required")
+	}
 	if config.Integrations.OnlyOffice.Url == "" {
 		return http.StatusInternalServerError, errors.New("only-office integration must be configured in settings")
 	}
@@ -98,6 +101,9 @@ func onlyofficeClientConfigGetHandler(w http.ResponseWriter, r *http.Request, d 
 	source := r.URL.Query().Get("source")
 	providedPath := r.URL.Query().Get("path")
 	hash := r.URL.Query().Get("hash")
+	if d.share == nil && hash != "" {
+		return http.StatusBadRequest, errors.New("hash is only valid for public share requests")
+	}
 
 	// Validate required parameters
 	if (providedPath == "" || source == "") && hash == "" {
@@ -115,7 +121,7 @@ func onlyofficeClientConfigGetHandler(w http.ResponseWriter, r *http.Request, d 
 	themeMode := utils.Ternary(d.user.DarkMode, "dark", "light")
 	var sourceInfo *settings.Source
 	var ok bool
-	if hash != "" {
+	if d.share != nil {
 		sourceInfo, ok = config.Server.SourceMap[d.share.Source]
 		if !ok {
 			logger.Error("OnlyOffice: source not found")
@@ -130,7 +136,7 @@ func onlyofficeClientConfigGetHandler(w http.ResponseWriter, r *http.Request, d 
 	}
 	source = sourceInfo.Name
 	path := providedPath
-	if hash == "" {
+	if d.share == nil {
 		// Build file info based on whether this is a share or regular request
 		// Regular user request
 		logger.Debugf("OnlyOffice user request: request path=%s", path)

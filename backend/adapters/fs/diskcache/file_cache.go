@@ -89,24 +89,78 @@ func migrateOldCacheStructure(oldDir, newDir string) error {
 	return nil
 }
 
-func (f *FileCache) Store(ctx context.Context, key string, value []byte) error {
+func (f *FileCache) Store(ctx context.Context, key string, value []byte) (returnErr error) {
 	mu := f.getScopedLocks(key)
 	mu.Lock()
 	defer mu.Unlock()
 
 	fileName := f.getFileName(key)
-	if err := os.MkdirAll(filepath.Dir(fileName), fileutils.PermDir); err != nil {
+	parentDir := filepath.Dir(fileName)
+	if err := os.MkdirAll(parentDir, fileutils.PermDir); err != nil {
 		return err
 	}
 
-	if err := os.WriteFile(fileName, value, fileutils.PermFile); err != nil {
+	tempFile, err := os.CreateTemp(parentDir, "."+filepath.Base(fileName)+".tmp-*")
+	if err != nil {
 		return err
 	}
+	tempPath := tempFile.Name()
+	committed := false
+	defer func() {
+		if tempFile != nil {
+			returnErr = errors.Join(returnErr, tempFile.Close())
+		}
+		if !committed {
+			if removeErr := os.Remove(tempPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				returnErr = errors.Join(returnErr, fmt.Errorf("remove temporary cache file: %w", removeErr))
+			}
+		}
+	}()
+
+	if err := tempFile.Chmod(fileutils.PermFile); err != nil {
+		return fmt.Errorf("set temporary cache file permissions: %w", err)
+	}
+	written, err := tempFile.Write(value)
+	if err != nil {
+		return fmt.Errorf("write temporary cache file: %w", err)
+	}
+	if written != len(value) {
+		return fmt.Errorf("write temporary cache file: %w", io.ErrShortWrite)
+	}
+	tempInfo, err := tempFile.Stat()
+	if err != nil {
+		return fmt.Errorf("stat temporary cache file: %w", err)
+	}
+	if tempInfo.Size() != int64(len(value)) {
+		return fmt.Errorf("write temporary cache file: %w", io.ErrShortWrite)
+	}
+	if err := tempFile.Sync(); err != nil {
+		return fmt.Errorf("sync temporary cache file: %w", err)
+	}
+	if err := tempFile.Close(); err != nil {
+		tempFile = nil
+		return fmt.Errorf("close temporary cache file: %w", err)
+	}
+	tempFile = nil
+
+	root, err := os.OpenRoot(parentDir)
+	if err != nil {
+		return fmt.Errorf("open cache directory: %w", err)
+	}
+	defer root.Close()
+	if err := root.Rename(filepath.Base(tempPath), filepath.Base(fileName)); err != nil {
+		return fmt.Errorf("replace cache file: %w", err)
+	}
+	committed = true
 
 	return nil
 }
 
 func (f *FileCache) Load(ctx context.Context, key string) (value []byte, exist bool, err error) {
+	mu := f.getScopedLocks(key)
+	mu.Lock()
+	defer mu.Unlock()
+
 	r, ok, err := f.open(key)
 	if err != nil || !ok {
 		return nil, ok, err

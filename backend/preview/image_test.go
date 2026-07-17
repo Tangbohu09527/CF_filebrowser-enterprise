@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"image"
+	"image/color"
 	"image/gif"
 	"image/jpeg"
 	"image/png"
@@ -258,6 +259,79 @@ func TestService_Resize(t *testing.T) {
 			test.matcher(t, buf)
 		})
 	}
+}
+
+func TestService_ResizeSafeDerivedTransparentPNG(t *testing.T) {
+	img := image.NewNRGBA(image.Rect(0, 0, 32, 16))
+	for y := 0; y < img.Bounds().Dy(); y++ {
+		for x := 0; x < img.Bounds().Dx(); x++ {
+			img.SetNRGBA(x, y, color.NRGBA{R: 255, A: 0})
+		}
+	}
+
+	var source bytes.Buffer
+	require.NoError(t, png.Encode(&source, img))
+
+	var output bytes.Buffer
+	svc := NewPreviewGenerator(1, t.TempDir())
+	err := svc.Resize(context.Background(), bytes.NewReader(source.Bytes()), &output, ResizeOptions{
+		Width:       16,
+		Height:      16,
+		Format:      FormatPng,
+		ResizeMode:  ResizeModeFit,
+		Quality:     QualityHigh,
+		SafeDerived: true,
+	})
+	require.NoError(t, err)
+
+	derived, format, err := image.Decode(bytes.NewReader(output.Bytes()))
+	require.NoError(t, err)
+	require.Equal(t, "jpeg", format)
+	require.LessOrEqual(t, derived.Bounds().Dx(), 16)
+	require.LessOrEqual(t, derived.Bounds().Dy(), 16)
+	r, g, b, _ := derived.At(derived.Bounds().Min.X, derived.Bounds().Min.Y).RGBA()
+	require.GreaterOrEqual(t, r, uint32(0xf000))
+	require.GreaterOrEqual(t, g, uint32(0xf000))
+	require.GreaterOrEqual(t, b, uint32(0xf000))
+}
+
+func TestService_ResizeSafeDerivedAnimatedGIFUsesFirstFrame(t *testing.T) {
+	palette := color.Palette{
+		color.RGBA{R: 255, A: 255},
+		color.RGBA{B: 255, A: 255},
+	}
+	first := image.NewPaletted(image.Rect(0, 0, 40, 20), palette)
+	second := image.NewPaletted(image.Rect(0, 0, 40, 20), palette)
+	for i := range second.Pix {
+		second.Pix[i] = 1
+	}
+
+	var source bytes.Buffer
+	require.NoError(t, gif.EncodeAll(&source, &gif.GIF{
+		Image: []*image.Paletted{first, second},
+		Delay: []int{1, 1},
+	}))
+
+	var output bytes.Buffer
+	svc := NewPreviewGenerator(1, t.TempDir())
+	err := svc.Resize(context.Background(), bytes.NewReader(source.Bytes()), &output, ResizeOptions{
+		Width:       10,
+		Height:      10,
+		Format:      FormatGif,
+		ResizeMode:  ResizeModeFit,
+		Quality:     QualityHigh,
+		SafeDerived: true,
+	})
+	require.NoError(t, err)
+
+	derived, format, err := image.Decode(bytes.NewReader(output.Bytes()))
+	require.NoError(t, err)
+	require.Equal(t, "jpeg", format)
+	require.LessOrEqual(t, derived.Bounds().Dx(), 10)
+	require.LessOrEqual(t, derived.Bounds().Dy(), 10)
+	r, g, b, _ := derived.At(derived.Bounds().Min.X, derived.Bounds().Min.Y).RGBA()
+	require.Greater(t, r, g)
+	require.Greater(t, r, b)
 }
 
 func sizeMatcher(width, height int) func(t *testing.T, reader io.Reader) {

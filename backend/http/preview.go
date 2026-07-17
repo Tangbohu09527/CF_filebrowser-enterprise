@@ -48,12 +48,19 @@ func isClientCancellation(ctx context.Context, err error) bool {
 // @Success 200 {file} file "Preview image content"
 // @Failure 202 {object} map[string]string "Download permissions required"
 // @Failure 400 {object} map[string]string "Invalid request path"
+// @Failure 403 {object} map[string]string "Browse, preview, or download permission required"
 // @Failure 404 {object} map[string]string "File not found"
 // @Failure 415 {object} map[string]string "Unsupported file type for preview"
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Failure 501 {object} map[string]string "Preview generation not implemented"
 // @Router /api/resources/preview [get]
 func previewHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+	if d.user == nil || !d.user.Permissions.Browse || !d.user.Permissions.Preview {
+		return http.StatusForbidden, fmt.Errorf("browse and preview permissions are required")
+	}
+	if r.URL.Query().Get("size") == "original" && !d.user.Permissions.Download {
+		return http.StatusForbidden, fmt.Errorf("download permission is required for original previews")
+	}
 	if config.Server.DisablePreviews {
 		return http.StatusNotImplemented, fmt.Errorf("preview is disabled")
 	}
@@ -100,7 +107,10 @@ func shouldServeOriginalPreview(ext string, resizable bool, realPath, previewSiz
 	return preview.ShouldServeOriginalImage(realPath, previewSize)
 }
 
-func rawFileHandler(w http.ResponseWriter, r *http.Request, file iteminfo.ExtendedFileInfo) (int, error) {
+func rawFileHandler(w http.ResponseWriter, r *http.Request, file iteminfo.ExtendedFileInfo, allowOriginal bool) (int, error) {
+	if !allowOriginal {
+		return http.StatusForbidden, fmt.Errorf("download permission is required for original previews")
+	}
 	fd, err := os.Open(file.RealPath)
 	if err != nil {
 		return http.StatusInternalServerError, err
@@ -155,7 +165,11 @@ func getDirectoryPreview(r *http.Request, d *requestContext, frameIndex int) (*i
 		return nil, err
 	}
 	tempCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	_, previewErr := preview.GetPreviewForFile(tempCtx, *fileInfo, "small", "", 0)
+	getPreview := preview.GetPreviewForFile
+	if d.share == nil && d.user != nil && !d.user.Permissions.Download {
+		getPreview = preview.GetSafePreviewForFile
+	}
+	_, previewErr := getPreview(tempCtx, *fileInfo, "small", "", 0)
 	cancel()
 	if previewErr != nil {
 		if !errors.Is(previewErr, context.Canceled) && !errors.Is(previewErr, context.DeadlineExceeded) {
@@ -230,10 +244,11 @@ func previewHelperFunc(w http.ResponseWriter, r *http.Request, d *requestContext
 	ext := strings.ToLower(filepath.Ext(d.fileInfo.Name))
 	resizable := iteminfo.ResizableImageTypes[ext]
 
-	// For small displayable images (jpg, png, etc.) serve the original to avoid processing.
-	// Also serve the original when dimensions already fit the requested preview size.
-	if isImage && shouldServeOriginalPreview(ext, resizable, d.fileInfo.RealPath, previewSize, d.fileInfo.Size) {
-		return rawFileHandler(w, r, d.fileInfo)
+	// Public shares retain their existing behavior. Authenticated preview-only users must
+	// always use the bounded derived-image pipeline, even for small or already fitting images.
+	allowOriginal := d.share != nil || (d.user != nil && d.user.Permissions.Download)
+	if allowOriginal && isImage && shouldServeOriginalPreview(ext, resizable, d.fileInfo.RealPath, previewSize, d.fileInfo.Size) {
+		return rawFileHandler(w, r, d.fileInfo, allowOriginal)
 	}
 
 	officeUrl := ""
@@ -250,7 +265,11 @@ func previewHelperFunc(w http.ResponseWriter, r *http.Request, d *requestContext
 			officeUrl = scheme + "://" + r.Host + pathUrl
 		}
 	}
-	previewImg, err := preview.GetPreviewForFile(ctx, d.fileInfo, previewSize, officeUrl, seekPercentage)
+	getPreview := preview.GetPreviewForFile
+	if d.share == nil && d.user != nil && !d.user.Permissions.Download {
+		getPreview = preview.GetSafePreviewForFile
+	}
+	previewImg, err := getPreview(ctx, d.fileInfo, previewSize, officeUrl, seekPercentage)
 	if err != nil {
 		// Check if it was a context cancellation (client navigated away)
 		if isClientCancellation(ctx, err) {
