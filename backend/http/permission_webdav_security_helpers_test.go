@@ -224,14 +224,7 @@ func setFutureReadPermission(t *testing.T, permissions *users.Permissions, name 
 	}
 }
 
-func permissionHandlerStatus(returned int, recorder *httptest.ResponseRecorder) int {
-	if returned != 0 && returned != http.StatusOK {
-		return returned
-	}
-	return recorder.Code
-}
-
-func assertNoOriginalHeaders(t *testing.T, headers http.Header) {
+func assertNoPermissionWebDAVOriginalHeaders(t *testing.T, headers http.Header) {
 	t.Helper()
 
 	for _, name := range []string{
@@ -251,7 +244,7 @@ func assertNoOriginalHeaders(t *testing.T, headers http.Header) {
 	}
 }
 
-func configurePermissionReadAuth(t *testing.T) {
+func configurePermissionWebDAVAuth(t *testing.T) {
 	t.Helper()
 
 	previousConfigAuth := config.Auth
@@ -265,7 +258,7 @@ func configurePermissionReadAuth(t *testing.T) {
 	})
 }
 
-func savePermissionReadUser(t *testing.T, user *users.User) {
+func savePermissionWebDAVUser(t *testing.T, user *users.User) {
 	t.Helper()
 
 	user.Permissions.Api = true
@@ -274,7 +267,7 @@ func savePermissionReadUser(t *testing.T, user *users.User) {
 	}
 }
 
-func issuePermissionReadAPIToken(t *testing.T, user *users.User, name string, permissions users.Permissions) string {
+func issuePermissionWebDAVAPIToken(t *testing.T, user *users.User, name string, permissions users.Permissions) string {
 	t.Helper()
 
 	permissionNames := make([]string, 0, 2)

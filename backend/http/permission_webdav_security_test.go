@@ -120,7 +120,7 @@ func TestPermissionWebDAVSecurity_GETRequiresBrowseAndDownload(t *testing.T) {
 			if strings.Contains(recorder.Body.String(), "public content") {
 				t.Errorf("unauthorized WebDAV GET leaked original bytes %q", recorder.Body.String())
 			}
-			assertNoOriginalHeaders(t, recorder.Header())
+			assertNoPermissionWebDAVOriginalHeaders(t, recorder.Header())
 		})
 	}
 }
@@ -156,7 +156,7 @@ func TestPermissionWebDAVSecurity_RangeGETRequiresBrowseAndDownload(t *testing.T
 			if body := recorder.Body.String(); body != "" {
 				t.Errorf("unauthorized WebDAV Range leaked body %q", body)
 			}
-			assertNoOriginalHeaders(t, recorder.Header())
+			assertNoPermissionWebDAVOriginalHeaders(t, recorder.Header())
 		})
 	}
 }
@@ -185,7 +185,7 @@ func TestPermissionWebDAVSecurity_HEADDoesNotLeakOriginalMetadata(t *testing.T) 
 					t.Errorf("authorized WebDAV HEAD Content-Length: expected 14, got %q", contentLength)
 				}
 			} else {
-				assertNoOriginalHeaders(t, recorder.Header())
+				assertNoPermissionWebDAVOriginalHeaders(t, recorder.Header())
 			}
 			if recorder.Body.Len() != 0 {
 				t.Errorf("WebDAV HEAD emitted body %q", recorder.Body.String())
@@ -216,7 +216,7 @@ func TestPermissionWebDAVSecurity_AdminDoesNotBypassReadPermissions(t *testing.T
 			if status != http.StatusForbidden {
 				t.Errorf("Admin WebDAV %s status: expected %d, got %d (err: %v)", tc.method, http.StatusForbidden, status, err)
 			}
-			assertNoOriginalHeaders(t, recorder.Header())
+			assertNoPermissionWebDAVOriginalHeaders(t, recorder.Header())
 			if strings.Contains(recorder.Body.String(), "public content") {
 				t.Errorf("Admin without read permissions leaked original bytes %q", recorder.Body.String())
 			}
@@ -291,7 +291,7 @@ func TestPermissionWebDAVSecurity_KnownPathReadAliasesRequireBrowse(t *testing.T
 				}
 				return
 			}
-			assertNoOriginalHeaders(t, recorder.Header())
+			assertNoPermissionWebDAVOriginalHeaders(t, recorder.Header())
 			for _, name := range []string{"Allow", "DAV", "MS-Author-Via"} {
 				if value := recorder.Header().Get(name); value != "" {
 					t.Errorf("unauthorized WebDAV %s leaked %s %q", tc.method, name, value)
@@ -306,7 +306,7 @@ func TestPermissionWebDAVSecurity_KnownPathReadAliasesRequireBrowse(t *testing.T
 
 func TestPermissionWebDAVSecurity_TokenPermissionIntersection(t *testing.T) {
 	sourcePath, _ := setupPermissionWebDAVSecurityEnv(t)
-	configurePermissionReadAuth(t)
+	configurePermissionWebDAVAuth(t)
 	router := permissionWebDAVRouter()
 
 	for _, tc := range []struct {
@@ -331,11 +331,11 @@ func TestPermissionWebDAVSecurity_TokenPermissionIntersection(t *testing.T) {
 			suffix := strings.ReplaceAll(tc.name, " ", "-")
 			user := permissionWebDAVUser(t, sourcePath, tc.userBrowse, tc.userDownload)
 			user.Username = "permission-webdav-token-user-" + suffix
-			savePermissionReadUser(t, user)
+			savePermissionWebDAVUser(t, user)
 
 			tokenPermissions := users.Permissions{Download: tc.tokenDownload}
 			setFutureReadPermission(t, &tokenPermissions, "Browse", tc.tokenBrowse)
-			token := issuePermissionReadAPIToken(t, user, "permission-webdav-token-"+suffix, tokenPermissions)
+			token := issuePermissionWebDAVAPIToken(t, user, "permission-webdav-token-"+suffix, tokenPermissions)
 			if tc.revokeUserBrowse {
 				setFutureReadPermission(t, &user.Permissions, "Browse", false)
 			}
@@ -361,7 +361,7 @@ func TestPermissionWebDAVSecurity_TokenPermissionIntersection(t *testing.T) {
 				}
 				return
 			}
-			assertNoOriginalHeaders(t, recorder.Header())
+			assertNoPermissionWebDAVOriginalHeaders(t, recorder.Header())
 			if strings.Contains(recorder.Body.String(), "public content") {
 				t.Errorf("unauthorized WebDAV token leaked original bytes %q", recorder.Body.String())
 			}
@@ -371,7 +371,7 @@ func TestPermissionWebDAVSecurity_TokenPermissionIntersection(t *testing.T) {
 
 func TestPermissionWebDAVSecurity_TokenPROPFINDUsesBrowsePermission(t *testing.T) {
 	sourcePath, _ := setupPermissionWebDAVSecurityEnv(t)
-	configurePermissionReadAuth(t)
+	configurePermissionWebDAVAuth(t)
 	router := permissionWebDAVRouter()
 
 	for _, tc := range []struct {
@@ -387,9 +387,9 @@ func TestPermissionWebDAVSecurity_TokenPROPFINDUsesBrowsePermission(t *testing.T
 			suffix := strings.ReplaceAll(tc.name, " ", "-")
 			user := permissionWebDAVUser(t, sourcePath, true, true)
 			user.Username = "permission-webdav-propfind-token-user-" + suffix
-			savePermissionReadUser(t, user)
+			savePermissionWebDAVUser(t, user)
 			tokenPermissions := users.Permissions{Browse: tc.tokenBrowse, Download: tc.tokenDownload}
-			token := issuePermissionReadAPIToken(t, user, "permission-webdav-propfind-token-"+suffix, tokenPermissions)
+			token := issuePermissionWebDAVAPIToken(t, user, "permission-webdav-propfind-token-"+suffix, tokenPermissions)
 
 			req := httptest.NewRequest("PROPFIND", "/dav/source1/public/", nil)
 			req.SetBasicAuth("ignored", token)
@@ -413,12 +413,12 @@ func TestPermissionWebDAVSecurity_TokenPROPFINDUsesBrowsePermission(t *testing.T
 
 func TestPermissionWebDAVSecurity_RoutedHEADDoesNotLeakMetadata(t *testing.T) {
 	sourcePath, _ := setupPermissionWebDAVSecurityEnv(t)
-	configurePermissionReadAuth(t)
+	configurePermissionWebDAVAuth(t)
 
 	user := permissionWebDAVUser(t, sourcePath, true, true)
 	user.Username = "permission-webdav-routed-head-user"
-	savePermissionReadUser(t, user)
-	token := issuePermissionReadAPIToken(t, user, "permission-webdav-routed-head-token", users.Permissions{Download: true})
+	savePermissionWebDAVUser(t, user)
+	token := issuePermissionWebDAVAPIToken(t, user, "permission-webdav-routed-head-token", users.Permissions{Download: true})
 
 	server := httptest.NewServer(permissionWebDAVRouter())
 	t.Cleanup(server.Close)
@@ -445,7 +445,7 @@ func TestPermissionWebDAVSecurity_RoutedHEADDoesNotLeakMetadata(t *testing.T) {
 			if response.StatusCode != http.StatusForbidden {
 				t.Errorf("routed WebDAV HEAD status: expected %d, got %d", http.StatusForbidden, response.StatusCode)
 			}
-			assertNoOriginalHeaders(t, response.Header)
+			assertNoPermissionWebDAVOriginalHeaders(t, response.Header)
 			if response.ContentLength > 0 {
 				t.Errorf("routed WebDAV HEAD leaked Content-Length %d", response.ContentLength)
 			}
