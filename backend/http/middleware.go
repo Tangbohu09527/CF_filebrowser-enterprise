@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	pathpkg "path"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -22,6 +24,7 @@ import (
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	"github.com/gtsteffaniak/filebrowser/backend/database/share"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
+	"github.com/gtsteffaniak/filebrowser/backend/indexing"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing/iteminfo"
 	"github.com/gtsteffaniak/go-logger/logger"
 )
@@ -29,6 +32,12 @@ import (
 type requestContext struct {
 	user         *users.User
 	shareUser    *users.User
+	shareAccess  publicShareAccess
+	shareQuery   url.Values
+	shareRoute   publicShareRoute
+	shareScope   string
+	shareTargets []publicShareTarget
+	shareArchive []publicShareArchiveEntry
 	fileInfo     iteminfo.ExtendedFileInfo
 	token        string
 	share        *share.Link
@@ -49,18 +58,464 @@ var FileInfoFasterFunc = files.FileInfoFaster
 // Updated handleFunc to match the new signature
 type handleFunc func(w http.ResponseWriter, r *http.Request, data *requestContext) (int, error)
 
+type publicShareReadRequirement uint8
+
+const (
+	publicShareReadNone   publicShareReadRequirement = 0
+	publicShareReadBrowse publicShareReadRequirement = 1 << iota
+	publicShareReadThumbnail
+	publicShareReadViewer
+	publicShareReadDownload
+	publicShareReadOriginalViewer = publicShareReadBrowse | publicShareReadViewer | publicShareReadDownload
+)
+
+type publicShareTargetMode uint8
+
+const (
+	publicShareTargetNone publicShareTargetMode = iota
+	publicShareTargetPath
+	publicShareTargetFiles
+	publicShareTargetImage
+)
+
+type publicShareRoute struct {
+	recognized                bool
+	read                      bool
+	requirement               publicShareReadRequirement
+	targetMode                publicShareTargetMode
+	skipFileInfo              bool
+	albumArt                  bool
+	uploadInitializationProbe bool
+}
+
+type publicShareTarget struct {
+	RequestedPath string
+	LogicalPath   string
+	CanonicalPath string
+	ScopedPath    string
+	RealPath      string
+	IsDir         bool
+}
+
+type publicShareAccess struct {
+	browse    bool
+	thumbnail bool
+	viewer    bool
+	download  bool
+}
+
+func calculatePublicShareAccess(link *share.Link, owner *users.User) publicShareAccess {
+	readable := link.ShareType != "upload"
+	return publicShareAccess{
+		browse:    readable && owner.Permissions.Browse,
+		thumbnail: readable && owner.Permissions.Preview && !link.DisableThumbnails,
+		viewer:    readable && owner.Permissions.Preview && !link.DisableFileViewer,
+		download:  readable && owner.Permissions.Download && !link.DisableDownload,
+	}
+}
+
+func (access publicShareAccess) allows(requirement publicShareReadRequirement) bool {
+	if requirement&publicShareReadBrowse != 0 && !access.browse {
+		return false
+	}
+	if requirement&publicShareReadThumbnail != 0 && !access.thumbnail {
+		return false
+	}
+	if requirement&publicShareReadViewer != 0 && !access.viewer {
+		return false
+	}
+	if requirement&publicShareReadDownload != 0 && !access.download {
+		return false
+	}
+	return true
+}
+
+func isPublicShareUploadInitializationProbe(method, routePath string, query url.Values) bool {
+	if method != http.MethodGet || routePath != "/resources" || query.Get("hash") == "" || query.Get("path") == "" {
+		return false
+	}
+	for key := range query {
+		switch key {
+		case "hash", "path", "token":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func publicShareRouteForRequest(method, routePath string, query url.Values) (publicShareRoute, error) {
+	readMethod := method == http.MethodGet || method == http.MethodHead
+	if readMethod {
+		switch routePath {
+		case "/resources":
+			requirement := publicShareReadBrowse
+			uploadInitializationProbe := isPublicShareUploadInitializationProbe(method, routePath, query)
+			if query.Get("content") == "true" {
+				requirement = publicShareReadOriginalViewer
+			} else if query.Get("metadata") == "true" {
+				requirement = publicShareReadBrowse | publicShareReadViewer
+			}
+			return publicShareRoute{
+				recognized:                true,
+				read:                      true,
+				requirement:               requirement,
+				targetMode:                publicShareTargetPath,
+				uploadInitializationProbe: uploadInitializationProbe,
+			}, nil
+		case "/resources/items":
+			return publicShareRoute{recognized: true, read: true, requirement: publicShareReadBrowse, targetMode: publicShareTargetPath}, nil
+		case "/resources/download", "/raw":
+			return publicShareRoute{recognized: true, read: true, requirement: publicShareReadBrowse | publicShareReadDownload, targetMode: publicShareTargetFiles, skipFileInfo: true}, nil
+		case "/resources/preview":
+			requirement := publicShareReadBrowse | publicShareReadThumbnail
+			switch query.Get("size") {
+			case "large", "xlarge":
+				requirement = publicShareReadBrowse | publicShareReadViewer
+			case "original":
+				requirement = publicShareReadOriginalViewer
+			}
+			return publicShareRoute{recognized: true, read: true, requirement: requirement, targetMode: publicShareTargetPath, albumArt: true}, nil
+		case "/media/metadata", "/media/lyrics":
+			return publicShareRoute{recognized: true, read: true, requirement: publicShareReadBrowse | publicShareReadViewer, targetMode: publicShareTargetPath}, nil
+		case "/office/config":
+			return publicShareRoute{recognized: true, read: true, requirement: publicShareReadOriginalViewer, targetMode: publicShareTargetPath}, nil
+		case "/share/image":
+			isBanner := query.Get("banner") == "true"
+			isFavicon := query.Get("favicon") == "true"
+			if isBanner == isFavicon {
+				return publicShareRoute{}, fmt.Errorf("exactly one share image type is required")
+			}
+			requirement := publicShareReadBrowse | publicShareReadThumbnail
+			if isBanner {
+				requirement |= publicShareReadViewer
+			}
+			return publicShareRoute{recognized: true, read: true, requirement: requirement, targetMode: publicShareTargetImage, skipFileInfo: true}, nil
+		}
+	}
+
+	switch {
+	case method == http.MethodPost && routePath == "/resources":
+		return publicShareRoute{recognized: true, targetMode: publicShareTargetPath, skipFileInfo: true}, nil
+	case method == http.MethodPost && routePath == "/resources/pause":
+		return publicShareRoute{recognized: true, targetMode: publicShareTargetPath, skipFileInfo: true}, nil
+	case (method == http.MethodPut || method == http.MethodPatch || method == http.MethodDelete) && routePath == "/resources":
+		return publicShareRoute{recognized: true, targetMode: publicShareTargetPath}, nil
+	case method == http.MethodDelete && routePath == "/resources/bulk":
+		return publicShareRoute{recognized: true, targetMode: publicShareTargetPath}, nil
+	case (method == http.MethodGet || method == http.MethodPost) && routePath == "/office/callback":
+		return publicShareRoute{recognized: true, targetMode: publicShareTargetPath}, nil
+	default:
+		return publicShareRoute{}, nil
+	}
+}
+
+func publicShareReadRequirementForRequest(r *http.Request) publicShareReadRequirement {
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return publicShareReadNone
+	}
+	route, err := publicShareRouteForRequest(r.Method, r.URL.Path, query)
+	if err != nil || !route.recognized || !route.read {
+		return publicShareReadNone
+	}
+	return route.requirement
+}
+
+func publicShareRequirementUsesDownload(requirement publicShareReadRequirement) bool {
+	return requirement&publicShareReadDownload != 0
+}
+
+func normalizePublicShareIndexPath(value string) string {
+	value = strings.ReplaceAll(value, "\\", "/")
+	return pathpkg.Clean("/" + strings.TrimPrefix(value, "/"))
+}
+
+func publicSharePathWithin(base, target string) bool {
+	base = normalizePublicShareIndexPath(base)
+	target = normalizePublicShareIndexPath(target)
+	if runtime.GOOS == "windows" {
+		base = strings.ToLower(base)
+		target = strings.ToLower(target)
+	}
+	return base == "/" || target == base || strings.HasPrefix(target, strings.TrimSuffix(base, "/")+"/")
+}
+
+func publicSharePathsOverlap(first, second string) bool {
+	return publicSharePathWithin(first, second) || publicSharePathWithin(second, first)
+}
+
+func publicShareSingleQueryValue(query url.Values, key string) (string, error) {
+	values, ok := query[key]
+	if !ok {
+		return "", nil
+	}
+	if len(values) != 1 {
+		return "", fmt.Errorf("ambiguous %s parameter", key)
+	}
+	return values[0], nil
+}
+
+func validatePublicShareQuery(query url.Values) error {
+	for _, key := range []string{
+		"hash", "path", "content", "metadata", "size", "banner", "favicon",
+		"albumArt", "atPercentage", "only", "archiveToken", "algo", "inline",
+		"auth", "token", "password", "override", "action",
+	} {
+		if _, err := publicShareSingleQueryValue(query, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func publicShareHasDotDotSegment(value string) bool {
+	value = strings.ReplaceAll(value, "\\", "/")
+	for _, segment := range strings.Split(value, "/") {
+		if segment == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func publicShareHasDrivePrefix(value string) bool {
+	value = strings.TrimPrefix(strings.ReplaceAll(value, "\\", "/"), "/")
+	return len(value) >= 2 && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) && value[1] == ':'
+}
+
+func publicShareWindowsReservedSegment(segment string) bool {
+	segment = strings.TrimSuffix(segment, ".")
+	base := strings.ToUpper(strings.SplitN(segment, ".", 2)[0])
+	if base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" {
+		return true
+	}
+	if len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) && base[3] >= '1' && base[3] <= '9' {
+		return true
+	}
+	return false
+}
+
+func publicShareRepeatedEncodingIsDangerous(value string) bool {
+	current := value
+	for range 3 {
+		next, err := url.PathUnescape(current)
+		if err != nil {
+			return true
+		}
+		if next == current {
+			return false
+		}
+		if strings.ContainsAny(next, "/\\\x00") || publicShareHasDotDotSegment(next) || publicShareHasDrivePrefix(next) ||
+			(runtime.GOOS == "windows" && strings.Contains(next, ":")) {
+			return true
+		}
+		current = next
+	}
+	return false
+}
+
+func cleanPublicShareRelativePath(value string) (string, error) {
+	if strings.ContainsRune(value, '\x00') || publicShareRepeatedEncodingIsDangerous(value) {
+		return "", fmt.Errorf("invalid public path")
+	}
+	if strings.HasPrefix(value, "\\") {
+		return "", fmt.Errorf("invalid public path")
+	}
+	normalized := strings.ReplaceAll(value, "\\", "/")
+	if strings.HasPrefix(normalized, "//") {
+		return "", fmt.Errorf("invalid public path")
+	}
+	if strings.HasPrefix(normalized, "/") {
+		normalized = strings.TrimPrefix(normalized, "/")
+	}
+	if strings.HasPrefix(normalized, "/") || publicShareHasDotDotSegment(normalized) || publicShareHasDrivePrefix(normalized) {
+		return "", fmt.Errorf("invalid public path")
+	}
+	for _, segment := range strings.Split(normalized, "/") {
+		if runtime.GOOS == "windows" && (strings.Contains(segment, ":") || strings.HasSuffix(segment, " ") ||
+			strings.HasSuffix(segment, ".") || publicShareWindowsReservedSegment(segment)) {
+			return "", fmt.Errorf("invalid public path")
+		}
+	}
+	cleaned := pathpkg.Clean(normalized)
+	if cleaned == "." {
+		return "", nil
+	}
+	if pathpkg.IsAbs(cleaned) || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return "", fmt.Errorf("invalid public path")
+	}
+	return cleaned, nil
+}
+
+func publicShareRealPathWithin(base, target string) bool {
+	relative, err := filepath.Rel(base, target)
+	if err != nil || filepath.IsAbs(relative) {
+		return false
+	}
+	return relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+func publicShareCanonicalCaseRelative(root, relative string) string {
+	if runtime.GOOS != "windows" || relative == "." || relative == "" {
+		return relative
+	}
+	current := root
+	parts := strings.Split(filepath.Clean(relative), string(filepath.Separator))
+	for i, part := range parts {
+		entries, err := os.ReadDir(current)
+		if err != nil {
+			return relative
+		}
+		actual := part
+		for _, entry := range entries {
+			if entry.Name() == part {
+				actual = entry.Name()
+				break
+			}
+			if strings.EqualFold(entry.Name(), part) {
+				actual = entry.Name()
+			}
+		}
+		parts[i] = actual
+		current = filepath.Join(current, actual)
+	}
+	return filepath.Join(parts...)
+}
+
+func publicShareScopedPath(ownerScope, logicalPath string) (string, error) {
+	ownerScope = normalizePublicShareIndexPath(ownerScope)
+	logicalPath = normalizePublicShareIndexPath(logicalPath)
+	if !publicSharePathWithin(ownerScope, logicalPath) {
+		return "", errors.ErrAccessDenied
+	}
+	if ownerScope == "/" {
+		return logicalPath, nil
+	}
+	if ownerScope == logicalPath || (runtime.GOOS == "windows" && strings.EqualFold(ownerScope, logicalPath)) {
+		return "/", nil
+	}
+	prefixLength := len(ownerScope)
+	if prefixLength > len(logicalPath) || (runtime.GOOS == "windows" && !strings.EqualFold(logicalPath[:prefixLength], ownerScope)) {
+		return "", errors.ErrAccessDenied
+	}
+	return normalizePublicShareIndexPath(logicalPath[prefixLength:]), nil
+}
+
+func resolvePublicShareLogicalTarget(d *requestContext, sourcePath, logicalPath string) (publicShareTarget, error) {
+	var target publicShareTarget
+	shareRootRelative, err := cleanPublicShareRelativePath(d.share.Path)
+	if err != nil {
+		return target, errors.ErrAccessDenied
+	}
+	shareRoot := normalizePublicShareIndexPath(shareRootRelative)
+	logicalRelative, err := cleanPublicShareRelativePath(logicalPath)
+	if err != nil {
+		return target, errors.ErrAccessDenied
+	}
+	logicalPath = normalizePublicShareIndexPath(logicalRelative)
+	if !publicSharePathWithin(shareRoot, logicalPath) {
+		return target, errors.ErrAccessDenied
+	}
+
+	sourceAbsolute, err := filepath.Abs(sourcePath)
+	if err != nil {
+		return target, err
+	}
+	sourceReal, err := filepath.EvalSymlinks(sourceAbsolute)
+	if err != nil {
+		return target, err
+	}
+	shareRootReal, err := filepath.EvalSymlinks(filepath.Join(sourceAbsolute, filepath.FromSlash(strings.TrimPrefix(shareRoot, "/"))))
+	if err != nil || !publicShareRealPathWithin(sourceReal, shareRootReal) {
+		return target, errors.ErrAccessDenied
+	}
+	targetReal, err := filepath.EvalSymlinks(filepath.Join(sourceAbsolute, filepath.FromSlash(strings.TrimPrefix(logicalPath, "/"))))
+	if err != nil {
+		return target, err
+	}
+	if !publicShareRealPathWithin(sourceReal, targetReal) || !publicShareRealPathWithin(shareRootReal, targetReal) {
+		return target, errors.ErrAccessDenied
+	}
+	canonicalRelative, err := filepath.Rel(sourceReal, targetReal)
+	if err != nil {
+		return target, errors.ErrAccessDenied
+	}
+	canonicalRelative = publicShareCanonicalCaseRelative(sourceReal, canonicalRelative)
+	canonicalPath := normalizePublicShareIndexPath(filepath.ToSlash(canonicalRelative))
+	if !publicSharePathWithin(d.shareScope, logicalPath) || !publicSharePathWithin(d.shareScope, canonicalPath) {
+		return target, errors.ErrAccessDenied
+	}
+	if store.Access == nil || !store.Access.PermittedFresh(sourcePath, logicalPath, d.shareUser.Username) ||
+		!store.Access.PermittedFresh(sourcePath, canonicalPath, d.shareUser.Username) {
+		return target, errors.ErrAccessDenied
+	}
+	scopedPath, err := publicShareScopedPath(d.shareScope, canonicalPath)
+	if err != nil {
+		return target, err
+	}
+	info, err := os.Stat(targetReal)
+	if err != nil {
+		return target, err
+	}
+	target = publicShareTarget{
+		LogicalPath:   logicalPath,
+		CanonicalPath: canonicalPath,
+		ScopedPath:    scopedPath,
+		RealPath:      targetReal,
+		IsDir:         info.IsDir(),
+	}
+	return target, nil
+}
+
+func resolvePublicShareTarget(d *requestContext, sourcePath, requestedPath string) (publicShareTarget, error) {
+	var target publicShareTarget
+	requestedRelative, err := cleanPublicShareRelativePath(requestedPath)
+	if err != nil {
+		return target, err
+	}
+	shareRootRelative, err := cleanPublicShareRelativePath(d.share.Path)
+	if err != nil {
+		return target, err
+	}
+	logicalPath := normalizePublicShareIndexPath(pathpkg.Join("/"+shareRootRelative, requestedRelative))
+	target, err = resolvePublicShareLogicalTarget(d, sourcePath, logicalPath)
+	if err != nil {
+		return target, err
+	}
+	target.RequestedPath = requestedRelative
+	return target, nil
+
+}
+
+func resolvePublicShareWriteTarget(linkPath, ownerScope, requestedPath string) (string, error) {
+	shareRoot := normalizePublicShareIndexPath(linkPath)
+	ownerScope = normalizePublicShareIndexPath(ownerScope)
+	requestedPath = strings.TrimPrefix(filepath.ToSlash(requestedPath), "/")
+	target := normalizePublicShareIndexPath(pathpkg.Join(shareRoot, requestedPath))
+	if !publicSharePathWithin(shareRoot, target) || !publicSharePathWithin(ownerScope, target) {
+		return "", errors.ErrAccessDenied
+	}
+	return publicShareScopedPath(ownerScope, target)
+}
+
 // Middleware to handle file requests by hash and pass it to the handler
 func withHashFileHelper(fn handleFunc) handleFunc {
-	return withOrWithoutUserHelper(func(w http.ResponseWriter, r *http.Request, data *requestContext) (int, error) {
-		hash := r.URL.Query().Get("hash")
-		inputPath := r.URL.Query().Get("path")
-		path, err := utils.SanitizeUserPath(inputPath)
-		if err != nil && inputPath != "" {
-			return http.StatusBadRequest, err
+	authenticated := withOrWithoutUserHelper(func(w http.ResponseWriter, r *http.Request, data *requestContext) (int, error) {
+		query := data.shareQuery
+		route := data.shareRoute
+		var err error
+		hash := query.Get("hash")
+		inputPath := query.Get("path")
+		requestedPath := inputPath
+		if !route.read {
+			requestedPath, err = utils.SanitizeUserPath(inputPath)
+			if err != nil && inputPath != "" {
+				return http.StatusBadRequest, err
+			}
+			requestedPath = filepath.ToSlash(requestedPath)
 		}
-		path = filepath.ToSlash(path)
 
-		// Get the file link by hash
 		link, err := store.Share.GetByHash(hash)
 		if err != nil {
 			data.share = &share.Link{}
@@ -91,6 +546,12 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 				return status, fmt.Errorf("could not authenticate share request")
 			}
 		}
+		if link.Path == "" {
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
+		if _, pathErr := cleanPublicShareRelativePath(link.Path); pathErr != nil {
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
 		source, ok := config.Server.SourceMap[link.Source]
 		if !ok {
 			return http.StatusNotFound, fmt.Errorf("source not found")
@@ -98,54 +559,125 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 		if source.Config.Private {
 			return http.StatusForbidden, fmt.Errorf("the target source is private")
 		}
-		// Get file information with options
-		getContent := r.URL.Query().Get("content") == "true"
-		getMetadata := r.URL.Query().Get("metadata") == "true"
-		reachedDownloadsLimit := link.Downloads >= link.DownloadsLimit && link.DownloadsLimit > 0
-		if link.DisableFileViewer || reachedDownloadsLimit {
-			getContent = false
-		}
+
 		data.shareUser, err = store.Users.Get(link.UserID)
 		if err != nil {
 			return http.StatusNotFound, fmt.Errorf("user for share no longer exists")
 		}
-		// get user scope path from share
+		data.shareAccess = calculatePublicShareAccess(link, data.shareUser)
+		if link.ShareType == "upload" && route.uploadInitializationProbe && r.Header.Get("Range") == "" {
+			if _, pathErr := cleanPublicShareRelativePath(inputPath); pathErr != nil {
+				return http.StatusForbidden, fmt.Errorf("public share access denied")
+			}
+			return http.StatusNotImplemented, fmt.Errorf("browsing is disabled for upload shares")
+		}
+		if route.read && !data.shareAccess.allows(route.requirement) {
+			invalidatePublicShareArchiveToken(query.Get("archiveToken"), link.Hash)
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
+		if route.read && r.URL.Path == "/office/config" && !link.EnableOnlyOffice {
+			invalidatePublicShareArchiveToken(query.Get("archiveToken"), link.Hash)
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
+
+		reachedDownloadsLimit := !link.PerUserDownloadLimit && link.Downloads >= link.DownloadsLimit && link.DownloadsLimit > 0
+		if route.read && reachedDownloadsLimit && publicShareRequirementUsesDownload(route.requirement) {
+			invalidatePublicShareArchiveToken(query.Get("archiveToken"), link.Hash)
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
+
 		userScope, err := data.shareUser.GetScopeForSourceName(source.Name)
-		if err != nil {
-			return http.StatusForbidden, err
+		if err != nil || userScope == "" {
+			invalidatePublicShareArchiveToken(query.Get("archiveToken"), link.Hash)
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
 		}
-		// so trim user scope from link.Path
-		pathWithoutUserScope := utils.JoinPathAsUnix("/", strings.TrimPrefix(link.Path, userScope), path)
-		if !strings.HasSuffix(pathWithoutUserScope, "/") {
-			pathWithoutUserScope = pathWithoutUserScope + "/"
+		cleanScope, scopeErr := cleanPublicShareRelativePath(userScope)
+		if scopeErr != nil {
+			invalidatePublicShareArchiveToken(query.Get("archiveToken"), link.Hash)
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
 		}
-		data.IndexPath = pathWithoutUserScope
-		// skip file fetch for certain apis
-		if (r.Method == "POST" && strings.Contains(r.URL.Path, "/resources")) ||
-			(r.Method == "GET" && strings.Contains(r.URL.Path, "/resources/items")) ||
-			(r.Method == "GET" && strings.Contains(r.URL.Path, "/media/metadata")) {
+		data.shareScope = normalizePublicShareIndexPath(cleanScope)
+
+		if route.targetMode == publicShareTargetImage {
 			return fn(w, r, data)
 		}
+
+		if route.targetMode == publicShareTargetFiles {
+			requestedFiles := query["file"]
+			if len(requestedFiles) == 0 {
+				requestedFiles = []string{"/"}
+			}
+			data.shareTargets = make([]publicShareTarget, 0, len(requestedFiles))
+			for _, requestedFile := range requestedFiles {
+				if requestedFile == "" {
+					return http.StatusBadRequest, fmt.Errorf("invalid file path")
+				}
+				target, resolveErr := resolvePublicShareTarget(data, source.Path, requestedFile)
+				if resolveErr != nil {
+					invalidatePublicShareArchiveToken(query.Get("archiveToken"), link.Hash)
+					return http.StatusForbidden, fmt.Errorf("public share access denied")
+				}
+				if len(data.shareTargets) == 0 {
+					data.IndexPath = utils.AddTrailingSlashIfNotExists(target.ScopedPath)
+				}
+				data.shareTargets = append(data.shareTargets, target)
+			}
+			return fn(w, r, data)
+		}
+
+		var readTarget publicShareTarget
+		if route.read {
+			readTarget, err = resolvePublicShareTarget(data, source.Path, requestedPath)
+			if err != nil {
+				invalidatePublicShareArchiveToken(query.Get("archiveToken"), link.Hash)
+				return http.StatusForbidden, fmt.Errorf("public share access denied")
+			}
+			data.shareTargets = []publicShareTarget{readTarget}
+			data.IndexPath = utils.AddTrailingSlashIfNotExists(readTarget.ScopedPath)
+		} else {
+			var scopedPath string
+			scopedPath, err = resolvePublicShareWriteTarget(link.Path, data.shareScope, requestedPath)
+			if err != nil {
+				return http.StatusForbidden, fmt.Errorf("public share access denied")
+			}
+			data.IndexPath = utils.AddTrailingSlashIfNotExists(scopedPath)
+		}
+
+		if route.skipFileInfo {
+			return fn(w, r, data)
+		}
+
+		getContent := query.Get("content") == "true"
 		file, err := FileInfoFasterFunc(utils.FileOptions{
-			Path:                     pathWithoutUserScope,
+			Path:                     data.IndexPath,
 			Source:                   source.Name,
 			Expand:                   true,
 			Content:                  getContent,
-			Metadata:                 getMetadata,
-			AlbumArt:                 strings.Contains(r.URL.Path, "/preview"),
+			Metadata:                 false,
+			AlbumArt:                 route.albumArt,
 			ExtractEmbeddedSubtitles: config.Integrations.Media.ExtractEmbeddedSubtitles && link.ExtractEmbeddedSubtitles,
 			ShowHidden:               link.ShowHidden,
 			HideFileExt:              link.HideFileExt,
 			FollowSymlinks:           true,
 		}, store.Access, data.shareUser, store.Share)
 		if err != nil {
-			logger.Errorf("error fetching file info for share. hash=%v path=%v error=%v", hash, path, err)
+			logger.Errorf("error fetching file info for share. hash=%v path=%v error=%v", hash, requestedPath, err)
 			return errToStatus(err), fmt.Errorf("error fetching share from server")
+		}
+		if route.read {
+			file.RealPath = readTarget.RealPath
+			if file.Type == "directory" {
+				idx := indexing.GetIndex(source.Name)
+				if idx == nil {
+					return http.StatusNotFound, fmt.Errorf("source not found")
+				}
+				filterPublicShareFileInfo(data, readTarget, file, idx)
+			}
 		}
 		file.Token = link.Token
 		file.Source = link.Hash
 		file.Hash = link.Hash
-		if !link.EnableOnlyOffice || link.DisableFileViewer || reachedDownloadsLimit {
+		if !link.EnableOnlyOffice || !data.shareAccess.allows(publicShareReadOriginalViewer) || reachedDownloadsLimit {
 			file.OnlyOfficeId = ""
 		}
 		if getContent && file.Content != "" {
@@ -157,12 +689,32 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 				link.IncrementUserDownload(data.user.Username)
 			}
 		}
-		file.Path = utils.AddTrailingSlashIfNotExists(path)
+		file.Path = utils.AddTrailingSlashIfNotExists(inputPath)
 		// Set the file info in the `data` object
 		data.fileInfo = *file
+		if route.read && r.URL.Path == "/media/metadata" {
+			return publicVerifiedMetadataHandler(w, r, data)
+		}
 		// Call the next handler with the data
 		return fn(w, r, data)
 	})
+	return func(w http.ResponseWriter, r *http.Request, data *requestContext) (int, error) {
+		query, err := url.ParseQuery(r.URL.RawQuery)
+		if err != nil || validatePublicShareQuery(query) != nil {
+			return http.StatusForbidden, fmt.Errorf("invalid public share query")
+		}
+		route, err := publicShareRouteForRequest(r.Method, r.URL.Path, query)
+		if err != nil {
+			return http.StatusBadRequest, fmt.Errorf("invalid public share request")
+		}
+		if !route.recognized {
+			return http.StatusForbidden, fmt.Errorf("public share route is not allowed")
+		}
+		data.shareQuery = query
+		data.shareRoute = route
+		r.URL.RawQuery = query.Encode()
+		return authenticated(w, r, data)
+	}
 }
 
 // Middleware to ensure the user is an admin

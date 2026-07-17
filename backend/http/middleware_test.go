@@ -34,17 +34,17 @@ func setupTestEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	config = &settings.Config // mocked
+	sourcePath := t.TempDir()
+	source := &settings.Source{
+		Path: sourcePath,
+		Name: "srv",
+	}
 	config.Server.SourceMap = map[string]*settings.Source{
-		"/srv": &settings.Source{
-			Path: "/srv",
-			Name: "srv",
-		},
+		"/srv":     source,
+		sourcePath: source,
 	}
 	config.Server.NameToSource = map[string]*settings.Source{
-		"srv": &settings.Source{
-			Path: "/srv",
-			Name: "srv",
-		},
+		"srv": source,
 	}
 	// Initialize user resolvers so users package can resolve source names
 	settings.InitializeUserResolvers()
@@ -158,7 +158,7 @@ func TestPublicShareHandlerAuthentication(t *testing.T) {
 	dummyUser := &users.User{
 		ID:          1,
 		Username:    "testuser",
-		Permissions: users.Permissions{Admin: false},
+		Permissions: users.Permissions{Admin: false, Browse: true},
 		Scopes: []users.SourceScope{
 			{Name: "srv", Scope: "/"}, // Root scope on srv source
 		},
@@ -182,6 +182,7 @@ func TestPublicShareHandlerAuthentication(t *testing.T) {
 				UserID: 1,
 				CommonShare: share.CommonShare{
 					Source: "/srv",
+					Path:   "/",
 				},
 			},
 			expectedStatusCode: http.StatusOK, // zero means 200 on helpers
@@ -195,6 +196,7 @@ func TestPublicShareHandlerAuthentication(t *testing.T) {
 				Token:        "some_random_token",
 				CommonShare: share.CommonShare{
 					Source: "/srv",
+					Path:   "/",
 				},
 			},
 			extraHeaders: map[string]string{
@@ -221,6 +223,7 @@ func TestPublicShareHandlerAuthentication(t *testing.T) {
 				Token:        "123",
 				CommonShare: share.CommonShare{
 					Source: "/srv",
+					Path:   "/",
 				},
 			},
 			token:              "123",
@@ -302,10 +305,9 @@ func mockHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int
 	return http.StatusOK, nil // mock response
 }
 
-// Modify newHTTPRequest to accept the hash and use it in the URL path.
 func newHTTPRequest(t *testing.T, hash string, requestModifiers ...func(*http.Request)) *http.Request {
 	t.Helper()
-	url := "/public/share/" + hash + "/" // Dynamically include the hash in the URL path
+	url := "/resources"
 	r, err := http.NewRequest(http.MethodGet, url, http.NoBody)
 	if err != nil {
 		t.Fatalf("failed to create request: %v", err)

@@ -341,6 +341,68 @@ func (s *Storage) Permitted(sourcePath, indexPath, username string) bool {
 	return result
 }
 
+// PermittedFresh evaluates the authoritative in-memory rules under one read lock.
+// Public share authorization uses this path so a concurrent cache fill cannot
+// reintroduce a permission result computed before a completed revocation.
+func (s *Storage) PermittedFresh(sourcePath, indexPath, username string) bool {
+	if !strings.HasPrefix(indexPath, "/") {
+		indexPath = "/" + indexPath
+	}
+	indexPath = utils.AddTrailingSlashIfNotExists(indexPath)
+
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+
+	var rulesFound []*AccessRule
+	rulesBySource := s.AllRules[sourcePath]
+	currentPath := indexPath
+	for {
+		normalizedPath := utils.AddTrailingSlashIfNotExists(currentPath)
+		if rule, ok := rulesBySource[normalizedPath]; ok {
+			rulesFound = append(rulesFound, rule)
+		}
+		if currentPath == "/" || currentPath == "." || currentPath == "" {
+			break
+		}
+		parent := utils.GetParentDirectoryPath(currentPath)
+		if parent == currentPath {
+			break
+		}
+		currentPath = parent
+	}
+
+	for _, rule := range rulesFound {
+		if _, found := rule.Deny.Users[username]; found {
+			return false
+		}
+		for group := range rule.Deny.Groups {
+			if usersInGroup, ok := s.Groups[group]; ok {
+				if _, found := usersInGroup[username]; found {
+					return false
+				}
+			}
+		}
+		if _, found := rule.Allow.Users[username]; found {
+			return true
+		}
+		for group := range rule.Allow.Groups {
+			if usersInGroup, ok := s.Groups[group]; ok {
+				if _, found := usersInGroup[username]; found {
+					return true
+				}
+			}
+		}
+	}
+	for _, rule := range rulesFound {
+		if rule.DenyAll {
+			return false
+		}
+	}
+
+	sourceInfo, ok := settings.Config.Server.SourceMap[sourcePath]
+	return ok && !sourceInfo.Config.DenyByDefault
+}
+
 func (s *Storage) computePermitted(sourcePath, indexPath, username string) bool {
 	var rulesFound []*AccessRule
 

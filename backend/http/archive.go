@@ -50,6 +50,10 @@ type archiveSpoolSession struct {
 	sourcePath       string
 	requestFileList  []string
 	memberPaths      []string
+	shareHash        string
+	archiveExtension string
+	shareTargets     []publicShareTarget
+	shareMembers     []publicShareArchiveEntry
 	lifecycle        *archiveSpoolLifecycle
 }
 
@@ -128,6 +132,17 @@ func scheduleArchiveSpoolIdleCleanupLocked(token string, session archiveSpoolSes
 	lifecycle.timer = archiveSpoolAfterFunc(archiveMultiRequestIdle, func() {
 		expireArchiveSpool(token, session, generation)
 	})
+}
+
+func invalidatePublicShareArchiveToken(token, shareHash string) {
+	if token == "" || shareHash == "" {
+		return
+	}
+	session, ok := archiveSpoolCache.Get(token)
+	if !ok || session.shareHash != shareHash {
+		return
+	}
+	removeSpooledArchiveNow(token, session.tmpPath)
 }
 
 // rescheduleArchiveSpoolIdleCleanup is retained for focused lifecycle tests and cleanup callers.
@@ -818,6 +833,88 @@ func addSingleFile(realPath, archivePath string, zipWriter *zip.Writer, tarWrite
 	return nil
 }
 
+func addPublicShareArchiveEntry(d *requestContext, entry publicShareArchiveEntry, tarWriter *tar.Writer, zipWriter *zip.Writer) error {
+	target, err := reauthorizePublicShareArchiveEntry(d, entry)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(target.RealPath)
+	if err != nil || info.IsDir() != entry.IsDir {
+		return fmt.Errorf("public archive member changed")
+	}
+	archivePath := filepath.ToSlash(entry.ArchivePath)
+	if info.IsDir() {
+		archivePath = strings.TrimSuffix(archivePath, "/") + "/"
+		if tarWriter != nil {
+			header, err := tar.FileInfoHeader(info, "")
+			if err != nil {
+				return err
+			}
+			header.Name = archivePath
+			return tarWriter.WriteHeader(header)
+		}
+		if zipWriter != nil {
+			header, err := zip.FileInfoHeader(info)
+			if err != nil {
+				return err
+			}
+			header.Name = archivePath
+			header.Method = zip.Store
+			_, err = zipWriter.CreateHeader(header)
+			return err
+		}
+		return nil
+	}
+	return addSingleFile(target.RealPath, archivePath, zipWriter, tarWriter)
+}
+
+func createPublicShareZip(d *requestContext, w io.Writer) error {
+	zipWriter := zip.NewWriter(w)
+	for _, entry := range d.shareArchive {
+		if err := addPublicShareArchiveEntry(d, entry, nil, zipWriter); err != nil {
+			_ = zipWriter.Close()
+			return err
+		}
+	}
+	return zipWriter.Close()
+}
+
+func createPublicShareTarGz(d *requestContext, w io.Writer) error {
+	gzipWriter := gzip.NewWriter(w)
+	tarWriter := tar.NewWriter(gzipWriter)
+	for _, entry := range d.shareArchive {
+		if err := addPublicShareArchiveEntry(d, entry, tarWriter, nil); err != nil {
+			_ = tarWriter.Close()
+			_ = gzipWriter.Close()
+			return err
+		}
+	}
+	if err := tarWriter.Close(); err != nil {
+		_ = gzipWriter.Close()
+		return err
+	}
+	return gzipWriter.Close()
+}
+
+func publicShareArchiveSize(d *requestContext) (int64, error) {
+	var size int64
+	for _, entry := range d.shareArchive {
+		if entry.IsDir {
+			continue
+		}
+		target, err := reauthorizePublicShareArchiveEntry(d, entry)
+		if err != nil {
+			return 0, err
+		}
+		info, err := os.Stat(target.RealPath)
+		if err != nil || info.IsDir() {
+			return 0, fmt.Errorf("public archive member changed")
+		}
+		size += info.Size()
+	}
+	return size, nil
+}
+
 // createZip writes a ZIP archive into w containing the given paths; access rules apply.
 func createZip(d *requestContext, source string, w io.Writer, filenames ...string) error {
 	return createZipTracked(d, source, w, nil, filenames...)
@@ -904,6 +1001,17 @@ func createTarGzWithLevel(d *requestContext, source string, w io.Writer, level i
 //
 // server.maxArchiveSizeGB is enforced only for the HEAD/Range spool path.
 func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestContext, source string, fileList []string) (int, error) {
+	var shareRealPath string
+	if d.share != nil {
+		idx := indexing.GetIndex(source)
+		if idx == nil {
+			return http.StatusInternalServerError, fmt.Errorf("source %s is not available", source)
+		}
+		if len(d.shareTargets) == 0 {
+			return http.StatusForbidden, fmt.Errorf("public share archive target is missing")
+		}
+		shareRealPath = d.shareTargets[0].RealPath
+	}
 	algo := r.URL.Query().Get("algo")
 	var extension string
 	switch algo {
@@ -914,14 +1022,53 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 	default:
 		return http.StatusInternalServerError, errors.New("format not implemented")
 	}
+	var shareOriginalFileName string
+	if d.share != nil {
+		shareOriginalFileName = archiveAttachmentStem(fileList, shareRealPath) + extension
+	}
 
 	token := r.URL.Query().Get("archiveToken")
 	if token != "" {
 		session, ok := archiveSpoolCache.Get(token)
 		if !ok {
+			if d.share != nil {
+				return http.StatusNotFound, fmt.Errorf("invalid or expired archiveToken")
+			}
 			return http.StatusGone, fmt.Errorf("invalid or expired archiveToken")
 		}
-		if d.share == nil {
+		if d.share != nil {
+			if session.shareHash != d.share.Hash || session.source != source || session.archiveExtension != extension ||
+				session.originalFileName != shareOriginalFileName || len(session.shareTargets) != len(d.shareTargets) {
+				removeSpooledArchiveNow(token, session.tmpPath)
+				return http.StatusForbidden, fmt.Errorf("archiveToken is not valid for this share")
+			}
+			sourceInfo, exists := config.Server.SourceMap[d.share.Source]
+			if !exists || session.sourcePath == "" || sourceInfo.Path != session.sourcePath || sourceInfo.Name != session.source {
+				removeSpooledArchiveNow(token, session.tmpPath)
+				return http.StatusForbidden, fmt.Errorf("public archive source changed")
+			}
+			for i, originalTarget := range session.shareTargets {
+				currentTarget := d.shareTargets[i]
+				if currentTarget.LogicalPath != originalTarget.LogicalPath || currentTarget.CanonicalPath != originalTarget.CanonicalPath ||
+					!publicShareSameRealPath(currentTarget.RealPath, originalTarget.RealPath) || currentTarget.IsDir != originalTarget.IsDir {
+					removeSpooledArchiveNow(token, session.tmpPath)
+					return http.StatusForbidden, fmt.Errorf("public archive target changed")
+				}
+				if _, authErr := reauthorizePublicShareTarget(d, sourceInfo.Path, originalTarget); authErr != nil {
+					removeSpooledArchiveNow(token, session.tmpPath)
+					return http.StatusForbidden, fmt.Errorf("public archive target authorization changed")
+				}
+			}
+			for _, member := range session.shareMembers {
+				if _, authErr := reauthorizePublicShareArchiveEntry(d, member); authErr != nil {
+					removeSpooledArchiveNow(token, session.tmpPath)
+					return http.StatusForbidden, fmt.Errorf("public archive authorization changed")
+				}
+			}
+		} else {
+			if session.shareHash != "" {
+				return http.StatusForbidden, fmt.Errorf("archiveToken is not valid for this request")
+			}
 			if session.username == "" || session.userID != d.user.ID || session.username != d.user.Username || session.source != source || !slices.Equal(session.requestFileList, fileList) {
 				return http.StatusForbidden, fmt.Errorf("archive resume session is not valid for the current user scope")
 			}
@@ -981,9 +1128,15 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 			return http.StatusForbidden, fmt.Errorf("no archive members are accessible")
 		}
 	}
-	realPath, _, err := idx.GetRealPath(fileList[0])
-	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("failed to get real path for %s: %v", fileList[0], err)
+	var realPath string
+	var err error
+	if d.share != nil {
+		realPath = shareRealPath
+	} else {
+		realPath, _, err = idx.GetRealPath(fileList[0])
+		if err != nil {
+			return http.StatusInternalServerError, fmt.Errorf("failed to get real path for %s: %v", fileList[0], err)
+		}
 	}
 	originalFileName := archiveAttachmentStem(fileList, realPath) + extension
 
@@ -992,7 +1145,11 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 
 	if needMultiRequestSession && config.Server.MaxArchiveSizeGB > 0 {
 		var estimatedSize int64
-		estimatedSize, err = computeArchiveSize(source, fileList, d)
+		if d.share != nil {
+			estimatedSize, err = publicShareArchiveSize(d)
+		} else {
+			estimatedSize, err = computeArchiveSize(source, fileList, d)
+		}
 		if err != nil {
 			return http.StatusInternalServerError, fmt.Errorf("failed to compute archive size: %v", err)
 		}
@@ -1018,7 +1175,11 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 			burst := d.share.MaxBandwidth * 1024
 			writer = newThrottledWriter(w, limit, burst, r.Context())
 		}
-		if extension == ".zip" {
+		if d.share != nil && extension == ".zip" {
+			err = createPublicShareZip(d, writer)
+		} else if d.share != nil {
+			err = createPublicShareTarGz(d, writer)
+		} else if extension == ".zip" {
 			err = createZip(d, source, writer, fileList...)
 		} else {
 			err = createTarGz(d, source, writer, fileList...)
@@ -1043,7 +1204,11 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 	}()
 	memberTracker := &archiveMemberTracker{}
 
-	if extension == ".zip" {
+	if d.share != nil && extension == ".zip" {
+		err = createPublicShareZip(d, tmpF)
+	} else if d.share != nil {
+		err = createPublicShareTarGz(d, tmpF)
+	} else if extension == ".zip" {
 		err = createZipTracked(d, source, tmpF, memberTracker, fileList...)
 	} else {
 		err = createTarGzTracked(d, source, tmpF, memberTracker, fileList...)
@@ -1091,9 +1256,14 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 		sourcePath:       idx.Path,
 		requestFileList:  requestFileList,
 		memberPaths:      append([]string(nil), memberTracker.paths...),
+		archiveExtension: extension,
 		lifecycle:        &archiveSpoolLifecycle{active: 1},
 	}
-	if d.share == nil {
+	if d.share != nil {
+		session.shareHash = d.share.Hash
+		session.shareTargets = append([]publicShareTarget(nil), d.shareTargets...)
+		session.shareMembers = append([]publicShareArchiveEntry(nil), d.shareArchive...)
+	} else {
 		session.userID = d.user.ID
 		session.username = d.user.Username
 	}
