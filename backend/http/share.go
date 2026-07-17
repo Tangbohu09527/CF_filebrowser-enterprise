@@ -269,6 +269,9 @@ func sharePostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 		if err != nil {
 			return http.StatusBadRequest, fmt.Errorf("invalid hash provided")
 		}
+		if !s.UserCanEdit(d.user) {
+			return http.StatusForbidden, fmt.Errorf("you are not allowed to update this share")
+		}
 	}
 
 	var expire int64 = 0
@@ -632,6 +635,21 @@ func shareInfoHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	shareLink, err := store.Share.GetByHash(hash)
 	if err != nil {
 		return http.StatusNotFound, fmt.Errorf("share hash not found")
+	}
+	owner, err := store.Users.Get(shareLink.UserID)
+	if err != nil {
+		return http.StatusNotFound, fmt.Errorf("user for share no longer exists")
+	}
+	if shareLink.ShareType != "upload" {
+		access := calculatePublicShareAccess(shareLink, owner)
+		source, ok := config.Server.SourceMap[shareLink.Source]
+		if !ok {
+			return http.StatusNotFound, fmt.Errorf("source not found")
+		}
+		ownerScope, scopeErr := owner.GetScopeForSourceName(source.Name)
+		if scopeErr != nil || !access.allows(publicShareReadBrowse) || !publicSharePathsOverlap(shareLink.Path, ownerScope) {
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
 	}
 	commonShare := shareLink.CommonShare
 	commonShare.ShareURL = getShareURL(r, hash, false, "")

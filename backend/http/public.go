@@ -3,14 +3,23 @@ package http
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/gtsteffaniak/filebrowser/backend/adapters/fs/files"
 	"github.com/gtsteffaniak/filebrowser/backend/common/errors"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	"github.com/gtsteffaniak/filebrowser/backend/indexing"
+	"github.com/gtsteffaniak/filebrowser/backend/indexing/iteminfo"
 	"github.com/gtsteffaniak/filebrowser/backend/preview"
 	"github.com/gtsteffaniak/go-logger/logger"
+	"golang.org/x/time/rate"
 
 	_ "github.com/gtsteffaniak/filebrowser/backend/swagger/docs"
 )
@@ -45,6 +54,23 @@ func publicDownloadHandler(w http.ResponseWriter, r *http.Request, d *requestCon
 	if d.share.DisableDownload {
 		return http.StatusForbidden, fmt.Errorf("downloads are not allowed for this share")
 	}
+	if len(d.shareTargets) == 0 {
+		return http.StatusForbidden, fmt.Errorf("public share access denied")
+	}
+
+	sourceInfo, ok := config.Server.SourceMap[d.share.Source]
+	if !ok {
+		return http.StatusInternalServerError, fmt.Errorf("source not found for share")
+	}
+	manifest, err := buildPublicShareArchiveManifest(d, sourceInfo.Path, d.shareTargets)
+	if err != nil {
+		invalidatePublicShareArchiveToken(d.shareQuery.Get("archiveToken"), d.share.Hash)
+		if err == errors.ErrAccessDenied {
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
+		return http.StatusNotFound, fmt.Errorf("public share target not available")
+	}
+	d.shareArchive = manifest
 
 	// Check global download limit (if not using per-user limits)
 	if !d.share.PerUserDownloadLimit && d.share.DownloadsLimit > 0 && d.share.Downloads >= d.share.DownloadsLimit {
@@ -72,42 +98,243 @@ func publicDownloadHandler(w http.ResponseWriter, r *http.Request, d *requestCon
 		d.share.IncrementUserDownload(d.user.Username)
 	}
 
-	// Get all "file" parameter values (supports repeated params)
-	files := r.URL.Query()["file"]
-	if len(files) == 0 {
-		files = []string{"/"}
-	}
-
-	// Get the actual source name from the share's source mapping
-	sourceInfo, ok := config.Server.SourceMap[d.share.Source]
-	if !ok {
-		return http.StatusInternalServerError, fmt.Errorf("source not found for share")
-	}
-	actualSourceName := sourceInfo.Name
-
-	// Process each file path
-	fileList := []string{}
-	for _, file := range files {
-		// Rule 1: Validate each file path to prevent path traversal
-		cleanFile, err := utils.SanitizeUserPath(file)
-		if err != nil {
-			return http.StatusBadRequest, fmt.Errorf("invalid file path: %v", err)
+	var status int
+	if len(d.shareTargets) == 1 && !d.shareTargets[0].IsDir {
+		status, err = servePublicShareFile(w, r, d, sourceInfo.Path, d.shareTargets[0])
+	} else {
+		logicalPaths := make([]string, 0, len(d.shareTargets))
+		for _, target := range d.shareTargets {
+			logicalPaths = append(logicalPaths, target.LogicalPath)
 		}
-
-		// Join the share path with the requested path
-		filePath := utils.JoinPathAsUnix(d.share.Path, cleanFile)
-		fileList = append(fileList, filePath)
+		status, err = BuildAndStreamArchive(w, r, d, sourceInfo.Name, logicalPaths)
 	}
-
-	status, err := rawFilesHandler(w, r, d, actualSourceName, fileList)
 	if err != nil {
 		if err == errors.ErrDownloadNotAllowed {
 			return http.StatusForbidden, errors.ErrDownloadNotAllowed
 		}
-		logger.Errorf("public share handler: error processing filelist: %v with error %v", files, err)
-		return status, fmt.Errorf("error processing filelist: %v", files)
+		logger.Errorf("public share handler: error processing filelist with error %v", err)
+		return status, fmt.Errorf("error processing public share filelist")
 	}
 	return status, nil
+}
+
+type publicShareArchiveEntry struct {
+	LogicalPath   string
+	CanonicalPath string
+	RealPath      string
+	ArchivePath   string
+	IsDir         bool
+}
+
+func publicShareSameRealPath(first, second string) bool {
+	first = filepath.Clean(first)
+	second = filepath.Clean(second)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(first, second)
+	}
+	return first == second
+}
+
+func reauthorizePublicShareTarget(d *requestContext, sourcePath string, checked publicShareTarget) (publicShareTarget, error) {
+	current, err := resolvePublicShareLogicalTarget(d, sourcePath, checked.LogicalPath)
+	if err != nil {
+		return publicShareTarget{}, err
+	}
+	if current.CanonicalPath != checked.CanonicalPath || !publicShareSameRealPath(current.RealPath, checked.RealPath) || current.IsDir != checked.IsDir {
+		return publicShareTarget{}, errors.ErrAccessDenied
+	}
+	current.RequestedPath = checked.RequestedPath
+	return current, nil
+}
+
+func buildPublicShareArchiveManifest(d *requestContext, sourcePath string, targets []publicShareTarget) ([]publicShareArchiveEntry, error) {
+	manifest := make([]publicShareArchiveEntry, 0, len(targets))
+	for _, checked := range targets {
+		target, err := reauthorizePublicShareTarget(d, sourcePath, checked)
+		if err != nil {
+			return nil, err
+		}
+		if !target.IsDir {
+			manifest = append(manifest, publicShareArchiveEntry{
+				LogicalPath:   target.LogicalPath,
+				CanonicalPath: target.CanonicalPath,
+				RealPath:      target.RealPath,
+				ArchivePath:   filepath.Base(target.RealPath),
+			})
+			continue
+		}
+
+		baseName := filepath.Base(target.RealPath)
+		err = filepath.WalkDir(target.RealPath, func(filePath string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			relativePath, err := filepath.Rel(target.RealPath, filePath)
+			if err != nil || relativePath == "." {
+				return err
+			}
+			logicalPath := normalizePublicShareIndexPath(path.Join(target.LogicalPath, filepath.ToSlash(relativePath)))
+			child, err := resolvePublicShareLogicalTarget(d, sourcePath, logicalPath)
+			if err != nil {
+				return err
+			}
+			manifest = append(manifest, publicShareArchiveEntry{
+				LogicalPath:   child.LogicalPath,
+				CanonicalPath: child.CanonicalPath,
+				RealPath:      child.RealPath,
+				ArchivePath:   path.Join(baseName, filepath.ToSlash(relativePath)),
+				IsDir:         child.IsDir,
+			})
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return manifest, nil
+}
+
+func reauthorizePublicShareArchiveEntry(d *requestContext, entry publicShareArchiveEntry) (publicShareTarget, error) {
+	sourceInfo, ok := config.Server.SourceMap[d.share.Source]
+	if !ok {
+		return publicShareTarget{}, errors.ErrAccessDenied
+	}
+	checked := publicShareTarget{
+		LogicalPath:   entry.LogicalPath,
+		CanonicalPath: entry.CanonicalPath,
+		RealPath:      entry.RealPath,
+		IsDir:         entry.IsDir,
+	}
+	return reauthorizePublicShareTarget(d, sourceInfo.Path, checked)
+}
+
+func servePublicShareFile(w http.ResponseWriter, r *http.Request, d *requestContext, sourcePath string, checked publicShareTarget) (int, error) {
+	target, err := reauthorizePublicShareTarget(d, sourcePath, checked)
+	if err != nil || target.IsDir {
+		return http.StatusForbidden, errors.ErrAccessDenied
+	}
+	file, err := os.Open(target.RealPath)
+	if err != nil {
+		return http.StatusNotFound, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || info.IsDir() {
+		return http.StatusNotFound, fmt.Errorf("public share target is not a file")
+	}
+
+	fileName := filepath.Base(target.LogicalPath)
+	setContentDisposition(w, r, fileName)
+	w.Header().Set("Cache-Control", "private")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	var reader io.ReadSeeker = file
+	if d.share.MaxBandwidth > 0 {
+		limit := rate.Limit(d.share.MaxBandwidth * 1024)
+		reader = newThrottledReadSeeker(file, limit, d.share.MaxBandwidth*1024, r.Context())
+	}
+	http.ServeContent(w, r, fileName, info.ModTime(), reader)
+	return http.StatusOK, nil
+}
+
+func filterPublicShareFileInfo(d *requestContext, parent publicShareTarget, file *iteminfo.ExtendedFileInfo, idx *indexing.Index) {
+	filesAllowed := file.Files[:0]
+	for _, child := range file.Files {
+		logicalPath := normalizePublicShareIndexPath(path.Join(parent.LogicalPath, child.Name))
+		target, err := resolvePublicShareLogicalTarget(d, idx.Path, logicalPath)
+		if err == nil && !target.IsDir {
+			filesAllowed = append(filesAllowed, child)
+		}
+	}
+	file.Files = filesAllowed
+
+	foldersAllowed := file.Folders[:0]
+	for _, child := range file.Folders {
+		logicalPath := normalizePublicShareIndexPath(path.Join(parent.LogicalPath, child.Name))
+		target, err := resolvePublicShareLogicalTarget(d, idx.Path, logicalPath)
+		if err == nil && target.IsDir {
+			foldersAllowed = append(foldersAllowed, child)
+		}
+	}
+	file.Folders = foldersAllowed
+
+	file.Size = 0
+	file.HasPreview = false
+	for _, child := range file.Files {
+		file.Size += child.Size
+		file.HasPreview = file.HasPreview || child.HasPreview
+	}
+	for _, child := range file.Folders {
+		file.Size += child.Size
+		file.HasPreview = file.HasPreview || child.HasPreview
+	}
+}
+
+func populatePublicShareMetadata(d *requestContext, albumArt bool) error {
+	if len(d.shareTargets) != 1 {
+		return errors.ErrAccessDenied
+	}
+	sourceInfo, ok := config.Server.SourceMap[d.share.Source]
+	if !ok {
+		return errors.ErrAccessDenied
+	}
+	parent := d.shareTargets[0]
+	if !parent.IsDir {
+		current, err := reauthorizePublicShareTarget(d, sourceInfo.Path, parent)
+		if err != nil {
+			return err
+		}
+		metadata, err := files.FileInfoFaster(utils.FileOptions{
+			Path:                     current.ScopedPath,
+			Source:                   sourceInfo.Name,
+			Expand:                   true,
+			Metadata:                 true,
+			AlbumArt:                 albumArt,
+			ExtractEmbeddedSubtitles: config.Integrations.Media.ExtractEmbeddedSubtitles && d.share.ExtractEmbeddedSubtitles,
+			ShowHidden:               d.share.ShowHidden,
+			HideFileExt:              d.share.HideFileExt,
+			FollowSymlinks:           true,
+		}, store.Access, d.shareUser, store.Share)
+		if err != nil {
+			return err
+		}
+		d.fileInfo.Metadata = metadata.Metadata
+		d.fileInfo.Subtitles = metadata.Subtitles
+		d.fileInfo.RealPath = current.RealPath
+		return nil
+	}
+
+	for i := range d.fileInfo.Files {
+		child := &d.fileInfo.Files[i]
+		if !strings.HasPrefix(child.Type, "audio") && !strings.HasPrefix(child.Type, "video") {
+			continue
+		}
+		logicalPath := normalizePublicShareIndexPath(path.Join(parent.LogicalPath, child.Name))
+		current, err := resolvePublicShareLogicalTarget(d, sourceInfo.Path, logicalPath)
+		if err != nil || current.IsDir {
+			continue
+		}
+		metadata, err := files.FileInfoFaster(utils.FileOptions{
+			Path:           current.ScopedPath,
+			Source:         sourceInfo.Name,
+			Expand:         false,
+			Metadata:       true,
+			AlbumArt:       albumArt,
+			ShowHidden:     d.share.ShowHidden,
+			HideFileExt:    d.share.HideFileExt,
+			FollowSymlinks: true,
+		}, store.Access, d.shareUser, store.Share)
+		if err == nil {
+			child.Metadata = metadata.Metadata
+		}
+	}
+	return nil
+}
+
+func publicVerifiedMetadataHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+	if err := populatePublicShareMetadata(d, d.shareQuery.Get("albumArt") == "true"); err != nil {
+		return http.StatusNotFound, fmt.Errorf("metadata is not available")
+	}
+	return renderJSON(w, r, d.fileInfo)
 }
 
 // publicShareHandler returns file or directory information from a public share.
@@ -129,6 +356,11 @@ func publicDownloadHandler(w http.ResponseWriter, r *http.Request, d *requestCon
 func publicGetResourceHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
 	if d.share.ShareType == "upload" {
 		return http.StatusNotImplemented, fmt.Errorf("browsing is disabled for upload shares")
+	}
+	if d.shareQuery.Get("metadata") == "true" {
+		if err := populatePublicShareMetadata(d, d.shareQuery.Get("albumArt") == "true"); err != nil {
+			return http.StatusNotFound, fmt.Errorf("metadata is not available")
+		}
 	}
 	return renderJSON(w, r, d.fileInfo)
 }
@@ -208,11 +440,24 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 // @Failure 501 {object} map[string]string "Previews disabled globally, for this share, or for upload shares"
 // @Router /public/api/resources/preview [get]
 func publicPreviewHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
-	if config.Server.DisablePreviews || d.share.DisableThumbnails {
+	if config.Server.DisablePreviews {
 		return http.StatusNotImplemented, fmt.Errorf("preview is disabled")
 	}
 	if d.share.ShareType == "upload" {
-		return http.StatusNotImplemented, fmt.Errorf("preview is disabled for upload shares")
+		return http.StatusForbidden, fmt.Errorf("preview is disabled for upload shares")
+	}
+	if d.fileInfo.Type == "directory" {
+		file, err := publicShareDirectoryPreviewFile(r, d)
+		if err != nil {
+			return http.StatusNotFound, fmt.Errorf("preview not available for this item")
+		}
+		d.fileInfo = *file
+	}
+	if publicPreviewServesOriginal(r, d.fileInfo) {
+		if !d.shareAccess.allows(d.shareRoute.requirement|publicShareReadViewer|publicShareReadDownload) ||
+			!consumePublicShareOriginalRead(d) {
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
 	}
 	status, err := previewHelperFunc(w, r, d)
 	if err != nil {
@@ -221,6 +466,91 @@ func publicPreviewHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 		return http.StatusNotFound, fmt.Errorf("preview not available for this item")
 	}
 	return status, err
+}
+
+func consumePublicShareOriginalRead(d *requestContext) bool {
+	d.share.Mu.Lock()
+	defer d.share.Mu.Unlock()
+	if d.share.DownloadsLimit > 0 {
+		if d.share.PerUserDownloadLimit {
+			if d.share.UserDownloads[d.user.Username] >= d.share.DownloadsLimit {
+				return false
+			}
+		} else if d.share.Downloads >= d.share.DownloadsLimit {
+			return false
+		}
+	}
+	d.share.Downloads++
+	if d.share.PerUserDownloadLimit {
+		if d.share.UserDownloads == nil {
+			d.share.UserDownloads = make(map[string]int)
+		}
+		d.share.UserDownloads[d.user.Username]++
+	}
+	return true
+}
+
+func publicShareDirectoryPreviewFile(r *http.Request, d *requestContext) (*iteminfo.ExtendedFileInfo, error) {
+	if len(d.shareTargets) != 1 {
+		return nil, errors.ErrAccessDenied
+	}
+	previewableNames := make([]string, 0, len(d.fileInfo.Files))
+	for _, child := range d.fileInfo.Files {
+		if iteminfo.ShouldBubbleUpToFolderPreview(child.ItemInfo) {
+			previewableNames = append(previewableNames, child.Name)
+		}
+	}
+	if len(previewableNames) == 0 {
+		return nil, fmt.Errorf("no previewable files found")
+	}
+	percentage, err := strconv.Atoi(d.shareQuery.Get("atPercentage"))
+	if err != nil || percentage < 0 || percentage > 100 {
+		percentage = 0
+	}
+	frame := 0
+	switch {
+	case percentage > 50:
+		frame = 3
+	case percentage > 25:
+		frame = 2
+	case percentage > 0:
+		frame = 1
+	}
+	name := previewableNames[frame%len(previewableNames)]
+	sourceInfo, ok := config.Server.SourceMap[d.share.Source]
+	if !ok {
+		return nil, errors.ErrAccessDenied
+	}
+	logicalPath := normalizePublicShareIndexPath(path.Join(d.shareTargets[0].LogicalPath, name))
+	target, err := resolvePublicShareLogicalTarget(d, sourceInfo.Path, logicalPath)
+	if err != nil || target.IsDir {
+		return nil, errors.ErrAccessDenied
+	}
+	file, err := files.FileInfoFaster(utils.FileOptions{
+		Path:           target.ScopedPath,
+		Source:         sourceInfo.Name,
+		AlbumArt:       true,
+		Metadata:       true,
+		FollowSymlinks: true,
+	}, store.Access, d.shareUser, store.Share)
+	if err != nil {
+		return nil, err
+	}
+	file.RealPath = target.RealPath
+	return file, nil
+}
+
+func publicPreviewServesOriginal(r *http.Request, file iteminfo.ExtendedFileInfo) bool {
+	previewSize := r.URL.Query().Get("size")
+	if previewSize != "large" && previewSize != "original" && previewSize != "xlarge" {
+		previewSize = "small"
+	}
+	if previewSize == "original" {
+		return true
+	}
+	ext := strings.ToLower(filepath.Ext(file.Name))
+	return strings.HasPrefix(file.Type, "image") &&
+		shouldServeOriginalPreview(ext, iteminfo.ResizableImageTypes[ext], file.RealPath, previewSize, file.Size)
 }
 
 // publicPutHandler handles the PUT request for a public share.
@@ -420,26 +750,29 @@ func getShareImage(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 		return http.StatusBadRequest, fmt.Errorf("either banner or favicon parameter must be true")
 	}
 
-	shareCreatedByUser, err := store.Users.Get(d.share.UserID)
-	if err != nil {
-		return http.StatusNotFound, fmt.Errorf("user for share no longer exists")
-	}
-
 	sourceName, assetPath, err := d.share.GetShareImagePartsHelper(isBanner)
 	if err != nil {
 		return http.StatusBadRequest, fmt.Errorf("invalid asset configuration: %v", err)
 	}
+	sourceInfo, ok := config.Server.SourceMap[d.share.Source]
+	if !ok || sourceName != sourceInfo.Name {
+		return http.StatusForbidden, fmt.Errorf("public share access denied")
+	}
+	target, err := resolvePublicShareLogicalTarget(d, sourceInfo.Path, assetPath)
+	if err != nil || target.IsDir {
+		return http.StatusForbidden, fmt.Errorf("public share access denied")
+	}
 
 	// Get file info
 	fileInfo, err := files.FileInfoFaster(utils.FileOptions{
-		Path:           assetPath,
-		Source:         sourceName,
+		Path:           target.ScopedPath,
+		Source:         sourceInfo.Name,
 		Expand:         false,
 		Content:        false,
 		Metadata:       false,
 		ShowHidden:     false,
 		FollowSymlinks: true,
-	}, store.Access, shareCreatedByUser, store.Share)
+	}, store.Access, d.shareUser, store.Share)
 
 	if err != nil {
 		logger.Errorf("error accessing share asset: source=%v path=%v error=%v", sourceName, assetPath, err)
@@ -452,6 +785,7 @@ func getShareImage(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 	}
 
 	// Set file info in request context for preview generation
+	fileInfo.RealPath = target.RealPath
 	d.fileInfo = *fileInfo
 	q := r.URL.Query()
 	if isBanner {
@@ -460,6 +794,12 @@ func getShareImage(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 		q.Set("size", "small")
 	}
 	r.URL.RawQuery = q.Encode()
+	if publicPreviewServesOriginal(r, d.fileInfo) {
+		if !d.shareAccess.allows(d.shareRoute.requirement|publicShareReadViewer|publicShareReadDownload) ||
+			!consumePublicShareOriginalRead(d) {
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
+	}
 
 	// Use the preview helper to generate and serve a resized preview
 	status, err := previewHelperFunc(w, r, d)
@@ -486,22 +826,23 @@ func getShareImage(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /public/api/resources/items [get]
 func publicItemsGetHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
-	sourceInfo, ok := config.Server.SourceMap[d.share.Source]
-	if !ok {
-		return http.StatusNotFound, fmt.Errorf("source not found")
+	if d.share.ShareType == "upload" {
+		return http.StatusForbidden, fmt.Errorf("browsing is disabled for upload shares")
 	}
-	items, err := files.GetDirItems(utils.FileOptions{
-		FollowSymlinks: true,
-		Path:           d.IndexPath,
-		Source:         sourceInfo.Name,
-		ShowHidden:     d.shareUser.ShowHidden,
-		Only:           r.URL.Query().Get("only"),
-	}, store.Access, d.shareUser)
-	if err != nil {
-		if err == errors.ErrAccessDenied {
-			return http.StatusForbidden, err
+	if d.fileInfo.Type != "directory" {
+		return http.StatusNotFound, fmt.Errorf("path is not a directory")
+	}
+	items := files.Items{}
+	only := d.shareQuery.Get("only")
+	if only == "" || only == "files" {
+		for _, file := range d.fileInfo.Files {
+			items.Files = append(items.Files, file.Name)
 		}
-		return http.StatusInternalServerError, err
+	}
+	if only == "" || only == "folders" {
+		for _, folder := range d.fileInfo.Folders {
+			items.Folders = append(items.Folders, folder.Name)
+		}
 	}
 	return renderJSON(w, r, items)
 }
