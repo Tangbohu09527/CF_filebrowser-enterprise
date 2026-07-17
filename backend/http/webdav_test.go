@@ -293,6 +293,7 @@ func TestWebDAV_PROPFIND_UserScopes(t *testing.T) {
 		Username: "admin",
 		Permissions: users.Permissions{
 			Admin:    true,
+			Browse:   true,
 			Download: true,
 			Create:   true,
 			Delete:   true,
@@ -308,6 +309,7 @@ func TestWebDAV_PROPFIND_UserScopes(t *testing.T) {
 		ID:       2,
 		Username: "scoped",
 		Permissions: users.Permissions{
+			Browse:   true,
 			Download: true,
 		},
 		Scopes: []users.SourceScope{
@@ -319,6 +321,7 @@ func TestWebDAV_PROPFIND_UserScopes(t *testing.T) {
 		ID:       3,
 		Username: "restricted",
 		Permissions: users.Permissions{
+			Browse:   true,
 			Download: true,
 		},
 		Scopes: []users.SourceScope{
@@ -587,6 +590,7 @@ func TestWebDAV_AccessControl(t *testing.T) {
 		ID:       1,
 		Username: "user1",
 		Permissions: users.Permissions{
+			Browse:   true,
 			Download: true,
 			Create:   true,
 		},
@@ -599,6 +603,7 @@ func TestWebDAV_AccessControl(t *testing.T) {
 		ID:       2,
 		Username: "user2",
 		Permissions: users.Permissions{
+			Browse:   true,
 			Download: true,
 		},
 		Scopes: []users.SourceScope{
@@ -703,6 +708,7 @@ func TestWebDAV_IndexingStates(t *testing.T) {
 		ID:       1,
 		Username: "testuser",
 		Permissions: users.Permissions{
+			Browse:   true,
 			Download: true,
 			Create:   true,
 			Modify:   true,
