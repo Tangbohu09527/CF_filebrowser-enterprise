@@ -111,6 +111,23 @@ func setContentDisposition(w http.ResponseWriter, r *http.Request, fileName stri
 	w.Header().Set("Content-Disposition", fmt.Sprintf("%s; filename=%q; filename*=utf-8''%s", dispositionType, asciiFileName, encodedFileName))
 }
 
+func sanitizeAuthenticatedReadPath(userPath string) (string, error) {
+	normalized := strings.ReplaceAll(userPath, "\\", "/")
+	if normalized == "" || strings.HasPrefix(normalized, "//") || strings.ContainsRune(normalized, '\x00') {
+		return "", fmt.Errorf("invalid physical or empty path")
+	}
+	drivePath := strings.TrimPrefix(normalized, "/")
+	if len(drivePath) >= 2 && drivePath[1] == ':' && ((drivePath[0] >= 'a' && drivePath[0] <= 'z') || (drivePath[0] >= 'A' && drivePath[0] <= 'Z')) {
+		return "", fmt.Errorf("physical drive paths are not allowed")
+	}
+	for _, segment := range strings.Split(normalized, "/") {
+		if segment == ".." {
+			return "", fmt.Errorf("path traversal is not allowed")
+		}
+	}
+	return utils.SanitizeUserPath(normalized)
+}
+
 // downloadHandler serves the raw content of a file, multiple files, or directory in various formats.
 // @Summary Download content of a file, multiple files, or directory
 // @Description Returns the raw content of a file, multiple files, or a directory. Supports downloading files as archives in various formats.
@@ -136,12 +153,16 @@ func setContentDisposition(w http.ResponseWriter, r *http.Request, fileName stri
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /api/resources/download [get]
 func downloadHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
-	source := r.URL.Query().Get("source")
-	fileList := r.URL.Query()["file"]
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return http.StatusBadRequest, fmt.Errorf("invalid query parameters: %v", err)
+	}
+	source := query.Get("source")
+	fileList := query["file"]
 
 	// Rule 1: Validate all user-provided file paths to prevent path traversal
 	for i, filePath := range fileList {
-		cleanPath, err := utils.SanitizeUserPath(filePath)
+		cleanPath, err := sanitizeAuthenticatedReadPath(filePath)
 		if err != nil {
 			return http.StatusBadRequest, fmt.Errorf("invalid file path: %v", err)
 		}
@@ -152,8 +173,8 @@ func downloadHandler(w http.ResponseWriter, r *http.Request, d *requestContext) 
 }
 
 func rawFilesHandler(w http.ResponseWriter, r *http.Request, d *requestContext, source string, fileList []string) (int, error) {
-	if !d.user.Permissions.Download && d.share == nil {
-		return http.StatusForbidden, fmt.Errorf("user is not allowed to download")
+	if d.share == nil && (!d.user.Permissions.Browse || !d.user.Permissions.Download) {
+		return http.StatusForbidden, fmt.Errorf("user is not allowed to browse and download resources")
 	}
 
 	if len(fileList) == 0 && d.share == nil {
@@ -174,22 +195,6 @@ func rawFilesHandler(w http.ResponseWriter, r *http.Request, d *requestContext, 
 	if d.share == nil {
 		userscope, err = d.user.GetScopeForSourceName(source)
 		if err != nil {
-			// Send OnlyOffice error log if this was an OnlyOffice file
-			if isOnlyOffice {
-				// Try to get document ID for error logging
-				idx := indexing.GetIndex(source)
-				if idx != nil {
-					tempPath := utils.JoinPathAsUnix(userscope, firstFilePath)
-					if realPath, _, realErr := idx.GetRealPath(tempPath); realErr == nil {
-						if docId, _ := getOnlyOfficeId(realPath); docId != "" {
-							if ctx := getOnlyOfficeLogContext(docId); ctx != nil {
-								sendOnlyOfficeLogEvent(ctx, "ERROR", "download",
-									fmt.Sprintf("OnlyOffice download failed - source not available: %s - %v", firstFilePath, err))
-							}
-						}
-					}
-				}
-			}
 			return http.StatusForbidden, err
 		}
 		for i, filePath := range fileList {
@@ -197,6 +202,9 @@ func rawFilesHandler(w http.ResponseWriter, r *http.Request, d *requestContext, 
 		}
 	}
 	firstFilePath = fileList[0]
+	if d.share == nil && r.URL.Query().Get("archiveToken") != "" {
+		return BuildAndStreamArchive(w, r, d, source, fileList)
+	}
 	// For shares, the path is already correctly resolved by publicRawHandler
 	idx := indexing.GetIndex(source)
 	if idx == nil {
@@ -206,6 +214,13 @@ func rawFilesHandler(w http.ResponseWriter, r *http.Request, d *requestContext, 
 				fmt.Sprintf("OnlyOffice download failed - source index not available: %s", source))
 		}
 		return http.StatusInternalServerError, fmt.Errorf("source %s is not available", source)
+	}
+	if d.share == nil && len(fileList) > 1 {
+		return BuildAndStreamArchive(w, r, d, source, fileList)
+	}
+	if d.share == nil && store.Access != nil && !store.Access.Permitted(idx.Path, firstFilePath, d.user.Username) {
+		logger.Debugf("user %s denied access to path %s", d.user.Username, firstFilePath)
+		return http.StatusForbidden, fmt.Errorf("access denied to path %s", firstFilePath)
 	}
 	realPath, isDir, err := idx.GetRealPath(firstFilePath)
 	if err != nil {
@@ -228,19 +243,6 @@ func rawFilesHandler(w http.ResponseWriter, r *http.Request, d *requestContext, 
 			documentId, _ = getOnlyOfficeId(realPath)
 			if documentId != "" {
 				logContext = getOnlyOfficeLogContext(documentId)
-			}
-		}
-
-		// Verify access control before opening the file (direct rule check)
-		if d.share == nil && store.Access != nil {
-			if !store.Access.Permitted(idx.Path, firstFilePath, d.user.Username) {
-				logger.Debugf("user %s denied access to path %s", d.user.Username, firstFilePath)
-				// Send OnlyOffice error log if this was an OnlyOffice download
-				if isOnlyOffice && logContext != nil {
-					sendOnlyOfficeLogEvent(logContext, "ERROR", "download",
-						fmt.Sprintf("OnlyOffice download failed - access denied by rule: %s", firstFilePath))
-				}
-				return http.StatusForbidden, fmt.Errorf("access denied to path %s", firstFilePath)
 			}
 		}
 
