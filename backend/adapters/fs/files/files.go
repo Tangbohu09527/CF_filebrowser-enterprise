@@ -526,8 +526,9 @@ func extractAudioMetadata(ctx context.Context, item *iteminfo.ExtendedItemInfo, 
 	return nil
 }
 
-// Returns lyrics from an audio file (from embedded tags or from a .lrc file with the same name).
-func ExtractLyrics(realPath string) ([]iteminfo.Lyric, error) {
+// ExtractLyrics returns lyrics from embedded tags. When sidecarContent is provided,
+// it is the only sidecar data considered; omitting it retains the legacy .lrc lookup.
+func ExtractLyrics(realPath string, sidecarContent ...string) ([]iteminfo.Lyric, error) {
 	file, err := os.Open(realPath)
 	if err != nil {
 		return nil, err
@@ -544,14 +545,18 @@ func ExtractLyrics(realPath string) ([]iteminfo.Lyric, error) {
 		lyrics = parseLRC(raw)
 	}
 	if len(lyrics) == 0 {
-		// Check for sidecar .lrc file
-		dir := filepath.Dir(realPath)
-		base := filepath.Base(realPath)
-		ext := filepath.Ext(base)
-		nameWithoutExt := strings.TrimSuffix(base, ext)
-		lrcPath := filepath.Join(dir, nameWithoutExt+".lrc")
-		if data, err := os.ReadFile(lrcPath); err == nil {
-			lyrics = parseLRC(string(data))
+		if len(sidecarContent) > 0 {
+			lyrics = parseLRC(sidecarContent[0])
+		} else {
+			// Public-share and internal callers retain the legacy sidecar lookup.
+			dir := filepath.Dir(realPath)
+			base := filepath.Base(realPath)
+			ext := filepath.Ext(base)
+			nameWithoutExt := strings.TrimSuffix(base, ext)
+			lrcPath := filepath.Join(dir, nameWithoutExt+".lrc")
+			if data, err := os.ReadFile(lrcPath); err == nil {
+				lyrics = parseLRC(string(data))
+			}
 		}
 	}
 	return lyrics, nil

@@ -4,14 +4,20 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gtsteffaniak/filebrowser/backend/adapters/fs/files"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	"github.com/gtsteffaniak/filebrowser/backend/ffmpeg"
+	"github.com/gtsteffaniak/filebrowser/backend/indexing/iteminfo"
+	"github.com/gtsteffaniak/filebrowser/backend/preview"
 )
 
 // subtitlesHandler handles subtitle requests for both external files and embedded streams
@@ -31,6 +37,9 @@ import (
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /api/media/subtitles [get]
 func subtitlesHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+	if d.user == nil || !d.user.Permissions.Browse || !d.user.Permissions.Download {
+		return http.StatusForbidden, fmt.Errorf("browse and download permissions are required for subtitles")
+	}
 	path := r.URL.Query().Get("path")
 	source := r.URL.Query().Get("source")
 	name := r.URL.Query().Get("name")
@@ -62,17 +71,28 @@ func subtitlesHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 		return http.StatusNotFound, fmt.Errorf("file is not a video")
 	}
 
-	track := findSubtitleTrack(fileInfo.Subtitles, name, embedded)
-	if track == nil {
-		return http.StatusNotFound, fmt.Errorf("subtitle track '%s' not found", name)
+	var track *utils.SubtitleTrack
+	if embedded {
+		track = findSubtitleTrack(fileInfo.Subtitles, name, true)
+		if track == nil {
+			return http.StatusNotFound, fmt.Errorf("subtitle track '%s' not found", name)
+		}
+	} else {
+		if !isExternalSubtitleForMedia(fileInfo.Name, name) {
+			return http.StatusNotFound, fmt.Errorf("subtitle track '%s' not found", name)
+		}
+		track = &utils.SubtitleTrack{Name: name}
 	}
 
 	var content string
 	if !embedded {
-		subtitlePath := filepath.Join(filepath.Dir(fileInfo.RealPath), filepath.Base(track.Name))
-		content, err = utils.GetSubtitleSidecarContent(subtitlePath)
+		sidecarInfo, sidecarErr := authorizedMediaSidecar(fileInfo.Path, source, track.Name, d)
+		if sidecarErr != nil {
+			return mediaSidecarStatus(sidecarErr), sidecarErr
+		}
+		content, err = readAuthorizedTextSidecar(sidecarInfo.RealPath)
 		if err != nil {
-			return http.StatusInternalServerError, fmt.Errorf("failed to get subtitle sidecar content: %v", err)
+			return mediaSidecarStatus(err), fmt.Errorf("failed to get subtitle sidecar content: %w", err)
 		}
 	} else {
 		if track.Index == nil {
@@ -102,6 +122,138 @@ func findSubtitleTrack(subtitles []utils.SubtitleTrack, name string, embedded bo
 	return nil
 }
 
+func isExternalSubtitleForMedia(mediaName, sidecarName string) bool {
+	ext := strings.ToLower(filepath.Ext(sidecarName))
+	if !iteminfo.SubtitleExts[ext] {
+		return false
+	}
+	mediaBase := strings.TrimSuffix(mediaName, filepath.Ext(mediaName))
+	sidecarBase := strings.TrimSuffix(sidecarName, filepath.Ext(sidecarName))
+	withoutLanguage := strings.TrimSuffix(sidecarBase, filepath.Ext(sidecarBase))
+	return sidecarBase == mediaBase || withoutLanguage == mediaBase
+}
+
+var (
+	errInvalidMediaSidecar = errors.New("invalid media sidecar path")
+	errUnsafeMediaSidecar  = errors.New("unsafe media sidecar")
+)
+
+func mediaSidecarIndexPath(mediaPath, name string) (string, error) {
+	if mediaPath == "" || name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		return "", errInvalidMediaSidecar
+	}
+	mediaPath = strings.ReplaceAll(mediaPath, "\\", "/")
+	mediaPath = pathpkg.Clean("/" + strings.TrimPrefix(mediaPath, "/"))
+	if mediaPath == "/" {
+		return "", errInvalidMediaSidecar
+	}
+	return pathpkg.Join(pathpkg.Dir(mediaPath), name), nil
+}
+
+func authorizedMediaSidecar(mediaPath, source, name string, d *requestContext) (*iteminfo.ExtendedFileInfo, error) {
+	sidecarPath, err := mediaSidecarIndexPath(mediaPath, name)
+	if err != nil {
+		return nil, err
+	}
+	info, err := files.FileInfoFaster(utils.FileOptions{
+		Path:              sidecarPath,
+		Source:            source,
+		Expand:            false,
+		Content:           false,
+		Metadata:          false,
+		ShowHidden:        d.user.ShowHidden,
+		HideFileExt:       d.user.HideFileExt,
+		FollowSymlinks:    false,
+		SkipExtendedAttrs: true,
+	}, store.Access, d.user, store.Share)
+	if err != nil {
+		return nil, err
+	}
+	if info.Type == "directory" {
+		return nil, os.ErrNotExist
+	}
+	return info, nil
+}
+
+func readAuthorizedTextSidecar(realPath string) (string, error) {
+	const maxSidecarSize = 50 * 1024 * 1024
+
+	before, err := os.Lstat(realPath)
+	if err != nil {
+		return "", err
+	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
+		return "", errUnsafeMediaSidecar
+	}
+	if before.Size() > maxSidecarSize {
+		return "", errors.New("media sidecar is too large")
+	}
+
+	file, err := os.Open(realPath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	after, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !os.SameFile(before, after) || !after.Mode().IsRegular() {
+		return "", errUnsafeMediaSidecar
+	}
+
+	content, err := io.ReadAll(io.LimitReader(file, maxSidecarSize+1))
+	if err != nil {
+		return "", err
+	}
+	if len(content) > maxSidecarSize {
+		return "", errors.New("media sidecar is too large")
+	}
+	if !isTextSidecar(content) {
+		return "", nil
+	}
+	return string(content), nil
+}
+
+func isTextSidecar(content []byte) bool {
+	if len(content) == 0 {
+		return true
+	}
+	sample := content
+	if len(sample) > 8192 {
+		sample = sample[:8192]
+	}
+	if bytes.Count(sample, []byte{0}) > len(sample)/20 {
+		return false
+	}
+	return utf8.Valid(content)
+}
+
+func mediaSidecarStatus(err error) int {
+	switch {
+	case errors.Is(err, errInvalidMediaSidecar):
+		return http.StatusBadRequest
+	case errors.Is(err, errUnsafeMediaSidecar):
+		return http.StatusForbidden
+	default:
+		return errToStatus(err)
+	}
+}
+
+func filterInaccessibleSubtitleSidecars(fileInfo *iteminfo.ExtendedFileInfo, source string, d *requestContext) {
+	filtered := make([]utils.SubtitleTrack, 0, len(fileInfo.Subtitles))
+	for _, track := range fileInfo.Subtitles {
+		if track.Embedded {
+			filtered = append(filtered, track)
+			continue
+		}
+		if _, err := authorizedMediaSidecar(fileInfo.Path, source, track.Name, d); err == nil {
+			filtered = append(filtered, track)
+		}
+	}
+	fileInfo.Subtitles = filtered
+}
+
 // metadataHandler returns the same directory resource shape as GET /api/resources with metadata enabled,
 // for client-side patching after a fast listing load.
 // @Summary Directory with media metadata
@@ -117,9 +269,20 @@ func findSubtitleTrack(subtitles []utils.SubtitleTrack, name string, embedded bo
 // @Failure 404 {object} map[string]string "Not found"
 // @Router /api/media/metadata [get]
 func metadataHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+	if d.user == nil || !d.user.Permissions.Browse {
+		return http.StatusForbidden, fmt.Errorf("browse permission is required for media metadata")
+	}
 	path := r.URL.Query().Get("path")
 	source := r.URL.Query().Get("source")
 	albumArt := r.URL.Query().Get("albumArt") == "true"
+	if albumArt {
+		if !d.user.Permissions.Preview {
+			return http.StatusForbidden, fmt.Errorf("browse and preview permissions are required for album art")
+		}
+		if config.Server.DisablePreviews {
+			return http.StatusNotImplemented, fmt.Errorf("preview is disabled")
+		}
+	}
 	fileInfo, err := files.FileInfoFaster(utils.FileOptions{
 		FollowSymlinks:           true,
 		Path:                     path,
@@ -136,6 +299,40 @@ func metadataHandler(w http.ResponseWriter, r *http.Request, d *requestContext) 
 	}, store.Access, d.user, store.Share)
 	if err != nil {
 		return errToStatus(err), err
+	}
+	filterInaccessibleSubtitleSidecars(fileInfo, source, d)
+	if albumArt {
+		deriveAlbumArt := func(info iteminfo.ExtendedFileInfo) ([]byte, error) {
+			info.HasPreview = true
+			return preview.GetSafePreviewForFile(r.Context(), info, "small", "", 0)
+		}
+		if fileInfo.Metadata != nil && len(fileInfo.Metadata.AlbumArt) > 0 {
+			derivedAlbumArt, previewErr := deriveAlbumArt(*fileInfo)
+			if previewErr != nil {
+				return http.StatusInternalServerError, fmt.Errorf("failed to create album art preview: %w", previewErr)
+			}
+			fileInfo.Metadata.AlbumArt = derivedAlbumArt
+		}
+		for i := range fileInfo.Files {
+			child := &fileInfo.Files[i]
+			if child.Metadata == nil || len(child.Metadata.AlbumArt) == 0 {
+				continue
+			}
+			childInfo := iteminfo.ExtendedFileInfo{
+				FileInfo: iteminfo.FileInfo{
+					ItemInfo: child.ItemInfo,
+					Path:     utils.JoinPathAsUnix(fileInfo.Path, child.Name),
+				},
+				Metadata: child.Metadata,
+				Source:   fileInfo.Source,
+				RealPath: filepath.Join(fileInfo.RealPath, child.Name),
+			}
+			derivedAlbumArt, previewErr := deriveAlbumArt(childInfo)
+			if previewErr != nil {
+				return http.StatusInternalServerError, fmt.Errorf("failed to create album art preview for %s: %w", child.Name, previewErr)
+			}
+			child.Metadata.AlbumArt = derivedAlbumArt
+		}
 	}
 	return renderJSON(w, r, fileInfo)
 }
@@ -191,6 +388,9 @@ func publicMetadataHandler(w http.ResponseWriter, r *http.Request, d *requestCon
 // @Failure 404 {object} map[string]string "Not found"
 // @Router /api/media/lyrics [get]
 func lyricsHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+	if d.user == nil || !d.user.Permissions.Browse || !d.user.Permissions.Download {
+		return http.StatusForbidden, fmt.Errorf("browse and download permissions are required for lyrics")
+	}
 	path := r.URL.Query().Get("path")
 	source := r.URL.Query().Get("source")
 	if path == "" || source == "" {
@@ -215,7 +415,21 @@ func lyricsHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 		return http.StatusNotFound, fmt.Errorf("file is not an audio file")
 	}
 
-	lyrics, err := files.ExtractLyrics(fileInfo.RealPath)
+	lrcName := strings.TrimSuffix(fileInfo.Name, filepath.Ext(fileInfo.Name)) + ".lrc"
+	sidecarContent := ""
+	sidecarInfo, sidecarErr := authorizedMediaSidecar(fileInfo.Path, source, lrcName, d)
+	if sidecarErr != nil {
+		if errToStatus(sidecarErr) != http.StatusNotFound {
+			return mediaSidecarStatus(sidecarErr), sidecarErr
+		}
+	} else {
+		sidecarContent, err = readAuthorizedTextSidecar(sidecarInfo.RealPath)
+		if err != nil {
+			return mediaSidecarStatus(err), fmt.Errorf("failed to get lyrics sidecar content: %w", err)
+		}
+	}
+
+	lyrics, err := files.ExtractLyrics(fileInfo.RealPath, sidecarContent)
 	if err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("failed to extract lyrics: %v", err)
 	}

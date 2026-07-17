@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"image"
+	"image/color"
 	"image/jpeg"
 	"io"
 
@@ -19,12 +20,18 @@ func configureImagingParallelism() {
 	imaging.SetMaxProcs(1)
 }
 
-// previewDecodeOpts returns decode options tuned for thumbnails: skip ICC/sRGB conversion
-// (not needed for previews) and optionally apply EXIF orientation.
-func previewDecodeOpts(autoOrient bool) []imaging.DecodeOption {
-	opts := []imaging.DecodeOption{imaging.ColorSpace(imaging.NO_CHANGE_OF_COLORSPACE)}
+// previewDecodeOpts returns decode options tuned for legacy or safe-derived thumbnails.
+func previewDecodeOpts(autoOrient, safeDerived bool) []imaging.DecodeOption {
+	colorSpace := imaging.NO_CHANGE_OF_COLORSPACE
+	if safeDerived {
+		colorSpace = imaging.SRGB_COLORSPACE
+	}
+	opts := []imaging.DecodeOption{imaging.ColorSpace(colorSpace)}
 	if autoOrient {
 		opts = append(opts, imaging.AutoOrientation(true))
+	}
+	if safeDerived {
+		opts = append(opts, imaging.Background(color.White))
 	}
 	return opts
 }
@@ -165,6 +172,7 @@ type ResizeOptions struct {
 	ResizeMode  ResizeMode
 	Quality     Quality
 	JpegQuality int // JPEG encoding quality (1-100), 0 means use Quality default
+	SafeDerived bool
 }
 
 func (s *Service) Resize(ctx context.Context, in io.Reader, out io.Writer, opts ResizeOptions) error {
@@ -201,9 +209,11 @@ func (s *Service) resizeWithSize(in io.Reader, out io.Writer, fileSize int64, op
 	// Skip format detection - format is already known (FormatJpeg from CreatePreviewFromReaderWithSize)
 	// This avoids unnecessary I/O and DecodeConfig issues with corrupted files
 	var wrappedReader = in
-	var err error
 
 	if opts.Format == FormatHeic {
+		opts.Format = FormatJpeg
+	}
+	if opts.SafeDerived {
 		opts.Format = FormatJpeg
 	}
 	// Ensure JPEG quality is set based on quality setting
@@ -212,19 +222,18 @@ func (s *Service) resizeWithSize(in io.Reader, out io.Writer, fileSize int64, op
 	}
 
 	// Try to use embedded EXIF thumbnail for JPEGs (only for low quality to keep it simple)
-	if opts.Format == FormatJpeg && opts.Quality == QualityLow {
+	if !opts.SafeDerived && opts.Format == FormatJpeg && opts.Quality == QualityLow {
 		thm, newWrappedReader, errThm := getEmbeddedThumbnail(wrappedReader)
 		wrappedReader = newWrappedReader
 		if errThm == nil && len(thm) > 0 {
-			_, err = out.Write(thm)
-			if err == nil {
+			if _, err := out.Write(thm); err == nil {
 				return nil
 			}
 		}
 	}
 
 	// Decode the image - try imaging library first, fall back to format-specific decoder if it fails
-	img, err := imaging.Decode(wrappedReader, previewDecodeOpts(true)...)
+	img, err := imaging.Decode(wrappedReader, previewDecodeOpts(true, opts.SafeDerived)...)
 	if err != nil {
 		// Imaging library failed, try format-specific standard decoder as fallback
 		// Reset reader if possible
@@ -282,7 +291,7 @@ func applyOrientationToPreviewBytes(imageBytes []byte, orientation string) []byt
 	if len(imageBytes) < 100 {
 		return imageBytes
 	}
-	img, err := imaging.Decode(bytes.NewReader(imageBytes), previewDecodeOpts(false)...)
+	img, err := imaging.Decode(bytes.NewReader(imageBytes), previewDecodeOpts(false, false)...)
 	if err != nil {
 		return imageBytes
 	}

@@ -4,15 +4,20 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"image"
 	"io"
 	"os"
+	pathpkg "path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gtsteffaniak/filebrowser/backend/adapters/fs/diskcache"
@@ -23,13 +28,18 @@ import (
 	"github.com/gtsteffaniak/go-logger/logger"
 )
 
-const minPreviewSize = 100
+const (
+	minPreviewSize                   = 100
+	safeDerivedPreviewCacheNamespace = "safe-derived-jpeg-v1"
+)
 
 var (
 	ErrUnsupportedFormat = errors.New("preview is not available for provided file format")
 	ErrUnsupportedMedia  = errors.New("unsupported media type")
 	ErrPreviewTooSmall   = errors.New("generated image is too small, likely an error occurred")
+	ErrSafeCacheDisabled = errors.New("safe preview cache is disabled for large source files")
 	service              *Service
+	safeGenerationID     atomic.Uint64
 )
 
 type Service struct {
@@ -176,6 +186,19 @@ func GetService() *Service {
 }
 
 func GetPreviewForFile(ctx context.Context, file iteminfo.ExtendedFileInfo, previewSize, url string, seekPercentage int) ([]byte, error) {
+	return getPreviewForFile(ctx, file, previewSize, url, seekPercentage, false)
+}
+
+// GetSafePreviewForFile returns a bounded JPEG from a cache namespace that cannot
+// contain entries produced by the legacy original-serving preview path.
+func GetSafePreviewForFile(ctx context.Context, file iteminfo.ExtendedFileInfo, previewSize, url string, seekPercentage int) ([]byte, error) {
+	if previewSize == "original" {
+		return nil, ErrUnsupportedFormat
+	}
+	return getPreviewForFile(ctx, file, previewSize, url, seekPercentage, true)
+}
+
+func getPreviewForFile(ctx context.Context, file iteminfo.ExtendedFileInfo, previewSize, url string, seekPercentage int, safeDerived bool) ([]byte, error) {
 	if !file.HasPreview {
 		return nil, ErrUnsupportedMedia
 	}
@@ -201,15 +224,41 @@ func GetPreviewForFile(ctx context.Context, file iteminfo.ExtendedFileInfo, prev
 	}
 
 	cacheKey := CacheKey(cacheHash, previewSize, seekPercentage)
-	if data, found, err := service.fileCache.Load(ctx, cacheKey); err != nil {
-		return nil, fmt.Errorf("failed to load from cache: %w", err)
-	} else if found {
-		if len(data) < minPreviewSize {
-			return nil, ErrPreviewTooSmall
+	cacheEnabled := true
+	if safeDerived {
+		var err error
+		cacheKey, err = SafeCacheKey(file, previewSize, seekPercentage)
+		if errors.Is(err, ErrSafeCacheDisabled) {
+			cacheEnabled = false
+			cacheKey = safeEphemeralGenerationKey()
+		} else if err != nil {
+			return nil, err
 		}
-		return data, nil
 	}
-	return GeneratePreviewWithMD5(ctx, file, previewSize, url, seekPercentage, cacheHash)
+	if cacheEnabled {
+		if data, found, err := service.fileCache.Load(ctx, cacheKey); err != nil {
+			return nil, fmt.Errorf("failed to load from cache: %w", err)
+		} else if found {
+			if safeDerived && isSafeDerivedPreview(data, previewSize) {
+				return data, nil
+			}
+			if safeDerived {
+				if err := service.fileCache.Delete(ctx, cacheKey); err != nil {
+					logger.Debugf("failed to discard invalid safe preview cache entry: %v", err)
+				}
+			} else {
+				if len(data) < minPreviewSize {
+					return nil, ErrPreviewTooSmall
+				}
+				return data, nil
+			}
+		}
+	}
+	return generatePreviewWithMD5(ctx, file, previewSize, url, seekPercentage, cacheHash, safeDerived, cacheKey, cacheEnabled)
+}
+
+func safeEphemeralGenerationKey() string {
+	return fmt.Sprintf("%s:uncached:%d:%d", safeDerivedPreviewCacheNamespace, time.Now().UnixNano(), safeGenerationID.Add(1))
 }
 
 // filePreviewType represents the type of preview generation needed
@@ -257,7 +306,7 @@ func determinePreviewType(file iteminfo.ExtendedFileInfo) filePreviewType {
 }
 
 // generateRawPreview generates the initial preview image bytes based on file type
-func (s *Service) generateRawPreview(ctx context.Context, file iteminfo.ExtendedFileInfo, previewSize, officeUrl string, seekPercentage int, hash string) ([]byte, error) {
+func (s *Service) generateRawPreview(ctx context.Context, file iteminfo.ExtendedFileInfo, previewSize, officeUrl string, seekPercentage int, hash string, safeDerived bool) ([]byte, error) {
 	previewType := determinePreviewType(file)
 
 	switch previewType {
@@ -271,7 +320,7 @@ func (s *Service) generateRawPreview(ctx context.Context, file iteminfo.Extended
 		return s.generateHEICPreview(ctx, file, previewSize)
 
 	case previewTypeImage:
-		return s.generateImagePreview(ctx, file, previewSize)
+		return s.generateImagePreview(ctx, file, previewSize, safeDerived)
 
 	case previewTypeVideo:
 		return s.generateVideoPreviewBytes(ctx, file, seekPercentage)
@@ -344,9 +393,9 @@ func (s *Service) generateVideoPreviewBytes(ctx context.Context, file iteminfo.E
 }
 
 // generateImagePreview generates preview for regular image files
-func (s *Service) generateImagePreview(ctx context.Context, file iteminfo.ExtendedFileInfo, previewSize string) ([]byte, error) {
+func (s *Service) generateImagePreview(ctx context.Context, file iteminfo.ExtendedFileInfo, previewSize string, safeDerived bool) ([]byte, error) {
 	const maxSizeForOriginal = 256 * 1024 // 256KB
-	if previewSize != "original" && (file.Size < maxSizeForOriginal || ShouldServeOriginalImage(file.RealPath, previewSize)) {
+	if !safeDerived && previewSize != "original" && (file.Size < maxSizeForOriginal || ShouldServeOriginalImage(file.RealPath, previewSize)) {
 		if original, err := os.ReadFile(file.RealPath); err == nil {
 			return original, nil
 		}
@@ -364,6 +413,7 @@ func (s *Service) generateImagePreview(ctx context.Context, file iteminfo.Extend
 	if err != nil {
 		return nil, err
 	}
+	options.SafeDerived = safeDerived
 
 	imageBytes, err := s.CreatePreview(ctx, f, file.Size, options)
 	if err != nil {
@@ -403,6 +453,11 @@ func handleJPEGFallback(ctx context.Context, s *Service, file iteminfo.ExtendedF
 }
 
 func GeneratePreviewWithMD5(ctx context.Context, file iteminfo.ExtendedFileInfo, previewSize, officeUrl string, seekPercentage int, fileMD5 string) ([]byte, error) {
+	cacheKey := CacheKey(fileMD5, previewSize, seekPercentage)
+	return generatePreviewWithMD5(ctx, file, previewSize, officeUrl, seekPercentage, fileMD5, false, cacheKey, true)
+}
+
+func generatePreviewWithMD5(ctx context.Context, file iteminfo.ExtendedFileInfo, previewSize, officeUrl string, seekPercentage int, fileMD5 string, safeDerived bool, cacheKey string, cacheEnabled bool) ([]byte, error) {
 	// Note: fileMD5 is actually a cache hash (metadata-based), not a true file content MD5
 	// Validate that cache hash is not empty to prevent cache corruption
 	if fileMD5 == "" {
@@ -445,10 +500,8 @@ func GeneratePreviewWithMD5(ctx context.Context, file iteminfo.ExtendedFileInfo,
 
 	// Generate hash for temp file paths
 	hasher := md5.New()
-	_, _ = hasher.Write([]byte(CacheKey(fileMD5, previewSize, seekPercentage)))
+	_, _ = hasher.Write([]byte(cacheKey))
 	hash := hex.EncodeToString(hasher.Sum(nil))
-
-	cacheKey := CacheKey(fileMD5, previewSize, seekPercentage)
 
 	// If this file type might have an embedded preview, try exiftool first before any type-specific path.
 	var imageBytes []byte
@@ -468,7 +521,7 @@ func GeneratePreviewWithMD5(ctx context.Context, file iteminfo.ExtendedFileInfo,
 
 	if !fromExiftool {
 		var err error
-		imageBytes, err = service.generateRawPreview(ctx, file, previewSize, officeUrl, seekPercentage, hash)
+		imageBytes, err = service.generateRawPreview(ctx, file, previewSize, officeUrl, seekPercentage, hash, safeDerived)
 		if err != nil {
 			return nil, err
 		}
@@ -477,20 +530,22 @@ func GeneratePreviewWithMD5(ctx context.Context, file iteminfo.ExtendedFileInfo,
 	if len(imageBytes) < minPreviewSize {
 		logger.Errorf("Generated image too small for '%s' (type: %s): %d bytes - likely an error occurred",
 			file.Name, file.Type, len(imageBytes))
-		_ = service.fileCache.Store(ctx, cacheKey, []byte{})
+		if !safeDerived {
+			_ = service.fileCache.Store(ctx, cacheKey, []byte{})
+		}
 		return nil, ErrPreviewTooSmall
 	}
 
 	// When we got bytes from exiftool, we still need to resize to small/large/xlarge (original is never converted).
 	// When we got bytes from type-specific path, HEIC/Image are already resized; others need resize below.
 	previewType := determinePreviewType(file)
-	if !fromExiftool && previewType == previewTypeHEIC {
+	if !safeDerived && !fromExiftool && previewType == previewTypeHEIC {
 		if err := service.fileCache.Store(ctx, cacheKey, imageBytes); err != nil {
 			logger.Errorf("failed to cache HEIC image: %v", err)
 		}
 		return imageBytes, nil
 	}
-	if !fromExiftool && previewType == previewTypeImage {
+	if !safeDerived && !fromExiftool && previewType == previewTypeImage {
 		if err := service.fileCache.Store(ctx, cacheKey, imageBytes); err != nil {
 			logger.Errorf("failed to cache image: %v", err)
 		}
@@ -508,8 +563,9 @@ func GeneratePreviewWithMD5(ctx context.Context, file iteminfo.ExtendedFileInfo,
 		if err != nil {
 			return nil, err
 		}
-
-		if cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(imageBytes)); cfgErr == nil && ImageFitsPreviewSize(cfg.Width, cfg.Height, previewSize) {
+		if safeDerived {
+			options.SafeDerived = true
+		} else if cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(imageBytes)); cfgErr == nil && ImageFitsPreviewSize(cfg.Width, cfg.Height, previewSize) {
 			if err = service.fileCache.Store(ctx, cacheKey, imageBytes); err != nil {
 				logger.Errorf("failed to cache image: %v", err)
 			}
@@ -523,7 +579,16 @@ func GeneratePreviewWithMD5(ctx context.Context, file iteminfo.ExtendedFileInfo,
 			}
 			// For JPEG files, try FFmpeg fallback if resize failed
 			if strings.HasPrefix(file.Type, "image/jpeg") {
-				resizedBytes, err = handleJPEGFallback(ctx, service, file, previewSize, err)
+				fallbackBytes, fallbackErr := handleJPEGFallback(ctx, service, file, previewSize, err)
+				if fallbackErr != nil {
+					return nil, fallbackErr
+				}
+				if safeDerived {
+					resizedBytes, err = service.CreatePreview(ctx, bytes.NewReader(fallbackBytes), 0, options)
+				} else {
+					resizedBytes = fallbackBytes
+					err = nil
+				}
 				if err != nil {
 					return nil, err
 				}
@@ -531,10 +596,22 @@ func GeneratePreviewWithMD5(ctx context.Context, file iteminfo.ExtendedFileInfo,
 				return nil, fmt.Errorf("failed to resize preview image: %w", err)
 			}
 		}
+		if safeDerived && !isSafeDerivedPreview(resizedBytes, previewSize) {
+			return nil, fmt.Errorf("generated preview is not a bounded JPEG")
+		}
 
 		// Cache and return resized image
-		if err := service.fileCache.Store(ctx, cacheKey, resizedBytes); err != nil {
-			logger.Errorf("failed to cache resized image: %v", err)
+		if cacheEnabled {
+			if safeDerived {
+				currentKey, keyErr := SafeCacheKey(file, previewSize, seekPercentage)
+				if keyErr != nil || currentKey != cacheKey {
+					logger.Debugf("safe preview source changed during generation; skipping cache store for %s", file.Name)
+					return resizedBytes, nil
+				}
+			}
+			if err := service.fileCache.Store(ctx, cacheKey, resizedBytes); err != nil {
+				logger.Errorf("failed to cache resized image: %v", err)
+			}
 		}
 		return resizedBytes, nil
 	}
@@ -634,8 +711,112 @@ func (s *Service) CreatePreview(ctx context.Context, reader io.Reader, fileSize 
 }
 
 func CacheKey(md5, previewSize string, percentage int) string {
-	key := fmt.Sprintf("%x%x%x", md5, previewSize, percentage)
-	return key
+	return fmt.Sprintf("%x%x%x", md5, previewSize, percentage)
+}
+
+func SafeCacheKey(file iteminfo.ExtendedFileInfo, previewSize string, percentage int) (string, error) {
+	if file.Source == "" {
+		return "", errors.New("safe preview cache identity is missing source")
+	}
+	if file.Path == "" {
+		return "", errors.New("safe preview cache identity is missing index path")
+	}
+	if file.RealPath == "" {
+		return "", errors.New("safe preview cache identity is missing real path")
+	}
+	if file.ModTime.IsZero() {
+		return "", errors.New("safe preview cache identity is missing modification time")
+	}
+	if _, err := getPreviewOptions(previewSize); err != nil {
+		return "", err
+	}
+
+	indexPath := strings.ReplaceAll(file.Path, "\\", "/")
+	indexPath = pathpkg.Clean("/" + strings.TrimPrefix(indexPath, "/"))
+	realPath, err := filepath.Abs(file.RealPath)
+	if err != nil {
+		realPath = filepath.Clean(file.RealPath)
+	} else {
+		realPath = filepath.Clean(realPath)
+	}
+
+	contentVersion, err := safePreviewContentVersion(file)
+	if err != nil {
+		return "", err
+	}
+	fields := []string{
+		safeDerivedPreviewCacheNamespace,
+		file.Source,
+		indexPath,
+		realPath,
+		strconv.FormatInt(file.Size, 10),
+		strconv.FormatInt(file.ModTime.UTC().UnixNano(), 10),
+		previewSize,
+		strconv.Itoa(percentage),
+		contentVersion,
+	}
+
+	hasher := sha256.New()
+	var length [8]byte
+	for _, field := range fields {
+		binary.BigEndian.PutUint64(length[:], uint64(len(field)))
+		_, _ = hasher.Write(length[:])
+		_, _ = io.WriteString(hasher, field)
+	}
+	return safeDerivedPreviewCacheNamespace + ":" + hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func safePreviewContentVersion(file iteminfo.ExtendedFileInfo) (string, error) {
+	if determinePreviewType(file) == previewTypeAudio {
+		digest := sha256.Sum256(file.Metadata.AlbumArt)
+		return "album-art-sha256:" + hex.EncodeToString(digest[:]), nil
+	}
+
+	source, err := os.Open(file.RealPath)
+	if err != nil {
+		return "", fmt.Errorf("open safe preview source for content version: %w", err)
+	}
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil {
+		return "", fmt.Errorf("stat safe preview source for content version: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", errors.New("safe preview source is not a regular file")
+	}
+	if info.Size() > iteminfo.LargeFileSizeThreshold {
+		return "", ErrSafeCacheDisabled
+	}
+
+	hasher := sha256.New()
+	written, err := io.Copy(hasher, io.LimitReader(source, iteminfo.LargeFileSizeThreshold+1))
+	if err != nil {
+		return "", fmt.Errorf("hash safe preview source: %w", err)
+	}
+	if written > iteminfo.LargeFileSizeThreshold {
+		return "", ErrSafeCacheDisabled
+	}
+	return "source-sha256:" + hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func isSafeDerivedPreview(data []byte, previewSize string) bool {
+	if len(data) < minPreviewSize || len(data) < 4 || data[0] != 0xff || data[1] != 0xd8 {
+		return false
+	}
+	if bytes.Index(data, []byte{0xff, 0xd9}) != len(data)-2 {
+		return false
+	}
+	options, err := getPreviewOptions(previewSize)
+	if err != nil {
+		return false
+	}
+	decoded, format, err := image.Decode(bytes.NewReader(data))
+	if err != nil || format != "jpeg" {
+		return false
+	}
+	bounds := decoded.Bounds()
+	return bounds.Dx() > 0 && bounds.Dy() > 0 &&
+		bounds.Dx() <= options.Width && bounds.Dy() <= options.Height
 }
 
 func DelThumbs(ctx context.Context, file iteminfo.ExtendedFileInfo) {
@@ -650,6 +831,11 @@ func DelThumbs(ctx context.Context, file iteminfo.ExtendedFileInfo) {
 		errLarge := service.fileCache.Delete(ctx, CacheKey(cacheHash, "large", 0))
 		if errLarge != nil {
 			logger.Debugf("Could not delete thumbnail: %v", file.Name)
+		}
+	}
+	for _, size := range []string{"small", "large"} {
+		if key, err := SafeCacheKey(file, size, 0); err == nil {
+			_ = service.fileCache.Delete(ctx, key)
 		}
 	}
 }
