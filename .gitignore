@@ -39,6 +39,13 @@ node_modules
 # local env files
 .env.local
 .env.*.local
+/deploy/.env
+/deploy/secrets/*
+!/deploy/secrets/README.md
+/deploy/tls/
+/deploy/backups/
+/deploy/**/__pycache__/
+/scripts/**/__pycache__/
 
 # Log files
 npm-debug.log*

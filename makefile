@@ -14,7 +14,7 @@ endif
 .SILENT:
 
 .PHONY: setup update build build-docker build-backend build-frontend dev run generate-docs
-.PHONY: lint-frontend lint-backend lint test test-backend test-frontend check-all
+.PHONY: lint-frontend lint-backend lint test test-backend test-frontend check-all validate-deployment
 .PHONY: check-translations sync-translations test-playwright run-proxy screenshots
 
 setup:
@@ -95,6 +95,9 @@ lint: lint-backend lint-frontend
 test: test-backend test-frontend
 
 check-all: lint test check-translations
+
+validate-deployment:
+	"$(SHELL)" ./scripts/validate-deployment.sh --repository
 
 check-translations:
 	cd frontend && npm run i18n:check

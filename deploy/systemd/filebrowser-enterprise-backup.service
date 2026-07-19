@@ -1,0 +1,19 @@
+[Unit]
+Description=Consistent FileBrowser Enterprise local backup
+Requires=docker.service
+After=docker.service filebrowser-enterprise.service
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/filebrowser-enterprise/scripts/backup.sh
+TimeoutStartSec=infinity
+TimeoutStopSec=infinity
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/backups/filebrowser-enterprise /run/lock/filebrowser-enterprise /run/docker.sock

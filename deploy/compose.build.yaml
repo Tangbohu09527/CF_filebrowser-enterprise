@@ -1,0 +1,11 @@
+# Local/internal CI override only. Production uses FILEBROWSER_IMAGE pinned by digest.
+services:
+  filebrowser-enterprise:
+    image: ${FILEBROWSER_BUILD_IMAGE:-filebrowser-enterprise:local-validation}
+    pull_policy: build
+    build:
+      context: ..
+      dockerfile: _docker/Dockerfile
+      args:
+        VERSION: ${BUILD_VERSION:-internal}
+        REVISION: ${BUILD_REVISION:-uncommitted}

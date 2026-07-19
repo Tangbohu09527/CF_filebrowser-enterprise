@@ -1,0 +1,12 @@
+# Lifecycle transactions use this override until their durable state commits.
+# A host reboot must not bypass restore/upgrade fail-closed checks.
+services:
+  filebrowser-enterprise:
+    restart: "no"
+  nginx:
+    restart: "no"
+    volumes:
+      - type: bind
+        source: ${DEPLOY_ROOT:?DEPLOY_ROOT is required}/nginx/filebrowser-maintenance.conf.template
+        target: /etc/nginx/templates/filebrowser.conf.template
+        read_only: true
