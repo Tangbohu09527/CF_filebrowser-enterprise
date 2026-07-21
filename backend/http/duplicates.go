@@ -5,14 +5,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing/iteminfo"
 	"github.com/gtsteffaniak/go-cache/cache"
@@ -71,13 +70,15 @@ type duplicatesOptions struct {
 	combinedPath string
 	minSize      int64
 	useChecksum  bool
-	username     string
+	user         *users.User
+	token        string
 }
 
 // duplicateProcessingStats tracks resource usage during duplicate search
 type duplicateProcessingStats struct {
 	startTime           time.Time
 	filesScanned        int
+	filesExamined       int
 	checksumOperations  int
 	sizeGroupsProcessed int
 	stopped             bool
@@ -92,7 +93,7 @@ func (s *duplicateProcessingStats) shouldStop() (bool, string) {
 	if elapsed > maxProcessingTime {
 		return true, fmt.Sprintf("processing time limit exceeded (%v)", maxProcessingTime)
 	}
-	if s.filesScanned >= maxFilesToScan {
+	if s.filesExamined >= maxFilesToScan {
 		return true, fmt.Sprintf("file scan limit exceeded (%d files)", maxFilesToScan)
 	}
 	if s.checksumOperations >= maxChecksumOperations {
@@ -144,7 +145,19 @@ func (s *duplicateProcessingStats) shouldStop() (bool, string) {
 // @Failure 503 {object} map[string]string "Service Unavailable (indexing in progress or another search running)"
 // @Router /api/tools/duplicateFinder [get]
 func duplicatesHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
-	opts, err := prepDuplicatesOptions(r, d)
+	if d == nil || d.user == nil || !d.user.Permissions.Browse || !d.user.Permissions.Download {
+		return http.StatusForbidden, fmt.Errorf("browse and download permissions are required for duplicate search")
+	}
+	current, err := currentAuthenticatedReadUser(d.user, d.token)
+	if err != nil || !current.Permissions.Browse || !current.Permissions.Download {
+		return http.StatusForbidden, fmt.Errorf("browse and download permissions are required for duplicate search")
+	}
+	if _, err = current.GetScopeForSourceName(r.URL.Query().Get("source")); err != nil {
+		return http.StatusForbidden, err
+	}
+	freshContext := *d
+	freshContext.user = current
+	opts, err := prepDuplicatesOptions(r, &freshContext)
 	if err != nil {
 		return http.StatusBadRequest, err
 	}
@@ -153,14 +166,8 @@ func duplicatesHandler(w http.ResponseWriter, r *http.Request, d *requestContext
 	if index == nil {
 		return http.StatusBadRequest, fmt.Errorf("index not found for source %s", opts.source)
 	}
-	userscope, err := d.user.GetScopeForSourceName(index.Name)
-	if err != nil {
-		return http.StatusForbidden, err
-	}
-	userscope = strings.TrimRight(userscope, "/")
-	scopePath := utils.JoinPathAsUnix(userscope, opts.searchScope)
-	fullPath := index.MakeIndexPath(scopePath, true)
-	if !store.Access.Permitted(index.Path, fullPath, d.user.Username) {
+	if store.Access == nil || (!store.Access.PermittedFresh(index.Path, opts.combinedPath, current.Username) &&
+		!store.Access.HasPermittedDescendantFresh(index.Path, opts.combinedPath, current.Username)) {
 		return http.StatusForbidden, fmt.Errorf("user is not allowed to access this location")
 	}
 
@@ -170,24 +177,12 @@ func duplicatesHandler(w http.ResponseWriter, r *http.Request, d *requestContext
 		return http.StatusServiceUnavailable, fmt.Errorf("duplicate search is not available while indexing is in progress - please try again when indexing completes")
 	}
 
-	userscope, err = d.user.GetScopeForSourceName(index.Name)
-	if err != nil {
-		return http.StatusForbidden, err
-	}
-	userscope = strings.TrimRight(userscope, "/")
-	scopePath = utils.JoinPathAsUnix(userscope, opts.searchScope)
-	fullPath = index.MakeIndexPath(scopePath, true)
-	if !store.Access.Permitted(index.Path, fullPath, d.user.Username) {
-		return http.StatusForbidden, fmt.Errorf("user is not allowed to access this location")
-	}
-
-	// Generate cache key from all input parameters that affect results
-	// Checksums are always enabled, so cache key doesn't need to include that flag
-	cacheKey := fmt.Sprintf("%s:%s:%d", index.Path, opts.combinedPath, opts.minSize)
-
-	// Check cache first (before acquiring mutex)
+	cacheKey := duplicateResultsCacheKey(index, opts)
 	if cachedResults, ok := duplicateResultsCache.Get(cacheKey); ok {
-		// Set headers if cached result was incomplete (metadata only, don't change status code)
+		cachedResults, err = filterCachedDuplicateResponse(cachedResults, opts)
+		if err != nil {
+			return http.StatusForbidden, err
+		}
 		if cachedResults.Incomplete {
 			w.Header().Set("X-Search-Incomplete", "true")
 			w.Header().Set("X-Search-Incomplete-Reason", cachedResults.Reason)
@@ -203,6 +198,10 @@ func duplicatesHandler(w http.ResponseWriter, r *http.Request, d *requestContext
 
 	// Check cache again after acquiring lock (another request might have just completed)
 	if cachedResults, ok := duplicateResultsCache.Get(cacheKey); ok {
+		cachedResults, err = filterCachedDuplicateResponse(cachedResults, opts)
+		if err != nil {
+			return http.StatusForbidden, err
+		}
 		// Set headers if cached result was incomplete (metadata only, don't change status code)
 		if cachedResults.Incomplete {
 			w.Header().Set("X-Search-Incomplete", "true")
@@ -217,7 +216,7 @@ func duplicatesHandler(w http.ResponseWriter, r *http.Request, d *requestContext
 		startTime:       time.Now(),
 		uniqueChecksums: make(map[string]bool),
 	}
-	duplicateGroups := findDuplicatesInIndex(index, opts, stats)
+	duplicateGroups := findDuplicatesInIndex(opts, stats)
 
 	// Log resource usage for monitoring
 	uniqueChecksumCount := len(stats.uniqueChecksums)
@@ -232,6 +231,10 @@ func duplicatesHandler(w http.ResponseWriter, r *http.Request, d *requestContext
 		Incomplete: stats.stopped,
 		Reason:     stats.stopReason,
 	}
+	response, err = filterCachedDuplicateResponse(response, opts)
+	if err != nil {
+		return http.StatusForbidden, err
+	}
 
 	// Cache the results before returning (even partial results)
 	duplicateResultsCache.Set(cacheKey, response)
@@ -245,7 +248,7 @@ func duplicatesHandler(w http.ResponseWriter, r *http.Request, d *requestContext
 }
 
 // findDuplicatesInIndex finds duplicates using the shared IndexDB with resource limits
-func findDuplicatesInIndex(index *indexing.Index, opts *duplicatesOptions, stats *duplicateProcessingStats) []duplicateGroup {
+func findDuplicatesInIndex(opts *duplicatesOptions, stats *duplicateProcessingStats) []duplicateGroup {
 	// Get the shared IndexDB
 	indexDB := indexing.GetIndexDB()
 
@@ -312,16 +315,15 @@ func findDuplicatesInIndex(index *indexing.Index, opts *duplicatesOptions, stats
 				continue
 			}
 
-			stats.sizeGroupsProcessed++
-			stats.filesScanned += len(files)
-
 			// Filter files by permission early, before any processing
-			files = filterFilesByPermission(files, index, opts.username)
+			files = filterFilesByPermissionWithStats(files, opts, stats)
 			if len(files) < 2 {
 				// Clear entry if filtered out to free memory
 				delete(filesBySize, size)
 				continue
 			}
+			stats.sizeGroupsProcessed++
+			stats.filesScanned += len(files)
 
 			// Group files by MIME type in memory (already ordered by type from SQL)
 			filesByType := groupFilesByType(files)
@@ -381,7 +383,7 @@ func findDuplicatesInIndex(index *indexing.Index, opts *duplicatesOptions, stats
 					// Verify with checksums using 3-pass progressive verification
 					// At this point, files match on: size + MIME type + fuzzy filename similarity (50%+)
 					// Large fuzzy groups (>10 files) are skipped above to avoid expensive false positives
-					verifiedGroups := groupFilesByChecksum(fileGroup, index, size, stats)
+					verifiedGroups := groupFilesByChecksum(fileGroup, opts, size, stats)
 
 					// Create SearchResult objects and track checksums for merging
 					for _, checksumGroup := range verifiedGroups {
@@ -555,7 +557,11 @@ func mergeGroupsByChecksum(groups []duplicateGroupWithChecksums) []duplicateGrou
 
 func prepDuplicatesOptions(r *http.Request, d *requestContext) (*duplicatesOptions, error) {
 	source := r.URL.Query().Get("source")
-	scope, err := utils.SanitizeUserPath(r.URL.Query().Get("scope"))
+	rawScope := r.URL.Query().Get("scope")
+	if rawScope == "" {
+		rawScope = "/"
+	}
+	scope, err := sanitizeAuthenticatedReadPath(rawScope)
 	if err != nil {
 		return nil, fmt.Errorf("invalid scope: %v", err)
 	}
@@ -586,7 +592,7 @@ func prepDuplicatesOptions(r *http.Request, d *requestContext) (*duplicatesOptio
 		return nil, err
 	}
 
-	combinedPath := index.MakeIndexPath(filepath.Join(userscope, searchScope), true) // searchScope is a directory
+	combinedPath := index.MakeIndexPath(utils.JoinPathAsUnix(userscope, searchScope), true) // searchScope is a directory
 
 	return &duplicatesOptions{
 		source:       source,
@@ -594,12 +600,13 @@ func prepDuplicatesOptions(r *http.Request, d *requestContext) (*duplicatesOptio
 		combinedPath: combinedPath,
 		minSize:      minSize,
 		useChecksum:  useChecksum,
-		username:     d.user.Username,
+		user:         d.user,
+		token:        d.token,
 	}, nil
 }
 
 // groupFilesByChecksum groups files by partial checksum and returns groups with their checksums
-func groupFilesByChecksum(files []*iteminfo.FileInfo, index *indexing.Index, fileSize int64, stats *duplicateProcessingStats) []checksumGroup {
+func groupFilesByChecksum(files []*iteminfo.FileInfo, opts *duplicatesOptions, fileSize int64, stats *duplicateProcessingStats) []checksumGroup {
 	if len(files) < 2 {
 		return nil
 	}
@@ -621,10 +628,11 @@ func groupFilesByChecksum(files []*iteminfo.FileInfo, index *indexing.Index, fil
 			continue
 		}
 
-		// Construct filesystem path for checksum computation
-		// index.Path is the absolute filesystem root, file.Path is index-relative
-		filePath := filepath.Join(index.Path, file.Path)
-		headerChecksum, err := computeHeaderChecksum(index.Path, filePath, fileSize, file.ModTime)
+		target, err := resolveDuplicateChecksumTarget(opts, file.Path, fileSize)
+		if err != nil {
+			continue
+		}
+		headerChecksum, err := computeHeaderChecksum(target)
 		if err != nil {
 			continue
 		}
@@ -663,8 +671,11 @@ func groupFilesByChecksum(files []*iteminfo.FileInfo, index *indexing.Index, fil
 				break
 			}
 
-			filePath := filepath.Join(index.Path, file.Path)
-			middleChecksum, err := computeMiddleChecksum(index.Path, filePath, fileSize, file.ModTime)
+			target, err := resolveDuplicateChecksumTarget(opts, file.Path, fileSize)
+			if err != nil {
+				continue
+			}
+			middleChecksum, err := computeMiddleChecksum(target)
 			if err != nil {
 				continue
 			}
@@ -692,20 +703,16 @@ func groupFilesByChecksum(files []*iteminfo.FileInfo, index *indexing.Index, fil
 
 // computeHeaderChecksum calculates MD5 hash of only the first 8KB of a file
 // This is the fastest initial pass to eliminate non-matching files
-func computeHeaderChecksum(sourcePath, filePath string, size int64, modTime time.Time) (string, error) {
-	// Generate cache key for header-only checksum
-	cacheKey := fmt.Sprintf("%s:%s:%d:%d:header", sourcePath, filePath, size, modTime.Unix())
-
-	// Check cache first
-	if cachedChecksum, ok := checksumCache.Get(cacheKey); ok {
-		return cachedChecksum, nil
-	}
-
-	file, err := os.Open(filePath)
+func computeHeaderChecksum(target authenticatedReadTarget) (string, error) {
+	file, info, err := openAuthenticatedReadTarget(target)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
+	cacheKey := fmt.Sprintf("%s:%s:%d:%d:header", target.SourceReal, target.CanonicalPath, info.Size(), info.ModTime().UnixNano())
+	if cachedChecksum, ok := checksumCache.Get(cacheKey); ok {
+		return cachedChecksum, nil
+	}
 
 	hash := md5.New()
 	buf := make([]byte, 8192) // 8KB buffer
@@ -727,20 +734,16 @@ func computeHeaderChecksum(sourcePath, filePath string, size int64, modTime time
 
 // computeMiddleChecksum calculates MD5 hash of header + middle portion
 // Only called when header checksums match (progressive verification)
-func computeMiddleChecksum(sourcePath, filePath string, size int64, modTime time.Time) (string, error) {
-	// Generate cache key for header+middle checksum
-	cacheKey := fmt.Sprintf("%s:%s:%d:%d:middle", sourcePath, filePath, size, modTime.Unix())
-
-	// Check cache first
-	if cachedChecksum, ok := checksumCache.Get(cacheKey); ok {
-		return cachedChecksum, nil
-	}
-
-	file, err := os.Open(filePath)
+func computeMiddleChecksum(target authenticatedReadTarget) (string, error) {
+	file, info, err := openAuthenticatedReadTarget(target)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
+	cacheKey := fmt.Sprintf("%s:%s:%d:%d:middle", target.SourceReal, target.CanonicalPath, info.Size(), info.ModTime().UnixNano())
+	if cachedChecksum, ok := checksumCache.Get(cacheKey); ok {
+		return cachedChecksum, nil
+	}
 
 	hash := md5.New()
 	buf := make([]byte, 8192) // 8KB buffer
@@ -753,8 +756,8 @@ func computeMiddleChecksum(sourcePath, filePath string, size int64, modTime time
 	hash.Write(buf[:n])
 
 	// For larger files, also read middle 8KB
-	if size > 16384 { // 16KB
-		middleOffset := size / 2
+	if info.Size() > 16384 { // 16KB
+		middleOffset := info.Size() / 2
 		if _, err := file.Seek(middleOffset, 0); err == nil {
 			n, err := io.ReadFull(file, buf)
 			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
@@ -941,20 +944,91 @@ func groupFilesByType(files []*iteminfo.FileInfo) map[string][]*iteminfo.FileInf
 	return grouped
 }
 
+func duplicateResultsCacheKey(index *indexing.Index, opts *duplicatesOptions) string {
+	return fmt.Sprintf("%s:%s:%s:%d:%s", opts.source, index.Path, opts.combinedPath, opts.minSize, opts.user.Username)
+}
+
+func currentDuplicateReadUser(opts *duplicatesOptions) (*users.User, error) {
+	current, err := currentAuthenticatedReadUser(opts.user, opts.token)
+	if err != nil {
+		return nil, err
+	}
+	if !current.Permissions.Browse || !current.Permissions.Download {
+		return nil, fmt.Errorf("duplicate read permissions were revoked")
+	}
+	return current, nil
+}
+
+func resolveDuplicateChecksumTarget(opts *duplicatesOptions, indexPath string, expectedSize int64) (authenticatedReadTarget, error) {
+	current, err := currentDuplicateReadUser(opts)
+	if err != nil {
+		return authenticatedReadTarget{}, err
+	}
+	target, err := resolveAuthenticatedReadIndexTarget(current, opts.source, indexPath)
+	if err != nil {
+		return target, err
+	}
+	if !publicSharePathWithin(opts.combinedPath, target.CanonicalPath) || target.Info == nil || target.Info.Size() != expectedSize {
+		return target, fmt.Errorf("duplicate checksum target changed")
+	}
+	return target, nil
+}
+
 // filterFilesByPermission filters files to only include those the user is permitted to access
 // This is called early in the duplicate search process to avoid processing files the user can't see
-func filterFilesByPermission(files []*iteminfo.FileInfo, index *indexing.Index, username string) []*iteminfo.FileInfo {
-	if store.Access == nil {
-		// No access control configured, return all files
-		return files
-	}
+func filterFilesByPermission(files []*iteminfo.FileInfo, opts *duplicatesOptions) []*iteminfo.FileInfo {
+	return filterFilesByPermissionWithStats(files, opts, nil)
+}
 
+func filterFilesByPermissionWithStats(files []*iteminfo.FileInfo, opts *duplicatesOptions, stats *duplicateProcessingStats) []*iteminfo.FileInfo {
 	filtered := make([]*iteminfo.FileInfo, 0, len(files))
+	current, err := currentDuplicateReadUser(opts)
+	if err != nil {
+		return filtered
+	}
 	for _, file := range files {
-		// Check permission using index.Path (source root) and file.Path (index-relative path)
-		if store.Access.Permitted(index.Path, file.Path, username) {
-			filtered = append(filtered, file)
+		if stats != nil {
+			if shouldStop, reason := stats.shouldStop(); shouldStop {
+				stats.stopped = true
+				stats.stopReason = reason
+				break
+			}
+			stats.filesExamined++
 		}
+		target, err := resolveAuthenticatedReadIndexTarget(current, opts.source, file.Path)
+		if err != nil || !publicSharePathWithin(opts.combinedPath, target.CanonicalPath) {
+			continue
+		}
+		logicalFile := *file
+		logicalFile.Path = normalizePublicShareIndexPath(file.Path)
+		filtered = append(filtered, &logicalFile)
 	}
 	return filtered
+}
+
+func filterCachedDuplicateResponse(response duplicateResponse, opts *duplicatesOptions) (duplicateResponse, error) {
+	filtered := duplicateResponse{Incomplete: response.Incomplete, Reason: response.Reason}
+	current, err := currentDuplicateReadUser(opts)
+	if err != nil {
+		return filtered, err
+	}
+	for _, group := range response.Groups {
+		files := make([]*indexing.SearchResult, 0, len(group.Files))
+		for _, file := range group.Files {
+			indexPath := utils.JoinPathAsUnix(opts.combinedPath, file.Path)
+			target, err := resolveAuthenticatedReadIndexTarget(current, opts.source, indexPath)
+			if err != nil || !publicSharePathWithin(opts.combinedPath, target.CanonicalPath) {
+				continue
+			}
+			fileCopy := *file
+			files = append(files, &fileCopy)
+		}
+		if len(files) < 2 {
+			continue
+		}
+		group.Files = files
+		group.Count = len(files)
+		filtered.Groups = append(filtered.Groups, group)
+	}
+	return filtered, nil
 }

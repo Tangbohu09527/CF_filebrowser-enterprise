@@ -67,5 +67,7 @@ type ExtendedFileInfo struct {
 	Source       string                `json:"source,omitempty"`       // associated index source for the file
 	Hash         string                `json:"hash,omitempty"`         // hash for the file -- used for sharing
 	RealPath     string                `json:"-"`
-	PinnedItems  []string              `json:"pinnedItems,omitempty"` // pinned item names in this directory listing
+	// PreviewSourcePath is a stable request-local snapshot used only by authenticated previews.
+	PreviewSourcePath string   `json:"-"`
+	PinnedItems       []string `json:"pinnedItems,omitempty"` // pinned item names in this directory listing
 }

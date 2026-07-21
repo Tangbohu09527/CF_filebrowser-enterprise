@@ -48,6 +48,7 @@ func GetChecksum(fullPath, algo string) (string, error) {
 // FileOptions are the options when getting a file info.
 type FileOptions struct {
 	Path                     string // realpath
+	ReadPath                 string // internal stable snapshot used for file content and media reads
 	Source                   string
 	IsDir                    bool
 	Expand                   bool

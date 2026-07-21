@@ -11,12 +11,15 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -107,6 +110,71 @@ func TestPermissionPreviewSecurity(t *testing.T) {
 		user := fixture.user(t, true, true, false)
 		response := fixture.previewRequest(t, user, fixture.largeImage, "original", 0)
 		assertPreviewForbidden(t, response)
+	})
+
+	t.Run("original image does not require preview permission", func(t *testing.T) {
+		user := fixture.user(t, true, false, true)
+		response := fixture.previewRequest(t, user, fixture.largeImage, "original", 0)
+		if response.status != http.StatusOK || response.err != nil || !bytes.Equal(response.body, fixture.largeImage.content) {
+			t.Errorf("expected original image with browse and download, got status %d, %d bytes, err %v", response.status, len(response.body), response.err)
+		}
+	})
+
+	t.Run("authenticated original responses do not create full snapshots", func(t *testing.T) {
+		previousSnapshotHook := authenticatedReadSnapshotCompleteHook
+		snapshotCalls := 0
+		authenticatedReadSnapshotCompleteHook = func() { snapshotCalls++ }
+		t.Cleanup(func() { authenticatedReadSnapshotCompleteHook = previousSnapshotHook })
+
+		user := fixture.user(t, true, true, true)
+		for _, tc := range []struct {
+			name string
+			file previewSecurityFile
+			size string
+		}{
+			{name: "size original", file: fixture.largeImage, size: "original"},
+			{name: "small image shortcut", file: fixture.smallImage, size: "small"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				response := fixture.previewRequest(t, user, tc.file, tc.size, 0)
+				if response.status != http.StatusOK || response.err != nil || !bytes.Equal(response.body, tc.file.content) {
+					t.Errorf("authenticated original response: status=%d bytes=%d err=%v", response.status, len(response.body), response.err)
+				}
+			})
+		}
+		if snapshotCalls != 0 {
+			t.Errorf("authenticated original responses created %d full snapshot(s)", snapshotCalls)
+		}
+	})
+
+	t.Run("oversized derived image is rejected before snapshot", func(t *testing.T) {
+		oversized := fixture.writeFile(t, "oversized-derived.png", fixture.smallImage.content)
+		if err := os.Truncate(oversized.realPath, iteminfo.LargeFileSizeThreshold+1); err != nil {
+			t.Fatal(err)
+		}
+		originalFileInfoFaster := files.FileInfoFasterFunc
+		files.FileInfoFasterFunc = func(opts utils.FileOptions, accessStore *access.Storage, user *users.User, shareStore *share.Storage) (*iteminfo.ExtendedFileInfo, error) {
+			info, err := originalFileInfoFaster(opts, accessStore, user, shareStore)
+			if err == nil && strings.HasSuffix(filepath.ToSlash(opts.Path), "/oversized-derived.png") {
+				info.Type = "image/png"
+				info.HasPreview = true
+			}
+			return info, err
+		}
+		t.Cleanup(func() { files.FileInfoFasterFunc = originalFileInfoFaster })
+		previousSnapshotHook := authenticatedReadSnapshotCompleteHook
+		snapshotCalls := 0
+		authenticatedReadSnapshotCompleteHook = func() { snapshotCalls++ }
+		t.Cleanup(func() { authenticatedReadSnapshotCompleteHook = previousSnapshotHook })
+
+		user := fixture.user(t, true, true, false)
+		response := fixture.previewRequest(t, user, oversized, "small", 0)
+		if response.status != http.StatusInternalServerError || response.err == nil {
+			t.Errorf("oversized derived image: status=%d err=%v", response.status, response.err)
+		}
+		if snapshotCalls != 0 {
+			t.Errorf("oversized derived image completed %d full snapshot(s) before rejection", snapshotCalls)
+		}
 	})
 
 	t.Run("small images do not leak through rawFileHandler", func(t *testing.T) {
@@ -313,6 +381,111 @@ func TestPermissionPreviewSecurity(t *testing.T) {
 		}
 	})
 
+	t.Run("derived preview reads the stable authorized snapshot", func(t *testing.T) {
+		authorizedContent := makeSolidBMP(t, color.RGBA{R: 0xf0, G: 0x20, B: 0x20, A: 0xff})
+		replacementContent := makeSolidBMP(t, color.RGBA{R: 0x20, G: 0x20, B: 0xf0, A: 0xff})
+		if len(authorizedContent) != len(replacementContent) {
+			t.Fatalf("swap fixtures must have equal size: authorized=%d replacement=%d", len(authorizedContent), len(replacementContent))
+		}
+		file := fixture.writeFile(t, "stable-snapshot.bmp", authorizedContent)
+		backupPath := file.realPath + ".authorized-backup"
+		replacementPath := file.realPath + ".replacement"
+		if err := os.WriteFile(replacementPath, replacementContent, 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		swapped := false
+		restore := func() {
+			if !swapped {
+				return
+			}
+			_ = os.Remove(file.realPath)
+			_ = os.Rename(backupPath, file.realPath)
+			swapped = false
+		}
+		defer restore()
+		defer func() { authenticatedPreviewGenerationHook = nil }()
+		hookCalls := 0
+		authenticatedPreviewGenerationHook = func(before bool) {
+			hookCalls++
+			if before {
+				if err := os.Rename(file.realPath, backupPath); err != nil {
+					t.Fatalf("preserve authorized file before preview read: %v", err)
+				}
+				if err := os.Rename(replacementPath, file.realPath); err != nil {
+					_ = os.Rename(backupPath, file.realPath)
+					t.Fatalf("install replacement during preview read: %v", err)
+				}
+				swapped = true
+				return
+			}
+			restore()
+		}
+
+		user := fixture.user(t, true, true, false)
+		response := fixture.previewRequest(t, user, file, "small", 0)
+		assertDerivedPreview(t, response, authorizedContent, "small")
+		assertDominantPreviewColor(t, response.body, true)
+		if hookCalls != 2 {
+			t.Fatalf("authenticated preview generation hook calls = %d, want 2", hookCalls)
+		}
+	})
+
+	t.Run("album art extraction starts from the stable snapshot", func(t *testing.T) {
+		cover := fixture.fittingImage.content
+		originalFileInfoFaster := files.FileInfoFasterFunc
+		defer func() { files.FileInfoFasterFunc = originalFileInfoFaster }()
+		initialLookup := false
+		snapshotLookup := false
+		files.FileInfoFasterFunc = func(opts utils.FileOptions, accessStore *access.Storage, user *users.User, shareStore *share.Storage) (*iteminfo.ExtendedFileInfo, error) {
+			info, err := originalFileInfoFaster(opts, accessStore, user, shareStore)
+			if err != nil || opts.Source != "source1" || !strings.HasSuffix(filepath.ToSlash(opts.Path), "/audio.mp3") {
+				return info, err
+			}
+			if !opts.AlbumArt {
+				initialLookup = true
+				if opts.ReadPath != "" {
+					t.Errorf("initial album-art lookup unexpectedly received read path %q", opts.ReadPath)
+				}
+				return info, nil
+			}
+			snapshotLookup = true
+			if opts.ReadPath == "" || filepath.Clean(opts.ReadPath) == filepath.Clean(fixture.files["full audio"].realPath) {
+				t.Errorf("album-art extraction did not use a distinct snapshot path: %q", opts.ReadPath)
+			}
+			if filepath.Ext(opts.ReadPath) != ".mp3" {
+				t.Errorf("album-art snapshot extension = %q, want .mp3", filepath.Ext(opts.ReadPath))
+			}
+			if _, statErr := os.Stat(opts.ReadPath); statErr != nil {
+				t.Errorf("album-art snapshot is unavailable during extraction: %v", statErr)
+			}
+			info.Metadata = &iteminfo.MediaMetadata{AlbumArt: append([]byte(nil), cover...)}
+			info.HasPreview = true
+			return info, nil
+		}
+
+		user := fixture.user(t, true, true, false)
+		response := fixture.previewRequest(t, user, fixture.files["full audio"], "small", 0)
+		assertDerivedPreview(t, response, cover, "small")
+		if !initialLookup || !snapshotLookup {
+			t.Fatalf("album-art lookup phases: initial=%v snapshot=%v", initialLookup, snapshotLookup)
+		}
+	})
+
+	t.Run("authenticated preview errors do not expose physical paths", func(t *testing.T) {
+		broken := fixture.writeFile(t, "broken-preview.bmp", bytes.Repeat([]byte("not-an-image"), 64))
+		user := fixture.user(t, true, true, false)
+		response := fixture.previewRequest(t, user, broken, "small", 0)
+		if response.status != http.StatusInternalServerError || response.err == nil {
+			t.Fatalf("broken authenticated preview: status %d, err %v", response.status, response.err)
+		}
+		for _, physicalPath := range []string{fixture.sourcePath, broken.realPath} {
+			if strings.Contains(response.err.Error(), physicalPath) {
+				t.Errorf("authenticated preview error exposed physical path %q: %v", physicalPath, response.err)
+			}
+		}
+	})
+
 	t.Run("legacy cache entries containing originals are not preview only content", func(t *testing.T) {
 		user := fixture.user(t, true, true, false)
 		fileInfo := fixture.fileInfo(t, user, fixture.legacyImage)
@@ -367,33 +540,38 @@ func TestPermissionPreviewSecurity(t *testing.T) {
 
 	t.Run("album art metadata reencodes directory child covers", func(t *testing.T) {
 		originalCover := fixture.fittingImage.content
+		musicDirectory := filepath.Join(fixture.sourcePath, "public", "music")
+		if err := os.MkdirAll(musicDirectory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(musicDirectory, "track.mp3"), []byte("preview-security-directory-audio"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
 		originalFileInfoFaster := files.FileInfoFasterFunc
-		files.FileInfoFasterFunc = func(_ utils.FileOptions, _ *access.Storage, _ *users.User, _ *share.Storage) (*iteminfo.ExtendedFileInfo, error) {
-			return &iteminfo.ExtendedFileInfo{
-				FileInfo: iteminfo.FileInfo{
-					ItemInfo: iteminfo.ItemInfo{Name: "music", Type: "directory"},
-					Path:     "/public/music",
-					Files: []iteminfo.ExtendedItemInfo{
-						{
-							ItemInfo: iteminfo.ItemInfo{
-								Name:       "track.mp3",
-								Size:       int64(len(originalCover)),
-								ModTime:    time.Now(),
-								Type:       "audio/mpeg",
-								HasPreview: true,
-							},
-							Metadata: &iteminfo.MediaMetadata{AlbumArt: append([]byte(nil), originalCover...)},
-						},
-					},
-				},
-				Source:   "source1",
-				RealPath: filepath.Join(fixture.sourcePath, "public", "music"),
-			}, nil
+		files.FileInfoFasterFunc = func(opts utils.FileOptions, accessStore *access.Storage, currentUser *users.User, shareStore *share.Storage) (*iteminfo.ExtendedFileInfo, error) {
+			lookupOpts := opts
+			isTrackMetadata := filepath.ToSlash(opts.Path) == "/public/music/track.mp3" && opts.Metadata
+			if isTrackMetadata {
+				lookupOpts.Metadata = false
+				lookupOpts.AlbumArt = false
+				lookupOpts.ExtractEmbeddedSubtitles = false
+			}
+			info, err := originalFileInfoFaster(lookupOpts, accessStore, currentUser, shareStore)
+			if err != nil || !isTrackMetadata {
+				return info, err
+			}
+			info.HasPreview = true
+			info.Metadata = &iteminfo.MediaMetadata{AlbumArt: append([]byte(nil), originalCover...)}
+			return info, nil
 		}
 		defer func() { files.FileInfoFasterFunc = originalFileInfoFaster }()
 
 		user := fixture.user(t, true, true, false)
-		response := fixture.metadataRequest(t, user, fixture.files["full audio"], true)
+		response := fixture.metadataRequest(t, user, previewSecurityFile{
+			indexPath: "/public/music",
+			realPath:  musicDirectory,
+		}, true)
 		if response.status != http.StatusOK || response.err != nil {
 			t.Fatalf("directory album art request: status %d, err %v", response.status, response.err)
 		}
@@ -752,6 +930,373 @@ func TestPermissionPreviewSecurity(t *testing.T) {
 	})
 }
 
+func TestPermissionPreviewSecurity_RejectsUnsafePathsBeforeLookup(t *testing.T) {
+	h := newPermissionReadSecurityHarness(t)
+	user := h.user(t, true, true, true)
+
+	for _, unsafePath := range []string{
+		`C:\Windows\win.ini`,
+		`\\server\share\preview.jpg`,
+		`\\?\C:\Windows\preview.jpg`,
+		`/public\..\private\preview.jpg`,
+	} {
+		t.Run(unsafePath, func(t *testing.T) {
+			reads := observePermissionFileInfoReads(t)
+			query := url.Values{"source": {"source1"}, "path": {unsafePath}}
+			req := httptest.NewRequest(http.MethodGet, "/api/resources/preview?"+query.Encode(), nil)
+			recorder := httptest.NewRecorder()
+
+			returned, err := previewHandler(recorder, req, &requestContext{user: user})
+			if got := permissionHandlerStatus(returned, recorder); got != http.StatusBadRequest {
+				t.Errorf("unsafe preview path status: got %d, want %d (err: %v)", got, http.StatusBadRequest, err)
+			}
+			if reads.total != 0 {
+				t.Errorf("unsafe preview path performed %d metadata lookup(s)", reads.total)
+			}
+		})
+	}
+}
+
+func TestPermissionPreviewSecurity_SnapshotRejectsSizeChanges(t *testing.T) {
+	var snapshot bytes.Buffer
+	if err := copyAuthenticatedReadSnapshot(&snapshot, strings.NewReader("short"), int64(len("short")+1)); err == nil {
+		t.Fatal("short authenticated snapshot copy was accepted")
+	}
+	snapshot.Reset()
+	if err := copyAuthenticatedReadSnapshot(&snapshot, strings.NewReader("overlong"), int64(len("overlong")-1)); err == nil {
+		t.Fatal("growing authenticated snapshot copy was accepted")
+	}
+	snapshot.Reset()
+	if err := copyAuthenticatedReadSnapshot(&snapshot, strings.NewReader("complete"), int64(len("complete"))); err != nil {
+		t.Fatalf("complete authenticated snapshot copy failed: %v", err)
+	}
+	if snapshot.String() != "complete" {
+		t.Fatalf("authenticated snapshot content = %q, want complete", snapshot.String())
+	}
+}
+
+func TestPermissionPreviewSecurity_SnapshotCompletionRechecksAuthorization(t *testing.T) {
+	fixture := setupPreviewSecurityFixture(t)
+	user := fixture.user(t, true, true, false)
+	user.Username = "permission-preview-snapshot-revocation-user"
+	savePermissionReadUser(t, user)
+
+	previousSnapshotHook := authenticatedReadSnapshotCompleteHook
+	authenticatedReadSnapshotCompleteHook = func() {
+		updated := *user
+		updated.Permissions.Preview = false
+		if err := store.Users.Update(&updated, true, "Permissions"); err != nil {
+			t.Errorf("revoke Preview after preview snapshot: %v", err)
+		}
+	}
+	t.Cleanup(func() { authenticatedReadSnapshotCompleteHook = previousSnapshotHook })
+
+	previousGenerationHook := authenticatedPreviewGenerationHook
+	generationCalls := 0
+	authenticatedPreviewGenerationHook = func(bool) { generationCalls++ }
+	t.Cleanup(func() { authenticatedPreviewGenerationHook = previousGenerationHook })
+
+	response := fixture.previewRequest(t, user, fixture.safeImage, "small", 0)
+	assertPreviewForbidden(t, response)
+	if generationCalls != 0 {
+		t.Errorf("revoked snapshot reached preview generation hook %d time(s)", generationCalls)
+	}
+}
+
+func TestPermissionPreviewSecurity_GenerationHookRechecksAuthorizationBeforeCache(t *testing.T) {
+	fixture := setupPreviewSecurityFixture(t)
+	user := fixture.user(t, true, true, false)
+	user.Username = "permission-preview-generation-revocation-user"
+	savePermissionReadUser(t, user)
+
+	const percentage = 73
+	fileInfo := fixture.fileInfo(t, user, fixture.safeImage)
+	cacheKey, err := preview.SafeCacheKey(fileInfo, "small", percentage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache, err := diskcache.NewFileCache(fixture.cacheRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Delete(context.Background(), cacheKey); err != nil {
+		t.Fatal(err)
+	}
+
+	previousGenerationHook := authenticatedPreviewGenerationHook
+	authenticatedPreviewGenerationHook = func(before bool) {
+		if !before {
+			return
+		}
+		updated := *user
+		updated.Permissions.Preview = false
+		if err := store.Users.Update(&updated, true, "Permissions"); err != nil {
+			t.Errorf("revoke Preview before generation: %v", err)
+		}
+	}
+	t.Cleanup(func() { authenticatedPreviewGenerationHook = previousGenerationHook })
+
+	response := fixture.previewRequest(t, user, fixture.safeImage, "small", percentage)
+	assertPreviewForbidden(t, response)
+	if _, found, err := cache.Load(context.Background(), cacheKey); err != nil {
+		t.Fatal(err)
+	} else if found {
+		t.Error("revoked preview request populated the derived cache before fresh authorization")
+	}
+}
+
+func TestPermissionPreviewSecurity_AuthenticatedOnlyOfficeUsesSafeCacheOnly(t *testing.T) {
+	t.Run("snapshot callback ignores the request Host", func(t *testing.T) {
+		_ = setupPreviewSecurityFixture(t)
+		previousServer := config.Server
+		config.Server.BaseURL = "/"
+		config.Server.InternalUrl = ""
+		config.Server.ExternalUrl = ""
+		t.Cleanup(func() { config.Server = previousServer })
+
+		req := httptest.NewRequest(http.MethodGet, "http://attacker.invalid/api/resources/preview", nil)
+		req.Host = "attacker.invalid"
+		localAddress := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 43210}
+		req = req.WithContext(context.WithValue(req.Context(), http.LocalAddrContextKey, localAddress))
+		callbackURL := authenticatedPreviewSnapshotURL(req, "preview-ticket")
+		parsed, err := url.Parse(callbackURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if parsed.Host != localAddress.String() {
+			t.Fatalf("snapshot callback trusted request Host: got %q, want %q", parsed.Host, localAddress.String())
+		}
+	})
+
+	t.Run("cache miss converts the authorized snapshot", func(t *testing.T) {
+		fixture := setupPreviewSecurityFixture(t)
+		originalContent := []byte("authenticated-onlyoffice-original-content")
+		replacementContent := []byte("authenticated-onlyoffice-replaced-content")
+		if len(originalContent) != len(replacementContent) {
+			t.Fatalf("OnlyOffice replacement fixtures must have equal size: original=%d replacement=%d", len(originalContent), len(replacementContent))
+		}
+		officeFile := fixture.writeFile(t, "mutable-office.odt", originalContent)
+
+		previousOnlyOffice := config.Integrations.OnlyOffice
+		previousSettingsOnlyOffice := settings.Config.Integrations.OnlyOffice
+		config.Integrations.OnlyOffice.Url = ""
+		config.Integrations.OnlyOffice.InternalUrl = ""
+		config.Integrations.OnlyOffice.Secret = "preview-security-onlyoffice-secret"
+		settings.Config.Integrations.OnlyOffice = config.Integrations.OnlyOffice
+		t.Cleanup(func() {
+			config.Integrations.OnlyOffice = previousOnlyOffice
+			settings.Config.Integrations.OnlyOffice = previousSettingsOnlyOffice
+		})
+
+		user := fixture.user(t, true, true, true)
+		user.Username = "preview-security-onlyoffice-cache-miss-user"
+		savePermissionReadUser(t, user)
+		token := issuePermissionReadAPIToken(t, user, "preview-security-onlyoffice-cache-miss-token", user.Permissions)
+
+		fileInfo := fixture.fileInfo(t, user, officeFile)
+		if fileInfo.OnlyOfficeId == "" {
+			t.Fatal("OnlyOffice fixture did not receive a document ID")
+		}
+		cacheKey, err := preview.SafeCacheKey(fileInfo, "small", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cache, err := diskcache.NewFileCache(fixture.cacheRoot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if deleteErr := cache.Delete(context.Background(), cacheKey); deleteErr != nil {
+			t.Fatal(deleteErr)
+		}
+
+		var converter *httptest.Server
+		var converterMu sync.Mutex
+		converterCalls := 0
+		var converterSource []byte
+		converterSourceURL := ""
+		converter = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/converter":
+				var payload struct {
+					URL string `json:"url"`
+				}
+				if decodeErr := json.NewDecoder(r.Body).Decode(&payload); decodeErr != nil {
+					http.Error(w, "invalid converter request", http.StatusBadRequest)
+					return
+				}
+				converterMu.Lock()
+				converterSourceURL = payload.URL
+				converterMu.Unlock()
+				response, getErr := http.Get(payload.URL)
+				if getErr != nil {
+					http.Error(w, "source callback failed", http.StatusBadGateway)
+					return
+				}
+				var source bytes.Buffer
+				_, copyErr := source.ReadFrom(response.Body)
+				_ = response.Body.Close()
+				if copyErr != nil || response.StatusCode != http.StatusOK {
+					http.Error(w, "source callback was rejected", http.StatusBadGateway)
+					return
+				}
+				converterMu.Lock()
+				converterCalls++
+				converterSource = append([]byte(nil), source.Bytes()...)
+				converterMu.Unlock()
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"fileUrl":    converter.URL + "/thumbnail.jpg",
+					"fileType":   "jpg",
+					"endConvert": true,
+				})
+			case "/thumbnail.jpg":
+				w.Header().Set("Content-Type", "image/jpeg")
+				_, _ = w.Write(fixture.safePreview)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer converter.Close()
+		config.Integrations.OnlyOffice.Url = converter.URL
+		settings.Config.Integrations.OnlyOffice.Url = converter.URL
+
+		backupPath := officeFile.realPath + ".authorized-backup"
+		replacementPath := officeFile.realPath + ".replacement"
+		if writeErr := os.WriteFile(replacementPath, replacementContent, 0o644); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+		swapped := false
+		restore := func() {
+			if !swapped {
+				return
+			}
+			_ = os.Remove(officeFile.realPath)
+			_ = os.Rename(backupPath, officeFile.realPath)
+			swapped = false
+		}
+		defer restore()
+		previousGenerationHook := authenticatedPreviewGenerationHook
+		authenticatedPreviewGenerationHook = func(before bool) {
+			if !before {
+				restore()
+				return
+			}
+			if renameErr := os.Rename(officeFile.realPath, backupPath); renameErr != nil {
+				t.Fatalf("preserve authenticated OnlyOffice source: %v", renameErr)
+			}
+			if installErr := os.Rename(replacementPath, officeFile.realPath); installErr != nil {
+				_ = os.Rename(backupPath, officeFile.realPath)
+				t.Fatalf("install authenticated OnlyOffice replacement: %v", installErr)
+			}
+			swapped = true
+		}
+		t.Cleanup(func() { authenticatedPreviewGenerationHook = previousGenerationHook })
+
+		app := httptest.NewServer(permissionReadAPIRouter())
+		defer app.Close()
+		query := url.Values{"source": {"source1"}, "path": {officeFile.indexPath}, "size": {"small"}}
+		request, err := http.NewRequest(http.MethodGet, app.URL+"/api/resources/preview?"+query.Encode(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+token)
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var responseBody bytes.Buffer
+		_, readErr := responseBody.ReadFrom(response.Body)
+		_ = response.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+
+		converterMu.Lock()
+		calls := converterCalls
+		fetched := append([]byte(nil), converterSource...)
+		sourceURL := converterSourceURL
+		converterMu.Unlock()
+		cached, found, cacheErr := cache.Load(context.Background(), cacheKey)
+		if cacheErr != nil {
+			t.Fatal(cacheErr)
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Errorf("authenticated OnlyOffice cache miss status: got %d, want %d (body: %q, converter calls: %d)", response.StatusCode, http.StatusOK, responseBody.String(), calls)
+		}
+		if calls != 1 {
+			t.Errorf("authenticated OnlyOffice cache miss reached converter %d time(s), want 1", calls)
+		}
+		if !bytes.Equal(fetched, originalContent) {
+			t.Errorf("OnlyOffice callback read %q, want authorized snapshot %q", fetched, originalContent)
+		}
+		if !found || len(cached) == 0 {
+			t.Error("authenticated OnlyOffice cache miss did not populate the safe snapshot cache key")
+		} else if !bytes.Equal(cached, responseBody.Bytes()) {
+			t.Error("authenticated OnlyOffice response did not match the safe cached preview")
+		}
+		if sourceURL == "" {
+			t.Error("OnlyOffice converter did not receive a snapshot URL")
+		} else {
+			replay, replayErr := http.Get(sourceURL)
+			if replayErr != nil {
+				t.Fatalf("replay consumed snapshot URL: %v", replayErr)
+			}
+			_ = replay.Body.Close()
+			if replay.StatusCode != http.StatusNotFound {
+				t.Errorf("consumed snapshot URL replay status: got %d, want %d", replay.StatusCode, http.StatusNotFound)
+			}
+		}
+	})
+
+	t.Run("validated safe cache hit remains available", func(t *testing.T) {
+		fixture := setupPreviewSecurityFixture(t)
+		officeFile := fixture.writeFile(t, "cached-office.odt", []byte("authenticated-onlyoffice-cached-content"))
+
+		previousOnlyOffice := config.Integrations.OnlyOffice
+		previousSettingsOnlyOffice := settings.Config.Integrations.OnlyOffice
+		config.Integrations.OnlyOffice.Url = "http://127.0.0.1:1"
+		config.Integrations.OnlyOffice.InternalUrl = ""
+		config.Integrations.OnlyOffice.Secret = "preview-security-onlyoffice-secret"
+		settings.Config.Integrations.OnlyOffice = config.Integrations.OnlyOffice
+		t.Cleanup(func() {
+			config.Integrations.OnlyOffice = previousOnlyOffice
+			settings.Config.Integrations.OnlyOffice = previousSettingsOnlyOffice
+		})
+
+		user := fixture.user(t, true, true, true)
+		user.Username = "preview-security-onlyoffice-cache-hit-user"
+		savePermissionReadUser(t, user)
+		token := issuePermissionReadAPIToken(t, user, "preview-security-onlyoffice-cache-hit-token", user.Permissions)
+		fileInfo := fixture.fileInfo(t, user, officeFile)
+		if fileInfo.OnlyOfficeId == "" {
+			t.Fatal("OnlyOffice cache fixture did not receive a document ID")
+		}
+		fixture.seedCurrentCache(t, fileInfo, "small", 0, fixture.safePreview)
+
+		app := httptest.NewServer(permissionReadAPIRouter())
+		defer app.Close()
+		query := url.Values{"source": {"source1"}, "path": {officeFile.indexPath}, "size": {"small"}}
+		request, err := http.NewRequest(http.MethodGet, app.URL+"/api/resources/preview?"+query.Encode(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+token)
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body bytes.Buffer
+		_, readErr := body.ReadFrom(response.Body)
+		_ = response.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if response.StatusCode != http.StatusOK || !bytes.Equal(body.Bytes(), fixture.safePreview) {
+			t.Errorf("authenticated OnlyOffice safe cache hit: status=%d bytes=%d", response.StatusCode, body.Len())
+		}
+	})
+}
+
 func setupPreviewSecurityFixture(t *testing.T) *previewSecurityFixture {
 	t.Helper()
 
@@ -932,6 +1477,10 @@ func (fixture *previewSecurityFixture) writeFile(t *testing.T, name string, cont
 
 func (fixture *previewSecurityFixture) fileInfo(t *testing.T, user *users.User, file previewSecurityFile) iteminfo.ExtendedFileInfo {
 	t.Helper()
+	target, err := resolveAuthenticatedReadTarget(user, "source1", file.indexPath)
+	if err != nil {
+		t.Fatalf("resolve canonical preview fixture %s: %v", file.indexPath, err)
+	}
 	info, err := files.FileInfoFaster(utils.FileOptions{
 		Path:     file.indexPath,
 		Source:   "source1",
@@ -941,6 +1490,10 @@ func (fixture *previewSecurityFixture) fileInfo(t *testing.T, user *users.User, 
 	if err != nil {
 		t.Fatalf("load preview fixture %s: %v", file.indexPath, err)
 	}
+	info.Path = file.indexPath
+	info.RealPath = target.RealPath
+	info.Size = target.Info.Size()
+	info.ModTime = target.Info.ModTime()
 	return *info
 }
 
@@ -1073,8 +1626,8 @@ func (fixture *previewSecurityFixture) storeCacheEntry(t *testing.T, key string,
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cache.Store(context.Background(), key, content); err != nil {
-		t.Fatal(err)
+	if storeErr := cache.Store(context.Background(), key, content); storeErr != nil {
+		t.Fatal(storeErr)
 	}
 	stored, found, err := cache.Load(context.Background(), key)
 	if err != nil {

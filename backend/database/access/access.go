@@ -352,7 +352,36 @@ func (s *Storage) PermittedFresh(sourcePath, indexPath, username string) bool {
 
 	s.mux.RLock()
 	defer s.mux.RUnlock()
+	return s.permittedFreshLocked(sourcePath, indexPath, username)
+}
 
+// HasPermittedDescendantFresh reports whether an explicit rule below indexPath
+// currently grants the user access. Callers use this to preserve explicitly
+// allowed descendants without querying a wholly denied subtree.
+func (s *Storage) HasPermittedDescendantFresh(sourcePath, indexPath, username string) bool {
+	if !strings.HasPrefix(indexPath, "/") {
+		indexPath = "/" + indexPath
+	}
+	indexPath = utils.AddTrailingSlashIfNotExists(indexPath)
+
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	for candidate := range s.AllRules[sourcePath] {
+		if !strings.HasPrefix(candidate, "/") {
+			candidate = "/" + candidate
+		}
+		candidate = utils.AddTrailingSlashIfNotExists(candidate)
+		if candidate == indexPath || !strings.HasPrefix(candidate, indexPath) {
+			continue
+		}
+		if s.permittedFreshLocked(sourcePath, candidate, username) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Storage) permittedFreshLocked(sourcePath, indexPath, username string) bool {
 	var rulesFound []*AccessRule
 	rulesBySource := s.AllRules[sourcePath]
 	currentPath := indexPath

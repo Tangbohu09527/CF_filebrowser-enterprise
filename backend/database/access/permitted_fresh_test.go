@@ -108,6 +108,43 @@ func TestPermittedFreshRevocationLifecycleAndCacheIsolation(t *testing.T) {
 	}
 }
 
+func TestHasPermittedDescendantFresh(t *testing.T) {
+	const username = "search-scope-user"
+	storage, sourcePath := newPermittedFreshTestStorage(t, username)
+
+	if err := storage.DenyUser(sourcePath, "/documents", username); err != nil {
+		t.Fatalf("deny search scope: %v", err)
+	}
+	if storage.HasPermittedDescendantFresh(sourcePath, "/documents", username) {
+		t.Fatal("denied scope unexpectedly had a permitted descendant")
+	}
+	if err := storage.AllowUser(sourcePath, "/outside/report.txt", username); err != nil {
+		t.Fatalf("allow unrelated path: %v", err)
+	}
+	if storage.HasPermittedDescendantFresh(sourcePath, "/documents", username) {
+		t.Fatal("unrelated allow rule was treated as a permitted descendant")
+	}
+	if err := storage.AllowUser(sourcePath, "/documents/report.txt", username); err != nil {
+		t.Fatalf("allow child path: %v", err)
+	}
+	if !storage.HasPermittedDescendantFresh(sourcePath, "/documents", username) {
+		t.Fatal("explicitly allowed child was not detected")
+	}
+	removed, err := storage.RemoveAllowUser(sourcePath, "/documents/report.txt", username)
+	if err != nil || !removed {
+		t.Fatalf("remove child allow: removed=%t err=%v", removed, err)
+	}
+	if err := storage.AddUserToGroup("search-readers", username); err != nil {
+		t.Fatalf("add user to group: %v", err)
+	}
+	if err := storage.AllowGroup(sourcePath, "/documents/team/report.txt", "search-readers"); err != nil {
+		t.Fatalf("allow descendant for group: %v", err)
+	}
+	if !storage.HasPermittedDescendantFresh(sourcePath, "/documents", username) {
+		t.Fatal("group-allowed child was not detected")
+	}
+}
+
 func TestPermittedFreshConcurrentRuleUpdates(t *testing.T) {
 	const (
 		indexPath = "/documents/concurrent.txt"

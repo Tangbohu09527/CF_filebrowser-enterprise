@@ -2,15 +2,18 @@ package http
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
+	"runtime"
 	"strings"
 
-	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	commonerrors "github.com/gtsteffaniak/filebrowser/backend/common/errors"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing/iteminfo"
 	"github.com/gtsteffaniak/go-logger/logger"
@@ -124,8 +127,30 @@ func sanitizeAuthenticatedReadPath(userPath string) (string, error) {
 		if segment == ".." {
 			return "", fmt.Errorf("path traversal is not allowed")
 		}
+		if runtime.GOOS == "windows" && unsafeWindowsLogicalPathSegment(segment) {
+			return "", fmt.Errorf("unsafe Windows path segment")
+		}
 	}
-	return utils.SanitizeUserPath(normalized)
+	clean := pathpkg.Clean(normalized)
+	if clean == "." {
+		return "", fmt.Errorf("invalid logical path")
+	}
+	return clean, nil
+}
+
+func unsafeWindowsLogicalPathSegment(segment string) bool {
+	if segment == "" {
+		return false
+	}
+	if strings.Contains(segment, ":") || strings.HasSuffix(segment, ".") || strings.HasSuffix(segment, " ") {
+		return true
+	}
+	base := strings.ToUpper(strings.SplitN(segment, ".", 2)[0])
+	switch base {
+	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$":
+		return true
+	}
+	return len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) && base[3] >= '1' && base[3] <= '9'
 }
 
 // downloadHandler serves the raw content of a file, multiple files, or directory in various formats.
@@ -183,8 +208,8 @@ func rawFilesHandler(w http.ResponseWriter, r *http.Request, d *requestContext, 
 
 	firstFilePath := fileList[0]
 	var err error
-	var userscope string
 	fileName := filepath.Base(firstFilePath)
+	var authenticatedTargets []authenticatedReadTarget
 
 	// Check if this is an OnlyOffice file early for error logging
 	isOnlyOffice := isOnlyOfficeCompatibleFile(fileName) && config.Integrations.OnlyOffice.Url != ""
@@ -193,12 +218,19 @@ func rawFilesHandler(w http.ResponseWriter, r *http.Request, d *requestContext, 
 
 	// modify all filepaths for user scope
 	if d.share == nil {
-		userscope, err = d.user.GetScopeForSourceName(source)
-		if err != nil {
-			return http.StatusForbidden, err
-		}
+		authenticatedTargets = make([]authenticatedReadTarget, 0, len(fileList))
 		for i, filePath := range fileList {
-			fileList[i] = utils.JoinPathAsUnix(userscope, filePath)
+			target, resolveErr := resolveAuthenticatedReadTarget(d.user, source, filePath)
+			if resolveErr != nil {
+				if len(fileList) > 1 && errors.Is(resolveErr, commonerrors.ErrAccessDenied) && target.LogicalPath != "" && !target.LogicalAccess {
+					authenticatedTargets = append(authenticatedTargets, target)
+					fileList[i] = target.LogicalPath
+					continue
+				}
+				return errToStatus(resolveErr), resolveErr
+			}
+			authenticatedTargets = append(authenticatedTargets, target)
+			fileList[i] = target.LogicalPath
 		}
 	}
 	firstFilePath = fileList[0]
@@ -218,11 +250,14 @@ func rawFilesHandler(w http.ResponseWriter, r *http.Request, d *requestContext, 
 	if d.share == nil && len(fileList) > 1 {
 		return BuildAndStreamArchive(w, r, d, source, fileList)
 	}
-	if d.share == nil && store.Access != nil && !store.Access.Permitted(idx.Path, firstFilePath, d.user.Username) {
-		logger.Debugf("user %s denied access to path %s", d.user.Username, firstFilePath)
-		return http.StatusForbidden, fmt.Errorf("access denied to path %s", firstFilePath)
+	var realPath string
+	var isDir bool
+	if d.share == nil {
+		realPath = authenticatedTargets[0].RealPath
+		isDir = authenticatedTargets[0].Info.IsDir()
+	} else {
+		realPath, isDir, err = idx.GetRealPath(firstFilePath)
 	}
-	realPath, isDir, err := idx.GetRealPath(firstFilePath)
 	if err != nil {
 		// Send OnlyOffice error log if this was an OnlyOffice file
 		if isOnlyOffice {
@@ -246,27 +281,40 @@ func rawFilesHandler(w http.ResponseWriter, r *http.Request, d *requestContext, 
 			}
 		}
 
-		fd, err2 := os.Open(realPath)
+		var fd *os.File
+		var fileInfo os.FileInfo
+		var err2 error
+		if d.share == nil {
+			currentUser, currentErr := currentAuthenticatedReadUser(d.user, d.token)
+			if currentErr != nil || !currentUser.Permissions.Browse || !currentUser.Permissions.Download {
+				return http.StatusForbidden, commonerrors.ErrAccessDenied
+			}
+			currentTarget, currentErr := resolveAuthenticatedReadTarget(currentUser, source, authenticatedTargets[0].RequestedPath)
+			if currentErr != nil || !sameAuthenticatedReadTarget(authenticatedTargets[0], currentTarget) {
+				return http.StatusForbidden, commonerrors.ErrAccessDenied
+			}
+			fd, fileInfo, err2 = openAuthenticatedReadTarget(currentTarget)
+		} else {
+			fd, err2 = os.Open(realPath)
+			if err2 == nil {
+				fileInfo, err2 = fd.Stat()
+			}
+		}
 		if err2 != nil {
+			if fd != nil {
+				_ = fd.Close()
+			}
 			// Send OnlyOffice error log if this was an OnlyOffice download
 			if isOnlyOffice && logContext != nil {
 				sendOnlyOfficeLogEvent(logContext, "ERROR", "download",
 					fmt.Sprintf("OnlyOffice download failed - could not open file: %s - %v", firstFilePath, err2))
 			}
-			return http.StatusInternalServerError, err2
+			if d.share != nil {
+				return http.StatusInternalServerError, err2
+			}
+			return errToStatus(err2), err2
 		}
 		defer fd.Close()
-
-		// Get file size
-		fileInfo, err2 := fd.Stat()
-		if err2 != nil {
-			// Send OnlyOffice error log if this was an OnlyOffice download
-			if isOnlyOffice && logContext != nil {
-				sendOnlyOfficeLogEvent(logContext, "ERROR", "download",
-					fmt.Sprintf("OnlyOffice download failed - could not get file info: %s - %v", firstFilePath, err2))
-			}
-			return http.StatusInternalServerError, err2
-		}
 
 		// Send success log for OnlyOffice downloads
 		if isOnlyOffice && logContext != nil {

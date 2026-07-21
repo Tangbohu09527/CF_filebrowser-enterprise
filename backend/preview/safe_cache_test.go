@@ -122,6 +122,47 @@ func TestSafeCacheKeyDetectsSameSizeSameModTimeReplacement(t *testing.T) {
 	require.NotEqual(t, keyA, keyB)
 }
 
+func TestSafeCacheKeyUsesCanonicalIdentityAndSnapshotContent(t *testing.T) {
+	root := t.TempDir()
+	canonicalPath := filepath.Join(root, "source", "same.bmp")
+	require.NoError(t, os.MkdirAll(filepath.Dir(canonicalPath), 0755))
+	require.NoError(t, os.WriteFile(canonicalPath, []byte("canonical-content"), 0644))
+	modTime := time.Date(2026, time.July, 19, 10, 0, 0, 0, time.UTC)
+	file := iteminfo.ExtendedFileInfo{
+		FileInfo: iteminfo.FileInfo{
+			ItemInfo: iteminfo.ItemInfo{
+				Name:    "same.bmp",
+				Type:    "image/bmp",
+				Size:    int64(len("snapshot-content-a")),
+				ModTime: modTime,
+			},
+			Path: "/folder/same.bmp",
+		},
+		Source:   "source-a",
+		RealPath: canonicalPath,
+	}
+
+	snapshotA := filepath.Join(root, "random-a", "snapshot.bmp")
+	snapshotB := filepath.Join(root, "random-b", "snapshot.bmp")
+	require.NoError(t, os.MkdirAll(filepath.Dir(snapshotA), 0755))
+	require.NoError(t, os.MkdirAll(filepath.Dir(snapshotB), 0755))
+	require.NoError(t, os.WriteFile(snapshotA, []byte("snapshot-content-a"), 0644))
+	require.NoError(t, os.WriteFile(snapshotB, []byte("snapshot-content-a"), 0644))
+
+	file.PreviewSourcePath = snapshotA
+	keyA, err := SafeCacheKey(file, "small", 0)
+	require.NoError(t, err)
+	file.PreviewSourcePath = snapshotB
+	keyB, err := SafeCacheKey(file, "small", 0)
+	require.NoError(t, err)
+	require.Equal(t, keyA, keyB, "random snapshot paths must not change the canonical cache identity")
+
+	require.NoError(t, os.WriteFile(snapshotB, []byte("snapshot-content-b"), 0644))
+	keyC, err := SafeCacheKey(file, "small", 0)
+	require.NoError(t, err)
+	require.NotEqual(t, keyA, keyC, "snapshot content changes must invalidate the safe cache")
+}
+
 func TestSafeCacheKeyDisablesLargeSourceCache(t *testing.T) {
 	realPath := filepath.Join(t.TempDir(), "large.bin")
 	require.NoError(t, os.WriteFile(realPath, nil, 0644))

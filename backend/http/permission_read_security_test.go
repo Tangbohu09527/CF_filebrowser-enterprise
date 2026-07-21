@@ -1,12 +1,18 @@
 package http
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -39,6 +45,17 @@ type permissionReadSecurityHarness struct {
 	previewData []byte
 }
 
+type permissionReadCallbackWriter struct {
+	writer   io.Writer
+	once     sync.Once
+	callback func()
+}
+
+func (w *permissionReadCallbackWriter) Write(p []byte) (int, error) {
+	w.once.Do(w.callback)
+	return w.writer.Write(p)
+}
+
 func newPermissionReadSecurityHarness(t *testing.T) *permissionReadSecurityHarness {
 	t.Helper()
 
@@ -68,6 +85,30 @@ func newPermissionReadSecurityHarness(t *testing.T) *permissionReadSecurityHarne
 		secretPath:  secretPath,
 		previewPath: previewPath,
 		previewData: previewData,
+	}
+}
+
+func indexPermissionReadPublicDirectory(t *testing.T) {
+	t.Helper()
+
+	idx := indexing.GetIndex("source1")
+	if idx == nil {
+		t.Fatal("source1 index was not initialized")
+	}
+	if ok := idx.UpdateMetadata(&iteminfo.FileInfo{
+		ItemInfo: iteminfo.ItemInfo{
+			Name:    "public",
+			Type:    "directory",
+			ModTime: time.Now(),
+		},
+		Path:  "/public",
+		IsDir: true,
+		Files: []iteminfo.ExtendedItemInfo{
+			{ItemInfo: iteminfo.ItemInfo{Name: "secret.txt", Size: int64(len(permissionReadSecret)), Type: "text/plain", ModTime: time.Now()}},
+			{ItemInfo: iteminfo.ItemInfo{Name: "preview.jpg", Type: "image/jpeg", ModTime: time.Now()}},
+		},
+	}, nil, true); !ok {
+		t.Fatal("index permission read public directory")
 	}
 }
 
@@ -320,6 +361,7 @@ func permissionReadAPIRouter() *http.ServeMux {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /resources/download", withUser(downloadHandler))
 	api.HandleFunc("GET /resources/preview", withTimeout(30*time.Second, withUserHelper(previewHandler)))
+	api.HandleFunc("GET /resources/preview-source/{ticket}", authenticatedPreviewSnapshotHandler)
 	api.HandleFunc("GET /raw", withUser(downloadHandler))
 	router := http.NewServeMux()
 	router.Handle("/api/", http.StripPrefix("/api", api))
@@ -465,6 +507,187 @@ func TestPermissionReadSecurity_BrowseEndpoints(t *testing.T) {
 	})
 }
 
+func TestPermissionReadSecurity_SearchRechecksPermissionsAfterQuery(t *testing.T) {
+	h := newPermissionReadSecurityHarness(t)
+	user := h.user(t, true, true, true)
+	user.Username = "permission-search-post-query-revocation-user"
+	savePermissionReadUser(t, user)
+
+	previousHook := authenticatedSearchAfterQueryHook
+	authenticatedSearchAfterQueryHook = func() {
+		updated := *user
+		updated.Permissions.Browse = false
+		if err := store.Users.Update(&updated, true, "Permissions"); err != nil {
+			t.Errorf("revoke Browse after search query: %v", err)
+		}
+	}
+	t.Cleanup(func() { authenticatedSearchAfterQueryHook = previousHook })
+
+	request := httptest.NewRequest(http.MethodGet, "/api/tools/search?source=source1&largest=true", nil)
+	request.Header.Set("SessionId", t.Name())
+	recorder := httptest.NewRecorder()
+	returned, err := searchHandler(recorder, request, &requestContext{user: user})
+	assertPermissionReadDenied(t, permissionHandlerStatus(returned, recorder), err, "search permission revoked after index query")
+	if recorder.Body.Len() != 0 {
+		t.Errorf("post-query revoked search emitted response %q", recorder.Body.Bytes())
+	}
+}
+
+func TestPermissionReadSecurity_SearchReturnsAuthorizedScopedResults(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		userScope string
+		query     string
+	}{
+		{name: "non-root user scope", userScope: "/public", query: "source=source1&largest=true"},
+		{name: "explicit search scope", userScope: "/", query: "scope=source1%3A%2Fpublic&largest=true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newPermissionReadSecurityHarness(t)
+			indexPermissionReadPublicDirectory(t)
+			user := h.user(t, true, true, true)
+			user.Username = "permission-search-scope-" + strings.ReplaceAll(tc.name, " ", "-")
+			user.Scopes[0].Scope = tc.userScope
+
+			request := httptest.NewRequest(http.MethodGet, "/api/tools/search?"+tc.query, nil)
+			request.Header.Set("SessionId", t.Name())
+			recorder := httptest.NewRecorder()
+			returned, err := searchHandler(recorder, request, &requestContext{user: user})
+			if got := permissionHandlerStatus(returned, recorder); got != http.StatusOK {
+				t.Fatalf("scoped search status: got %d, want %d (err: %v, body: %q)", got, http.StatusOK, err, recorder.Body.String())
+			}
+
+			var results []*indexing.SearchResult
+			if err := json.Unmarshal(recorder.Body.Bytes(), &results); err != nil {
+				t.Fatalf("decode scoped search response: %v", err)
+			}
+			found := false
+			for _, result := range results {
+				if result.Source == "source1" && result.Path == "secret.txt" {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("authorized scoped result was filtered out: %+v", results)
+			}
+		})
+	}
+}
+
+func TestPermissionReadSecurity_SearchScopeACLBeforeQuery(t *testing.T) {
+	h := newPermissionReadSecurityHarness(t)
+	indexPermissionReadPublicDirectory(t)
+	user := h.user(t, true, true, true)
+	user.Username = "permission-search-scope-acl-user"
+	savePermissionReadUser(t, user)
+	if err := store.Access.DenyUser(h.sourcePath, "/public", user.Username); err != nil {
+		t.Fatal(err)
+	}
+
+	queried := false
+	previousHook := authenticatedSearchAfterQueryHook
+	authenticatedSearchAfterQueryHook = func() { queried = true }
+	t.Cleanup(func() { authenticatedSearchAfterQueryHook = previousHook })
+
+	search := func() (int, *httptest.ResponseRecorder, error) {
+		request := httptest.NewRequest(http.MethodGet, "/api/tools/search?scope=source1%3A%2Fpublic&largest=true", nil)
+		request.Header.Set("SessionId", t.Name())
+		recorder := httptest.NewRecorder()
+		returned, err := searchHandler(recorder, request, &requestContext{user: user})
+		return permissionHandlerStatus(returned, recorder), recorder, err
+	}
+
+	status, recorder, err := search()
+	if status != http.StatusForbidden {
+		t.Errorf("denied search scope status: got %d, want %d (err: %v, body: %q)", status, http.StatusForbidden, err, recorder.Body.String())
+	}
+	if queried {
+		t.Error("denied search scope reached the index query")
+	}
+
+	if allowErr := store.Access.AllowUser(h.sourcePath, "/public/secret.txt", user.Username); allowErr != nil {
+		t.Fatal(allowErr)
+	}
+	queried = false
+	status, recorder, err = search()
+	if status != http.StatusOK {
+		t.Fatalf("search scope with explicitly allowed child status: got %d, want %d (err: %v, body: %q)", status, http.StatusOK, err, recorder.Body.String())
+	}
+	if !queried {
+		t.Error("search scope with explicitly allowed child did not query the index")
+	}
+	if !strings.Contains(recorder.Body.String(), `"path":"secret.txt"`) {
+		t.Errorf("explicitly allowed child was not returned: %s", recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "preview.jpg") {
+		t.Errorf("inherited-denied child was returned: %s", recorder.Body.String())
+	}
+}
+
+func TestPermissionReadSecurity_ResourceAndItemsRefreshBeforeLookup(t *testing.T) {
+	for _, revoke := range []string{"account Browse", "token"} {
+		t.Run(revoke, func(t *testing.T) {
+			h := newPermissionReadSecurityHarness(t)
+			indexPermissionReadPublicDirectory(t)
+			configurePermissionReadAuth(t)
+			user := h.user(t, true, true, true)
+			user.Username = "permission-resource-fresh-" + strings.ReplaceAll(revoke, " ", "-")
+			savePermissionReadUser(t, user)
+
+			token := ""
+			if revoke == "token" {
+				token = issuePermissionReadAPIToken(t, user, "resource-fresh-token", user.Permissions)
+				if err := auth.RevokeApiToken(store.Access, token); err != nil {
+					t.Fatalf("revoke API token: %v", err)
+				}
+			} else {
+				updated := *user
+				updated.Permissions.Browse = false
+				if err := store.Users.Update(&updated, true, "Permissions"); err != nil {
+					t.Fatalf("revoke account Browse: %v", err)
+				}
+			}
+
+			probe := observePermissionFileInfoReads(t)
+			for _, endpoint := range []struct {
+				name string
+				path string
+				call func(*httptest.ResponseRecorder, *http.Request, *requestContext) (int, error)
+			}{
+				{name: "resource existing", path: "/public/secret.txt", call: func(w *httptest.ResponseRecorder, r *http.Request, d *requestContext) (int, error) {
+					return resourceGetHandler(w, r, d)
+				}},
+				{name: "resource missing", path: "/public/does-not-exist.txt", call: func(w *httptest.ResponseRecorder, r *http.Request, d *requestContext) (int, error) {
+					return resourceGetHandler(w, r, d)
+				}},
+				{name: "items existing", path: "/public", call: func(w *httptest.ResponseRecorder, r *http.Request, d *requestContext) (int, error) {
+					return itemsGetHandler(w, r, d)
+				}},
+				{name: "items missing", path: "/does-not-exist", call: func(w *httptest.ResponseRecorder, r *http.Request, d *requestContext) (int, error) {
+					return itemsGetHandler(w, r, d)
+				}},
+			} {
+				t.Run(endpoint.name, func(t *testing.T) {
+					query := url.Values{"source": {"source1"}, "path": {endpoint.path}}
+					request := httptest.NewRequest(http.MethodGet, "/api/resources?"+query.Encode(), nil)
+					recorder := httptest.NewRecorder()
+					returned, err := endpoint.call(recorder, request, &requestContext{user: user, token: token})
+					if got := permissionHandlerStatus(returned, recorder); got != http.StatusForbidden {
+						t.Errorf("revoked %s status: got %d, want %d (err: %v, body: %q)", endpoint.name, got, http.StatusForbidden, err, recorder.Body.String())
+					}
+					if recorder.Body.Len() != 0 {
+						t.Errorf("revoked %s emitted body %q", endpoint.name, recorder.Body.Bytes())
+					}
+				})
+			}
+			if probe.total != 0 {
+				t.Errorf("revoked read reached FileInfoFaster %d time(s) before fresh authorization", probe.total)
+			}
+		})
+	}
+}
+
 func TestPermissionReadSecurity_PreviewAndDownloadRequireBrowse(t *testing.T) {
 	h := newPermissionReadSecurityHarness(t)
 
@@ -519,6 +742,10 @@ func TestPermissionReadSecurity_PreviewAndDownloadRequireBrowse(t *testing.T) {
 
 func TestPermissionReadSecurity_DownloadOriginalAccess(t *testing.T) {
 	h := newPermissionReadSecurityHarness(t)
+	const mediaTextContent = "metadata fixture"
+	if err := os.WriteFile(filepath.Join(h.sourcePath, "public", "song.mp3"), []byte(mediaTextContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	fileQuery := url.Values{"source": {"source1"}, "file": {"/public/secret.txt"}}
 
 	t.Run("Download=false rejects ordinary GET", func(t *testing.T) {
@@ -731,6 +958,7 @@ func TestPermissionReadSecurity_DownloadOriginalAccess(t *testing.T) {
 					return
 				}
 				assertPermissionReadDenied(t, permissionHandlerStatus(returned, recorder), err, "unauthorized Range status")
+				assertNoOriginalHeaders(t, recorder.Header())
 				if recorder.Header().Get("Content-Range") != "" {
 					t.Errorf("unauthorized Range leaked Content-Range %q", recorder.Header().Get("Content-Range"))
 				}
@@ -830,7 +1058,7 @@ func TestPermissionReadSecurity_DownloadOriginalAccess(t *testing.T) {
 		if got := permissionHandlerStatus(returned, recorder); got != http.StatusOK {
 			t.Fatalf("Preview-derived metadata status: got %d, want %d (err: %v)", got, http.StatusOK, err)
 		}
-		if len(calls) != 2 || calls[0].Metadata || !calls[1].Metadata || calls[0].Content || calls[1].Content {
+		if len(calls) != 2 || calls[0].Metadata || !calls[1].Metadata || calls[0].Content || calls[1].Content || calls[1].ReadPath == "" {
 			t.Fatalf("Preview-derived metadata options: %+v", calls)
 		}
 		var response iteminfo.ExtendedFileInfo
@@ -868,16 +1096,19 @@ func TestPermissionReadSecurity_DownloadOriginalAccess(t *testing.T) {
 		var calls []utils.FileOptions
 		files.FileInfoFasterFunc = func(opts utils.FileOptions, _ *access.Storage, _ *users.User, _ *dbshare.Storage) (*iteminfo.ExtendedFileInfo, error) {
 			calls = append(calls, opts)
-			return &iteminfo.ExtendedFileInfo{
+			response := &iteminfo.ExtendedFileInfo{
 				FileInfo: iteminfo.FileInfo{
 					ItemInfo: iteminfo.ItemInfo{Name: "song.mp3", Size: 1234, Type: "audio/mpeg"},
 					Path:     "/public/song.mp3",
 				},
-				Content:   permissionReadSecret,
-				Metadata:  &iteminfo.MediaMetadata{Title: "preview-only", AlbumArt: []byte("album-art")},
-				Subtitles: []utils.SubtitleTrack{{Name: "preview-only.srt"}},
-				RealPath:  h.secretPath,
-			}, nil
+				RealPath: h.secretPath,
+			}
+			if opts.Content {
+				response.Content = permissionReadSecret
+			}
+			response.Metadata = &iteminfo.MediaMetadata{Title: "preview-only", AlbumArt: []byte("album-art")}
+			response.Subtitles = []utils.SubtitleTrack{{Name: "preview-only.srt"}}
+			return response, nil
 		}
 		t.Cleanup(func() { files.FileInfoFasterFunc = original })
 
@@ -893,15 +1124,15 @@ func TestPermissionReadSecurity_DownloadOriginalAccess(t *testing.T) {
 		if got := permissionHandlerStatus(returned, recorder); got != http.StatusOK {
 			t.Fatalf("Download content without Preview status: got %d, want %d (err: %v)", got, http.StatusOK, err)
 		}
-		if len(calls) != 1 || !calls[0].Content || calls[0].Metadata {
-			t.Fatalf("Download content without Preview options: %+v", calls)
+		if len(calls) != 1 || calls[0].Content || calls[0].Metadata || calls[0].ReadPath != "" {
+			t.Fatalf("audio content options: %+v", calls)
 		}
 		var response iteminfo.ExtendedFileInfo
 		if err = json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 			t.Fatalf("decode Download content without Preview response: %v", err)
 		}
-		if response.Content != permissionReadSecret {
-			t.Errorf("Download content was removed: got %q", response.Content)
+		if response.Content != mediaTextContent {
+			t.Errorf("Download content was removed: got %q, want %q", response.Content, mediaTextContent)
 		}
 		if response.Metadata != nil || len(response.Subtitles) != 0 {
 			t.Errorf("Download substituted for Preview: metadata=%+v subtitles=%+v", response.Metadata, response.Subtitles)
@@ -1004,6 +1235,309 @@ func TestPermissionReadSecurity_DownloadOriginalAccess(t *testing.T) {
 		assertNoOriginalHeaders(t, recorder.Header())
 		if recorder.Body.Len() != 0 {
 			t.Errorf("Download=false conditional request emitted %d byte(s)", recorder.Body.Len())
+		}
+	})
+}
+
+func TestPermissionReadSecurity_ResourceMediaReads(t *testing.T) {
+	h := newPermissionReadSecurityHarness(t)
+
+	t.Run("directory metadata excludes unauthorized canonical targets", func(t *testing.T) {
+		directoryName := "resource-media-boundaries"
+		directoryPath := filepath.Join(h.sourcePath, "public", directoryName)
+		aclTargetDirectory := filepath.Join(h.sourcePath, "public", "resource-media-acl-targets")
+		privateDirectory := filepath.Join(h.sourcePath, "private")
+		if err := os.MkdirAll(directoryPath, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(aclTargetDirectory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(privateDirectory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		allowedTitle := "allowed resource media title"
+		outsideTitle := "outside source media secret"
+		scopeTitle := "scope outside media secret"
+		aclTitle := "canonical acl media secret"
+		allowedPath := filepath.Join(directoryPath, "allowed.mp3")
+		outsidePath := filepath.Join(t.TempDir(), "outside.mp3")
+		scopePath := filepath.Join(privateDirectory, "scope-outside.mp3")
+		aclPath := filepath.Join(aclTargetDirectory, "acl-denied.mp3")
+		for targetPath, title := range map[string]string{
+			allowedPath: allowedTitle,
+			outsidePath: outsideTitle,
+			scopePath:   scopeTitle,
+			aclPath:     aclTitle,
+		} {
+			if err := os.WriteFile(targetPath, permissionReadID3Audio(title), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		createPermissionReadSymlink(t, outsidePath, filepath.Join(directoryPath, "outside-link.mp3"))
+		createPermissionReadSymlink(t, scopePath, filepath.Join(directoryPath, "scope-link.mp3"))
+		createPermissionReadSymlink(t, aclPath, filepath.Join(directoryPath, "acl-link.mp3"))
+
+		user := h.user(t, true, true, false)
+		user.Username = "permission-read-resource-media-boundary-user"
+		user.Scopes[0].Scope = "/public"
+		savePermissionReadUser(t, user)
+		if err := store.Access.DenyUser(h.sourcePath, "/public/resource-media-acl-targets/acl-denied.mp3", user.Username); err != nil {
+			t.Fatal(err)
+		}
+		originalFileInfo := files.FileInfoFasterFunc
+		metadataCalls := make([]utils.FileOptions, 0)
+		files.FileInfoFasterFunc = func(opts utils.FileOptions, accessStorage *access.Storage, currentUser *users.User, shareStorage *dbshare.Storage) (*iteminfo.ExtendedFileInfo, error) {
+			if opts.Metadata {
+				metadataCalls = append(metadataCalls, opts)
+			}
+			return originalFileInfo(opts, accessStorage, currentUser, shareStorage)
+		}
+		t.Cleanup(func() { files.FileInfoFasterFunc = originalFileInfo })
+
+		query := url.Values{"source": {"source1"}, "path": {"/" + directoryName}, "metadata": {"true"}}
+		req := httptest.NewRequest(http.MethodGet, "/api/resources?"+query.Encode(), nil)
+		recorder := httptest.NewRecorder()
+		returned, err := resourceGetHandler(recorder, req, &requestContext{user: user})
+		if got := permissionHandlerStatus(returned, recorder); got != http.StatusOK {
+			t.Fatalf("directory media metadata status: got %d, want %d (err: %v)", got, http.StatusOK, err)
+		}
+
+		var response iteminfo.ExtendedFileInfo
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode directory media response: %v", err)
+		}
+		titles := make(map[string]string)
+		for _, child := range response.Files {
+			if child.Metadata != nil {
+				titles[child.Name] = child.Metadata.Title
+			}
+		}
+		if got := titles["allowed.mp3"]; got != allowedTitle {
+			t.Errorf("allowed media metadata title: got %q, want %q; titles=%v", got, allowedTitle, titles)
+		}
+		if len(metadataCalls) != 1 || metadataCalls[0].Path != "/"+directoryName+"/allowed.mp3" || metadataCalls[0].ReadPath == "" {
+			t.Errorf("directory metadata reads were not isolated to the authorized snapshot: %+v", metadataCalls)
+		}
+		for name, forbiddenTitle := range map[string]string{
+			"outside-link.mp3": outsideTitle,
+			"scope-link.mp3":   scopeTitle,
+			"acl-link.mp3":     aclTitle,
+		} {
+			if got := titles[name]; got != "" {
+				t.Errorf("unauthorized media metadata leaked through %s: got %q, forbidden %q", name, got, forbiddenTitle)
+			}
+			if bytes.Contains(recorder.Body.Bytes(), []byte(forbiddenTitle)) {
+				t.Errorf("unauthorized media title %q leaked in response", forbiddenTitle)
+			}
+		}
+	})
+
+	t.Run("directory alias respects logical child ACL", func(t *testing.T) {
+		canonicalDirectory := filepath.Join(h.sourcePath, "public", "resource-media-alias-target")
+		aliasPath := filepath.Join(h.sourcePath, "public", "resource-media-alias")
+		if err := os.MkdirAll(canonicalDirectory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		deniedTitle := "logical alias child secret"
+		if err := os.WriteFile(filepath.Join(canonicalDirectory, "denied.mp3"), permissionReadID3Audio(deniedTitle), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		createPermissionReadSymlink(t, canonicalDirectory, aliasPath)
+
+		user := h.user(t, true, true, false)
+		user.Username = "permission-read-resource-media-alias-user"
+		savePermissionReadUser(t, user)
+		if err := store.Access.DenyUser(h.sourcePath, "/public/resource-media-alias/denied.mp3", user.Username); err != nil {
+			t.Fatal(err)
+		}
+
+		originalFileInfo := files.FileInfoFasterFunc
+		metadataCalls := make([]utils.FileOptions, 0)
+		files.FileInfoFasterFunc = func(opts utils.FileOptions, accessStorage *access.Storage, currentUser *users.User, shareStorage *dbshare.Storage) (*iteminfo.ExtendedFileInfo, error) {
+			if opts.Metadata {
+				metadataCalls = append(metadataCalls, opts)
+			}
+			return originalFileInfo(opts, accessStorage, currentUser, shareStorage)
+		}
+		t.Cleanup(func() { files.FileInfoFasterFunc = originalFileInfo })
+
+		query := url.Values{"source": {"source1"}, "path": {"/public/resource-media-alias"}, "metadata": {"true"}}
+		req := httptest.NewRequest(http.MethodGet, "/api/resources?"+query.Encode(), nil)
+		recorder := httptest.NewRecorder()
+		returned, err := resourceGetHandler(recorder, req, &requestContext{user: user})
+		if got := permissionHandlerStatus(returned, recorder); got != http.StatusOK {
+			t.Fatalf("directory alias metadata status: got %d, want %d (err: %v)", got, http.StatusOK, err)
+		}
+		if len(metadataCalls) != 0 {
+			t.Errorf("logical ACL denied alias child reached media extraction: %+v", metadataCalls)
+		}
+		if bytes.Contains(recorder.Body.Bytes(), []byte(`"name":"denied.mp3"`)) {
+			t.Errorf("logical ACL denied alias child leaked basic listing data in response %q", recorder.Body.Bytes())
+		}
+		if bytes.Contains(recorder.Body.Bytes(), []byte(deniedTitle)) {
+			t.Errorf("logical ACL denied alias child leaked metadata in response %q", recorder.Body.Bytes())
+		}
+
+		itemsQuery := url.Values{"source": {"source1"}, "path": {"/public/resource-media-alias"}}
+		itemsRequest := httptest.NewRequest(http.MethodGet, "/api/resources/items?"+itemsQuery.Encode(), nil)
+		itemsRecorder := httptest.NewRecorder()
+		itemsReturned, itemsErr := itemsGetHandler(itemsRecorder, itemsRequest, &requestContext{user: user})
+		if got := permissionHandlerStatus(itemsReturned, itemsRecorder); got != http.StatusOK {
+			t.Fatalf("directory alias items status: got %d, want %d (err: %v)", got, http.StatusOK, itemsErr)
+		}
+		if bytes.Contains(itemsRecorder.Body.Bytes(), []byte("denied.mp3")) {
+			t.Errorf("logical ACL denied alias child leaked through items response %q", itemsRecorder.Body.Bytes())
+		}
+	})
+
+	for _, tc := range []struct {
+		name  string
+		query url.Values
+	}{
+		{
+			name:  "audio metadata reads an authorized snapshot",
+			query: url.Values{"source": {"source1"}, "path": {"/public/resource-metadata.mp3"}, "metadata": {"true"}, "skipExtendedAttrs": {"true"}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			targetPath := filepath.Join(h.sourcePath, filepath.FromSlash(strings.TrimPrefix(tc.query.Get("path"), "/")))
+			replacementPath := targetPath + ".replacement"
+			backupPath := targetPath + ".original"
+			originalTitle := "authorized snapshot title"
+			replacementTitle := "replacement media secret"
+			if err := os.WriteFile(targetPath, permissionReadID3Audio(originalTitle), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(replacementPath, permissionReadID3Audio(replacementTitle), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			originalFileInfo := files.FileInfoFasterFunc
+			files.FileInfoFasterFunc = func(opts utils.FileOptions, accessStorage *access.Storage, user *users.User, shareStorage *dbshare.Storage) (*iteminfo.ExtendedFileInfo, error) {
+				if !opts.Content && !opts.Metadata {
+					return originalFileInfo(opts, accessStorage, user, shareStorage)
+				}
+				if err := os.Rename(targetPath, backupPath); err != nil {
+					return nil, err
+				}
+				if err := os.Rename(replacementPath, targetPath); err != nil {
+					_ = os.Rename(backupPath, targetPath)
+					return nil, err
+				}
+				response, readErr := originalFileInfo(opts, accessStorage, user, shareStorage)
+				restoreErr := os.Rename(targetPath, replacementPath)
+				if restoreErr == nil {
+					restoreErr = os.Rename(backupPath, targetPath)
+				}
+				if readErr != nil {
+					return response, readErr
+				}
+				return response, restoreErr
+			}
+			t.Cleanup(func() { files.FileInfoFasterFunc = originalFileInfo })
+
+			user := h.user(t, true, true, true)
+			req := httptest.NewRequest(http.MethodGet, "/api/resources?"+tc.query.Encode(), nil)
+			recorder := httptest.NewRecorder()
+			returned, err := resourceGetHandler(recorder, req, &requestContext{user: user})
+			if got := permissionHandlerStatus(returned, recorder); got != http.StatusOK {
+				t.Fatalf("stable resource media status: got %d, want %d (err: %v)", got, http.StatusOK, err)
+			}
+			var response iteminfo.ExtendedFileInfo
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode stable resource media response: %v", err)
+			}
+			if response.Metadata == nil || response.Metadata.Title != originalTitle {
+				t.Errorf("resource media did not use authorized snapshot: metadata=%+v", response.Metadata)
+			}
+			if bytes.Contains(recorder.Body.Bytes(), []byte(replacementTitle)) {
+				t.Errorf("resource media leaked replacement title %q", replacementTitle)
+			}
+		})
+	}
+
+	t.Run("permission revocation after basic lookup prevents media conversion", func(t *testing.T) {
+		targetPath := filepath.Join(h.sourcePath, "public", "resource-revoked-before-converter.mp3")
+		if err := os.WriteFile(targetPath, permissionReadID3Audio("revoked converter secret"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		user := h.user(t, true, true, false)
+		user.Username = "permission-read-resource-converter-revocation-user"
+		savePermissionReadUser(t, user)
+
+		original := files.FileInfoFasterFunc
+		calls := 0
+		converterCalls := 0
+		files.FileInfoFasterFunc = func(opts utils.FileOptions, accessStorage *access.Storage, currentUser *users.User, shareStorage *dbshare.Storage) (*iteminfo.ExtendedFileInfo, error) {
+			calls++
+			if opts.Metadata {
+				converterCalls++
+			}
+			response, err := original(opts, accessStorage, currentUser, shareStorage)
+			if calls == 1 && err == nil {
+				revoked := *user
+				revoked.Permissions.Preview = false
+				if updateErr := store.Users.Update(&revoked, true, "Permissions"); updateErr != nil {
+					return nil, updateErr
+				}
+			}
+			return response, err
+		}
+		t.Cleanup(func() { files.FileInfoFasterFunc = original })
+
+		query := url.Values{"source": {"source1"}, "path": {"/public/resource-revoked-before-converter.mp3"}, "metadata": {"true"}}
+		req := httptest.NewRequest(http.MethodGet, "/api/resources?"+query.Encode(), nil)
+		recorder := httptest.NewRecorder()
+		returned, err := resourceGetHandler(recorder, req, &requestContext{user: user})
+		assertPermissionReadDenied(t, permissionHandlerStatus(returned, recorder), err, "revoked resource media conversion")
+		if calls != 1 || converterCalls != 0 {
+			t.Errorf("revoked media read calls: total=%d converter=%d, want 1/0", calls, converterCalls)
+		}
+		if bytes.Contains(recorder.Body.Bytes(), []byte("revoked converter secret")) {
+			t.Errorf("revoked media conversion leaked response %q", recorder.Body.Bytes())
+		}
+	})
+
+	t.Run("physical media errors do not expose source paths", func(t *testing.T) {
+		targetPath := filepath.Join(h.sourcePath, "public", "resource-error.mp3")
+		if err := os.WriteFile(targetPath, permissionReadID3Audio("resource error fixture"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for _, failCall := range []int{1, 2} {
+			t.Run(fmt.Sprintf("file info call %d", failCall), func(t *testing.T) {
+				original := files.FileInfoFasterFunc
+				calls := 0
+				files.FileInfoFasterFunc = func(opts utils.FileOptions, accessStorage *access.Storage, user *users.User, shareStorage *dbshare.Storage) (*iteminfo.ExtendedFileInfo, error) {
+					calls++
+					if calls == failCall {
+						if failCall == 1 {
+							return nil, &os.PathError{Op: "open", Path: targetPath, Err: os.ErrNotExist}
+						}
+						return nil, fmt.Errorf("media helper failed for %s", targetPath)
+					}
+					return original(opts, accessStorage, user, shareStorage)
+				}
+				t.Cleanup(func() { files.FileInfoFasterFunc = original })
+
+				query := url.Values{"source": {"source1"}, "path": {"/public/resource-error.mp3"}, "metadata": {"true"}}
+				req := httptest.NewRequest(http.MethodGet, "/api/resources?"+query.Encode(), nil)
+				recorder := httptest.NewRecorder()
+				returned, err := resourceGetHandler(recorder, req, &requestContext{user: h.user(t, true, true, false)})
+				status := permissionHandlerStatus(returned, recorder)
+				if failCall == 1 {
+					assertPermissionReadDenied(t, status, err, "resource media path error")
+				} else if status != http.StatusInternalServerError {
+					t.Errorf("generic media error status: got %d, want %d (err: %v)", status, http.StatusInternalServerError, err)
+				}
+				if err == nil {
+					t.Fatal("resource media path error was unexpectedly nil")
+				}
+				if strings.Contains(strings.ToLower(err.Error()), strings.ToLower(h.sourcePath)) || strings.Contains(strings.ToLower(err.Error()), strings.ToLower(targetPath)) {
+					t.Errorf("resource media error leaked physical path: %v", err)
+				}
+			})
 		}
 	})
 }
@@ -1239,6 +1773,184 @@ func TestPermissionReadSecurity_ArchiveReadsRecheckPermissions(t *testing.T) {
 		}
 	})
 
+	t.Run("directory archives exclude unauthorized symlink targets", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			algo string
+		}{
+			{name: "zip", algo: "zip"},
+			{name: "tar.gz", algo: "tar.gz"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				archiveDirName := "archive-symlink-boundary-" + strings.ReplaceAll(tc.name, ".", "-")
+				archiveDir := filepath.Join(h.sourcePath, "public", archiveDirName)
+				if err := os.MkdirAll(archiveDir, 0755); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if err := os.RemoveAll(archiveDir); err != nil {
+						t.Errorf("remove archive symlink fixture: %v", err)
+					}
+				})
+
+				allowedName := "allowed.txt"
+				allowedContent := "allowed-archive-symlink-member-" + tc.name
+				if err := os.WriteFile(filepath.Join(archiveDir, allowedName), []byte(allowedContent), 0644); err != nil {
+					t.Fatal(err)
+				}
+
+				outsideSourceContent := "outside-source-archive-secret-" + tc.name
+				outsideSourcePath := filepath.Join(t.TempDir(), "outside-source.txt")
+				if err := os.WriteFile(outsideSourcePath, []byte(outsideSourceContent), 0644); err != nil {
+					t.Fatal(err)
+				}
+
+				privateDir := filepath.Join(h.sourcePath, "private")
+				if err := os.MkdirAll(privateDir, 0755); err != nil {
+					t.Fatal(err)
+				}
+				scopeOutsideContent := "scope-outside-archive-secret-" + tc.name
+				scopeOutsidePath := filepath.Join(privateDir, "scope-outside-"+archiveDirName+".txt")
+				if err := os.WriteFile(scopeOutsidePath, []byte(scopeOutsideContent), 0644); err != nil {
+					t.Fatal(err)
+				}
+
+				aclTargetDir := filepath.Join(h.sourcePath, "public", "archive-acl-targets")
+				if err := os.MkdirAll(aclTargetDir, 0755); err != nil {
+					t.Fatal(err)
+				}
+				aclDeniedContent := "canonical-acl-archive-secret-" + tc.name
+				aclTargetName := "acl-target-" + archiveDirName + ".txt"
+				aclTargetPath := filepath.Join(aclTargetDir, aclTargetName)
+				if err := os.WriteFile(aclTargetPath, []byte(aclDeniedContent), 0644); err != nil {
+					t.Fatal(err)
+				}
+
+				createPermissionReadSymlink(t, outsideSourcePath, filepath.Join(archiveDir, "outside-source-link.txt"))
+				createPermissionReadSymlink(t, scopeOutsidePath, filepath.Join(archiveDir, "scope-outside-link.txt"))
+				createPermissionReadSymlink(t, aclTargetPath, filepath.Join(archiveDir, "acl-denied-link.txt"))
+
+				user := h.user(t, true, true, true)
+				user.Username = "permission-read-archive-symlink-" + strings.ReplaceAll(tc.name, ".", "-")
+				user.Scopes[0].Scope = "/public"
+				savePermissionReadUser(t, user)
+				if err := store.Access.DenyUser(h.sourcePath, "/public/archive-acl-targets/"+aclTargetName, user.Username); err != nil {
+					t.Fatal(err)
+				}
+
+				query := url.Values{
+					"source": {"source1"},
+					"file":   {"/" + archiveDirName},
+					"algo":   {tc.algo},
+				}
+				req := httptest.NewRequest(http.MethodGet, "/api/resources/download?"+query.Encode(), nil)
+				recorder := httptest.NewRecorder()
+				returned, err := downloadHandler(recorder, req, &requestContext{user: user})
+				if err != nil {
+					t.Fatalf("archive download: %v", err)
+				}
+				if got := permissionHandlerStatus(returned, recorder); got != http.StatusOK {
+					t.Fatalf("archive status: got %d, want %d", got, http.StatusOK)
+				}
+
+				entries := make(map[string]string)
+				switch tc.algo {
+				case "zip":
+					reader, err := zip.NewReader(bytes.NewReader(recorder.Body.Bytes()), int64(recorder.Body.Len()))
+					if err != nil {
+						t.Fatalf("open response zip: %v", err)
+					}
+					for _, entry := range reader.File {
+						file, err := entry.Open()
+						if err != nil {
+							t.Fatalf("open zip entry %q: %v", entry.Name, err)
+						}
+						content, readErr := io.ReadAll(file)
+						closeErr := file.Close()
+						if readErr != nil || closeErr != nil {
+							t.Fatalf("read zip entry %q: read=%v close=%v", entry.Name, readErr, closeErr)
+						}
+						entries[entry.Name] = string(content)
+					}
+				case "tar.gz":
+					gzipReader, err := gzip.NewReader(bytes.NewReader(recorder.Body.Bytes()))
+					if err != nil {
+						t.Fatalf("open response gzip: %v", err)
+					}
+					tarReader := tar.NewReader(gzipReader)
+					for {
+						header, err := tarReader.Next()
+						if errors.Is(err, io.EOF) {
+							break
+						}
+						if err != nil {
+							t.Fatalf("read response tar: %v", err)
+						}
+						content, err := io.ReadAll(tarReader)
+						if err != nil {
+							t.Fatalf("read tar entry %q: %v", header.Name, err)
+						}
+						entries[header.Name] = string(content)
+					}
+					if err := gzipReader.Close(); err != nil {
+						t.Fatalf("close response gzip: %v", err)
+					}
+				}
+
+				allowedArchivePath := archiveDirName + "/" + allowedName
+				if got := entries[allowedArchivePath]; got != allowedContent {
+					t.Errorf("allowed archive member: got %q, want %q; entries=%v", got, allowedContent, entries)
+				}
+				for name, content := range entries {
+					for _, denied := range []string{outsideSourceContent, scopeOutsideContent, aclDeniedContent} {
+						if strings.Contains(content, denied) {
+							t.Errorf("unauthorized target bytes leaked through %q: %q", name, content)
+						}
+					}
+				}
+				for _, deniedName := range []string{"outside-source-link.txt", "scope-outside-link.txt", "acl-denied-link.txt"} {
+					if _, exists := entries[archiveDirName+"/"+deniedName]; exists {
+						t.Errorf("unauthorized symlink member %q was archived; entries=%v", deniedName, entries)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("archive build aborts after read permission revocation", func(t *testing.T) {
+		archiveDirName := "archive-mid-build-revocation"
+		archiveDir := filepath.Join(h.sourcePath, "public", archiveDirName)
+		if err := os.MkdirAll(archiveDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{"first.txt", "second.txt", "third.txt"} {
+			if err := os.WriteFile(filepath.Join(archiveDir, name), []byte("archive-revocation-"+name), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		user := h.user(t, true, true, true)
+		var output bytes.Buffer
+		writer := &permissionReadCallbackWriter{
+			writer: &output,
+			callback: func() {
+				user.Permissions.Download = false
+			},
+		}
+		tarWriter := tar.NewWriter(writer)
+		err := addFile("source1", "/public/"+archiveDirName, &requestContext{user: user}, tarWriter, nil, false, nil)
+		_ = tarWriter.Close()
+		if !errors.Is(err, errAuthenticatedArchiveReadPermissions) {
+			t.Fatalf("archive build after revocation: got %v, want authenticated read permission error", err)
+		}
+		if got := errToStatus(err); got != http.StatusForbidden {
+			t.Errorf("archive build revocation status: got %d, want %d", got, http.StatusForbidden)
+		}
+		if bytes.Contains(output.Bytes(), []byte("archive-revocation-")) {
+			t.Errorf("archive build wrote member content after read permission revocation")
+		}
+	})
+
 	t.Run("archive download rejects a denied top-level path", func(t *testing.T) {
 		user := h.user(t, true, true, true)
 		user.Username = "permission-read-archive-denied-root-user"
@@ -1382,6 +2094,43 @@ func TestPermissionReadSecurity_ArchiveReadsRecheckPermissions(t *testing.T) {
 			savePermissionReadUser(t, owner)
 			query, token := startSession(t, owner)
 			if err := store.Access.DenyUser(h.sourcePath, "/public/secret.txt", owner.Username); err != nil {
+				t.Fatal(err)
+			}
+			resume(t, owner, query, token)
+		})
+
+		t.Run("member canonical target changed", func(t *testing.T) {
+			targetDir := filepath.Join(h.sourcePath, "private", "archive-resume-target-change")
+			if err := os.MkdirAll(targetDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			originalTarget := filepath.Join(targetDir, "original.txt")
+			replacementTarget := filepath.Join(targetDir, "replacement.txt")
+			if err := os.WriteFile(originalTarget, []byte("original-archive-resume-member"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(replacementTarget, []byte("replacement-archive-resume-member"), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			linkPath := filepath.Join(h.sourcePath, "public", "archive-resume-target-link.txt")
+			createPermissionReadSymlink(t, originalTarget, linkPath)
+			t.Cleanup(func() {
+				if err := os.Remove(linkPath); err != nil && !os.IsNotExist(err) {
+					t.Errorf("remove archive resume symlink: %v", err)
+				}
+			})
+
+			owner := h.user(t, true, true, true)
+			owner.Username = "permission-read-archive-target-change-user"
+			savePermissionReadUser(t, owner)
+			query, token := startSession(t, owner)
+
+			if err := os.Remove(linkPath); err != nil {
+				t.Fatal(err)
+			}
+			createPermissionReadSymlink(t, replacementTarget, linkPath)
+			if err := store.Access.DenyUser(h.sourcePath, "/private/archive-resume-target-change/original.txt", owner.Username); err != nil {
 				t.Fatal(err)
 			}
 			resume(t, owner, query, token)
@@ -1570,6 +2319,50 @@ func TestPermissionReadSecurity_ArchiveReadsRecheckPermissions(t *testing.T) {
 					t.Errorf("stat unsafe archive destination: %v", statErr)
 				}
 			})
+		}
+	})
+
+	t.Run("directory alias archive enforces logical child ACL", func(t *testing.T) {
+		canonicalDirectory := filepath.Join(h.sourcePath, "public", "archive-logical-target")
+		aliasDirectory := filepath.Join(h.sourcePath, "public", "archive-logical-alias")
+		if err := os.MkdirAll(canonicalDirectory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{"allowed.txt", "denied.txt"} {
+			if err := os.WriteFile(filepath.Join(canonicalDirectory, name), []byte("archive "+name), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		createPermissionReadSymlink(t, canonicalDirectory, aliasDirectory)
+
+		user := h.user(t, true, true, true)
+		user.Username = "permission-read-archive-logical-alias-user"
+		savePermissionReadUser(t, user)
+		if err := store.Access.DenyUser(h.sourcePath, "/public/archive-logical-alias/denied.txt", user.Username); err != nil {
+			t.Fatal(err)
+		}
+
+		query := url.Values{"source": {"source1"}, "file": {"/public/archive-logical-alias"}, "algo": {"zip"}}
+		request := httptest.NewRequest(http.MethodGet, "/api/resources/download?"+query.Encode(), nil)
+		recorder := httptest.NewRecorder()
+		returned, err := downloadHandler(recorder, request, &requestContext{user: user})
+		if got := permissionHandlerStatus(returned, recorder); got != http.StatusOK || err != nil {
+			t.Fatalf("logical alias archive status: got %d, want %d (err: %v)", got, http.StatusOK, err)
+		}
+		archiveReader, err := zip.NewReader(bytes.NewReader(recorder.Body.Bytes()), int64(recorder.Body.Len()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		entryNames := make([]string, 0, len(archiveReader.File))
+		for _, entry := range archiveReader.File {
+			entryNames = append(entryNames, entry.Name)
+		}
+		joinedNames := strings.Join(entryNames, "\n")
+		if !strings.Contains(joinedNames, "archive-logical-alias/allowed.txt") {
+			t.Errorf("logical alias archive omitted allowed entry: %v", entryNames)
+		}
+		if strings.Contains(joinedNames, "denied.txt") || strings.Contains(joinedNames, "archive-logical-target") {
+			t.Errorf("logical alias archive leaked denied or canonical entry names: %v", entryNames)
 		}
 	})
 
@@ -2050,6 +2843,10 @@ func TestPermissionReadSecurity_ArchiveSessionLifecycle(t *testing.T) {
 	t.Run("missing spool failure clears its idle timer", func(t *testing.T) {
 		token := "permission-read-missing-spool-token"
 		spoolPath := filepath.Join(settings.DownloadCacheDir(), "dl-archive-100001.zip")
+		memberTarget, err := resolveCurrentAuthenticatedArchiveTarget(&requestContext{user: user}, "source1", "/public/secret.txt")
+		if err != nil {
+			t.Fatalf("resolve missing spool member: %v", err)
+		}
 		session := archiveSpoolSession{
 			tmpPath:          spoolPath,
 			originalFileName: "missing.zip",
@@ -2059,6 +2856,7 @@ func TestPermissionReadSecurity_ArchiveSessionLifecycle(t *testing.T) {
 			sourcePath:       h.sourcePath,
 			requestFileList:  []string{"/public"},
 			memberPaths:      []string{"/public/secret.txt"},
+			memberTargets:    []authenticatedReadTarget{memberTarget},
 		}
 		archiveSpoolCache.SetWithExp(token, session, archiveMultiRequestIdle)
 		t.Cleanup(func() { removeSpooledArchiveNow(token, spoolPath) })
@@ -2297,6 +3095,21 @@ func createPermissionReadJPEG(t *testing.T, path string) []byte {
 		t.Fatal(err)
 	}
 	return append([]byte(nil), data...)
+}
+
+func permissionReadID3Audio(title string) []byte {
+	frameBody := append([]byte{3}, []byte(title)...)
+	frame := make([]byte, 10, 10+len(frameBody))
+	copy(frame, "TIT2")
+	binary.BigEndian.PutUint32(frame[4:8], uint32(len(frameBody)))
+	frame = append(frame, frameBody...)
+	header := []byte{'I', 'D', '3', 3, 0, 0, 0, 0, 0, 0}
+	size := len(frame)
+	header[6] = byte((size >> 21) & 0x7f)
+	header[7] = byte((size >> 14) & 0x7f)
+	header[8] = byte((size >> 7) & 0x7f)
+	header[9] = byte(size & 0x7f)
+	return append(header, frame...)
 }
 
 func createPermissionReadZip(t *testing.T, archivePath, name, content string) {

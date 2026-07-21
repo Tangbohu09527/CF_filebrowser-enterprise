@@ -22,8 +22,10 @@ import (
 
 	"github.com/gtsteffaniak/filebrowser/backend/adapters/fs/files"
 	"github.com/gtsteffaniak/filebrowser/backend/adapters/fs/fileutils"
+	commonerrors "github.com/gtsteffaniak/filebrowser/backend/common/errors"
 	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing"
 	"github.com/gtsteffaniak/go-cache/cache"
 	"github.com/gtsteffaniak/go-logger/logger"
@@ -50,6 +52,7 @@ type archiveSpoolSession struct {
 	sourcePath       string
 	requestFileList  []string
 	memberPaths      []string
+	memberTargets    []authenticatedReadTarget
 	shareHash        string
 	archiveExtension string
 	shareTargets     []publicShareTarget
@@ -67,13 +70,181 @@ type archiveSpoolLifecycle struct {
 }
 
 type archiveMemberTracker struct {
-	paths []string
+	paths   []string
+	targets []authenticatedReadTarget
 }
 
-func (t *archiveMemberTracker) add(path string) {
+type authenticatedArchiveMember struct {
+	indexPath   string
+	archivePath string
+	target      authenticatedReadTarget
+	root        bool
+}
+
+var errAuthenticatedArchiveReadPermissions = fmt.Errorf("authenticated archive read permissions are required: %w", commonerrors.ErrAccessDenied)
+
+func (t *archiveMemberTracker) add(path string, target authenticatedReadTarget) {
 	if t != nil {
 		t.paths = append(t.paths, path)
+		t.targets = append(t.targets, target)
 	}
+}
+
+func currentAuthenticatedArchiveUser(d *requestContext) (*users.User, error) {
+	if d == nil || d.user == nil {
+		return nil, errAuthenticatedArchiveReadPermissions
+	}
+	current, err := currentAuthenticatedReadUser(d.user, d.token)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errAuthenticatedArchiveReadPermissions, err)
+	}
+	if !current.Permissions.Browse || !current.Permissions.Download {
+		return nil, errAuthenticatedArchiveReadPermissions
+	}
+	return current, nil
+}
+
+func resolveCurrentAuthenticatedArchiveTarget(d *requestContext, source, indexPath string) (authenticatedReadTarget, error) {
+	current, err := currentAuthenticatedArchiveUser(d)
+	if err != nil {
+		return authenticatedReadTarget{}, err
+	}
+	return resolveAuthenticatedReadIndexTarget(current, source, indexPath)
+}
+
+func reauthorizeAuthenticatedArchiveRoot(d *requestContext, source, indexPath string, checked authenticatedReadTarget) error {
+	current, err := resolveCurrentAuthenticatedArchiveTarget(d, source, indexPath)
+	if err != nil {
+		return fmt.Errorf("%w: archive root authorization changed", errAuthenticatedArchiveReadPermissions)
+	}
+	if current.CanonicalPath != checked.CanonicalPath || !publicShareSameRealPath(current.RealPath, checked.RealPath) ||
+		current.Info == nil || checked.Info == nil || current.Info.IsDir() != checked.Info.IsDir() {
+		return errAuthenticatedArchiveReadPermissions
+	}
+	return nil
+}
+
+func reauthorizeAuthenticatedArchiveMember(d *requestContext, source string, member authenticatedArchiveMember) error {
+	current, err := resolveCurrentAuthenticatedArchiveTarget(d, source, member.indexPath)
+	if err != nil || !sameAuthenticatedReadTarget(member.target, current) {
+		return errAuthenticatedArchiveReadPermissions
+	}
+	return nil
+}
+
+func reauthorizeAuthenticatedArchiveMembers(d *requestContext, source string, paths []string, targets []authenticatedReadTarget) error {
+	if len(paths) != len(targets) {
+		return errAuthenticatedArchiveReadPermissions
+	}
+	for i, memberPath := range paths {
+		member := authenticatedArchiveMember{indexPath: memberPath, target: targets[i]}
+		if err := reauthorizeAuthenticatedArchiveMember(d, source, member); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyAuthenticatedArchiveMember(d *requestContext, source string, member authenticatedArchiveMember, destination io.Writer, file *os.File) error {
+	buffer := make([]byte, 1024*1024)
+	for {
+		if err := reauthorizeAuthenticatedArchiveMember(d, source, member); err != nil {
+			return err
+		}
+		n, readErr := file.Read(buffer)
+		if n > 0 {
+			if err := reauthorizeAuthenticatedArchiveMember(d, source, member); err != nil {
+				return err
+			}
+			written, writeErr := destination.Write(buffer[:n])
+			if writeErr != nil {
+				return writeErr
+			}
+			if written != n {
+				return io.ErrShortWrite
+			}
+		}
+		if readErr == io.EOF {
+			return reauthorizeAuthenticatedArchiveMember(d, source, member)
+		}
+		if readErr != nil {
+			return normalizeAuthenticatedReadError(readErr)
+		}
+	}
+}
+
+func walkAuthenticatedArchiveMembers(
+	d *requestContext,
+	source string,
+	indexPath string,
+	flatten bool,
+	visit func(authenticatedArchiveMember) error,
+) error {
+	root, err := resolveCurrentAuthenticatedArchiveTarget(d, source, indexPath)
+	if err != nil {
+		return err
+	}
+	if root.Info == nil {
+		return commonerrors.ErrAccessDenied
+	}
+
+	baseName := authenticatedReadTargetName(root, filepath.Base(root.RealPath))
+	if !root.Info.IsDir() {
+		return visit(authenticatedArchiveMember{
+			indexPath:   indexPath,
+			archivePath: baseName,
+			target:      root,
+		})
+	}
+	if err := visit(authenticatedArchiveMember{indexPath: indexPath, target: root, root: true}); err != nil {
+		return err
+	}
+
+	return filepath.Walk(root.RealPath, func(filePath string, fileInfo os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return normalizeAuthenticatedReadError(walkErr)
+		}
+		relPath, err := filepath.Rel(root.RealPath, filePath)
+		if err != nil {
+			return fmt.Errorf("archive member path is unavailable")
+		}
+		if relPath == "." {
+			return nil
+		}
+		if reauthorizeErr := reauthorizeAuthenticatedArchiveRoot(d, source, indexPath, root); reauthorizeErr != nil {
+			return reauthorizeErr
+		}
+
+		relPath = filepath.ToSlash(relPath)
+		memberPath := filepath.ToSlash(utils.JoinPathAsUnix(indexPath, relPath))
+		memberTarget, err := resolveCurrentAuthenticatedArchiveTarget(d, source, memberPath)
+		if err != nil {
+			if errors.Is(err, errAuthenticatedArchiveReadPermissions) {
+				return err
+			}
+			if errors.Is(err, commonerrors.ErrAccessDenied) {
+				if fileInfo.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			return err
+		}
+
+		// filepath.Walk does not descend through directory symlinks; preserve that behavior.
+		if fileInfo.Mode()&os.ModeSymlink != 0 && memberTarget.Info.IsDir() {
+			return nil
+		}
+		archivePath := relPath
+		if !flatten {
+			archivePath = filepath.ToSlash(filepath.Join(baseName, relPath))
+		}
+		return visit(authenticatedArchiveMember{
+			indexPath:   memberPath,
+			archivePath: archivePath,
+			target:      memberTarget,
+		})
+	})
 }
 
 // archiveSpoolCache maps archiveToken to the scoped read session used to build the spool.
@@ -485,10 +656,19 @@ func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 
 	// Build full paths for items (same source)
 	itemPaths := make([]string, 0, len(req.Paths))
+	if _, authErr := currentAuthenticatedArchiveUser(d); authErr != nil {
+		return errToStatus(authErr), authErr
+	}
 	for _, it := range req.Paths {
 		full := utils.JoinPathAsUnix(userScope, it)
-		if store.Access != nil && !store.Access.Permitted(idx.Path, full, d.user.Username) {
-			continue // silently skip
+		if _, authErr := resolveCurrentAuthenticatedArchiveTarget(d, req.FromSource, full); authErr != nil {
+			if errors.Is(authErr, errAuthenticatedArchiveReadPermissions) {
+				return errToStatus(authErr), authErr
+			}
+			if errors.Is(authErr, commonerrors.ErrAccessDenied) {
+				continue
+			}
+			return errToStatus(authErr), authErr
 		}
 		itemPaths = append(itemPaths, full)
 	}
@@ -501,7 +681,7 @@ func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 		var estimatedSize int64
 		estimatedSize, err = computeArchiveSize(req.FromSource, itemPaths, d)
 		if err != nil {
-			return http.StatusInternalServerError, fmt.Errorf("failed to compute archive size: %v", err)
+			return errToStatus(err), fmt.Errorf("failed to compute archive size: %w", err)
 		}
 		maxSizeBytes := config.Server.MaxArchiveSizeGB * 1024 * 1024 * 1024
 		if estimatedSize > maxSizeBytes {
@@ -522,7 +702,7 @@ func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 		createErr = createTarGzWithLevel(d, req.FromSource, file, compression, itemPaths...)
 	}
 	if createErr != nil {
-		return http.StatusInternalServerError, createErr
+		return errToStatus(createErr), createErr
 	}
 
 	if req.DeleteAfter && d.user.Permissions.Delete {
@@ -690,97 +870,83 @@ func unarchiveHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	return renderJSON(w, r, map[string]string{"path": req.Destination, "source": req.ToSource}, http.StatusOK)
 }
 
-// addFile adds a file or directory to a tar or zip archive, respecting access rules.
-// For shares, path is already resolved; for users, access is checked via store.Access.
+// addFile adds an authenticated file or directory after resolving every member against
+// the user's current token, scope, canonical path, and access rules.
 func addFile(source string, path string, d *requestContext, tarWriter *tar.Writer, zipWriter *zip.Writer, flatten bool, tracker *archiveMemberTracker) error {
-	idx := indexing.GetIndex(source)
-	if idx == nil {
-		return fmt.Errorf("source %s is not available", source)
-	}
-
-	// Check access control directly for each file and silently skip if access is denied
-	if !store.Access.Permitted(idx.Path, path, d.user.Username) {
-		return nil // Silently skip this file/folder
-	}
-	if d.share == nil {
-		tracker.add(path)
-	}
-
-	realPath, _, _ := idx.GetRealPath(path)
-	info, err := os.Stat(realPath)
-	if err != nil {
-		return err
-	}
-
-	// Get the base name of the top-level folder or file
-	baseName := filepath.Base(realPath)
-
-	if info.IsDir() {
-		// Walk through directory contents
-		return filepath.Walk(realPath, func(filePath string, fileInfo os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-
-			// Calculate the relative path
-			relPath, err := filepath.Rel(realPath, filePath)
-			if err != nil {
-				return err
-			}
-
-			// Normalize for tar: convert \ to /
-			relPath = filepath.ToSlash(relPath)
-
-			// Skip adding `.` (current directory)
-			if relPath == "." {
-				return nil
-			}
-
-			// Check access control for each file/folder during walk
-			if d.share == nil {
-				indexRelPath := utils.JoinPathAsUnix(path, relPath)
-				indexRelPath = filepath.ToSlash(indexRelPath)
-				if !store.Access.Permitted(idx.Path, indexRelPath, d.user.Username) {
-					if fileInfo.IsDir() {
-						return filepath.SkipDir
-					}
-					return nil
-				}
-				tracker.add(indexRelPath)
-			}
-
-			// Prepend base folder name unless flatten is true
-			if !flatten {
-				relPath = filepath.Join(baseName, relPath)
-				relPath = filepath.ToSlash(relPath)
-			}
-
-			if fileInfo.IsDir() {
-				if tarWriter != nil {
-					header, err := tar.FileInfoHeader(fileInfo, "")
-					if err != nil {
-						return err
-					}
-					header.Name = relPath + "/"
-					return tarWriter.WriteHeader(header)
-				}
-				if zipWriter != nil {
-					zh, err := zip.FileInfoHeader(fileInfo)
-					if err != nil {
-						return err
-					}
-					zh.Name = relPath + "/"
-					zh.Method = zip.Store
-					_, err = zipWriter.CreateHeader(zh)
+	err := walkAuthenticatedArchiveMembers(d, source, path, flatten, func(member authenticatedArchiveMember) error {
+		if member.root {
+			tracker.add(member.indexPath, member.target)
+			return nil
+		}
+		if member.target.Info == nil {
+			return commonerrors.ErrAccessDenied
+		}
+		if member.target.Info.IsDir() {
+			if tarWriter != nil {
+				header, err := tar.FileInfoHeader(member.target.Info, "")
+				if err != nil {
 					return err
 				}
-				return nil
+				header.Name = filepath.ToSlash(member.archivePath) + "/"
+				if err = tarWriter.WriteHeader(header); err != nil {
+					return err
+				}
+			} else if zipWriter != nil {
+				header, err := zip.FileInfoHeader(member.target.Info)
+				if err != nil {
+					return err
+				}
+				header.Name = filepath.ToSlash(member.archivePath) + "/"
+				header.Method = zip.Store
+				if _, err = zipWriter.CreateHeader(header); err != nil {
+					return err
+				}
 			}
-			return addSingleFile(filePath, relPath, zipWriter, tarWriter)
-		})
+			if err := reauthorizeAuthenticatedArchiveMember(d, source, member); err != nil {
+				return err
+			}
+			tracker.add(member.indexPath, member.target)
+			return nil
+		}
+
+		file, info, err := openAuthenticatedReadTarget(member.target)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		if tarWriter != nil {
+			header, err := tar.FileInfoHeader(info, "")
+			if err != nil {
+				return err
+			}
+			header.Name = filepath.ToSlash(member.archivePath)
+			if err = tarWriter.WriteHeader(header); err != nil {
+				return err
+			}
+			if err = copyAuthenticatedArchiveMember(d, source, member, tarWriter, file); err != nil {
+				return err
+			}
+		} else if zipWriter != nil {
+			header, err := zip.FileInfoHeader(info)
+			if err != nil {
+				return err
+			}
+			header.Name = filepath.ToSlash(member.archivePath)
+			writer, err := zipWriter.CreateHeader(header)
+			if err != nil {
+				return err
+			}
+			if err = copyAuthenticatedArchiveMember(d, source, member, writer, file); err != nil {
+				return err
+			}
+		}
+		tracker.add(member.indexPath, member.target)
+		return nil
+	})
+	if errors.Is(err, commonerrors.ErrAccessDenied) && !errors.Is(err, errAuthenticatedArchiveReadPermissions) {
+		return nil
 	}
-	// For a single file, use the base name as the archive path
-	return addSingleFile(realPath, baseName, zipWriter, tarWriter)
+	return err
 }
 
 // addSingleFile writes one file into the given zip or tar writer.
@@ -1076,12 +1242,12 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 			if idx == nil || session.sourcePath == "" || idx.Path != session.sourcePath {
 				return http.StatusForbidden, fmt.Errorf("archive resume source is not available")
 			}
-			if store.Access != nil {
-				for _, memberPath := range session.memberPaths {
-					if !store.Access.Permitted(idx.Path, memberPath, d.user.Username) {
-						return http.StatusForbidden, fmt.Errorf("archive member access has changed")
-					}
-				}
+			if _, authErr := currentAuthenticatedArchiveUser(d); authErr != nil {
+				return errToStatus(authErr), authErr
+			}
+			if authErr := reauthorizeAuthenticatedArchiveMembers(d, session.source, session.memberPaths, session.memberTargets); authErr != nil {
+				denied := fmt.Errorf("archive member access has changed: %w", commonerrors.ErrAccessDenied)
+				return errToStatus(denied), denied
 			}
 		}
 
@@ -1116,12 +1282,22 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 		return http.StatusInternalServerError, fmt.Errorf("source %s is not available", source)
 	}
 	requestFileList := append([]string(nil), fileList...)
-	if d.share == nil && store.Access != nil {
+	if d.share == nil {
+		if _, authErr := currentAuthenticatedArchiveUser(d); authErr != nil {
+			return errToStatus(authErr), authErr
+		}
 		permitted := make([]string, 0, len(fileList))
 		for _, filePath := range fileList {
-			if store.Access.Permitted(idx.Path, filePath, d.user.Username) {
-				permitted = append(permitted, filePath)
+			if _, authErr := resolveCurrentAuthenticatedArchiveTarget(d, source, filePath); authErr != nil {
+				if errors.Is(authErr, errAuthenticatedArchiveReadPermissions) {
+					return errToStatus(authErr), authErr
+				}
+				if errors.Is(authErr, commonerrors.ErrAccessDenied) {
+					continue
+				}
+				return errToStatus(authErr), authErr
 			}
+			permitted = append(permitted, filePath)
 		}
 		fileList = permitted
 		if len(fileList) == 0 {
@@ -1133,10 +1309,12 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 	if d.share != nil {
 		realPath = shareRealPath
 	} else {
-		realPath, _, err = idx.GetRealPath(fileList[0])
+		var firstTarget authenticatedReadTarget
+		firstTarget, err = resolveCurrentAuthenticatedArchiveTarget(d, source, fileList[0])
 		if err != nil {
-			return http.StatusInternalServerError, fmt.Errorf("failed to get real path for %s: %v", fileList[0], err)
+			return errToStatus(err), fmt.Errorf("failed to resolve archive path %s: %w", fileList[0], err)
 		}
+		realPath = firstTarget.RealPath
 	}
 	originalFileName := archiveAttachmentStem(fileList, realPath) + extension
 
@@ -1151,7 +1329,11 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 			estimatedSize, err = computeArchiveSize(source, fileList, d)
 		}
 		if err != nil {
-			return http.StatusInternalServerError, fmt.Errorf("failed to compute archive size: %v", err)
+			status := http.StatusInternalServerError
+			if d.share == nil {
+				status = errToStatus(err)
+			}
+			return status, fmt.Errorf("failed to compute archive size: %w", err)
 		}
 		maxSizeBytes := config.Server.MaxArchiveSizeGB * 1024 * 1024 * 1024
 		if estimatedSize > maxSizeBytes {
@@ -1185,7 +1367,11 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 			err = createTarGz(d, source, writer, fileList...)
 		}
 		if err != nil {
-			return http.StatusInternalServerError, err
+			status := http.StatusInternalServerError
+			if d.share == nil {
+				status = errToStatus(err)
+			}
+			return status, err
 		}
 		return 0, nil
 	}
@@ -1214,7 +1400,16 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 		err = createTarGzTracked(d, source, tmpF, memberTracker, fileList...)
 	}
 	if err != nil {
-		return http.StatusInternalServerError, err
+		status := http.StatusInternalServerError
+		if d.share == nil {
+			status = errToStatus(err)
+		}
+		return status, err
+	}
+	if d.share == nil {
+		if authErr := reauthorizeAuthenticatedArchiveMembers(d, source, memberTracker.paths, memberTracker.targets); authErr != nil {
+			return http.StatusForbidden, commonerrors.ErrAccessDenied
+		}
 	}
 
 	if _, err = tmpF.Seek(0, 0); err != nil {
@@ -1256,6 +1451,7 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 		sourcePath:       idx.Path,
 		requestFileList:  requestFileList,
 		memberPaths:      append([]string(nil), memberTracker.paths...),
+		memberTargets:    append([]authenticatedReadTarget(nil), memberTracker.targets...),
 		archiveExtension: extension,
 		lifecycle:        &archiveSpoolLifecycle{active: 1},
 	}
@@ -1266,6 +1462,9 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 	} else {
 		session.userID = d.user.ID
 		session.username = d.user.Username
+		if authErr := reauthorizeAuthenticatedArchiveMembers(d, source, session.memberPaths, session.memberTargets); authErr != nil {
+			return http.StatusForbidden, commonerrors.ErrAccessDenied
+		}
 	}
 	archiveSpoolCache.SetWithExp(newTok, session, archiveSpoolActiveCacheTTL)
 	released := false
@@ -1647,28 +1846,26 @@ func extractTarGz(archivePath, destDir string) error {
 // Paths denied by access are skipped (not counted).
 func computeArchiveSize(source string, fileList []string, d *requestContext) (int64, error) {
 	var estimatedSize int64
-	idx := indexing.GetIndex(source)
-	if idx == nil {
-		return 0, fmt.Errorf("source %s is not available", source)
+	if _, err := currentAuthenticatedArchiveUser(d); err != nil {
+		return 0, err
 	}
-
-	for _, path := range fileList {
-		if !store.Access.Permitted(idx.Path, path, d.user.Username) {
+	for _, indexPath := range fileList {
+		err := walkAuthenticatedArchiveMembers(d, source, indexPath, false, func(member authenticatedArchiveMember) error {
+			if !member.root && member.target.Info != nil && !member.target.Info.IsDir() {
+				estimatedSize += member.target.Info.Size()
+			}
+			return nil
+		})
+		if err == nil {
 			continue
 		}
-		realPath, isDir, err := idx.GetRealPath(path)
-		if err != nil {
+		if errors.Is(err, errAuthenticatedArchiveReadPermissions) {
 			return 0, err
 		}
-		indexPath := idx.MakeIndexPath(realPath, isDir)
-		info, ok := idx.GetReducedMetadata(indexPath, isDir)
-		if !ok {
-			info, err = idx.GetFsInfo(indexPath, false, true)
-			if err != nil {
-				return 0, fmt.Errorf("failed to get file info for %s : %v", path, err)
-			}
+		if errors.Is(err, commonerrors.ErrAccessDenied) {
+			continue
 		}
-		estimatedSize += info.Size
+		return 0, err
 	}
 	return estimatedSize, nil
 }

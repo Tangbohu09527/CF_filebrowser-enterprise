@@ -147,7 +147,7 @@ func checkPermissionsImpl(opts utils.FileOptions, access *access.Storage, user *
 	indexPath := utils.JoinPathAsUnix(userScope, safePath)
 	// Layer 1: USER ACCESS CONTROL
 	// Quick check: Does THIS user have permission?
-	if !access.Permitted(idx.Path, indexPath, user.Username) {
+	if !access.PermittedFresh(idx.Path, indexPath, user.Username) {
 		return indexPath, "", errors.ErrAccessDenied
 	}
 	return indexPath, userScope, nil
@@ -309,6 +309,10 @@ func fileInfoFasterImpl(opts utils.FileOptions, access *access.Storage, user *us
 }
 
 func processContent(info *iteminfo.ExtendedFileInfo, idx *indexing.Index, opts utils.FileOptions) {
+	readPath := info.RealPath
+	if opts.ReadPath != "" {
+		readPath = opts.ReadPath
+	}
 	isVideo := strings.HasPrefix(info.Type, "video")
 	isAudio := strings.HasPrefix(info.Type, "audio")
 	isFolder := info.Type == "directory"
@@ -325,7 +329,7 @@ func processContent(info *iteminfo.ExtendedFileInfo, idx *indexing.Index, opts u
 		extItem := &iteminfo.ExtendedItemInfo{
 			ItemInfo: info.ItemInfo,
 		}
-		err := extractVideoMetadata(context.Background(), extItem, info.RealPath, nil)
+		err := extractVideoMetadata(context.Background(), extItem, readPath, nil)
 		if err != nil {
 			logger.Debugf("failed to extract video metadata for file: "+info.RealPath, info.Name, err)
 		} else {
@@ -338,7 +342,7 @@ func processContent(info *iteminfo.ExtendedFileInfo, idx *indexing.Index, opts u
 			info.GetSubtitles(parentInfo)
 		}
 		if opts.ExtractEmbeddedSubtitles {
-			subtitles := ffmpeg.DetectEmbeddedSubtitles(info.RealPath, info.ModTime)
+			subtitles := ffmpeg.DetectEmbeddedSubtitles(readPath, info.ModTime)
 			info.Subtitles = append(info.Subtitles, subtitles...)
 		}
 		return
@@ -350,7 +354,7 @@ func processContent(info *iteminfo.ExtendedFileInfo, idx *indexing.Index, opts u
 		extItem := &iteminfo.ExtendedItemInfo{
 			ItemInfo: info.ItemInfo,
 		}
-		err := extractAudioMetadata(context.Background(), extItem, info.RealPath, opts.AlbumArt || opts.Content, opts.Metadata || opts.Content, false, nil)
+		err := extractAudioMetadata(context.Background(), extItem, readPath, opts.AlbumArt, opts.Metadata, false, nil)
 		if err != nil {
 			logger.Debugf("failed to extract audio metadata for file: "+info.RealPath, info.Name, err)
 		} else {
@@ -362,7 +366,7 @@ func processContent(info *iteminfo.ExtendedFileInfo, idx *indexing.Index, opts u
 
 	// Process text content for non-video, non-audio files
 	if info.Size < 20*1024*1024 { // 20 megabytes in bytes
-		content, err := getContent(info.RealPath)
+		content, err := getContent(readPath)
 		if err != nil {
 			logger.Debugf("could not get content for file: "+info.RealPath, info.Name, err)
 			return

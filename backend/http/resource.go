@@ -15,6 +15,7 @@ import (
 	"github.com/gtsteffaniak/filebrowser/backend/adapters/fs/files"
 	"github.com/gtsteffaniak/filebrowser/backend/common/errors"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing/iteminfo"
 	"github.com/gtsteffaniak/filebrowser/backend/preview"
@@ -86,59 +87,261 @@ func resourceGetHandler(w http.ResponseWriter, r *http.Request, d *requestContex
 	if (getContent || checksumAlgo != "") && !d.user.Permissions.Download {
 		return http.StatusForbidden, fmt.Errorf("user is not allowed to read resource contents")
 	}
+	readUser, err := currentAuthenticatedReadUser(d.user, d.token)
+	if err != nil || !readUser.Permissions.Browse || ((getContent || checksumAlgo != "") && !readUser.Permissions.Download) {
+		return http.StatusForbidden, errors.ErrAccessDenied
+	}
+	canReadMetadata := getMetadata && readUser.Permissions.Preview
+	target, err := resolveAuthenticatedBrowseTarget(readUser, source, path)
+	if err != nil {
+		return errToStatus(err), err
+	}
 	skipExtendedAttrs := r.URL.Query().Get("skipExtendedAttrs") == "true"
 	fileOpts := utils.FileOptions{
-		FollowSymlinks:           true,
-		Path:                     path,
+		FollowSymlinks:           false,
+		Path:                     target.ScopedPath,
 		Source:                   source,
 		Expand:                   true,
-		Content:                  getContent,
+		Content:                  false,
 		ExtractEmbeddedSubtitles: config.Integrations.Media.ExtractEmbeddedSubtitles,
-		ShowHidden:               d.user.ShowHidden,
-		HideFileExt:              d.user.HideFileExt,
+		ShowHidden:               readUser.ShowHidden,
+		HideFileExt:              readUser.HideFileExt,
 		SkipExtendedAttrs:        skipExtendedAttrs,
 		ShowSharedAttr:           true,
 		ShowPinnedItems:          true,
 	}
-	fileInfo, err := files.FileInfoFaster(fileOpts, store.Access, d.user, store.Share)
+	fileInfo, err := files.FileInfoFaster(fileOpts, store.Access, readUser, store.Share)
 	if err != nil {
+		err = normalizeAuthenticatedResourceError(err)
 		return errToStatus(err), err
 	}
-
-	canReadMetadata := getMetadata && d.user.Permissions.Preview
-	metadataTarget := fileInfo.Type == "directory" || strings.HasPrefix(fileInfo.Type, "audio") || strings.HasPrefix(fileInfo.Type, "video")
-	if canReadMetadata && metadataTarget {
-		fileOpts.Metadata = true
-		fileInfo, err = files.FileInfoFaster(fileOpts, store.Access, d.user, store.Share)
+	applyAuthenticatedFileInfoIdentity(fileInfo, target)
+	if err = filterAuthenticatedDirectoryFileInfo(readUser, source, target, fileInfo); err != nil {
+		return http.StatusForbidden, errors.ErrAccessDenied
+	}
+	isAudio := strings.HasPrefix(fileInfo.Type, "audio")
+	isVideo := strings.HasPrefix(fileInfo.Type, "video")
+	protectedMediaTargets := make([]authenticatedReadTarget, 0)
+	if fileInfo.Type == "directory" && canReadMetadata {
+		protectedMediaTargets, err = enrichAuthenticatedResourceDirectoryMetadata(fileInfo, fileOpts, d, source, path, target)
+		if err != nil {
+			return http.StatusForbidden, errors.ErrAccessDenied
+		}
+	} else if (isAudio || isVideo) && canReadMetadata {
+		readUser, err = revalidateAuthenticatedResourceRead(d, source, path, target, nil, getContent, canReadMetadata)
+		if err != nil {
+			return http.StatusForbidden, errors.ErrAccessDenied
+		}
+		snapshotPath, _, cleanup, snapshotErr := snapshotAuthenticatedReadTarget(target)
+		if snapshotErr != nil {
+			return errToStatus(snapshotErr), snapshotErr
+		}
+		if _, err = revalidateAuthenticatedResourceRead(d, source, path, target, nil, getContent, canReadMetadata); err != nil {
+			cleanup()
+			return http.StatusForbidden, errors.ErrAccessDenied
+		}
+		mediaOpts := fileOpts
+		mediaOpts.Expand = false
+		mediaOpts.Metadata = canReadMetadata
+		mediaOpts.ReadPath = snapshotPath
+		mediaOpts.SkipExtendedAttrs = false
+		fileInfo, err = files.FileInfoFaster(mediaOpts, store.Access, readUser, store.Share)
+		cleanup()
+		if err != nil {
+			err = normalizeAuthenticatedResourceError(err)
+			return errToStatus(err), err
+		}
+		applyAuthenticatedFileInfoIdentity(fileInfo, target)
+		protectedMediaTargets = append(protectedMediaTargets, authenticatedMediaSidecarTargets(fileInfo, source, target, readUser)...)
+	}
+	if getContent && fileInfo.Type != "directory" {
+		_, err = revalidateAuthenticatedResourceRead(d, source, path, target, nil, true, false)
+		if err != nil {
+			return http.StatusForbidden, errors.ErrAccessDenied
+		}
+		fileInfo.Content, err = readAuthenticatedTextContent(target)
 		if err != nil {
 			return errToStatus(err), err
 		}
 	}
-	if !d.user.Permissions.Preview {
+
+	if !getContent {
+		fileInfo.Content = ""
+	}
+	if fileInfo.Type != "directory" && checksumAlgo != "" {
+		_, err = revalidateAuthenticatedResourceRead(d, source, path, target, nil, true, false)
+		if err != nil {
+			return http.StatusForbidden, errors.ErrAccessDenied
+		}
+		checksum, checksumErr := checksumAuthenticatedReadTarget(target, checksumAlgo)
+		if checksumErr == errors.ErrInvalidOption {
+			return http.StatusBadRequest, nil
+		} else if checksumErr != nil {
+			return http.StatusInternalServerError, checksumErr
+		}
+		fileInfo.Checksums = make(map[string]string)
+		fileInfo.Checksums[checksumAlgo] = checksum
+	}
+	responseUser, err := revalidateAuthenticatedResourceRead(d, source, path, target, protectedMediaTargets, getContent || checksumAlgo != "", canReadMetadata)
+	if err != nil {
+		return http.StatusForbidden, errors.ErrAccessDenied
+	}
+	currentTarget, err := resolveAuthenticatedBrowseTarget(responseUser, source, path)
+	if err != nil || !sameAuthenticatedReadTarget(target, currentTarget) {
+		return http.StatusForbidden, errors.ErrAccessDenied
+	}
+	if err = filterAuthenticatedDirectoryFileInfo(responseUser, source, currentTarget, fileInfo); err != nil {
+		return http.StatusForbidden, errors.ErrAccessDenied
+	}
+	if !responseUser.Permissions.Preview {
 		fileInfo.Metadata = nil
 		fileInfo.Subtitles = nil
 		for i := range fileInfo.Files {
 			fileInfo.Files[i].Metadata = nil
 		}
 	}
-	if !getContent {
-		fileInfo.Content = ""
-	}
-	if fileInfo.Type == "directory" {
-		return renderJSON(w, r, fileInfo)
-	}
-	if checksumAlgo != "" {
-		checksum, err := utils.GetChecksum(fileInfo.RealPath, checksumAlgo)
-		if err == errors.ErrInvalidOption {
-			return http.StatusBadRequest, nil
-		} else if err != nil {
-			return http.StatusInternalServerError, err
-		}
-		fileInfo.Checksums = make(map[string]string)
-		fileInfo.Checksums[checksumAlgo] = checksum
-	}
 	return renderJSON(w, r, fileInfo)
 
+}
+
+func normalizeAuthenticatedResourceError(err error) error {
+	return normalizeAuthenticatedReadError(err)
+}
+
+func applyAuthenticatedFileInfoIdentity(fileInfo *iteminfo.ExtendedFileInfo, target authenticatedReadTarget) {
+	fileInfo.Path = target.RequestedPath
+	fileInfo.RealPath = target.RealPath
+	if target.Info != nil {
+		fileInfo.Size = target.Info.Size()
+		fileInfo.ModTime = target.Info.ModTime()
+	}
+	logicalMatchesCanonical := publicSharePathWithin(target.LogicalPath, target.CanonicalPath) &&
+		publicSharePathWithin(target.CanonicalPath, target.LogicalPath)
+	if !logicalMatchesCanonical {
+		fileInfo.Name = authenticatedReadTargetName(target, fileInfo.Name)
+	}
+}
+
+func filterAuthenticatedDirectoryFileInfo(user *users.User, source string, directoryTarget authenticatedReadTarget, fileInfo *iteminfo.ExtendedFileInfo) error {
+	if fileInfo == nil || fileInfo.Type != "directory" {
+		return nil
+	}
+	filteredFiles := fileInfo.Files[:0]
+	for _, child := range fileInfo.Files {
+		childPath := utils.JoinPathAsUnix(directoryTarget.LogicalPath, child.Name)
+		childTarget, err := resolveAuthenticatedReadIndexTarget(user, source, childPath)
+		if err != nil || childTarget.Info == nil || childTarget.Info.IsDir() {
+			continue
+		}
+		child.Size = childTarget.Info.Size()
+		child.ModTime = childTarget.Info.ModTime()
+		filteredFiles = append(filteredFiles, child)
+	}
+	fileInfo.Files = filteredFiles
+
+	filteredFolders := fileInfo.Folders[:0]
+	for _, child := range fileInfo.Folders {
+		childPath := utils.JoinPathAsUnix(directoryTarget.LogicalPath, child.Name)
+		childTarget, err := resolveAuthenticatedReadIndexTarget(user, source, childPath)
+		if err != nil || childTarget.Info == nil || !childTarget.Info.IsDir() {
+			continue
+		}
+		child.Size = childTarget.Info.Size()
+		child.ModTime = childTarget.Info.ModTime()
+		filteredFolders = append(filteredFolders, child)
+	}
+	fileInfo.Folders = filteredFolders
+	if !directoryTarget.LogicalAccess && len(fileInfo.Files)+len(fileInfo.Folders) == 0 {
+		return errors.ErrAccessDenied
+	}
+	return nil
+}
+
+func filterAuthenticatedDirectoryItems(user *users.User, source string, directoryTarget authenticatedReadTarget, items files.Items) (files.Items, error) {
+	filtered := files.Items{}
+	for _, name := range items.Files {
+		childPath := utils.JoinPathAsUnix(directoryTarget.LogicalPath, name)
+		childTarget, err := resolveAuthenticatedReadIndexTarget(user, source, childPath)
+		if err == nil && childTarget.Info != nil && !childTarget.Info.IsDir() {
+			filtered.Files = append(filtered.Files, name)
+		}
+	}
+	for _, name := range items.Folders {
+		childPath := utils.JoinPathAsUnix(directoryTarget.LogicalPath, name)
+		childTarget, err := resolveAuthenticatedReadIndexTarget(user, source, childPath)
+		if err == nil && childTarget.Info != nil && childTarget.Info.IsDir() {
+			filtered.Folders = append(filtered.Folders, name)
+		}
+	}
+	if !directoryTarget.LogicalAccess && len(filtered.Files)+len(filtered.Folders) == 0 {
+		return filtered, errors.ErrAccessDenied
+	}
+	return filtered, nil
+}
+
+func enrichAuthenticatedResourceDirectoryMetadata(fileInfo *iteminfo.ExtendedFileInfo, fileOpts utils.FileOptions, d *requestContext, source, requestedPath string, directoryTarget authenticatedReadTarget) ([]authenticatedReadTarget, error) {
+	protectedTargets := make([]authenticatedReadTarget, 0)
+	for i := range fileInfo.Files {
+		child := &fileInfo.Files[i]
+		if !strings.HasPrefix(child.Type, "audio") && !strings.HasPrefix(child.Type, "video") {
+			continue
+		}
+		currentUser, err := currentAuthenticatedReadUser(d.user, d.token)
+		if err != nil || !currentUser.Permissions.Browse || !currentUser.Permissions.Preview {
+			return nil, errors.ErrAccessDenied
+		}
+		currentDirectory, err := resolveAuthenticatedBrowseTarget(currentUser, source, requestedPath)
+		if err != nil || !sameAuthenticatedReadTarget(directoryTarget, currentDirectory) {
+			return nil, errors.ErrAccessDenied
+		}
+		childPath := utils.JoinPathAsUnix(currentDirectory.LogicalPath, child.Name)
+		childTarget, err := resolveAuthenticatedReadIndexTarget(currentUser, source, childPath)
+		if err != nil {
+			continue
+		}
+		snapshotPath, _, cleanup, err := snapshotAuthenticatedReadTarget(childTarget)
+		if err != nil {
+			continue
+		}
+		if _, err = revalidateAuthenticatedResourceRead(d, source, requestedPath, directoryTarget, []authenticatedReadTarget{childTarget}, false, true); err != nil {
+			cleanup()
+			return nil, errors.ErrAccessDenied
+		}
+		childOpts := fileOpts
+		childOpts.Path = childTarget.ScopedPath
+		childOpts.Expand = false
+		childOpts.Content = false
+		childOpts.Metadata = true
+		childOpts.ReadPath = snapshotPath
+		childOpts.SkipExtendedAttrs = false
+		enriched, err := files.FileInfoFaster(childOpts, store.Access, currentUser, store.Share)
+		cleanup()
+		if err != nil {
+			continue
+		}
+		child.Metadata = enriched.Metadata
+		protectedTargets = append(protectedTargets, childTarget)
+		protectedTargets = append(protectedTargets, authenticatedMediaSidecarTargets(enriched, source, childTarget, currentUser)...)
+	}
+	return protectedTargets, nil
+}
+
+func revalidateAuthenticatedResourceRead(d *requestContext, source, requestedPath string, target authenticatedReadTarget, mediaTargets []authenticatedReadTarget, requireDownload, requirePreview bool) (*users.User, error) {
+	currentUser, err := currentAuthenticatedReadUser(d.user, d.token)
+	if err != nil || !currentUser.Permissions.Browse || requireDownload && !currentUser.Permissions.Download || requirePreview && !currentUser.Permissions.Preview {
+		return nil, errors.ErrAccessDenied
+	}
+	currentTarget, err := resolveAuthenticatedBrowseTarget(currentUser, source, requestedPath)
+	if err != nil || !sameAuthenticatedReadTarget(target, currentTarget) {
+		return nil, errors.ErrAccessDenied
+	}
+	for _, mediaTarget := range mediaTargets {
+		currentMediaTarget, err := resolveAuthenticatedReadIndexTarget(currentUser, source, mediaTarget.LogicalPath)
+		if err != nil || !sameAuthenticatedReadTarget(mediaTarget, currentMediaTarget) {
+			return nil, errors.ErrAccessDenied
+		}
+	}
+	return currentUser, nil
 }
 
 // resourceDeleteHandler deletes a resource at a specified path.
@@ -1310,18 +1513,37 @@ func itemsGetHandler(w http.ResponseWriter, r *http.Request, d *requestContext) 
 		return http.StatusBadRequest, fmt.Errorf("invalid resource path: %v", err)
 	}
 
-	items, err := files.GetDirItems(utils.FileOptions{
-		FollowSymlinks: true,
-		Path:           path,
-		Source:         r.URL.Query().Get("source"),
-		ShowHidden:     d.user.ShowHidden,
-		Only:           r.URL.Query().Get("only"),
-	}, store.Access, d.user)
+	source := r.URL.Query().Get("source")
+	readUser, err := currentAuthenticatedReadUser(d.user, d.token)
+	if err != nil || !readUser.Permissions.Browse {
+		return http.StatusForbidden, errors.ErrAccessDenied
+	}
+	target, err := resolveAuthenticatedBrowseTarget(readUser, source, path)
 	if err != nil {
-		if err == errors.ErrAccessDenied {
-			return http.StatusForbidden, err
-		}
-		return http.StatusInternalServerError, err
+		return errToStatus(err), err
+	}
+	items, err := files.GetDirItems(utils.FileOptions{
+		FollowSymlinks: false,
+		Path:           target.ScopedPath,
+		Source:         source,
+		ShowHidden:     readUser.ShowHidden,
+		Only:           r.URL.Query().Get("only"),
+	}, store.Access, readUser)
+	if err != nil {
+		err = normalizeAuthenticatedReadError(err)
+		return errToStatus(err), err
+	}
+	currentUser, err := currentAuthenticatedReadUser(d.user, d.token)
+	if err != nil || !currentUser.Permissions.Browse {
+		return http.StatusForbidden, errors.ErrAccessDenied
+	}
+	currentTarget, err := resolveAuthenticatedBrowseTarget(currentUser, source, path)
+	if err != nil || !sameAuthenticatedReadTarget(target, currentTarget) {
+		return http.StatusForbidden, errors.ErrAccessDenied
+	}
+	items, err = filterAuthenticatedDirectoryItems(currentUser, source, currentTarget, items)
+	if err != nil {
+		return http.StatusForbidden, errors.ErrAccessDenied
 	}
 	return renderJSON(w, r, items)
 }

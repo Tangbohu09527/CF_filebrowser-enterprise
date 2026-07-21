@@ -6,14 +6,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
-	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
-	"github.com/gtsteffaniak/filebrowser/backend/events"
-	"github.com/gtsteffaniak/filebrowser/backend/indexing"
+	commonerrors "github.com/gtsteffaniak/filebrowser/backend/common/errors"
+	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 )
 
 // fileWatchResponse represents the response from file watch
@@ -31,25 +30,44 @@ type fileWatchMetadata struct {
 	Modified time.Time `json:"modified"` // Modification time
 }
 
-// readLastNLines reads the last N lines from a file efficiently
-func readLastNLines(filePath string, n int) (string, error) {
+func isTextFileSample(reader io.ReadSeeker) (bool, error) {
+	const sampleSize = 8192
+	sample := make([]byte, sampleSize)
+	n, err := io.ReadFull(reader, sample)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return false, err
+	}
+	if _, err := reader.Seek(0, io.SeekStart); err != nil {
+		return false, err
+	}
+	sample = sample[:n]
+	if len(sample) == 0 {
+		return true, nil
+	}
+	nullCount := 0
+	for _, b := range sample {
+		if b == 0 {
+			nullCount++
+		}
+	}
+	if float64(nullCount)/float64(len(sample)) > 0.05 {
+		return false, nil
+	}
+	for len(sample) > 0 {
+		lastRune, size := utf8.DecodeLastRune(sample)
+		if lastRune != utf8.RuneError || size != 1 {
+			break
+		}
+		sample = sample[:len(sample)-1]
+	}
+	return len(sample) == 0 || utf8.Valid(sample), nil
+}
+
+// readLastNLines reads the last N lines from an already-authorized file handle.
+func readLastNLines(file io.ReadSeeker, fileSize int64, n int) (string, error) {
 	if n <= 0 {
 		return "", fmt.Errorf("number of lines must be positive")
 	}
-
-	file, err := os.Open(filePath)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-
-	// Get file size
-	stat, err := file.Stat()
-	if err != nil {
-		return "", err
-	}
-
-	fileSize := stat.Size()
 	if fileSize == 0 {
 		return "", nil
 	}
@@ -124,6 +142,12 @@ func readLastNLines(filePath string, n int) (string, error) {
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /api/tools/fileWatcher [get]
 func fileWatchHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+	if d == nil || d.user == nil || !d.user.Permissions.Browse || !d.user.Permissions.Download {
+		return http.StatusForbidden, fmt.Errorf("browse and download permissions are required for file watching")
+	}
+	if _, err := currentFileWatchUser(d, false); err != nil {
+		return http.StatusForbidden, err
+	}
 	// Check for latency check request - return immediately with minimal response
 	if r.URL.Query().Get("latencyCheck") != "" {
 		return http.StatusOK, nil
@@ -137,7 +161,7 @@ func fileWatchHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 		return http.StatusBadRequest, fmt.Errorf("path and source are required")
 	}
 	var err error
-	path, err = utils.SanitizeUserPath(path)
+	path, err = sanitizeAuthenticatedReadPath(path)
 	if err != nil {
 		return http.StatusBadRequest, err
 	}
@@ -156,78 +180,11 @@ func fileWatchHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 		lines = parsedLines
 	}
 
-	// Validate user has access to the source
-	userScope, err := d.user.GetScopeForSourceName(source)
+	isText, contents, metadata, err := readCurrentFileWatchTarget(d, source, path, lines, false)
 	if err != nil {
-		return http.StatusForbidden, err
+		return errToStatus(err), err
 	}
-
-	// Check download permission (required to read file content)
-	if !d.user.Permissions.Download {
-		return http.StatusForbidden, fmt.Errorf("user is not allowed to read file content")
-	}
-
-	// Resolve the full path
-	scopePath := utils.JoinPathAsUnix(userScope, path)
-
-	// Get the index for the source
-	idx := indexing.GetIndex(source)
-	if idx == nil {
-		return http.StatusNotFound, fmt.Errorf("source %s is not available", source)
-	}
-
-	// Check access control
-	if store.Access != nil {
-		if !store.Access.Permitted(idx.Path, scopePath, d.user.Username) {
-			return http.StatusForbidden, fmt.Errorf("access denied to file")
-		}
-	}
-
-	// Get real file path
-	realPath, _, err := idx.GetRealPath(scopePath)
-	if err != nil {
-		return http.StatusNotFound, fmt.Errorf("file not found: %v", err)
-	}
-
-	// Get file/directory info
-	info, err := os.Stat(realPath)
-	if err != nil {
-		return http.StatusNotFound, fmt.Errorf("path not found: %v", err)
-	}
-
-	// Get MIME type from the index if available
-	mimeType := "application/octet-stream"
-	reducedInfo, exists := idx.GetReducedMetadata(scopePath, false)
-	if exists && reducedInfo.Type != "" {
-		mimeType = reducedInfo.Type
-	}
-
-	response := fileWatchResponse{}
-	// Handle directory - just return metadata, no content
-	response.IsText = false
-	response.Metadata = &fileWatchMetadata{
-		Name:     info.Name(),
-		Size:     0, // Directories don't have a meaningful size
-		Type:     mimeType,
-		Modified: info.ModTime(),
-	}
-	if !info.IsDir() {
-		// Handle regular file
-		// Check if file is a text file
-		isText, err := utils.IsTextFile(realPath)
-		if err != nil {
-			return http.StatusInternalServerError, fmt.Errorf("error checking file type: %v", err)
-		}
-		if isText {
-			response.IsText = true
-			// Read the last N lines for text files only
-			content, err := readLastNLines(realPath, lines)
-			if err != nil {
-				return http.StatusInternalServerError, fmt.Errorf("error reading file: %v", err)
-			}
-			response.Contents = content
-		}
-	}
+	response := fileWatchResponse{IsText: isText, Contents: contents, Metadata: metadata}
 
 	w.Header().Set("Content-Type", "application/json")
 	return http.StatusOK, json.NewEncoder(w).Encode(response)
@@ -254,13 +211,11 @@ type fileWatchSSEEvent struct {
 // @Failure 404 {object} map[string]string "File not found"
 // @Router /api/tools/fileWatcher/sse [get]
 func fileWatchSSEHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
-	// Check realtime permissions
-	if !(d.user.Permissions.Realtime) {
-		return http.StatusForbidden, fmt.Errorf("realtime permission required for SSE file watching")
+	if d == nil || d.user == nil || !d.user.Permissions.Browse || !d.user.Permissions.Download {
+		return http.StatusForbidden, fmt.Errorf("browse and download permissions are required for file watching")
 	}
-
-	if !d.user.Permissions.Download {
-		return http.StatusForbidden, fmt.Errorf("user is not allowed to read file content")
+	if !d.user.Permissions.Realtime {
+		return http.StatusForbidden, fmt.Errorf("realtime permission required for SSE file watching")
 	}
 
 	path := r.URL.Query().Get("path")
@@ -273,8 +228,7 @@ func fileWatchSSEHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 		return http.StatusBadRequest, fmt.Errorf("path and source are required")
 	}
 
-	// Rule 1: Validate user-provided path to prevent path traversal
-	cleanPath, err := utils.SanitizeUserPath(path)
+	cleanPath, err := sanitizeAuthenticatedReadPath(path)
 	if err != nil {
 		return http.StatusBadRequest, err
 	}
@@ -309,37 +263,9 @@ func fileWatchSSEHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 		interval = time.Duration(parsedInterval) * time.Second
 	}
 
-	// Validate user has access to the source
-	userScope, err := d.user.GetScopeForSourceName(source)
+	_, err = authorizeCurrentFileWatchTarget(d, source, path, true)
 	if err != nil {
-		return http.StatusForbidden, err
-	}
-	// Resolve the full path
-	scopePath := utils.JoinPathAsUnix(userScope, path)
-
-	// Get the index for the source
-	idx := indexing.GetIndex(source)
-	if idx == nil {
-		return http.StatusNotFound, fmt.Errorf("source %s is not available", source)
-	}
-
-	// Check access control
-	if store.Access != nil {
-		if !store.Access.Permitted(idx.Path, scopePath, d.user.Username) {
-			return http.StatusForbidden, fmt.Errorf("access denied to file")
-		}
-	}
-
-	// Get real file path
-	realPath, _, err := idx.GetRealPath(scopePath)
-	if err != nil {
-		return http.StatusNotFound, fmt.Errorf("path not found: %v", err)
-	}
-
-	// Get file/directory info
-	info, err := os.Stat(realPath)
-	if err != nil {
-		return http.StatusNotFound, fmt.Errorf("path not found: %v", err)
+		return errToStatus(err), err
 	}
 
 	// Set up SSE headers
@@ -355,46 +281,19 @@ func fileWatchSSEHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 
 	msgr := messenger{flusher: flusher, writer: w}
 	clientGone := r.Context().Done()
-	username := d.user.Username
 
 	// Initial ack
 	statusMsg, _ := json.Marshal(map[string]interface{}{"status": "connected"})
+	setFileWatchWriteDeadline(msgr)
 	if err := msgr.sendEvent("fileWatch", string(statusMsg)); err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("error sending initial message: %v", err)
 	}
 
-	// Register this client with the events system (like general SSE handler)
-	sendChan := events.Register(username, []string{source})
-	defer events.Unregister(username, sendChan)
-
-	// Get MIME type (we'll reuse this)
-	mimeType := "application/octet-stream"
-	reducedInfo, exists := idx.GetReducedMetadata(scopePath, false)
-	if exists && reducedInfo.Type != "" {
-		mimeType = reducedInfo.Type
+	if err := sendFileWatchTarget(msgr, d, source, path, lines); err != nil {
+		return http.StatusOK, nil
 	}
-
-	// Determine if this is a directory
-	isDir := info.IsDir()
-
-	// Start background goroutine to periodically send file updates via events system
-	stopTicker := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-
-		// Send initial update
-		sendFileWatchUpdate(username, realPath, path, source, lines, mimeType, isDir)
-
-		for {
-			select {
-			case <-stopTicker:
-				return
-			case <-ticker.C:
-				sendFileWatchUpdate(username, realPath, path, source, lines, mimeType, isDir)
-			}
-		}
-	}()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
 	// Main loop: listen for events from events system (like general SSE handler)
 	// Use server context if available, otherwise use request context
@@ -406,90 +305,122 @@ func fileWatchSSEHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 	for {
 		select {
 		case <-serverCtx.Done():
-			close(stopTicker)
-			_ = msgr.sendEvent("fileWatch", "\"server shutting down\"")
 			return http.StatusOK, nil
 
 		case <-clientGone:
-			close(stopTicker)
 			return http.StatusOK, nil
 
-		case msg, ok := <-sendChan:
-			if !ok {
-				close(stopTicker)
+		case <-ticker.C:
+			if sendErr := sendFileWatchTarget(msgr, d, source, path, lines); sendErr != nil {
 				return http.StatusOK, nil
-			}
-			// Only process fileWatch events for this connection
-			if msg.EventType == "fileWatch" {
-				if err := msgr.sendEvent(msg.EventType, msg.Message); err != nil {
-					close(stopTicker)
-					return http.StatusInternalServerError, fmt.Errorf("error sending event: %v", err)
-				}
 			}
 		}
 	}
 }
 
-// sendFileWatchUpdate reads the file/directory and sends an update via the events system
-func sendFileWatchUpdate(username, realPath, path, source string, lines int, mimeType string, isDir bool) {
-	// Re-check path (in case it was deleted or changed)
-	info, err := os.Stat(realPath)
+func currentFileWatchUser(d *requestContext, requireRealtime bool) (*users.User, error) {
+	if d == nil || d.user == nil {
+		return nil, commonerrors.ErrAccessDenied
+	}
+	current, err := currentAuthenticatedReadUser(d.user, d.token)
 	if err != nil {
-		// Path no longer exists
-		errorMsg, _ := json.Marshal(map[string]interface{}{"status": "error", "error": "path not found"})
-		events.SendToUsers("fileWatch", string(errorMsg), []string{username})
+		return nil, err
+	}
+	if !current.Permissions.Browse || !current.Permissions.Download || (requireRealtime && !current.Permissions.Realtime) {
+		return nil, commonerrors.ErrAccessDenied
+	}
+	return current, nil
+}
+
+func authorizeCurrentFileWatchTarget(d *requestContext, source, path string, requireRealtime bool) (authenticatedReadTarget, error) {
+	current, err := currentFileWatchUser(d, requireRealtime)
+	if err != nil {
+		return authenticatedReadTarget{}, err
+	}
+	return resolveAuthenticatedReadTarget(current, source, path)
+}
+
+func setFileWatchWriteDeadline(msgr messenger) {
+	responseWriter, ok := msgr.writer.(http.ResponseWriter)
+	if !ok {
 		return
 	}
+	_ = http.NewResponseController(responseWriter).SetWriteDeadline(time.Now().Add(15 * time.Second))
+}
 
-	// Build the SSE event
-	sseEvent := fileWatchSSEEvent{}
-
-	if isDir {
-		// Handle directory - just return metadata, no content
-		sseEvent.IsText = false
-		sseEvent.Metadata = &fileWatchMetadata{
-			Name:     info.Name(),
-			Size:     0, // Directories don't have a meaningful size
+func readFileWatchTarget(target authenticatedReadTarget, lines int) (bool, string, *fileWatchMetadata, error) {
+	info := target.Info
+	mimeType := "application/octet-stream"
+	if reducedInfo, exists := target.Index.GetReducedMetadata(target.CanonicalPath, false); exists && reducedInfo.Type != "" {
+		mimeType = reducedInfo.Type
+	}
+	if info.IsDir() {
+		return false, "", &fileWatchMetadata{
+			Name:     authenticatedReadTargetName(target, info.Name()),
+			Size:     0,
 			Type:     "directory",
 			Modified: info.ModTime(),
-		}
-	} else {
-		// Handle regular file
-		// Check if file is a text file
-		var isText bool
-		isText, err = utils.IsTextFile(realPath)
-		if err != nil {
-			// Error checking file, skip this update
-			return
-		}
-
-		sseEvent.IsText = isText
-		sseEvent.Metadata = &fileWatchMetadata{
-			Name:     info.Name(),
-			Size:     info.Size(),
-			Type:     mimeType,
-			Modified: info.ModTime(),
-		}
-
-		if isText {
-			// Read the last N lines for text files only
-			var content string
-			content, err = readLastNLines(realPath, lines)
-			if err != nil {
-				// Error reading, skip this update
-				return
-			}
-			sseEvent.Contents = content
-		}
-		// For non-text files, Contents stays empty - frontend displays metadata
+		}, nil
 	}
+	file, opened, err := openAuthenticatedReadTarget(target)
+	if err != nil {
+		return false, "", nil, err
+	}
+	defer file.Close()
+	isText, err := isTextFileSample(file)
+	if err != nil {
+		return false, "", nil, err
+	}
+	metadata := &fileWatchMetadata{
+		Name:     authenticatedReadTargetName(target, opened.Name()),
+		Size:     opened.Size(),
+		Type:     mimeType,
+		Modified: opened.ModTime(),
+	}
+	if !isText {
+		return false, "", metadata, nil
+	}
+	contents, err := readLastNLines(file, opened.Size(), lines)
+	if err != nil {
+		return false, "", nil, err
+	}
+	return true, contents, metadata, nil
+}
 
-	// Serialize and send via events system
+func readCurrentFileWatchTarget(d *requestContext, source, path string, lines int, requireRealtime bool) (bool, string, *fileWatchMetadata, error) {
+	target, err := authorizeCurrentFileWatchTarget(d, source, path, requireRealtime)
+	if err != nil {
+		return false, "", nil, err
+	}
+	isText, contents, metadata, err := readFileWatchTarget(target, lines)
+	if err != nil {
+		return false, "", nil, err
+	}
+	currentTarget, err := authorizeCurrentFileWatchTarget(d, source, path, requireRealtime)
+	if err != nil || !sameAuthenticatedReadTarget(target, currentTarget) {
+		return false, "", nil, commonerrors.ErrAccessDenied
+	}
+	return isText, contents, metadata, nil
+}
+
+func sendFileWatchTarget(msgr messenger, d *requestContext, source, path string, lines int) error {
+	isText, contents, metadata, err := readCurrentFileWatchTarget(d, source, path, lines, true)
+	if err != nil {
+		return err
+	}
+	sseEvent := fileWatchSSEEvent{IsText: isText, Contents: contents, Metadata: metadata}
+
+	// Serialize and send only to this request's SSE stream.
 	eventJSON, err := json.Marshal(sseEvent)
 	if err != nil {
-		return
+		return err
 	}
-
-	// Send via events system to this user (like OnlyOffice does)
-	events.SendToUsers("fileWatch", string(eventJSON), []string{username})
+	setFileWatchWriteDeadline(msgr)
+	if err := msgr.sendEvent("fileWatch", string(eventJSON)); err != nil {
+		return fmt.Errorf("error sending event: %v", err)
+	}
+	if _, err := authorizeCurrentFileWatchTarget(d, source, path, true); err != nil {
+		return err
+	}
+	return nil
 }

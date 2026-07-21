@@ -1,6 +1,7 @@
 package http
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	commonerrors "github.com/gtsteffaniak/filebrowser/backend/common/errors"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing/iteminfo"
@@ -24,6 +26,8 @@ type searchOptions struct {
 	olderThanUnix int64 // optional; 0 = unset. Modified time must be strictly before this Unix second.
 	newerThanUnix int64 // optional; 0 = unset. Modified time must be >= this Unix second.
 }
+
+var authenticatedSearchAfterQueryHook func()
 
 // scopedSourcePath is one repeated "scope" query value using "sourceName:relativePath"
 // (split on the first ':'). Path is relative within the user's scope for that source; an
@@ -114,12 +118,21 @@ type scopedSourcePath struct {
 // @Failure 400 {object} map[string]string "Bad Request"
 // @Router /api/tools/search [get]
 func searchHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
-	if !d.user.Permissions.Browse {
+	if d == nil || d.user == nil || !d.user.Permissions.Browse {
 		return http.StatusForbidden, fmt.Errorf("user is not allowed to browse resources")
 	}
+	currentUser, err := currentAuthenticatedReadUser(d.user, d.token)
+	if err != nil || !currentUser.Permissions.Browse {
+		return http.StatusForbidden, commonerrors.ErrAccessDenied
+	}
+	freshContext := *d
+	freshContext.user = currentUser
 
-	searchOptions, err := prepSearchOptions(r, d)
+	searchOptions, err := prepSearchOptions(r, &freshContext)
 	if err != nil {
+		if errors.Is(err, commonerrors.ErrAccessDenied) {
+			return http.StatusForbidden, commonerrors.ErrAccessDenied
+		}
 		return http.StatusBadRequest, err
 	}
 
@@ -141,14 +154,29 @@ func searchHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 		// Multiple sources - use the new SearchMultiSources function
 		response = indexing.SearchMultiSourcesParsed(searchOptions.parsed, searchOptions.sources, searchOptions.combinedPath, searchOptions.sessionId, searchOptions.largest, searchSize, searchOptions.olderThanUnix, searchOptions.newerThanUnix, searchOptions.useWildcard)
 	}
+	if authenticatedSearchAfterQueryHook != nil {
+		authenticatedSearchAfterQueryHook()
+	}
+	responseUser, err := currentAuthenticatedReadUser(d.user, d.token)
+	if err != nil || !responseUser.Permissions.Browse {
+		return http.StatusForbidden, commonerrors.ErrAccessDenied
+	}
+	responseContext := *d
+	responseContext.user = responseUser
+	responseOptions, err := prepSearchOptions(r, &responseContext)
+	if err != nil || !sameAuthenticatedSearchScope(searchOptions, responseOptions) {
+		return http.StatusForbidden, commonerrors.ErrAccessDenied
+	}
 
 	// Filter out items that are not permitted according to access rules and trim user scope from paths
 	filteredResponse := make([]*indexing.SearchResult, 0, len(response))
 	for _, result := range response {
-		index := indexing.GetIndex(result.Source)
 		combinedPath := searchOptions.combinedPath[result.Source]
-		indexPath := utils.JoinPathAsUnix(combinedPath, result.Path)
-		if store.Access != nil && !store.Access.Permitted(index.Path, indexPath, d.user.Username) {
+		indexPath := normalizePublicShareIndexPath(result.Path)
+		if !publicSharePathWithin(combinedPath, indexPath) {
+			continue
+		}
+		if _, err := resolveAuthenticatedReadIndexTarget(responseUser, result.Source, indexPath); err != nil {
 			continue // Silently skip this file/folder
 		}
 		// Remove the user scope from the path (modifying in place is safe - these are fresh allocations)
@@ -158,7 +186,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 		}
 		filteredResponse = append(filteredResponse, result)
 		// This is to filter the ext-hidden files from search results, like the ones with the hidden property
-		if d.user.HideFileExt != "" {
+		if responseUser.HideFileExt != "" {
 			filtered := filteredResponse[:0]
 			for _, res := range filteredResponse {
 				if res.Type == "directory" {
@@ -166,7 +194,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 					continue
 				}
 				baseName := filepath.Base(res.Path)
-				if !utils.HideFileByExt(baseName, d.user.HideFileExt) {
+				if !utils.HideFileByExt(baseName, responseUser.HideFileExt) {
 					filtered = append(filtered, res)
 				}
 			}
@@ -174,6 +202,18 @@ func searchHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 		}
 	}
 	return renderJSON(w, r, filteredResponse)
+}
+
+func sameAuthenticatedSearchScope(original, current *searchOptions) bool {
+	if original == nil || current == nil || len(original.sources) != len(current.sources) || len(original.combinedPath) != len(current.combinedPath) {
+		return false
+	}
+	for i, source := range original.sources {
+		if current.sources[i] != source || current.combinedPath[source] != original.combinedPath[source] {
+			return false
+		}
+	}
+	return true
 }
 
 // parseRepeatedScopeParams interprets repeated "scope" query values.
@@ -291,11 +331,7 @@ func prepSearchOptions(r *http.Request, d *requestContext) (*searchOptions, erro
 			pathBySource[c.source] = c.relPath
 		}
 		for _, source := range sources {
-			index := indexing.GetIndex(source)
-			if index == nil {
-				return nil, fmt.Errorf("index not found for source %s", source)
-			}
-			userscope, err := d.user.GetScopeForSourceName(source)
+			index, userscope, err := authenticatedReadScope(d.user, source)
 			if err != nil {
 				return nil, err
 			}
@@ -314,13 +350,6 @@ func prepSearchOptions(r *http.Request, d *requestContext) (*searchOptions, erro
 			sources[i] = strings.TrimSpace(sources[i])
 		}
 
-		for _, source := range sources {
-			index := indexing.GetIndex(source)
-			if index == nil {
-				return nil, fmt.Errorf("index not found for source %s", source)
-			}
-		}
-
 		scope := legacyScopeOnly
 		if scope == "" {
 			scope = "/"
@@ -336,13 +365,20 @@ func prepSearchOptions(r *http.Request, d *requestContext) (*searchOptions, erro
 		}
 
 		for _, source := range sources {
-			index := indexing.GetIndex(source)
-			userscope, err := d.user.GetScopeForSourceName(source)
+			index, userscope, err := authenticatedReadScope(d.user, source)
 			if err != nil {
 				return nil, err
 			}
 			combinedPath := index.MakeIndexPath(filepath.Join(userscope, searchScopeOut), true)
 			combinedPathMap[source] = combinedPath
+		}
+	}
+	for _, source := range sources {
+		idx := indexing.GetIndex(source)
+		if idx == nil || store.Access == nil ||
+			(!store.Access.PermittedFresh(idx.Path, combinedPathMap[source], d.user.Username) &&
+				!store.Access.HasPermittedDescendantFresh(idx.Path, combinedPathMap[source], d.user.Username)) {
+			return nil, commonerrors.ErrAccessDenied
 		}
 	}
 

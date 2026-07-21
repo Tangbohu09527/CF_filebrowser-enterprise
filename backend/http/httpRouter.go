@@ -130,6 +130,7 @@ func StartHttp(ctx context.Context, storage *bolt.BoltStore, shutdownComplete ch
 	api.HandleFunc("POST /resources/unarchive", withUser(unarchiveHandler))
 	api.HandleFunc("GET /resources/download", withUser(downloadHandler))
 	api.HandleFunc("GET /resources/preview", withTimeout(30*time.Second, withUserHelper(previewHandler)))
+	api.HandleFunc("GET /resources/preview-source/{ticket}", authenticatedPreviewSnapshotHandler)
 	api.HandleFunc("POST /resources/pause", withUser(resourcePauseHandler))
 	publicApi.HandleFunc("GET /resources", withHashFile(publicGetResourceHandler))
 	publicApi.HandleFunc("GET /resources/items", withHashFile(publicItemsGetHandler))

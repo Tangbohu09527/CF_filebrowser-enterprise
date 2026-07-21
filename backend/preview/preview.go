@@ -198,6 +198,36 @@ func GetSafePreviewForFile(ctx context.Context, file iteminfo.ExtendedFileInfo, 
 	return getPreviewForFile(ctx, file, previewSize, url, seekPercentage, true)
 }
 
+// UsesOnlyOfficePreview reports whether this file would be sent to the
+// OnlyOffice converter after higher-priority document conversion checks.
+func UsesOnlyOfficePreview(file iteminfo.ExtendedFileInfo) bool {
+	return determinePreviewType(file) == previewTypeOffice
+}
+
+func loadValidatedSafePreview(ctx context.Context, cacheKey, previewSize string) ([]byte, bool, error) {
+	data, found, err := service.fileCache.Load(ctx, cacheKey)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to load from cache: %w", err)
+	}
+	if !found {
+		return nil, false, nil
+	}
+	if isSafeDerivedPreview(data, previewSize) {
+		return data, true, nil
+	}
+	if err := service.fileCache.Delete(ctx, cacheKey); err != nil {
+		logger.Debugf("failed to discard invalid safe preview cache entry: %v", err)
+	}
+	return nil, false, nil
+}
+
+func previewSourcePath(file iteminfo.ExtendedFileInfo) string {
+	if file.PreviewSourcePath != "" {
+		return file.PreviewSourcePath
+	}
+	return file.RealPath
+}
+
 func getPreviewForFile(ctx context.Context, file iteminfo.ExtendedFileInfo, previewSize, url string, seekPercentage int, safeDerived bool) ([]byte, error) {
 	if !file.HasPreview {
 		return nil, ErrUnsupportedMedia
@@ -236,17 +266,16 @@ func getPreviewForFile(ctx context.Context, file iteminfo.ExtendedFileInfo, prev
 		}
 	}
 	if cacheEnabled {
-		if data, found, err := service.fileCache.Load(ctx, cacheKey); err != nil {
-			return nil, fmt.Errorf("failed to load from cache: %w", err)
-		} else if found {
-			if safeDerived && isSafeDerivedPreview(data, previewSize) {
+		if safeDerived {
+			if data, found, err := loadValidatedSafePreview(ctx, cacheKey, previewSize); err != nil {
+				return nil, err
+			} else if found {
 				return data, nil
 			}
-			if safeDerived {
-				if err := service.fileCache.Delete(ctx, cacheKey); err != nil {
-					logger.Debugf("failed to discard invalid safe preview cache entry: %v", err)
-				}
-			} else {
+		} else {
+			if data, found, err := service.fileCache.Load(ctx, cacheKey); err != nil {
+				return nil, fmt.Errorf("failed to load from cache: %w", err)
+			} else if found {
 				if len(data) < minPreviewSize {
 					return nil, ErrPreviewTooSmall
 				}
@@ -498,6 +527,9 @@ func generatePreviewWithMD5(ctx context.Context, file iteminfo.ExtendedFileInfo,
 		return nil, errors.New(message)
 	}
 
+	sourceFile := file
+	sourceFile.RealPath = previewSourcePath(file)
+
 	// Generate hash for temp file paths
 	hasher := md5.New()
 	_, _ = hasher.Write([]byte(cacheKey))
@@ -506,12 +538,12 @@ func generatePreviewWithMD5(ctx context.Context, file iteminfo.ExtendedFileInfo,
 	// If this file type might have an embedded preview, try exiftool first before any type-specific path.
 	var imageBytes []byte
 	fromExiftool := false
-	if hasEmbeddedPreview(file.Type, file.Name) {
-		if exifBytes, _ := ExtractEmbeddedPreview(ctx, file.RealPath, file.Type); len(exifBytes) >= minPreviewSize {
+	if hasEmbeddedPreview(sourceFile.Type, sourceFile.Name) {
+		if exifBytes, _ := ExtractEmbeddedPreview(ctx, sourceFile.RealPath, sourceFile.Type); len(exifBytes) >= minPreviewSize {
 			imageBytes = exifBytes
 			fromExiftool = true
 			// Apply EXIF orientation from source file using exiftool + imaging (no FFmpeg).
-			if orient := GetOrientation(ctx, file.RealPath); orient != "" {
+			if orient := GetOrientation(ctx, sourceFile.RealPath); orient != "" {
 				if corrected := applyOrientationToPreviewBytes(imageBytes, orient); len(corrected) >= minPreviewSize {
 					imageBytes = corrected
 				}
@@ -521,7 +553,7 @@ func generatePreviewWithMD5(ctx context.Context, file iteminfo.ExtendedFileInfo,
 
 	if !fromExiftool {
 		var err error
-		imageBytes, err = service.generateRawPreview(ctx, file, previewSize, officeUrl, seekPercentage, hash, safeDerived)
+		imageBytes, err = service.generateRawPreview(ctx, sourceFile, previewSize, officeUrl, seekPercentage, hash, safeDerived)
 		if err != nil {
 			return nil, err
 		}
@@ -538,7 +570,7 @@ func generatePreviewWithMD5(ctx context.Context, file iteminfo.ExtendedFileInfo,
 
 	// When we got bytes from exiftool, we still need to resize to small/large/xlarge (original is never converted).
 	// When we got bytes from type-specific path, HEIC/Image are already resized; others need resize below.
-	previewType := determinePreviewType(file)
+	previewType := determinePreviewType(sourceFile)
 	if !safeDerived && !fromExiftool && previewType == previewTypeHEIC {
 		if err := service.fileCache.Store(ctx, cacheKey, imageBytes); err != nil {
 			logger.Errorf("failed to cache HEIC image: %v", err)
@@ -579,7 +611,7 @@ func generatePreviewWithMD5(ctx context.Context, file iteminfo.ExtendedFileInfo,
 			}
 			// For JPEG files, try FFmpeg fallback if resize failed
 			if strings.HasPrefix(file.Type, "image/jpeg") {
-				fallbackBytes, fallbackErr := handleJPEGFallback(ctx, service, file, previewSize, err)
+				fallbackBytes, fallbackErr := handleJPEGFallback(ctx, service, sourceFile, previewSize, err)
 				if fallbackErr != nil {
 					return nil, fallbackErr
 				}
@@ -772,7 +804,7 @@ func safePreviewContentVersion(file iteminfo.ExtendedFileInfo) (string, error) {
 		return "album-art-sha256:" + hex.EncodeToString(digest[:]), nil
 	}
 
-	source, err := os.Open(file.RealPath)
+	source, err := os.Open(previewSourcePath(file))
 	if err != nil {
 		return "", fmt.Errorf("open safe preview source for content version: %w", err)
 	}
