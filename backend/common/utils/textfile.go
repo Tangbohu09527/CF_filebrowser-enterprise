@@ -11,16 +11,21 @@ import (
 // - Valid UTF-8 encoding
 // - Not full of null bytes (which indicate binary data)
 func IsTextFile(realPath string) (bool, error) {
-	const sampleSize = 8192       // Read first 8KB to check
-	const maxNullByteRatio = 0.05 // Reject if more than 5% null bytes
-	// Read sample from file
 	content, err := os.ReadFile(realPath)
 	if err != nil {
 		return false, err
 	}
+	return IsTextContent(content), nil
+}
+
+// IsTextContent applies the same text heuristics as IsTextFile to bytes already
+// read from an authorized file descriptor.
+func IsTextContent(content []byte) bool {
+	const sampleSize = 8192
+	const maxNullByteRatio = 0.05
 	// Empty files are considered text
 	if len(content) == 0 {
-		return true, nil
+		return true
 	}
 	// Use sample for large files to avoid reading entire file into memory
 	sample := content
@@ -38,7 +43,7 @@ func IsTextFile(realPath string) (bool, error) {
 	if nullCount > 0 {
 		nullRatio := float64(nullCount) / float64(len(sample))
 		if nullRatio > maxNullByteRatio {
-			return false, nil
+			return false
 		}
 	}
 
@@ -58,8 +63,8 @@ func IsTextFile(realPath string) (bool, error) {
 	}
 
 	if len(trimmedSample) > 0 && !utf8.Valid(trimmedSample) {
-		return false, nil
+		return false
 	}
 
-	return true, nil
+	return true
 }

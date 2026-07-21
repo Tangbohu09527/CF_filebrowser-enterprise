@@ -543,7 +543,7 @@ func TestPermissionPreviewSecurity(t *testing.T) {
 		t.Run("OnlyOffice", func(t *testing.T) {
 			previousOnlyOffice := config.Integrations.OnlyOffice
 			config.Integrations.OnlyOffice.Url = "http://onlyoffice.test"
-			config.Integrations.OnlyOffice.Secret = ""
+			config.Integrations.OnlyOffice.Secret = "preview-security-onlyoffice-secret"
 			defer func() { config.Integrations.OnlyOffice = previousOnlyOffice }()
 
 			officeFile := fixture.files["Office"]
@@ -582,14 +582,28 @@ func TestPermissionPreviewSecurity(t *testing.T) {
 			}
 
 			t.Run("public share is not subject to user permission gate", func(t *testing.T) {
-				publicFileInfo := fixture.fileInfo(t, fixture.user(t, true, true, true), officeFile)
+				shareOwner := fixture.user(t, true, true, true)
+				shareOwner.ID = 1
+				shareOwner.Permissions.Share = true
+				publicFileInfo := fixture.fileInfo(t, shareOwner, officeFile)
 				publicFileInfo.Hash = "preview-security-public-share"
 				publicLink := &share.Link{
 					CommonShare: share.CommonShare{
-						Source: fixture.sourcePath,
-						Path:   "/public/",
+						Source:           fixture.sourcePath,
+						Path:             "/public/",
+						EnableOnlyOffice: true,
 					},
-					Hash: publicFileInfo.Hash,
+					Hash:                publicFileInfo.Hash,
+					UserID:              shareOwner.ID,
+					CapabilityVersion:   share.CurrentCapabilityVersion,
+					CreatorCapabilities: share.CapabilitiesFromPermissions(shareOwner.Permissions),
+				}
+				publicTarget := publicShareTarget{
+					RequestedPath: officeFile.indexPath,
+					LogicalPath:   officeFile.indexPath,
+					CanonicalPath: officeFile.indexPath,
+					ScopedPath:    officeFile.indexPath,
+					RealPath:      officeFile.realPath,
 				}
 				query := url.Values{
 					"hash": {publicLink.Hash},
@@ -598,10 +612,14 @@ func TestPermissionPreviewSecurity(t *testing.T) {
 				req := httptest.NewRequest(http.MethodGet, "/public/api/office/config?"+query.Encode(), nil)
 				recorder := httptest.NewRecorder()
 				status, err := onlyofficeClientConfigGetHandler(recorder, req, &requestContext{
-					user:     fixture.user(t, false, false, false),
-					share:    publicLink,
-					fileInfo: publicFileInfo,
-					token:    "preview-security-share-token",
+					user:         fixture.user(t, false, false, false),
+					shareUser:    shareOwner,
+					shareAccess:  calculatePublicShareAccess(publicLink, shareOwner),
+					shareScope:   "/",
+					shareTargets: []publicShareTarget{publicTarget},
+					share:        publicLink,
+					fileInfo:     publicFileInfo,
+					token:        "preview-security-share-token",
 				})
 				response := responseFromRecorder(recorder, status, err)
 				if response.status != http.StatusOK || response.err != nil || len(response.body) == 0 {

@@ -16,6 +16,7 @@ import (
 	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
 	dbshare "github.com/gtsteffaniak/filebrowser/backend/database/share"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
+	"github.com/gtsteffaniak/filebrowser/backend/indexing"
 )
 
 func TestPermissionShareLifecycleHardening(t *testing.T) {
@@ -149,6 +150,31 @@ func TestPermissionShareLifecycleHardening(t *testing.T) {
 		}
 	})
 
+	t.Run("narrow token cannot rebind a wider share", func(t *testing.T) {
+		owner := h.newOwner(t, "share-path-token-owner", users.Permissions{
+			Api: true, Share: true, Browse: true, Preview: true, Download: true,
+		})
+		if err := os.MkdirAll(filepath.Join(sourcePath, "public", "rebind-target"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		link := h.saveShare(t, owner, "share-path-token-rebind", "/public", nil)
+		narrow := issueShareSecurityToken(t, owner, "share-path-narrow-token", users.Permissions{Api: true, Share: true})
+		payload := []byte(`{"hash":"share-path-token-rebind","path":"/public/rebind-target"}`)
+		request := httptest.NewRequest(http.MethodPatch, "/api/share", bytes.NewReader(payload))
+		request.Header.Set("Authorization", "Bearer "+narrow)
+		status, err := withUserHelper(sharePatchHandler)(httptest.NewRecorder(), request, &requestContext{})
+		if status != http.StatusForbidden || err == nil {
+			t.Fatalf("narrow token path rebind: status=%d err=%v", status, err)
+		}
+		stored, loadErr := store.Share.GetByHash(link.Hash)
+		if loadErr != nil {
+			t.Fatal(loadErr)
+		}
+		if normalizePublicShareIndexPath(stored.Path) != "/public" {
+			t.Fatalf("narrow token changed share path to %q", stored.Path)
+		}
+	})
+
 	t.Run("share info exposes final capabilities", func(t *testing.T) {
 		owner := h.newOwner(t, "share-info-cap-owner", users.Permissions{
 			Share: true, Browse: true, Preview: true, Download: true,
@@ -171,6 +197,153 @@ func TestPermissionShareLifecycleHardening(t *testing.T) {
 			if got, exists := capabilities[name].(bool); !exists || got != expected {
 				t.Errorf("capability %s: got %v, want %v", name, capabilities[name], expected)
 			}
+		}
+	})
+
+	t.Run("share info enforces audience policy after token revocation", func(t *testing.T) {
+		owner := h.newOwner(t, "share-info-audience-owner", users.Permissions{
+			Api: true, Share: true, Browse: true,
+		})
+		link := h.saveShare(t, owner, "share-info-audience", "/public", func(common *dbshare.CommonShare) {
+			common.DisableAnonymous = true
+			common.AllowedUsernames = []string{owner.Username}
+		})
+		token := issueShareSecurityToken(t, owner, "share-info-audience-token", users.Permissions{
+			Api: true, Share: true, Browse: true,
+		})
+		query := url.Values{"hash": {link.Hash}}
+		allowed := h.request(http.MethodGet, "/public/api/share/info", query, nil, map[string]string{
+			"Authorization": "Bearer " + token,
+		})
+		requirePermissionShareStatus(t, "allowed share info audience", allowed, http.StatusOK)
+
+		if err := store.Access.RevokeToken(token); err != nil {
+			t.Fatalf("revoke info token: %v", err)
+		}
+		revoked := h.request(http.MethodGet, "/public/api/share/info", query, nil, map[string]string{
+			"Authorization": "Bearer " + token,
+		})
+		assertPermissionShareStatus(t, "revoked share info audience", revoked, http.StatusForbidden)
+		anonymous := h.request(http.MethodGet, "/public/api/share/info", query, nil, nil)
+		assertPermissionShareStatus(t, "anonymous share info audience", anonymous, http.StatusForbidden)
+	})
+
+	t.Run("future share capability version fails closed", func(t *testing.T) {
+		owner := h.newOwner(t, "share-future-version-owner", users.Permissions{
+			Share: true, Browse: true, Preview: true, Download: true,
+		})
+		link := h.saveShare(t, owner, "share-future-version", "/public", nil)
+		link.CapabilityVersion = dbshare.CurrentCapabilityVersion + 1
+		if err := store.Share.Save(link); err != nil {
+			t.Fatalf("save future-version share: %v", err)
+		}
+		payload, err := json.Marshal(dbshare.CreateBody{
+			Hash: link.Hash,
+			CommonShare: dbshare.CommonShare{
+				ShareType: "normal",
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		status, updateErr := sharePostHandler(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/share", bytes.NewReader(payload)), &requestContext{user: owner})
+		if status != http.StatusForbidden || updateErr == nil {
+			t.Fatalf("future-version update: status=%d err=%v", status, updateErr)
+		}
+		stored, err := store.Share.GetByHash(link.Hash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.CapabilityVersion != dbshare.CurrentCapabilityVersion+1 {
+			t.Fatalf("future capability version was rewritten to %d", stored.CapabilityVersion)
+		}
+	})
+
+	t.Run("legacy share requires explicit owner rebind", func(t *testing.T) {
+		owner := h.newOwner(t, "legacy-share-rebind-owner", users.Permissions{
+			Share: true, Browse: true, Preview: true, Download: true,
+		})
+		link := h.saveShare(t, owner, "legacy-share-rebind", "/public", nil)
+		legacy := link.Clone()
+		legacy.CapabilityVersion = 0
+		legacy.CreatorCapabilities = dbshare.CapabilitySnapshot{}
+		if err := store.Share.Save(legacy); err != nil {
+			t.Fatalf("save legacy share: %v", err)
+		}
+
+		before := h.download(link.Hash, "/secret.txt")
+		assertPermissionShareReadDenied(t, "legacy share before rebind", before)
+
+		payload, err := json.Marshal(dbshare.CreateBody{
+			Hash:        link.Hash,
+			CommonShare: legacy.CommonShare,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		recorder := httptest.NewRecorder()
+		status, rebindErr := sharePostHandler(recorder, httptest.NewRequest(http.MethodPost, "/api/share", bytes.NewReader(payload)), &requestContext{user: owner})
+		if rebindErr != nil || status != http.StatusOK {
+			t.Fatalf("explicit owner rebind: status=%d err=%v body=%q", status, rebindErr, recorder.Body.String())
+		}
+
+		rebound, err := store.Share.GetByHash(link.Hash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantCapabilities := dbshare.CapabilitiesFromPermissions(owner.Permissions)
+		if rebound.CapabilityVersion != dbshare.CurrentCapabilityVersion || rebound.CreatorCapabilities != wantCapabilities {
+			t.Fatalf("legacy share was not rebound to current owner capabilities: version=%d capabilities=%+v want=%+v", rebound.CapabilityVersion, rebound.CreatorCapabilities, wantCapabilities)
+		}
+		after := h.download(link.Hash, "/secret.txt")
+		requirePermissionShareStatus(t, "legacy share after rebind", after, http.StatusOK)
+		if after.Body.String() != permissionShareSecret {
+			t.Fatalf("rebound legacy share returned %q", after.Body.String())
+		}
+	})
+
+	t.Run("narrow caller does not reuse wider quick download share", func(t *testing.T) {
+		idx := indexing.GetIndex("source1")
+		if idx == nil {
+			t.Fatal("source index not found")
+		}
+		indexingDisabled := idx.Config.ResolvedRules.IndexingDisabled
+		idx.Config.ResolvedRules.IndexingDisabled = false
+		t.Cleanup(func() { idx.Config.ResolvedRules.IndexingDisabled = indexingDisabled })
+		if err := idx.RefreshDirectory("/public", false); err != nil {
+			t.Fatalf("index quick-download fixture: %v", err)
+		}
+		owner := h.newOwner(t, "quick-download-owner", users.Permissions{
+			Share: true, Browse: true, Preview: true, Download: true, Create: true,
+		})
+		existing := h.saveShare(t, owner, "quick-download-wide", "/public/secret.txt", func(common *dbshare.CommonShare) {
+			common.QuickDownload = true
+		})
+		caller := *owner
+		caller.Permissions = users.Permissions{Share: true, Browse: true, Download: true}
+		request := httptest.NewRequest(http.MethodGet, "/api/share/direct?"+url.Values{
+			"path":     {"/public/secret.txt"},
+			"source":   {"source1"},
+			"duration": {"60"},
+		}.Encode(), nil)
+		recorder := httptest.NewRecorder()
+		status, err := shareDirectDownloadHandler(recorder, request, &requestContext{user: &caller, apiToken: true})
+		if err != nil || status != http.StatusOK {
+			t.Fatalf("create narrow quick share: status=%d err=%v body=%s", status, err, recorder.Body.String())
+		}
+		var response DirectDownloadResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Hash == existing.Hash {
+			t.Fatalf("narrow caller reused wider share %q", response.Hash)
+		}
+		created, err := store.Share.GetByHash(response.Hash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if created.CreatorCapabilities.Preview || created.CreatorCapabilities.Create {
+			t.Fatalf("quick share widened caller capabilities: %+v", created.CreatorCapabilities)
 		}
 	})
 
@@ -211,6 +384,196 @@ func TestPermissionShareLifecycleHardening(t *testing.T) {
 			"hash": {"archive-identity-share"}, "file": {"/"}, "archiveToken": {token},
 		}, nil, map[string]string{"Range": "bytes=32-63"})
 		assertPermissionShareReadDenied(t, "archive identity replacement", resume)
+	})
+
+	t.Run("archive resume counts one download session", func(t *testing.T) {
+		owner := h.newOwner(t, "archive-limit-owner", users.Permissions{Share: true, Browse: true, Download: true})
+		directory := filepath.Join(sourcePath, "public", "archive-limit")
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, "member.bin"), permissionShareNoise(128*1024), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		link := h.saveShare(t, owner, "archive-limit-share", "/public/archive-limit", func(common *dbshare.CommonShare) {
+			common.DownloadsLimit = 1
+		})
+		first := h.request(http.MethodGet, "/public/api/resources/download", url.Values{
+			"hash": {link.Hash}, "file": {"/"},
+		}, nil, map[string]string{"Range": "bytes=0-31"})
+		requirePermissionShareStatus(t, "archive limit first range", first, http.StatusPartialContent)
+		token := first.Header().Get("X-Archive-Token")
+		if token == "" {
+			t.Fatal("archive limit response did not return X-Archive-Token")
+		}
+		if session, ok := archiveSpoolCache.Get(token); ok {
+			t.Cleanup(func() { removeSpooledArchiveNow(token, session.tmpPath) })
+		}
+		resume := h.request(http.MethodGet, "/public/api/resources/download", url.Values{
+			"hash": {link.Hash}, "file": {"/"}, "archiveToken": {token},
+		}, nil, map[string]string{"Range": "bytes=32-63"})
+		requirePermissionShareStatus(t, "archive limit resume", resume, http.StatusPartialContent)
+		if link.Downloads != 1 {
+			t.Fatalf("archive session download count: got %d, want 1", link.Downloads)
+		}
+		newSession := h.request(http.MethodGet, "/public/api/resources/download", url.Values{
+			"hash": {link.Hash}, "file": {"/"},
+		}, nil, map[string]string{"Range": "bytes=0-31"})
+		assertPermissionShareReadDenied(t, "archive limit new session", newSession)
+	})
+
+	t.Run("archive resume rejects in-place content replacement with restored metadata", func(t *testing.T) {
+		owner := h.newOwner(t, "archive-fingerprint-owner", users.Permissions{Share: true, Browse: true, Download: true})
+		directory := filepath.Join(sourcePath, "public", "archive-fingerprint")
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		memberPath := filepath.Join(directory, "member.bin")
+		original := permissionShareNoise(128 * 1024)
+		if err := os.WriteFile(memberPath, original, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		before, err := os.Stat(memberPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.saveShare(t, owner, "archive-fingerprint-share", "/public/archive-fingerprint", nil)
+		first := h.request(http.MethodGet, "/public/api/resources/download", url.Values{
+			"hash": {"archive-fingerprint-share"}, "file": {"/"},
+		}, nil, map[string]string{"Range": "bytes=0-31"})
+		requirePermissionShareStatus(t, "archive fingerprint first range", first, http.StatusPartialContent)
+		token := first.Header().Get("X-Archive-Token")
+		if token == "" {
+			t.Fatal("archive fingerprint response did not return X-Archive-Token")
+		}
+		if session, ok := archiveSpoolCache.Get(token); ok {
+			t.Cleanup(func() { removeSpooledArchiveNow(token, session.tmpPath) })
+		}
+
+		replacement := bytes.Repeat([]byte{0x5A}, len(original))
+		if err := os.WriteFile(memberPath, replacement, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(memberPath, before.ModTime(), before.ModTime()); err != nil {
+			t.Fatal(err)
+		}
+		after, err := os.Stat(memberPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+			t.Fatalf("fingerprint fixture did not preserve identity: before=%+v after=%+v", before, after)
+		}
+		resume := h.request(http.MethodGet, "/public/api/resources/download", url.Values{
+			"hash": {"archive-fingerprint-share"}, "file": {"/"}, "archiveToken": {token},
+		}, nil, map[string]string{"Range": "bytes=32-63"})
+		assertPermissionShareReadDenied(t, "archive in-place replacement", resume)
+	})
+
+	t.Run("archive audience revocation permanently invalidates the session", func(t *testing.T) {
+		owner := h.newOwner(t, "archive-audience-owner", users.Permissions{Share: true, Browse: true, Download: true})
+		directory := filepath.Join(sourcePath, "public", "archive-audience")
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, "member.bin"), permissionShareNoise(128*1024), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		link := h.saveShare(t, owner, "archive-audience-share", "/public/archive-audience", nil)
+		first := h.request(http.MethodGet, "/public/api/resources/download", url.Values{
+			"hash": {link.Hash}, "file": {"/"},
+		}, nil, map[string]string{"Range": "bytes=0-31"})
+		requirePermissionShareStatus(t, "archive audience first range", first, http.StatusPartialContent)
+		token := first.Header().Get("X-Archive-Token")
+		if token == "" {
+			t.Fatal("archive audience response did not return X-Archive-Token")
+		}
+		if session, ok := archiveSpoolCache.Get(token); ok {
+			t.Cleanup(func() { removeSpooledArchiveNow(token, session.tmpPath) })
+		}
+
+		revoked := link.Clone()
+		revoked.DisableAnonymous = true
+		if err := store.Share.Save(revoked); err != nil {
+			t.Fatal(err)
+		}
+		query := url.Values{"hash": {link.Hash}, "file": {"/"}, "archiveToken": {token}}
+		denied := h.request(http.MethodGet, "/public/api/resources/download", query, nil, map[string]string{"Range": "bytes=32-63"})
+		assertPermissionShareReadDenied(t, "archive audience revocation", denied)
+		if _, ok := archiveSpoolCache.Get(token); ok {
+			t.Error("audience revocation retained the archive session")
+		}
+
+		restored := revoked.Clone()
+		restored.DisableAnonymous = false
+		if err := store.Share.Save(restored); err != nil {
+			t.Fatal(err)
+		}
+		resumed := h.request(http.MethodGet, "/public/api/resources/download", query, nil, map[string]string{"Range": "bytes=32-63"})
+		assertPermissionShareReadDenied(t, "archive audience regrant", resumed)
+	})
+
+	t.Run("archive token cannot survive same-hash share recreation", func(t *testing.T) {
+		owner := h.newOwner(t, "archive-recreate-owner", users.Permissions{Share: true, Browse: true, Download: true})
+		directory := filepath.Join(sourcePath, "public", "archive-recreate")
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, "member.bin"), permissionShareNoise(128*1024), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		link := h.saveShare(t, owner, "archive-recreate-share", "/public/archive-recreate", nil)
+		first := h.request(http.MethodGet, "/public/api/resources/download", url.Values{
+			"hash": {link.Hash}, "file": {"/"},
+		}, nil, map[string]string{"Range": "bytes=0-31"})
+		requirePermissionShareStatus(t, "archive recreation first range", first, http.StatusPartialContent)
+		token := first.Header().Get("X-Archive-Token")
+		if token == "" {
+			t.Fatal("archive recreation response did not return X-Archive-Token")
+		}
+		if session, ok := archiveSpoolCache.Get(token); ok {
+			t.Cleanup(func() { removeSpooledArchiveNow(token, session.tmpPath) })
+		}
+		if err := store.Share.Delete(link.Hash); err != nil {
+			t.Fatal(err)
+		}
+		h.saveShare(t, owner, link.Hash, "/public/archive-recreate", nil)
+		resume := h.request(http.MethodGet, "/public/api/resources/download", url.Values{
+			"hash": {link.Hash}, "file": {"/"}, "archiveToken": {token},
+		}, nil, map[string]string{"Range": "bytes=32-63"})
+		assertPermissionShareReadDenied(t, "archive same-hash recreation", resume)
+	})
+
+	t.Run("invalid archive format does not consume the download limit", func(t *testing.T) {
+		owner := h.newOwner(t, "archive-format-limit-owner", users.Permissions{Share: true, Browse: true, Download: true})
+		directory := filepath.Join(sourcePath, "public", "archive-format-limit")
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, "member.bin"), permissionShareNoise(128*1024), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		link := h.saveShare(t, owner, "archive-format-limit-share", "/public/archive-format-limit", func(common *dbshare.CommonShare) {
+			common.DownloadsLimit = 1
+		})
+		invalid := h.request(http.MethodGet, "/public/api/resources/download", url.Values{
+			"hash": {link.Hash}, "file": {"/"}, "algo": {"invalid"},
+		}, nil, map[string]string{"Range": "bytes=0-31"})
+		if invalid.Code < http.StatusBadRequest {
+			t.Fatalf("invalid archive format status: got %d, want failure", invalid.Code)
+		}
+		if link.Downloads != 0 {
+			t.Fatalf("invalid archive format consumed downloads: got %d, want 0", link.Downloads)
+		}
+		valid := h.request(http.MethodGet, "/public/api/resources/download", url.Values{
+			"hash": {link.Hash}, "file": {"/"},
+		}, nil, map[string]string{"Range": "bytes=0-31"})
+		requirePermissionShareStatus(t, "valid archive after invalid format", valid, http.StatusPartialContent)
+		if token := valid.Header().Get("X-Archive-Token"); token != "" {
+			if session, ok := archiveSpoolCache.Get(token); ok {
+				removeSpooledArchiveNow(token, session.tmpPath)
+			}
+		}
 	})
 }
 

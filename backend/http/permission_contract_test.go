@@ -207,7 +207,7 @@ func TestExplicitEmptyFullTokenKeepsEmptyPermissionSnapshot(t *testing.T) {
 	}
 }
 
-func TestLegacyFullTokenNormalizesAndIntersectsReadPermissions(t *testing.T) {
+func TestLegacyFullTokenFailsClosedAndIntersectsReadPermissions(t *testing.T) {
 	setupPermissionContractHTTPTest(t)
 
 	tests := []struct {
@@ -228,7 +228,7 @@ func TestLegacyFullTokenNormalizesAndIntersectsReadPermissions(t *testing.T) {
 			},
 			legacyDownload: true,
 			wantBrowse:     false,
-			wantPreview:    true,
+			wantPreview:    false,
 			wantDownload:   false,
 		},
 		{
@@ -240,8 +240,8 @@ func TestLegacyFullTokenNormalizesAndIntersectsReadPermissions(t *testing.T) {
 				Download: true,
 			},
 			legacyDownload: false,
-			wantBrowse:     true,
-			wantPreview:    true,
+			wantBrowse:     false,
+			wantPreview:    false,
 			wantDownload:   false,
 		},
 	}
@@ -286,7 +286,7 @@ func TestMinimalTokenUsesCurrentUserPermissions(t *testing.T) {
 	}
 
 	current := users.Permissions{
-		Api:      false,
+		Api:      true,
 		Browse:   false,
 		Preview:  true,
 		Download: false,
@@ -564,6 +564,9 @@ func issuePermissionContractTokenRequest(t *testing.T, user *users.User, name, p
 	}
 	if status != http.StatusOK {
 		t.Fatalf("create full token status: got %d, want %d", status, http.StatusOK)
+	}
+	if cacheControl := response.Header().Get("Cache-Control"); cacheControl != "no-store" {
+		t.Fatalf("create full token cache control: got %q, want %q", cacheControl, "no-store")
 	}
 
 	var payload HttpResponse

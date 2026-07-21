@@ -158,7 +158,7 @@ func TestPublicShareHandlerAuthentication(t *testing.T) {
 	dummyUser := &users.User{
 		ID:          1,
 		Username:    "testuser",
-		Permissions: users.Permissions{Admin: false, Browse: true},
+		Permissions: users.Permissions{Admin: false, Share: true, Browse: true},
 		Scopes: []users.SourceScope{
 			{Name: "srv", Scope: "/"}, // Root scope on srv source
 		},
@@ -246,6 +246,8 @@ func TestPublicShareHandlerAuthentication(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			tc.share.CapabilityVersion = share.CurrentCapabilityVersion
+			tc.share.CreatorCapabilities = share.CapabilitiesFromPermissions(dummyUser.Permissions)
 			// Save the share in the mock store
 			if err := store.Share.Save(tc.share); err != nil {
 				t.Fatal("failed to save share:", err)

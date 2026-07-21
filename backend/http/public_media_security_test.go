@@ -26,6 +26,22 @@ func TestPublicMediaSecurity(t *testing.T) {
 	sourcePath := setupResourcePutTestEnv(t)
 	h := newPermissionShareSecurityHarness(t, sourcePath)
 
+	t.Run("authorized lyrics remain available", func(t *testing.T) {
+		audioPath, _ := writePublicLyricsFixture(t, sourcePath, "allowed", "PUBLIC-LYRICS-ALLOWED")
+		refreshPublicMediaFixture(t)
+		owner := h.newOwner(t, "public-lyrics-allowed-owner", users.Permissions{
+			Share: true, Browse: true, Preview: true, Download: true,
+		})
+		h.saveShare(t, owner, "public-lyrics-allowed", "/public", nil)
+		response := h.request(http.MethodGet, "/public/api/media/lyrics", url.Values{
+			"hash": {"public-lyrics-allowed"}, "path": {"/" + filepath.Base(audioPath)},
+		}, nil, nil)
+		requirePermissionShareStatus(t, "authorized public lyrics", response, http.StatusOK)
+		if !strings.Contains(response.Body.String(), "PUBLIC-LYRICS-ALLOWED") {
+			t.Fatalf("authorized public lyrics are missing: %q", response.Body.String())
+		}
+	})
+
 	t.Run("lyrics requires effective Download", func(t *testing.T) {
 		audioPath, _ := writePublicLyricsFixture(t, sourcePath, "download-policy", "PUBLIC-LYRICS-DOWNLOAD-POLICY")
 		refreshPublicMediaFixture(t)
@@ -39,6 +55,24 @@ func TestPublicMediaSecurity(t *testing.T) {
 			"hash": {"public-lyrics-download"}, "path": {"/" + filepath.Base(audioPath)},
 		}, nil, nil)
 		assertPermissionShareReadDenied(t, "public lyrics with DisableDownload", response)
+	})
+
+	t.Run("lyrics consumes the public download limit", func(t *testing.T) {
+		audioPath, _ := writePublicLyricsFixture(t, sourcePath, "download-limit", "PUBLIC-LYRICS-DOWNLOAD-LIMIT")
+		refreshPublicMediaFixture(t)
+		owner := h.newOwner(t, "public-lyrics-limit-owner", users.Permissions{
+			Share: true, Browse: true, Preview: true, Download: true,
+		})
+		h.saveShare(t, owner, "public-lyrics-limit", "/public", func(common *dbshare.CommonShare) {
+			common.DownloadsLimit = 1
+		})
+		query := url.Values{
+			"hash": {"public-lyrics-limit"}, "path": {"/" + filepath.Base(audioPath)},
+		}
+		first := h.request(http.MethodGet, "/public/api/media/lyrics", query, nil, nil)
+		requirePermissionShareStatus(t, "first public lyrics read", first, http.StatusOK)
+		second := h.request(http.MethodGet, "/public/api/media/lyrics", query, nil, nil)
+		assertPermissionShareReadDenied(t, "lyrics after download limit", second)
 	})
 
 	t.Run("single-file share cannot read sibling lyrics", func(t *testing.T) {
@@ -99,6 +133,103 @@ func TestPublicMediaSecurity(t *testing.T) {
 		}
 	})
 
+	t.Run("authorized external subtitles remain available", func(t *testing.T) {
+		videoPath, sidecarPath := writePublicSubtitleFixture(t, sourcePath, "subtitle-allowed", "PUBLIC-SUBTITLE-ALLOWED")
+		refreshPublicMediaFixture(t)
+		owner := h.newOwner(t, "public-subtitle-allowed-owner", users.Permissions{
+			Share: true, Browse: true, Preview: true, Download: true,
+		})
+		h.saveShare(t, owner, "public-subtitle-allowed", "/public", nil)
+		response := h.request(http.MethodGet, "/public/api/media/subtitles", url.Values{
+			"hash": {"public-subtitle-allowed"}, "path": {"/" + filepath.Base(videoPath)},
+			"name": {filepath.Base(sidecarPath)}, "embedded": {"false"},
+		}, nil, nil)
+		requirePermissionShareStatus(t, "authorized public subtitle", response, http.StatusOK)
+		if !strings.Contains(response.Body.String(), "PUBLIC-SUBTITLE-ALLOWED") {
+			t.Fatalf("authorized public subtitle is missing: %q", response.Body.String())
+		}
+	})
+
+	t.Run("subtitles require effective Download", func(t *testing.T) {
+		videoPath, sidecarPath := writePublicSubtitleFixture(t, sourcePath, "subtitle-download-policy", "PUBLIC-SUBTITLE-DOWNLOAD-POLICY")
+		refreshPublicMediaFixture(t)
+		owner := h.newOwner(t, "public-subtitle-download-owner", users.Permissions{
+			Share: true, Browse: true, Preview: true, Download: true,
+		})
+		h.saveShare(t, owner, "public-subtitle-download", "/public", func(common *dbshare.CommonShare) {
+			common.DisableDownload = true
+		})
+		response := h.request(http.MethodGet, "/public/api/media/subtitles", url.Values{
+			"hash": {"public-subtitle-download"}, "path": {"/" + filepath.Base(videoPath)},
+			"name": {filepath.Base(sidecarPath)}, "embedded": {"false"},
+		}, nil, nil)
+		assertPermissionShareReadDenied(t, "public subtitle with DisableDownload", response)
+	})
+
+	t.Run("single-file share cannot read sibling subtitles", func(t *testing.T) {
+		videoPath, sidecarPath := writePublicSubtitleFixture(t, sourcePath, "subtitle-single-file", "PUBLIC-SUBTITLE-SIBLING")
+		refreshPublicMediaFixture(t)
+		owner := h.newOwner(t, "public-subtitle-single-owner", users.Permissions{
+			Share: true, Browse: true, Preview: true, Download: true,
+		})
+		h.saveShare(t, owner, "public-subtitle-single", "/public/"+filepath.Base(videoPath), nil)
+		response := h.request(http.MethodGet, "/public/api/media/subtitles", url.Values{
+			"hash": {"public-subtitle-single"}, "path": {"/"},
+			"name": {filepath.Base(sidecarPath)}, "embedded": {"false"},
+		}, nil, nil)
+		assertPermissionShareReadDenied(t, "single-file sibling subtitle", response)
+		if strings.Contains(response.Body.String(), "PUBLIC-SUBTITLE-SIBLING") {
+			t.Fatalf("single-file sibling subtitle leaked: %q", response.Body.String())
+		}
+	})
+
+	t.Run("subtitle sidecar has an independent Access Rule", func(t *testing.T) {
+		videoPath, sidecarPath := writePublicSubtitleFixture(t, sourcePath, "subtitle-access-rule", "PUBLIC-SUBTITLE-ACCESS-RULE")
+		refreshPublicMediaFixture(t)
+		owner := h.newOwner(t, "public-subtitle-access-owner", users.Permissions{
+			Share: true, Browse: true, Preview: true, Download: true,
+		})
+		h.saveShare(t, owner, "public-subtitle-access", "/public", nil)
+		if err := store.Access.DenyUser(sourcePath, "/public/"+filepath.Base(sidecarPath), owner.Username); err != nil {
+			t.Fatal(err)
+		}
+		response := h.request(http.MethodGet, "/public/api/media/subtitles", url.Values{
+			"hash": {"public-subtitle-access"}, "path": {"/" + filepath.Base(videoPath)},
+			"name": {filepath.Base(sidecarPath)}, "embedded": {"false"},
+		}, nil, nil)
+		assertPermissionShareReadDenied(t, "Access Rule denied subtitle", response)
+		if strings.Contains(response.Body.String(), "PUBLIC-SUBTITLE-ACCESS-RULE") {
+			t.Fatalf("Access-denied subtitle leaked: %q", response.Body.String())
+		}
+	})
+
+	t.Run("subtitle sidecar symlink is rejected", func(t *testing.T) {
+		videoPath, sidecarPath := writePublicSubtitleFixture(t, sourcePath, "subtitle-symlink", "placeholder")
+		outsidePath := filepath.Join(t.TempDir(), "outside.srt")
+		if err := os.WriteFile(outsidePath, []byte("PUBLIC-SUBTITLE-SYMLINK"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(sidecarPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsidePath, sidecarPath); err != nil {
+			t.Skipf("symlink fixture is unavailable: %v", err)
+		}
+		refreshPublicMediaFixture(t)
+		owner := h.newOwner(t, "public-subtitle-symlink-owner", users.Permissions{
+			Share: true, Browse: true, Preview: true, Download: true,
+		})
+		h.saveShare(t, owner, "public-subtitle-symlink", "/public", nil)
+		response := h.request(http.MethodGet, "/public/api/media/subtitles", url.Values{
+			"hash": {"public-subtitle-symlink"}, "path": {"/" + filepath.Base(videoPath)},
+			"name": {filepath.Base(sidecarPath)}, "embedded": {"false"},
+		}, nil, nil)
+		assertPermissionShareReadDenied(t, "symlink subtitle", response)
+		if strings.Contains(response.Body.String(), "PUBLIC-SUBTITLE-SYMLINK") {
+			t.Fatalf("symlink subtitle leaked: %q", response.Body.String())
+		}
+	})
+
 	t.Run("metadata hides inaccessible sidecar fields", func(t *testing.T) {
 		audioPath, sidecarPath := writePublicLyricsFixture(t, sourcePath, "metadata", "PUBLIC-METADATA-LYRICS")
 		videoPath := filepath.Join(sourcePath, "public", "metadata-video.mp4")
@@ -143,6 +274,40 @@ func TestPublicMediaSecurity(t *testing.T) {
 		}
 		if len(video.Subtitles) != 0 {
 			t.Fatalf("metadata exposed denied subtitle sidecar: %+v", video.Subtitles)
+		}
+	})
+
+	t.Run("metadata never reads file content", func(t *testing.T) {
+		const sentinel = "PUBLIC-METADATA-CONTENT-SENTINEL"
+		contentPath := filepath.Join(sourcePath, "public", "metadata-content.txt")
+		if err := os.WriteFile(contentPath, []byte(sentinel), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		refreshPublicMediaFixture(t)
+		owner := h.newOwner(t, "public-metadata-content-owner", users.Permissions{
+			Share: true, Browse: true, Preview: true, Download: true,
+		})
+		h.saveShare(t, owner, "public-metadata-content", "/public", func(common *dbshare.CommonShare) {
+			common.DisableDownload = true
+		})
+
+		originalFileInfoFaster := FileInfoFasterFunc
+		contentRequested := false
+		FileInfoFasterFunc = func(options utils.FileOptions, accessStorage *access.Storage, user *users.User, shareStorage *dbshare.Storage) (*iteminfo.ExtendedFileInfo, error) {
+			contentRequested = contentRequested || options.Content
+			return originalFileInfoFaster(options, accessStorage, user, shareStorage)
+		}
+		defer func() { FileInfoFasterFunc = originalFileInfoFaster }()
+
+		response := h.request(http.MethodGet, "/public/api/media/metadata", url.Values{
+			"hash": {"public-metadata-content"}, "path": {"/metadata-content.txt"}, "content": {"true"},
+		}, nil, nil)
+		requirePermissionShareStatus(t, "public metadata content", response, http.StatusOK)
+		if contentRequested {
+			t.Fatal("public metadata requested file content before response filtering")
+		}
+		if strings.Contains(response.Body.String(), sentinel) {
+			t.Fatalf("public metadata leaked file content: %q", response.Body.String())
 		}
 	})
 
@@ -235,6 +400,19 @@ func writePublicLyricsFixture(t *testing.T, sourcePath, stem, lyrics string) (st
 		t.Fatal(err)
 	}
 	return audioPath, sidecarPath
+}
+
+func writePublicSubtitleFixture(t *testing.T, sourcePath, stem, content string) (string, string) {
+	t.Helper()
+	videoPath := filepath.Join(sourcePath, "public", stem+".mp4")
+	sidecarPath := filepath.Join(sourcePath, "public", stem+".srt")
+	if err := os.WriteFile(videoPath, []byte("public subtitle video"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sidecarPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return videoPath, sidecarPath
 }
 
 func refreshPublicMediaFixture(t *testing.T) {

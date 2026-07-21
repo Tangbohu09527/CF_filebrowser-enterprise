@@ -1037,6 +1037,7 @@ func TestPermissionReadSecurity_TokenPermissionIntersection(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			suffix := strings.ReplaceAll(tc.name, " ", "-")
 			user := h.user(t, tc.userBrowse, true, tc.userDownload)
+			user.Permissions.Api = true
 			user.Username = "permission-read-token-user-" + suffix
 			savePermissionReadUser(t, user)
 
@@ -1111,6 +1112,7 @@ func TestPermissionReadSecurity_PreviewTokenPermissionIntersection(t *testing.T)
 		t.Run(tc.name, func(t *testing.T) {
 			suffix := strings.ReplaceAll(tc.name, " ", "-")
 			user := h.user(t, true, tc.userPreview, true)
+			user.Permissions.Api = true
 			user.Username = "permission-preview-token-user-" + suffix
 			savePermissionReadUser(t, user)
 

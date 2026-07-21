@@ -1347,9 +1347,25 @@ func (s *Storage) IsTokenRevoked(tokenHash string) bool {
 func (s *Storage) AddApiToken(tokenString string, userID uint) error {
 	s.mux.Lock()
 	defer s.mux.Unlock()
+	if tokenString == "" || userID == 0 {
+		return fmt.Errorf("api token and user ID are required")
+	}
 	tokenHash := utils.HashSHA256(tokenString)
+	if _, revoked := s.RevokedTokens[tokenHash]; revoked {
+		return fmt.Errorf("api token has been revoked")
+	}
+	if existingUserID, exists := s.HashedTokens[tokenHash]; exists {
+		if existingUserID != userID {
+			return fmt.Errorf("api token is already registered to another user")
+		}
+		return nil
+	}
 	s.HashedTokens[tokenHash] = userID
-	return s.SaveToDB()
+	if err := s.SaveToDB(); err != nil {
+		delete(s.HashedTokens, tokenHash)
+		return err
+	}
+	return nil
 }
 
 // GetUserIDFromToken retrieves the user ID for a given token string (memory-only read).
@@ -1359,6 +1375,20 @@ func (s *Storage) GetUserIDFromToken(tokenString string) (uint, bool) {
 	tokenHash := utils.HashSHA256(tokenString)
 	userID, exists := s.HashedTokens[tokenHash]
 	return userID, exists
+}
+
+// IsApiTokenHashActive checks a pre-hashed API token without requiring the bearer secret.
+func (s *Storage) IsApiTokenHashActive(tokenHash string, userID uint) bool {
+	if tokenHash == "" || userID == 0 {
+		return false
+	}
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	if _, revoked := s.RevokedTokens[tokenHash]; revoked {
+		return false
+	}
+	mappedUserID, exists := s.HashedTokens[tokenHash]
+	return exists && mappedUserID == userID
 }
 
 // GetRevokedTokens returns a copy of all revoked token hashes.

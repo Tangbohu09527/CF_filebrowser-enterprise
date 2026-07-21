@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -40,6 +41,7 @@ type requestContext struct {
 	shareArchive []publicShareArchiveEntry
 	fileInfo     iteminfo.ExtendedFileInfo
 	token        string
+	apiToken     bool
 	share        *share.Link
 	ctx          context.Context
 	MaxBandwidth int
@@ -95,6 +97,7 @@ type publicShareTarget struct {
 	ScopedPath    string
 	RealPath      string
 	IsDir         bool
+	info          os.FileInfo
 }
 
 type publicShareAccess struct {
@@ -102,15 +105,68 @@ type publicShareAccess struct {
 	thumbnail bool
 	viewer    bool
 	download  bool
+	create    bool
+	modify    bool
+	replace   bool
+	delete    bool
 }
 
 func calculatePublicShareAccess(link *share.Link, owner *users.User) publicShareAccess {
+	if link == nil || owner == nil || link.CapabilityVersion != share.CurrentCapabilityVersion {
+		return publicShareAccess{}
+	}
+	ceiling := link.CreatorCapabilities
+	shareEnabled := owner.Permissions.Share && ceiling.Share
 	readable := link.ShareType != "upload"
+	preview := shareEnabled && readable && owner.Permissions.Preview && ceiling.Preview
 	return publicShareAccess{
-		browse:    readable && owner.Permissions.Browse,
-		thumbnail: readable && owner.Permissions.Preview && !link.DisableThumbnails,
-		viewer:    readable && owner.Permissions.Preview && !link.DisableFileViewer,
-		download:  readable && owner.Permissions.Download && !link.DisableDownload,
+		browse:    shareEnabled && readable && owner.Permissions.Browse && ceiling.Browse,
+		thumbnail: preview && !link.DisableThumbnails,
+		viewer:    preview && !link.DisableFileViewer,
+		download:  shareEnabled && readable && owner.Permissions.Download && ceiling.Download && !link.DisableDownload,
+		create:    shareEnabled && owner.Permissions.Create && ceiling.Create && link.AllowCreate,
+		modify:    shareEnabled && owner.Permissions.Modify && ceiling.Modify && link.AllowModify,
+		replace:   shareEnabled && owner.Permissions.Modify && ceiling.Modify && link.AllowReplacements,
+		delete:    shareEnabled && owner.Permissions.Delete && ceiling.Delete && link.AllowDelete,
+	}
+}
+
+func publicShareAudienceAllowed(link *share.Link, user *users.User) bool {
+	if link == nil {
+		return false
+	}
+	username := "anonymous"
+	if user != nil && user.Username != "" {
+		username = user.Username
+	}
+	if link.DisableAnonymous && username == "anonymous" {
+		return false
+	}
+	return len(link.AllowedUsernames) == 0 || slices.Contains(link.AllowedUsernames, username)
+}
+
+func publicShareWriteAllowed(method, routePath string, access publicShareAccess) bool {
+	switch {
+	case method == http.MethodPost && (routePath == "/resources" || routePath == "/resources/pause"):
+		return access.create || access.replace
+	case (method == http.MethodPut || method == http.MethodPatch) && routePath == "/resources":
+		return access.modify
+	case method == http.MethodDelete && (routePath == "/resources" || routePath == "/resources/bulk"):
+		return access.delete
+	case method == http.MethodPost && routePath == "/office/callback":
+		return true
+	default:
+		return false
+	}
+}
+
+func (access publicShareAccess) frontendCapabilities() *share.PublicCapabilities {
+	return &share.PublicCapabilities{
+		Browse:    access.browse,
+		Preview:   access.thumbnail || access.viewer,
+		Download:  access.download,
+		Thumbnail: access.thumbnail,
+		Viewer:    access.viewer,
 	}
 }
 
@@ -176,8 +232,12 @@ func publicShareRouteForRequest(method, routePath string, query url.Values) (pub
 				requirement = publicShareReadOriginalViewer
 			}
 			return publicShareRoute{recognized: true, read: true, requirement: requirement, targetMode: publicShareTargetPath, albumArt: true}, nil
-		case "/media/metadata", "/media/lyrics":
+		case "/media/metadata":
 			return publicShareRoute{recognized: true, read: true, requirement: publicShareReadBrowse | publicShareReadViewer, targetMode: publicShareTargetPath}, nil
+		case "/media/subtitles":
+			return publicShareRoute{recognized: true, read: true, requirement: publicShareReadOriginalViewer, targetMode: publicShareTargetPath}, nil
+		case "/media/lyrics":
+			return publicShareRoute{recognized: true, read: true, requirement: publicShareReadOriginalViewer, targetMode: publicShareTargetPath}, nil
 		case "/office/config":
 			return publicShareRoute{recognized: true, read: true, requirement: publicShareReadOriginalViewer, targetMode: publicShareTargetPath}, nil
 		case "/share/image":
@@ -200,11 +260,11 @@ func publicShareRouteForRequest(method, routePath string, query url.Values) (pub
 	case method == http.MethodPost && routePath == "/resources/pause":
 		return publicShareRoute{recognized: true, targetMode: publicShareTargetPath, skipFileInfo: true}, nil
 	case (method == http.MethodPut || method == http.MethodPatch || method == http.MethodDelete) && routePath == "/resources":
-		return publicShareRoute{recognized: true, targetMode: publicShareTargetPath}, nil
+		return publicShareRoute{recognized: true, targetMode: publicShareTargetPath, skipFileInfo: true}, nil
 	case method == http.MethodDelete && routePath == "/resources/bulk":
-		return publicShareRoute{recognized: true, targetMode: publicShareTargetPath}, nil
+		return publicShareRoute{recognized: true, targetMode: publicShareTargetPath, skipFileInfo: true}, nil
 	case (method == http.MethodGet || method == http.MethodPost) && routePath == "/office/callback":
-		return publicShareRoute{recognized: true, targetMode: publicShareTargetPath}, nil
+		return publicShareRoute{recognized: true, targetMode: publicShareTargetPath, skipFileInfo: true}, nil
 	default:
 		return publicShareRoute{}, nil
 	}
@@ -260,7 +320,7 @@ func validatePublicShareQuery(query url.Values) error {
 	for _, key := range []string{
 		"hash", "path", "content", "metadata", "size", "banner", "favicon",
 		"albumArt", "atPercentage", "only", "archiveToken", "algo", "inline",
-		"auth", "token", "password", "override", "action",
+		"auth", "token", "password", "override", "action", "name", "embedded",
 	} {
 		if _, err := publicShareSingleQueryValue(query, key); err != nil {
 			return err
@@ -464,6 +524,7 @@ func resolvePublicShareLogicalTarget(d *requestContext, sourcePath, logicalPath 
 		ScopedPath:    scopedPath,
 		RealPath:      targetReal,
 		IsDir:         info.IsDir(),
+		info:          info,
 	}
 	return target, nil
 }
@@ -488,7 +549,43 @@ func resolvePublicShareTarget(d *requestContext, sourcePath, requestedPath strin
 
 }
 
-func resolvePublicShareWriteTarget(linkPath, ownerScope, requestedPath string) (string, error) {
+func readPublicShareTextContent(target publicShareTarget) (string, error) {
+	if target.info == nil || target.IsDir {
+		return "", errors.ErrAccessDenied
+	}
+	before, err := os.Lstat(target.RealPath)
+	if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() ||
+		!publicShareSameFileIdentity(target.info, before) {
+		return "", errors.ErrAccessDenied
+	}
+	file, err := os.Open(target.RealPath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(before, opened) ||
+		!publicShareSameFileIdentity(target.info, opened) {
+		return "", errors.ErrAccessDenied
+	}
+	content, err := io.ReadAll(file)
+	if err != nil {
+		return "", err
+	}
+	after, err := file.Stat()
+	if err != nil || !publicShareSameFileIdentity(opened, after) {
+		return "", errors.ErrAccessDenied
+	}
+	if len(content) == 0 {
+		return "empty-file-x6OlSil", nil
+	}
+	if !utils.IsTextContent(content) {
+		return "", nil
+	}
+	return string(content), nil
+}
+
+func resolvePublicShareWriteScopedPath(linkPath, ownerScope, requestedPath string) (string, error) {
 	shareRoot := normalizePublicShareIndexPath(linkPath)
 	ownerScope = normalizePublicShareIndexPath(ownerScope)
 	requestedPath = strings.TrimPrefix(filepath.ToSlash(requestedPath), "/")
@@ -497,6 +594,167 @@ func resolvePublicShareWriteTarget(linkPath, ownerScope, requestedPath string) (
 		return "", errors.ErrAccessDenied
 	}
 	return publicShareScopedPath(ownerScope, target)
+}
+
+func resolveProspectivePublicShareRealPath(targetPath string) (string, error) {
+	current := targetPath
+	remaining := make([]string, 0, 4)
+	for {
+		info, err := os.Lstat(current)
+		if err == nil {
+			if !info.IsDir() {
+				return "", errors.ErrAccessDenied
+			}
+			resolved, resolveErr := filepath.EvalSymlinks(current)
+			if resolveErr != nil {
+				return "", resolveErr
+			}
+			parts := append([]string{resolved}, remaining...)
+			return filepath.Join(parts...), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", errors.ErrAccessDenied
+		}
+		remaining = append([]string{filepath.Base(current)}, remaining...)
+		current = parent
+	}
+}
+
+func authorizePublicShareWriteTarget(d *requestContext, sourcePath, requestedPath string) (publicShareTarget, bool, error) {
+	var target publicShareTarget
+	requestedRelative, err := cleanPublicShareRelativePath(requestedPath)
+	if err != nil {
+		return target, false, errors.ErrAccessDenied
+	}
+	shareRootRelative, err := cleanPublicShareRelativePath(d.share.Path)
+	if err != nil {
+		return target, false, errors.ErrAccessDenied
+	}
+	shareRoot := normalizePublicShareIndexPath(shareRootRelative)
+	logicalPath := normalizePublicShareIndexPath(pathpkg.Join("/"+shareRootRelative, requestedRelative))
+	if !publicSharePathWithin(shareRoot, logicalPath) || !publicSharePathWithin(d.shareScope, logicalPath) {
+		return target, false, errors.ErrAccessDenied
+	}
+
+	sourceAbsolute, err := filepath.Abs(sourcePath)
+	if err != nil {
+		return target, false, err
+	}
+	sourceReal, err := filepath.EvalSymlinks(sourceAbsolute)
+	if err != nil {
+		return target, false, err
+	}
+	shareRootReal, err := filepath.EvalSymlinks(filepath.Join(sourceAbsolute, filepath.FromSlash(strings.TrimPrefix(shareRoot, "/"))))
+	if err != nil || !publicShareRealPathWithin(sourceReal, shareRootReal) {
+		return target, false, errors.ErrAccessDenied
+	}
+	rootInfo, err := os.Stat(shareRootReal)
+	if err != nil || !rootInfo.IsDir() {
+		return target, false, errors.ErrAccessDenied
+	}
+
+	targetPath := filepath.Join(sourceAbsolute, filepath.FromSlash(strings.TrimPrefix(logicalPath, "/")))
+	if !publicShareRealPathWithin(sourceAbsolute, targetPath) {
+		return target, false, errors.ErrAccessDenied
+	}
+	info, statErr := os.Lstat(targetPath)
+	exists := statErr == nil
+	var targetReal string
+	if exists {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return target, false, errors.ErrAccessDenied
+		}
+		targetReal, err = filepath.EvalSymlinks(targetPath)
+		if err != nil {
+			return target, false, err
+		}
+		resolvedInfo, resolvedErr := os.Stat(targetReal)
+		if resolvedErr != nil || !os.SameFile(info, resolvedInfo) {
+			return target, false, errors.ErrAccessDenied
+		}
+		info = resolvedInfo
+	} else {
+		if !os.IsNotExist(statErr) {
+			return target, false, statErr
+		}
+		targetReal, err = resolveProspectivePublicShareRealPath(targetPath)
+		if err != nil {
+			return target, false, err
+		}
+		info = nil
+	}
+	if !publicShareRealPathWithin(sourceReal, targetReal) || !publicShareRealPathWithin(shareRootReal, targetReal) {
+		return target, false, errors.ErrAccessDenied
+	}
+	canonicalRelative, err := filepath.Rel(sourceReal, targetReal)
+	if err != nil {
+		return target, false, errors.ErrAccessDenied
+	}
+	canonicalRelative = publicShareCanonicalCaseRelative(sourceReal, canonicalRelative)
+	canonicalPath := normalizePublicShareIndexPath(filepath.ToSlash(canonicalRelative))
+	if !publicSharePathWithin(d.shareScope, canonicalPath) || store.Access == nil ||
+		!store.Access.PermittedFresh(sourcePath, logicalPath, d.shareUser.Username) ||
+		!store.Access.PermittedFresh(sourcePath, canonicalPath, d.shareUser.Username) {
+		return target, false, errors.ErrAccessDenied
+	}
+	scopedPath, err := publicShareScopedPath(d.shareScope, canonicalPath)
+	if err != nil {
+		return target, false, err
+	}
+	target = publicShareTarget{
+		RequestedPath: requestedRelative,
+		LogicalPath:   logicalPath,
+		CanonicalPath: canonicalPath,
+		ScopedPath:    scopedPath,
+		RealPath:      targetReal,
+		IsDir:         exists && info.IsDir(),
+		info:          info,
+	}
+	return target, exists, nil
+}
+
+func authorizePublicShareSingleWriteRequest(r *http.Request, d *requestContext, sourcePath string) (bool, error) {
+	method := r.Method
+	routePath := r.URL.Path
+	singleTarget := (method == http.MethodPost && (routePath == "/resources" || routePath == "/resources/pause")) ||
+		(method == http.MethodPut && routePath == "/resources") ||
+		(method == http.MethodDelete && routePath == "/resources")
+	if !singleTarget {
+		return false, nil
+	}
+
+	target, exists, err := authorizePublicShareWriteTarget(d, sourcePath, d.shareQuery.Get("path"))
+	if err != nil || target.RequestedPath == "" {
+		return true, errors.ErrAccessDenied
+	}
+	switch method {
+	case http.MethodPost:
+		replacementRequested := r.URL.Query().Get("action") == "override" || r.URL.Query().Get("override") == "true"
+		if (exists && replacementRequested && !d.shareAccess.replace) || (!exists && !d.shareAccess.create) {
+			return true, errors.ErrAccessDenied
+		}
+		if !exists && !d.shareAccess.replace {
+			query := r.URL.Query()
+			query.Set("override", "false")
+			r.URL.RawQuery = query.Encode()
+			d.shareQuery = query
+		}
+	case http.MethodPut:
+		if !exists || target.IsDir || !d.shareAccess.modify {
+			return true, errors.ErrAccessDenied
+		}
+	case http.MethodDelete:
+		if !exists || !d.shareAccess.delete {
+			return true, errors.ErrAccessDenied
+		}
+	}
+	d.shareTargets = []publicShareTarget{target}
+	d.IndexPath = utils.AddTrailingSlashIfNotExists(target.ScopedPath)
+	return true, nil
 }
 
 // Middleware to handle file requests by hash and pass it to the handler
@@ -521,20 +779,30 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 			data.share = &share.Link{}
 			return http.StatusNotFound, fmt.Errorf("share hash not found")
 		}
-		if link.DisableAnonymous && data.user.Username == "anonymous" {
-			return http.StatusForbidden, fmt.Errorf("share is not available to anonymous users")
+		archiveToken := query.Get("archiveToken")
+		keepArchiveToken := archiveToken == ""
+		defer func() {
+			if !keepArchiveToken {
+				invalidatePublicShareArchiveToken(archiveToken, link.Hash)
+			}
+		}()
+		callHandler := func() (int, error) {
+			status, handlerErr := fn(w, r, data)
+			if route.targetMode == publicShareTargetFiles && handlerErr == nil && status < http.StatusBadRequest {
+				keepArchiveToken = true
+			}
+			return status, handlerErr
 		}
+		if !publicShareAudienceAllowed(link, data.user) {
+			return http.StatusForbidden, fmt.Errorf("share is not available to this user")
+		}
+		archiveResume := archiveToken != "" && route.targetMode == publicShareTargetFiles
 		// Block anonymous users if per-user download limit is enabled
 		if link.PerUserDownloadLimit && data.user.Username == "anonymous" {
 			return http.StatusForbidden, fmt.Errorf("anonymous downloads are not allowed with per-user limits")
 		}
-		if len(link.AllowedUsernames) > 0 {
-			if !slices.Contains(link.AllowedUsernames, data.user.Username) {
-				return http.StatusForbidden, fmt.Errorf("share is not available to this user")
-			}
-		}
 		// Check per-user download limit
-		if link.PerUserDownloadLimit && link.HasReachedUserLimit(data.user.Username) {
+		if link.PerUserDownloadLimit && !archiveResume && link.HasReachedUserLimit(data.user.Username) {
 			return http.StatusForbidden, fmt.Errorf("user download limit reached for this share")
 		}
 		data.share = link
@@ -565,13 +833,8 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 			return http.StatusNotFound, fmt.Errorf("user for share no longer exists")
 		}
 		data.shareAccess = calculatePublicShareAccess(link, data.shareUser)
-		if link.ShareType == "upload" && route.uploadInitializationProbe && r.Header.Get("Range") == "" {
-			if _, pathErr := cleanPublicShareRelativePath(inputPath); pathErr != nil {
-				return http.StatusForbidden, fmt.Errorf("public share access denied")
-			}
-			return http.StatusNotImplemented, fmt.Errorf("browsing is disabled for upload shares")
-		}
-		if route.read && !data.shareAccess.allows(route.requirement) {
+		uploadInitializationProbe := link.ShareType == "upload" && route.uploadInitializationProbe && r.Header.Get("Range") == ""
+		if route.read && !uploadInitializationProbe && !data.shareAccess.allows(route.requirement) {
 			invalidatePublicShareArchiveToken(query.Get("archiveToken"), link.Hash)
 			return http.StatusForbidden, fmt.Errorf("public share access denied")
 		}
@@ -580,8 +843,10 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 			return http.StatusForbidden, fmt.Errorf("public share access denied")
 		}
 
+		link.Mu.Lock()
 		reachedDownloadsLimit := !link.PerUserDownloadLimit && link.Downloads >= link.DownloadsLimit && link.DownloadsLimit > 0
-		if route.read && reachedDownloadsLimit && publicShareRequirementUsesDownload(route.requirement) {
+		link.Mu.Unlock()
+		if route.read && !archiveResume && reachedDownloadsLimit && publicShareRequirementUsesDownload(route.requirement) {
 			invalidatePublicShareArchiveToken(query.Get("archiveToken"), link.Hash)
 			return http.StatusForbidden, fmt.Errorf("public share access denied")
 		}
@@ -597,9 +862,30 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 			return http.StatusForbidden, fmt.Errorf("public share access denied")
 		}
 		data.shareScope = normalizePublicShareIndexPath(cleanScope)
+		if uploadInitializationProbe {
+			if !publicShareWriteAllowed(http.MethodPost, "/resources", data.shareAccess) {
+				return http.StatusForbidden, fmt.Errorf("public share access denied")
+			}
+			if _, _, targetErr := authorizePublicShareWriteTarget(data, source.Path, inputPath); targetErr != nil {
+				return http.StatusForbidden, fmt.Errorf("public share access denied")
+			}
+			return http.StatusNotImplemented, fmt.Errorf("browsing is disabled for upload shares")
+		}
+		if !route.read && !publicShareWriteAllowed(r.Method, r.URL.Path, data.shareAccess) {
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
+		if !route.read {
+			handled, authorizeErr := authorizePublicShareSingleWriteRequest(r, data, source.Path)
+			if authorizeErr != nil {
+				return http.StatusForbidden, fmt.Errorf("public share access denied")
+			}
+			if handled {
+				return callHandler()
+			}
+		}
 
 		if route.targetMode == publicShareTargetImage {
-			return fn(w, r, data)
+			return callHandler()
 		}
 
 		if route.targetMode == publicShareTargetFiles {
@@ -622,7 +908,7 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 				}
 				data.shareTargets = append(data.shareTargets, target)
 			}
-			return fn(w, r, data)
+			return callHandler()
 		}
 
 		var readTarget publicShareTarget
@@ -636,7 +922,7 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 			data.IndexPath = utils.AddTrailingSlashIfNotExists(readTarget.ScopedPath)
 		} else {
 			var scopedPath string
-			scopedPath, err = resolvePublicShareWriteTarget(link.Path, data.shareScope, requestedPath)
+			scopedPath, err = resolvePublicShareWriteScopedPath(link.Path, data.shareScope, requestedPath)
 			if err != nil {
 				return http.StatusForbidden, fmt.Errorf("public share access denied")
 			}
@@ -644,15 +930,15 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 		}
 
 		if route.skipFileInfo {
-			return fn(w, r, data)
+			return callHandler()
 		}
 
-		getContent := query.Get("content") == "true"
+		getContent := r.URL.Path == "/resources" && query.Get("content") == "true"
 		file, err := FileInfoFasterFunc(utils.FileOptions{
 			Path:                     data.IndexPath,
 			Source:                   source.Name,
 			Expand:                   true,
-			Content:                  getContent,
+			Content:                  false,
 			Metadata:                 false,
 			AlbumArt:                 route.albumArt,
 			ExtractEmbeddedSubtitles: config.Integrations.Media.ExtractEmbeddedSubtitles && link.ExtractEmbeddedSubtitles,
@@ -661,11 +947,22 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 			FollowSymlinks:           true,
 		}, store.Access, data.shareUser, store.Share)
 		if err != nil {
-			logger.Errorf("error fetching file info for share. hash=%v path=%v error=%v", hash, requestedPath, err)
+			logger.Errorf("error fetching file info for share. path=%v error=%v", requestedPath, err)
 			return errToStatus(err), fmt.Errorf("error fetching share from server")
 		}
 		if route.read {
+			readTarget, err = reauthorizePublicShareTarget(data, source.Path, readTarget)
+			if err != nil {
+				return http.StatusForbidden, fmt.Errorf("public share access denied")
+			}
+			data.shareTargets = []publicShareTarget{readTarget}
 			file.RealPath = readTarget.RealPath
+			if getContent && !readTarget.IsDir {
+				file.Content, err = readPublicShareTextContent(readTarget)
+				if err != nil {
+					return http.StatusForbidden, fmt.Errorf("public share access denied")
+				}
+			}
 			if file.Type == "directory" {
 				idx := indexing.GetIndex(source.Name)
 				if idx == nil {
@@ -681,12 +978,8 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 			file.OnlyOfficeId = ""
 		}
 		if getContent && file.Content != "" {
-			link.Mu.Lock()
-			link.Downloads++
-			link.Mu.Unlock()
-			// Track per-user download if enabled
-			if link.PerUserDownloadLimit {
-				link.IncrementUserDownload(data.user.Username)
+			if !consumePublicShareOriginalRead(data) {
+				return http.StatusForbidden, fmt.Errorf("public share access denied")
 			}
 		}
 		file.Path = utils.AddTrailingSlashIfNotExists(inputPath)
@@ -696,7 +989,7 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 			return publicVerifiedMetadataHandler(w, r, data)
 		}
 		// Call the next handler with the data
-		return fn(w, r, data)
+		return callHandler()
 	})
 	return func(w http.ResponseWriter, r *http.Request, data *requestContext) (int, error) {
 		query, err := url.ParseQuery(r.URL.RawQuery)
@@ -797,24 +1090,14 @@ func withOrWithoutUserHelper(fn handleFunc) handleFunc {
 			return fn(w, r, data)
 		}
 
-		// Authentication failed, but try to extract user info from expired tokens
+		// Optional authentication must never recover identity from a credential that
+		// the normal authentication path rejected (revoked, expired, or malformed).
 		if status == http.StatusUnauthorized || status == http.StatusForbidden {
-			// Try to extract user info from potentially expired token
-			userFromExpiredToken := extractUserFromExpiredToken(r, data)
-			if userFromExpiredToken != nil {
-				data.user = userFromExpiredToken
-				if data.share != nil {
-					data.user.CustomTheme = data.share.ShareTheme
-				}
-				setUserInResponseWriter(w, data.user)
-				return fn(w, r, data)
-			}
-
-			// No valid token or user found, fall back to anonymous
 			data.user = &users.User{Username: "anonymous"}
 			settings.ApplyUserDefaults(data.user)
 			// Clear any user data that might have been partially set
 			data.token = ""
+			data.apiToken = false
 			if data.share != nil {
 				data.user.CustomTheme = data.share.ShareTheme
 			}
@@ -889,6 +1172,33 @@ func LoginHelper(disableOtp bool, fn handleFunc) handleFunc {
 	}
 }
 
+func configuredExternalJWT(r *http.Request) string {
+	if !config.Auth.Methods.JwtAuth.Enabled {
+		return ""
+	}
+	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+	headerName := strings.TrimSpace(config.Auth.Methods.JwtAuth.Header)
+	if strings.EqualFold(headerName, "Authorization") {
+		if authorization != "" {
+			fields := strings.Fields(authorization)
+			if len(fields) == 2 && (strings.EqualFold(fields[0], "bearer") || strings.EqualFold(fields[0], "basic")) {
+				return ""
+			}
+			return authorization
+		}
+		return strings.TrimSpace(r.URL.Query().Get("jwt"))
+	}
+	if authorization != "" {
+		return ""
+	}
+	if headerName != "" {
+		if token := strings.TrimSpace(r.Header.Get(headerName)); token != "" {
+			return token
+		}
+	}
+	return strings.TrimSpace(r.URL.Query().Get("jwt"))
+}
+
 // Middleware to retrieve and authenticate user
 func withUserHelper(fn handleFunc) handleFunc {
 	return func(w http.ResponseWriter, r *http.Request, data *requestContext) (int, error) {
@@ -906,17 +1216,9 @@ func withUserHelper(fn handleFunc) handleFunc {
 			return fn(w, r, data)
 		}
 
-		// Check for JWT external auth first (header or query param)
-		if config.Auth.Methods.JwtAuth.Enabled {
-			jwtToken := r.Header.Get(config.Auth.Methods.JwtAuth.Header)
-			if jwtToken == "" {
-				// Check query parameter (hardcoded to "jwt")
-				jwtToken = r.URL.Query().Get("jwt")
-			}
-
-			if jwtToken != "" {
-				return getJwtUser(w, r, data, fn, jwtToken)
-			}
+		// A standard Authorization credential is authoritative over external JWT fallbacks.
+		if jwtToken := configuredExternalJWT(r); jwtToken != "" {
+			return getJwtUser(w, r, data, fn, jwtToken)
 		}
 
 		proxyUser := r.Header.Get(config.Auth.Methods.ProxyAuth.Header)
@@ -944,6 +1246,17 @@ func withUserHelper(fn handleFunc) handleFunc {
 		if !token.Valid {
 			return http.StatusUnauthorized, fmt.Errorf("invalid token")
 		}
+		rawTokenType, hasTokenType := token.Header[auth.TokenTypeHeader]
+		tokenType, tokenTypeIsString := rawTokenType.(string)
+		if hasTokenType {
+			if !tokenTypeIsString || (tokenType != auth.TokenTypeWeb && tokenType != auth.TokenTypeAPI) {
+				return http.StatusUnauthorized, fmt.Errorf("invalid token type")
+			}
+			nonce, ok := token.Header[auth.TokenNonceHeader].(string)
+			if !ok || nonce == "" {
+				return http.StatusUnauthorized, fmt.Errorf("invalid token nonce")
+			}
+		}
 		if auth.IsRevokedApiToken(store.Access, data.token) {
 			return http.StatusUnauthorized, fmt.Errorf("token is expired or revoked")
 		}
@@ -958,6 +1271,9 @@ func withUserHelper(fn handleFunc) handleFunc {
 		}
 		// Check if token is minimal/stateful (no BelongsTo in claim)
 		minimalToken := tk.BelongsTo == 0
+		if tokenType == auth.TokenTypeWeb && (minimalToken || tk.Name != "" || tk.PermissionsVersion != 0) {
+			return http.StatusUnauthorized, fmt.Errorf("invalid web token")
+		}
 		if minimalToken {
 			// Hash the token and look up user ID in access storage
 			userID, found := store.Access.GetUserIDFromToken(data.token)
@@ -965,55 +1281,66 @@ func withUserHelper(fn handleFunc) handleFunc {
 				return http.StatusUnauthorized, fmt.Errorf("token is invalid or revoked")
 			}
 			tk.BelongsTo = userID
+			data.apiToken = true
 		}
 		data.user, err = store.Users.Get(tk.BelongsTo)
 		if err != nil {
 			logger.Errorf("Failed to get user with ID %v: %v", tk.BelongsTo, err)
 			return http.StatusInternalServerError, err
 		}
-		if !minimalToken {
-			findAPIToken := func(tokens map[string]users.AuthToken) (users.AuthToken, bool) {
-				for _, apiToken := range tokens {
-					if apiToken.Token == data.token || apiToken.Key == data.token {
-						return apiToken, true
-					}
+		findAPIToken := func(tokens map[string]users.AuthToken) (string, users.AuthToken, bool) {
+			for name, apiToken := range tokens {
+				if apiToken.Token == data.token || apiToken.Key == data.token {
+					return name, apiToken, true
 				}
-				return users.AuthToken{}, false
 			}
-			storedToken, stored := findAPIToken(data.user.Tokens)
+			return "", users.AuthToken{}, false
+		}
+		storedName, storedToken, stored := findAPIToken(data.user.Tokens)
+		if !stored {
+			storedName, storedToken, stored = findAPIToken(data.user.ApiKeys)
+		}
+		switch tokenType {
+		case auth.TokenTypeWeb:
+			if stored {
+				return http.StatusUnauthorized, fmt.Errorf("web token conflicts with API token metadata")
+			}
+		case auth.TokenTypeAPI, "":
 			if !stored {
-				storedToken, stored = findAPIToken(data.user.ApiKeys)
+				return http.StatusUnauthorized, fmt.Errorf("token metadata is missing or revoked")
 			}
-
+			data.apiToken = true
+			if minimalToken {
+				if storedToken.BelongsTo != 0 || storedToken.PermissionsVersion != 0 {
+					return http.StatusUnauthorized, fmt.Errorf("invalid minimal API token metadata")
+				}
+				break
+			}
 			var tokenPermissions users.Permissions
-			applyTokenPermissions := false
 			switch {
 			case tk.Name != "":
-				if tk.PermissionsVersion != users.CurrentPermissionsVersion ||
-					(stored && storedToken.PermissionsVersion != users.CurrentPermissionsVersion) {
+				if !stored || storedName != tk.Name || storedToken.Name != tk.Name ||
+					tk.PermissionsVersion != users.CurrentPermissionsVersion ||
+					storedToken.PermissionsVersion != users.CurrentPermissionsVersion ||
+					storedToken.Permissions != tk.Permissions {
 					return http.StatusUnauthorized, fmt.Errorf("invalid API token permissions version")
 				}
 				tokenPermissions = tk.Permissions
-				applyTokenPermissions = true
-			case stored:
+			default:
 				if tk.PermissionsVersion != 0 || storedToken.PermissionsVersion != 0 {
 					return http.StatusUnauthorized, fmt.Errorf("invalid API token permissions version")
 				}
-				tokenPermissions = users.NormalizeLegacyPermissions(tk.Permissions)
-				applyTokenPermissions = true
-			case tk.PermissionsVersion != 0:
-				return http.StatusUnauthorized, fmt.Errorf("invalid API token permissions version")
+				// Legacy API tokens only retain permissions explicitly present in their signed claims.
+				tokenPermissions = tk.Permissions
 			}
 
-			if applyTokenPermissions {
-				requestUser := *data.user
-				requestUser.Permissions = users.IntersectPermissions(data.user.Permissions, tokenPermissions)
-				data.user = &requestUser
-			}
+			requestUser := *data.user
+			requestUser.Permissions = users.IntersectPermissions(data.user.Permissions, tokenPermissions)
+			data.user = &requestUser
 		}
 
 		// Set cookie. Some clients like gvfs relies on it for concurrent uploads
-		if tk.RegisteredClaims.ExpiresAt != nil {
+		if !data.apiToken && tk.RegisteredClaims.ExpiresAt != nil {
 			setSessionCookie(w, r, data.token, tk.RegisteredClaims.ExpiresAt.Time)
 		}
 		setUserInResponseWriter(w, data.user)
@@ -1333,6 +1660,53 @@ func getRemoteIP(r *http.Request) string {
 	return ip
 }
 
+var sensitiveQueryKeys = map[string]struct{}{
+	"auth":         {},
+	"jwt":          {},
+	"token":        {},
+	"password":     {},
+	"code":         {},
+	"archivetoken": {},
+	"capability":   {},
+}
+
+func redactPublicSharePath(path string) string {
+	const marker = "/public/share/"
+	index := strings.Index(path, marker)
+	if index < 0 {
+		return path
+	}
+	valueStart := index + len(marker)
+	if valueStart >= len(path) {
+		return path
+	}
+	remainder := path[valueStart:]
+	if slash := strings.IndexByte(remainder, '/'); slash >= 0 {
+		return path[:valueStart] + "[REDACTED]" + remainder[slash:]
+	}
+	return path[:valueStart] + "[REDACTED]"
+}
+
+func redactedRequestURL(r *http.Request) string {
+	publicRoute := strings.Contains(r.URL.Path, "/public/")
+	path := redactPublicSharePath(r.URL.Path)
+	if r.URL.RawQuery == "" {
+		return path
+	}
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return path + "?[REDACTED]"
+	}
+	for key := range query {
+		lowerKey := strings.ToLower(key)
+		_, sensitive := sensitiveQueryKeys[lowerKey]
+		if sensitive || (publicRoute && lowerKey == "hash") {
+			query[key] = []string{"[REDACTED]"}
+		}
+	}
+	return path + "?" + query.Encode()
+}
+
 // LoggingMiddleware logs each request and its status code.
 func LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1340,7 +1714,7 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 		defer func() {
 			if rcv := recover(); rcv != nil {
 				method := r.Method
-				url := r.URL.String()
+				requestURL := redactedRequestURL(r)
 				username := "unknown" // Default username
 
 				// Attempt to get username from ResponseWriterWrapper if it's set
@@ -1352,8 +1726,8 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 				n := runtime.Stack(buf, false) // false for current goroutine only
 				stackTrace := string(buf[:n])
 
-				logger.Errorf("PANIC RECOVERED: %v\nUser: %s\nMethod: %s\nURL: %s\nRemoteAddr: %s\nGo Stack Trace:\n%s",
-					rcv, username, method, url, getRemoteIP(r), stackTrace)
+				logger.Errorf("PANIC RECOVERED (%T)\nUser: %s\nMethod: %s\nURL: %s\nRemoteAddr: %s\nGo Stack Trace:\n%s",
+					rcv, username, method, requestURL, getRemoteIP(r), stackTrace)
 
 				// Attempt to send a 500 error response to the client
 				// This is a best-effort; the connection might be broken or process too unstable.
@@ -1379,10 +1753,7 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(wrappedWriter, r)
 
 		// Existing logging logic for normal requests
-		fullURL := r.URL.Path
-		if r.URL.RawQuery != "" {
-			fullURL += "?" + r.URL.RawQuery
-		}
+		fullURL := redactedRequestURL(r)
 		truncUser := wrappedWriter.User
 		if truncUser == "" {
 			truncUser = "N/A" // Handle case where user might not be set (e.g., if panic occurred before user auth)

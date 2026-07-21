@@ -1,6 +1,7 @@
 package share
 
 import (
+	stderrors "errors"
 	"strings"
 	"sync"
 	"time"
@@ -11,6 +12,8 @@ import (
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 	"github.com/gtsteffaniak/go-logger/logger"
 )
+
+var ErrConcurrentUpdate = stderrors.New("share changed during update")
 
 // StorageBackend is the interface to implement for a share storage.
 type StorageBackend interface {
@@ -61,6 +64,7 @@ type Storage struct {
 	shareByHash map[string]*Link             // key: link hash
 	shareByPath map[string]map[string]string // key: pathKey(Source, Path), value: set of hashes (hash -> "")
 	mu          sync.RWMutex
+	mutationMu  sync.Mutex
 	users       *users.Storage
 }
 
@@ -322,37 +326,58 @@ func (s *Storage) IsShared(path, source string, id uint) bool {
 // UpdateShares updates all shares that match oldSource and oldPath to point to newSource and newPath.
 // Handles both exact matches and subdirectories, regardless of trailing slashes.
 func (s *Storage) UpdateShares(oldSource, oldPath, newSource, newPath string) (int, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	links, err := s.All()
 	if err != nil && err != errors.ErrNotExist {
 		logger.Error("failed to list shares", "error", err)
 		return 0, err
 	}
 
-	// Normalize paths for comparison (remove trailing slashes)
-	oldPath = utils.AddTrailingSlashIfNotExists(oldPath)
-	newPath = utils.AddTrailingSlashIfNotExists(newPath)
+	oldRoot := strings.TrimSuffix(utils.AddTrailingSlashIfNotExists(oldPath), "/")
+	if oldRoot == "" {
+		oldRoot = "/"
+	}
+	newRoot := strings.TrimSuffix(utils.AddTrailingSlashIfNotExists(newPath), "/")
+	if newRoot == "" {
+		newRoot = "/"
+	}
 
 	updated := 0
-	for _, l := range links {
-		if l == nil || l.Source != oldSource {
+	for _, link := range links {
+		if link == nil || link.Source != oldSource {
 			continue
 		}
-		l.Path = utils.AddTrailingSlashIfNotExists(l.Path)
-
-		pos := strings.Index(l.Path, oldPath)
-		if pos < 0 {
+		linkRoot := strings.TrimSuffix(utils.AddTrailingSlashIfNotExists(link.Path), "/")
+		if linkRoot == "" {
+			linkRoot = "/"
+		}
+		if oldRoot != "/" && linkRoot != oldRoot && !strings.HasPrefix(linkRoot, oldRoot+"/") {
 			continue
 		}
 
-		l.Source = newSource
-		l.Path = newPath
+		suffix := ""
+		if linkRoot != oldRoot {
+			if oldRoot == "/" {
+				suffix = linkRoot
+			} else {
+				suffix = strings.TrimPrefix(linkRoot, oldRoot)
+			}
+		}
+		movedPath := strings.TrimSuffix(newRoot, "/") + suffix
+		if movedPath == "" {
+			movedPath = "/"
+		}
+		candidate := link.Clone()
+		candidate.Source = newSource
+		candidate.Path = utils.AddTrailingSlashIfNotExists(movedPath)
 
-		if err := s.back.Save(l); err != nil {
-			logger.Error("failed to save updated share", "hash", l.Hash, "error", err)
+		if err := s.back.Save(candidate); err != nil {
+			logger.Error("failed to save updated share", "error", err)
 			return updated, err
 		}
 
-		s.setCacheAfterMove(l, oldSource, oldPath)
+		s.setCacheAfterMove(candidate, link.Source, link.Path)
 		updated++
 	}
 	return updated, nil
@@ -360,27 +385,32 @@ func (s *Storage) UpdateShares(oldSource, oldPath, newSource, newPath string) (i
 
 // UpdateSharePath updates the path for a specific share identified by hash
 func (s *Storage) UpdateSharePath(hash, newPath string) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	link, err := s.GetByHash(hash)
 	if err != nil {
 		return err
 	}
 
 	oldPath := link.Path
-	link.Path = newPath
+	updated := link.Clone()
+	updated.Path = newPath
 
-	if err := s.back.Save(link); err != nil {
-		logger.Error("failed to save updated share", "hash", hash, "error", err)
+	if err := s.back.Save(updated); err != nil {
+		logger.Error("failed to save updated share", "error", err)
 		return err
 	}
 
-	s.setCacheAfterMove(link, link.Source, oldPath)
+	s.setCacheAfterMove(updated, updated.Source, oldPath)
 
-	logger.Debug("share path updated", "hash", hash, "fromPath", oldPath, "toPath", newPath)
+	logger.Debug("share path updated", "fromPath", oldPath, "toPath", newPath)
 	return nil
 }
 
 // Save wraps StorageBackend.Save
 func (s *Storage) Save(l *Link) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	if err := s.back.Save(l); err != nil {
 		return err
 	}
@@ -388,8 +418,35 @@ func (s *Storage) Save(l *Link) error {
 	return nil
 }
 
+// UpdateIfUnchanged persists candidate only while existing is still the stable
+// cached share instance. Delete and concurrent updates invalidate that identity.
+func (s *Storage) UpdateIfUnchanged(existing, candidate *Link) error {
+	if existing == nil || candidate == nil || existing.Hash == "" || candidate.Hash != existing.Hash {
+		return ErrConcurrentUpdate
+	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
+	s.mu.RLock()
+	current := s.shareByHash[existing.Hash]
+	s.mu.RUnlock()
+	if current == nil {
+		return errors.ErrNotExist
+	}
+	if current != existing {
+		return ErrConcurrentUpdate
+	}
+	if err := s.back.Save(candidate); err != nil {
+		return err
+	}
+	s.setCacheAfterMove(candidate, existing.Source, existing.Path)
+	return nil
+}
+
 // Delete wraps StorageBackend.Delete
 func (s *Storage) Delete(hash string) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	if err := s.back.Delete(hash); err != nil {
 		return err
 	}

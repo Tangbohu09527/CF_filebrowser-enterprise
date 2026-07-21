@@ -313,6 +313,11 @@ func TestPublicUploadReplacementPermissions(t *testing.T) {
 
 	owner := &users.User{
 		Username: "public-upload-owner",
+		Permissions: users.Permissions{
+			Share:  true,
+			Create: true,
+			Modify: true,
+		},
 		Scopes: []users.SourceScope{
 			{Name: sourcePath, Scope: "/"},
 		},
@@ -441,8 +446,10 @@ func TestPublicUploadReplacementPermissions(t *testing.T) {
 
 			hash := fmt.Sprintf("public-upload-permissions-%d", i)
 			link := &dbshare.Link{
-				Hash:   hash,
-				UserID: owner.ID,
+				Hash:                hash,
+				UserID:              owner.ID,
+				CapabilityVersion:   dbshare.CurrentCapabilityVersion,
+				CreatorCapabilities: dbshare.CapabilitiesFromPermissions(owner.Permissions),
 				CommonShare: dbshare.CommonShare{
 					Source:            sourcePath,
 					Path:              "/public",

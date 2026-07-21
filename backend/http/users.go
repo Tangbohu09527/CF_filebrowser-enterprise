@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,7 +17,6 @@ import (
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	"github.com/gtsteffaniak/filebrowser/backend/database/storage"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
-	"github.com/gtsteffaniak/go-logger/logger"
 )
 
 type UserRequest struct {
@@ -517,22 +515,34 @@ func userPutHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (
 		}
 	}
 
+	permissionsUpdated := len(req.Which) == 0
+	for _, field := range req.Which {
+		if strings.EqualFold(field, "permissions") || strings.EqualFold(field, "all") {
+			permissionsUpdated = true
+			break
+		}
+	}
+	if permissionsUpdated && oldUser.Permissions.Api && !req.User.Permissions.Api {
+		tokens := make(map[string]struct{}, len(oldUser.Tokens)+len(oldUser.ApiKeys))
+		for _, tokenSet := range []map[string]users.AuthToken{oldUser.Tokens, oldUser.ApiKeys} {
+			for _, tokenInfo := range tokenSet {
+				for _, tokenString := range []string{tokenInfo.Token, tokenInfo.Key} {
+					if tokenString != "" {
+						tokens[tokenString] = struct{}{}
+					}
+				}
+			}
+		}
+		for tokenString := range tokens {
+			if err := auth.RevokeApiToken(store.Access, tokenString); err != nil {
+				return http.StatusInternalServerError, fmt.Errorf("revoke api token after permission removal: %w", err)
+			}
+		}
+	}
+
 	err = store.Users.Update(&req.User, d.user.Permissions.Admin, req.Which...)
 	if err != nil {
 		return http.StatusBadRequest, err
-	}
-
-	// Revoke all API keys if API permission was removed
-	if slices.Contains(req.Which, "Permissions") && oldUser.Permissions.Api && !req.User.Permissions.Api {
-		for _, tokenInfo := range oldUser.Tokens {
-			if err := auth.RevokeApiToken(store.Access, tokenInfo.Token); err != nil {
-				logger.Errorf("Failed to revoke API key: %v", err)
-			}
-			// Also remove from HashedTokens
-			if err := store.Access.RemoveApiToken(tokenInfo.Token); err != nil {
-				logger.Errorf("Failed to remove api token: %v", err)
-			}
-		}
 	}
 
 	return http.StatusNoContent, nil

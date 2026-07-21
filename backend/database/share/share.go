@@ -6,6 +6,60 @@ import (
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 )
 
+const CurrentCapabilityVersion = 1
+
+type CapabilitySnapshot struct {
+	Share    bool `json:"share"`
+	Browse   bool `json:"browse"`
+	Preview  bool `json:"preview"`
+	Download bool `json:"download"`
+	Create   bool `json:"create"`
+	Modify   bool `json:"modify"`
+	Delete   bool `json:"delete"`
+}
+
+func CapabilitiesFromPermissions(permissions users.Permissions) CapabilitySnapshot {
+	return CapabilitySnapshot{
+		Share:    permissions.Share,
+		Browse:   permissions.Browse,
+		Preview:  permissions.Preview,
+		Download: permissions.Download,
+		Create:   permissions.Create,
+		Modify:   permissions.Modify,
+		Delete:   permissions.Delete,
+	}
+}
+
+func (capabilities CapabilitySnapshot) Intersect(other CapabilitySnapshot) CapabilitySnapshot {
+	return CapabilitySnapshot{
+		Share:    capabilities.Share && other.Share,
+		Browse:   capabilities.Browse && other.Browse,
+		Preview:  capabilities.Preview && other.Preview,
+		Download: capabilities.Download && other.Download,
+		Create:   capabilities.Create && other.Create,
+		Modify:   capabilities.Modify && other.Modify,
+		Delete:   capabilities.Delete && other.Delete,
+	}
+}
+
+func (capabilities CapabilitySnapshot) IsSubsetOf(limit CapabilitySnapshot) bool {
+	return (!capabilities.Share || limit.Share) &&
+		(!capabilities.Browse || limit.Browse) &&
+		(!capabilities.Preview || limit.Preview) &&
+		(!capabilities.Download || limit.Download) &&
+		(!capabilities.Create || limit.Create) &&
+		(!capabilities.Modify || limit.Modify) &&
+		(!capabilities.Delete || limit.Delete)
+}
+
+type PublicCapabilities struct {
+	Browse    bool `json:"browse"`
+	Preview   bool `json:"preview"`
+	Download  bool `json:"download"`
+	Thumbnail bool `json:"thumbnail"`
+	Viewer    bool `json:"viewer"`
+}
+
 type CommonShare struct {
 	DownloadsLimit           int                 `json:"downloadsLimit,omitempty"`
 	ShareTheme               string              `json:"shareTheme,omitempty"`
@@ -48,6 +102,7 @@ type CommonShare struct {
 	DisableLoginOption       bool                `json:"disableLoginOption"`    // disable login option in share (true = hide, false = show)
 	SourceURL                string              `json:"sourceURL,omitempty"`
 	CanEditShare             bool                `json:"canEditShare,omitempty"`
+	Capabilities             *PublicCapabilities `json:"capabilities,omitempty"`
 }
 type CreateBody struct {
 	CommonShare
@@ -73,4 +128,39 @@ type Link struct {
 	Mu            sync.Mutex     `json:"-"`
 	UserDownloads map[string]int `json:"userDownloads,omitempty"` // Track downloads per username
 	Version       int            `json:"version,omitempty"`
+
+	CapabilityVersion   int                `json:"capabilityVersion,omitempty"`
+	CreatorCapabilities CapabilitySnapshot `json:"creatorCapabilities,omitempty"`
+}
+
+func (link *Link) Clone() *Link {
+	if link == nil {
+		return nil
+	}
+	link.Mu.Lock()
+	defer link.Mu.Unlock()
+	common := link.CommonShare
+	common.AllowedUsernames = append([]string(nil), link.AllowedUsernames...)
+	common.SidebarLinks = append([]users.SidebarLink(nil), link.SidebarLinks...)
+	if link.Capabilities != nil {
+		capabilities := *link.Capabilities
+		common.Capabilities = &capabilities
+	}
+	userDownloads := make(map[string]int, len(link.UserDownloads))
+	for username, downloads := range link.UserDownloads {
+		userDownloads[username] = downloads
+	}
+	return &Link{
+		CommonShare:         common,
+		Downloads:           link.Downloads,
+		Hash:                link.Hash,
+		UserID:              link.UserID,
+		Expire:              link.Expire,
+		PasswordHash:        link.PasswordHash,
+		Token:               link.Token,
+		UserDownloads:       userDownloads,
+		Version:             link.Version,
+		CapabilityVersion:   link.CapabilityVersion,
+		CreatorCapabilities: link.CreatorCapabilities,
+	}
 }
