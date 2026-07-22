@@ -3,6 +3,7 @@ package preview
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"image"
 	"image/color"
@@ -196,7 +197,7 @@ func TestService_Resize(t *testing.T) {
 			options: ResizeOptions{Width: 100, Height: 100, ResizeMode: ResizeModeFill, Quality: QualityLow},
 			source: func(t *testing.T) afero.File {
 				t.Helper()
-				return openFile(t, "testdata/gray-sample.jpg")
+				return newGrayJpegWithExifThumbnail(t, 640, 480, 125, 128, true)
 			},
 			matcher: sizeMatcher(125, 128),
 		},
@@ -204,7 +205,7 @@ func TestService_Resize(t *testing.T) {
 			options: ResizeOptions{Width: 100, Height: 100, ResizeMode: ResizeModeFill, Quality: QualityLow},
 			source: func(t *testing.T) afero.File {
 				t.Helper()
-				return openFile(t, "testdata/20130612_142406.jpg")
+				return newGrayJpegWithExifThumbnail(t, 640, 480, 320, 240, false)
 			},
 			matcher: sizeMatcher(320, 240),
 		},
@@ -212,7 +213,7 @@ func TestService_Resize(t *testing.T) {
 			options: ResizeOptions{Width: 100, Height: 100, ResizeMode: ResizeModeFill, Quality: QualityLow},
 			source: func(t *testing.T) afero.File {
 				t.Helper()
-				return openFile(t, "testdata/IMG_2578.JPG")
+				return newGrayJpegWithoutExifThumbnail(t, 200, 150, true)
 			},
 			matcher: sizeMatcher(100, 100),
 		},
@@ -220,7 +221,7 @@ func TestService_Resize(t *testing.T) {
 			options: ResizeOptions{Width: 100, Height: 100, ResizeMode: ResizeModeFill, Quality: QualityMedium},
 			source: func(t *testing.T) afero.File {
 				t.Helper()
-				return openFile(t, "testdata/gray-sample.jpg")
+				return newGrayJpegWithExifThumbnail(t, 640, 480, 125, 128, true)
 			},
 			matcher: sizeMatcher(100, 100),
 		},
@@ -368,6 +369,124 @@ func newGrayJpeg(t *testing.T, width, height int) afero.File {
 	return file
 }
 
+func newGrayJpegWithExifThumbnail(t *testing.T, width, height, thumbnailWidth, thumbnailHeight int, app0 bool) afero.File {
+	t.Helper()
+
+	thumbnail := encodeGrayJpeg(t, thumbnailWidth, thumbnailHeight)
+	return newGrayJpegWithExif(t, width, height, app0, thumbnail)
+}
+
+func newGrayJpegWithoutExifThumbnail(t *testing.T, width, height int, app0 bool) afero.File {
+	t.Helper()
+
+	return newGrayJpegWithExif(t, width, height, app0, nil)
+}
+
+func newGrayJpegWithExif(t *testing.T, width, height int, app0 bool, thumbnail []byte) afero.File {
+	t.Helper()
+
+	mainImage := encodeGrayJpeg(t, width, height)
+	require.GreaterOrEqual(t, len(mainImage), 2)
+	require.Equal(t, []byte{0xff, 0xd8}, mainImage[:2])
+
+	data := make([]byte, 0, len(mainImage)+len(thumbnail)+64)
+	data = append(data, 0xff, 0xd8)
+	if app0 {
+		data = append(data,
+			0xff, 0xe0, 0x00, 0x10,
+			'J', 'F', 'I', 'F', 0x00,
+			0x01, 0x01, 0x00,
+			0x00, 0x01, 0x00, 0x01,
+			0x00, 0x00,
+		)
+	}
+	data = append(data, buildExifAPP1(t, thumbnail)...)
+	data = append(data, mainImage[2:]...)
+
+	return newTemporaryJpeg(t, data)
+}
+
+func encodeGrayJpeg(t *testing.T, width, height int) []byte {
+	t.Helper()
+
+	var data bytes.Buffer
+	img := image.NewGray(image.Rect(0, 0, width, height))
+	require.NoError(t, jpeg.Encode(&data, img, &jpeg.Options{Quality: 90}))
+	return data.Bytes()
+}
+
+func buildExifAPP1(t *testing.T, thumbnail []byte) []byte {
+	t.Helper()
+
+	const (
+		ifd0Offset      = 8
+		ifd1Offset      = 14
+		thumbnailOffset = 44
+	)
+	tiffSize := ifd1Offset
+	if len(thumbnail) > 0 {
+		tiffSize = thumbnailOffset + len(thumbnail)
+	}
+	tiff := make([]byte, tiffSize)
+	copy(tiff[0:2], "II")
+	binary.LittleEndian.PutUint16(tiff[2:4], 42)
+	binary.LittleEndian.PutUint32(tiff[4:8], ifd0Offset)
+
+	if len(thumbnail) > 0 {
+		binary.LittleEndian.PutUint32(tiff[10:14], ifd1Offset)
+		binary.LittleEndian.PutUint16(tiff[14:16], 2)
+
+		jpegOffsetEntry := tiff[16:28]
+		binary.LittleEndian.PutUint16(jpegOffsetEntry[0:2], 0x0201)
+		binary.LittleEndian.PutUint16(jpegOffsetEntry[2:4], 4)
+		binary.LittleEndian.PutUint32(jpegOffsetEntry[4:8], 1)
+		binary.LittleEndian.PutUint32(jpegOffsetEntry[8:12], thumbnailOffset)
+
+		jpegLengthEntry := tiff[28:40]
+		binary.LittleEndian.PutUint16(jpegLengthEntry[0:2], 0x0202)
+		binary.LittleEndian.PutUint16(jpegLengthEntry[2:4], 4)
+		binary.LittleEndian.PutUint32(jpegLengthEntry[4:8], 1)
+		binary.LittleEndian.PutUint32(jpegLengthEntry[8:12], uint32(len(thumbnail)))
+
+		copy(tiff[thumbnailOffset:], thumbnail)
+	}
+
+	payload := make([]byte, 6+len(tiff))
+	copy(payload, "Exif\x00\x00")
+	copy(payload[6:], tiff)
+	require.LessOrEqual(t, len(payload)+2, int(^uint16(0)))
+
+	segment := make([]byte, 4+len(payload))
+	segment[0], segment[1] = 0xff, 0xe1
+	binary.BigEndian.PutUint16(segment[2:4], uint16(len(payload)+2))
+	copy(segment[4:], payload)
+	return segment
+}
+
+func newTemporaryJpeg(t *testing.T, data []byte) afero.File {
+	t.Helper()
+
+	file, err := os.CreateTemp(t.TempDir(), "preview-*.jpg")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = file.Close() })
+
+	written, err := file.Write(data)
+	require.NoError(t, err)
+	require.Equal(t, len(data), written)
+	_, err = file.Seek(0, io.SeekStart)
+	require.NoError(t, err)
+	return file
+}
+
+func newTemporaryGrayJpegPath(t *testing.T, width, height int) string {
+	t.Helper()
+
+	file := newTemporaryJpeg(t, encodeGrayJpeg(t, width, height))
+	path := file.Name()
+	require.NoError(t, file.Close())
+	return path
+}
+
 func newGrayPng(t *testing.T, width, height int) afero.File {
 	fs := afero.NewMemMapFs()
 	file, err := fs.Create("image.png")
@@ -423,15 +542,6 @@ func newGrayBmp(t *testing.T, width, height int) afero.File {
 	require.NoError(t, err)
 
 	_, err = file.Seek(0, io.SeekStart)
-	require.NoError(t, err)
-
-	return file
-}
-
-func openFile(t *testing.T, name string) afero.File {
-	appfs := afero.NewOsFs()
-	file, err := appfs.Open(name)
-
 	require.NoError(t, err)
 
 	return file
@@ -608,7 +718,7 @@ func TestImageFitsPreviewSize(t *testing.T) {
 func TestReadImageFileDimensions(t *testing.T) {
 	t.Parallel()
 
-	width, height, err := ReadImageFileDimensions("testdata/gray-sample.jpg")
+	width, height, err := ReadImageFileDimensions(newTemporaryGrayJpegPath(t, 125, 128))
 	require.NoError(t, err)
 	require.Greater(t, width, 0)
 	require.Greater(t, height, 0)
