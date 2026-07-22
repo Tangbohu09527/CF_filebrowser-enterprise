@@ -129,6 +129,77 @@ func subtitlesHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	return http.StatusOK, nil
 }
 
+// publicSubtitlesHandler is the share-link variant of subtitlesHandler.
+// @Summary Get subtitle content from a public share
+// @Tags Shares
+// @Produce text/plain
+// @Param hash query string true "Share hash"
+// @Param path query string false "Path within the share"
+// @Param name query string true "Subtitle track name"
+// @Param embedded query bool false "Whether this is an embedded subtitle stream"
+// @Success 200 {string} string "Raw subtitle content"
+// @Failure 400 {object} map[string]string "Bad request"
+// @Failure 403 {object} map[string]string "Forbidden"
+// @Failure 404 {object} map[string]string "Not found"
+// @Router /public/api/media/subtitles [get]
+func publicSubtitlesHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+	if d == nil || d.share == nil || d.share.ShareType == "upload" ||
+		!d.shareAccess.allows(publicShareReadOriginalViewer) || len(d.shareTargets) != 1 {
+		return http.StatusForbidden, commonerrors.ErrAccessDenied
+	}
+
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		return http.StatusBadRequest, errors.New("subtitle name is required")
+	}
+	embeddedValue := r.URL.Query().Get("embedded")
+	if embeddedValue != "" && embeddedValue != "true" && embeddedValue != "false" {
+		return http.StatusBadRequest, errors.New("invalid embedded parameter")
+	}
+	embedded := embeddedValue == "true"
+
+	target, err := reauthorizePublicMediaTarget(d, d.shareTargets[0])
+	if err != nil {
+		return http.StatusForbidden, commonerrors.ErrAccessDenied
+	}
+	if !strings.HasPrefix(d.fileInfo.Type, "video") {
+		return http.StatusNotFound, errors.New("file is not a video")
+	}
+
+	var content string
+	if embedded {
+		track := findSubtitleTrack(d.fileInfo.Subtitles, name, true)
+		if track == nil || track.Index == nil {
+			return http.StatusNotFound, errors.New("embedded subtitle track not found")
+		}
+		content, err = ffmpeg.ExtractSubtitleContent(target.RealPath, *track.Index)
+		if err != nil {
+			return http.StatusInternalServerError, errors.New("failed to extract embedded subtitle")
+		}
+	} else {
+		if !isExternalSubtitleForMedia(filepath.Base(target.LogicalPath), name) {
+			return http.StatusNotFound, errors.New("subtitle track not found")
+		}
+		sidecar, sidecarErr := authorizedPublicMediaSidecar(d, target, name)
+		if sidecarErr != nil {
+			return mediaSidecarStatus(sidecarErr), errors.New("subtitle sidecar is not available")
+		}
+		content, err = readAuthorizedPublicTextSidecar(sidecar.RealPath, sidecar.info)
+		if err != nil {
+			return mediaSidecarStatus(err), errors.New("subtitle sidecar is not available")
+		}
+	}
+
+	if !consumePublicShareOriginalRead(d) {
+		return http.StatusForbidden, commonerrors.ErrAccessDenied
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", "inline")
+	w.Header().Set("Cache-Control", "private")
+	http.ServeContent(w, r, name, time.Now(), bytes.NewReader([]byte(content)))
+	return http.StatusOK, nil
+}
+
 func findSubtitleTrack(subtitles []utils.SubtitleTrack, name string, embedded bool) *utils.SubtitleTrack {
 	for i := range subtitles {
 		sub := &subtitles[i]
@@ -152,6 +223,7 @@ func isExternalSubtitleForMedia(mediaName, sidecarName string) bool {
 
 var (
 	errInvalidMediaSidecar = errors.New("invalid media sidecar path")
+	errUnsafeMediaSidecar  = errors.New("unsafe media sidecar")
 )
 
 func mediaSidecarIndexPath(mediaPath, name string) (string, error) {
@@ -207,6 +279,49 @@ func readAuthorizedTextSidecar(target authenticatedReadTarget) (string, error) {
 	return string(content), nil
 }
 
+func readAuthorizedPublicTextSidecar(realPath string, expected os.FileInfo) (string, error) {
+	const maxSidecarSize = 50 * 1024 * 1024
+
+	before, err := os.Lstat(realPath)
+	if err != nil {
+		return "", err
+	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
+		return "", errUnsafeMediaSidecar
+	}
+	if !publicShareSameFileIdentity(expected, before) {
+		return "", errUnsafeMediaSidecar
+	}
+	if before.Size() > maxSidecarSize {
+		return "", errors.New("media sidecar is too large")
+	}
+
+	file, err := os.Open(realPath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	after, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !os.SameFile(before, after) || !after.Mode().IsRegular() || !publicShareSameFileIdentity(expected, after) {
+		return "", errUnsafeMediaSidecar
+	}
+
+	content, err := io.ReadAll(io.LimitReader(file, maxSidecarSize+1))
+	if err != nil {
+		return "", err
+	}
+	if len(content) > maxSidecarSize {
+		return "", errors.New("media sidecar is too large")
+	}
+	if !isTextSidecar(content) {
+		return "", nil
+	}
+	return string(content), nil
+}
+
 func isTextSidecar(content []byte) bool {
 	if len(content) == 0 {
 		return true
@@ -225,6 +340,8 @@ func mediaSidecarStatus(err error) int {
 	switch {
 	case errors.Is(err, errInvalidMediaSidecar):
 		return http.StatusBadRequest
+	case errors.Is(err, errUnsafeMediaSidecar):
+		return http.StatusForbidden
 	default:
 		return errToStatus(err)
 	}
@@ -262,11 +379,19 @@ func authenticatedMediaSidecarTargets(fileInfo *iteminfo.ExtendedFileInfo, sourc
 	}
 	fileInfo.Subtitles = filtered
 
-	if strings.HasPrefix(fileInfo.Type, "audio") && fileInfo.Metadata != nil && !fileInfo.Metadata.HasLyrics {
+	if strings.HasPrefix(fileInfo.Type, "audio") && fileInfo.Metadata != nil {
+		fileInfo.Metadata.Lyrics = nil
+		if !currentUser.Permissions.Download {
+			fileInfo.Metadata.HasLyrics = false
+			return targets
+		}
 		lrcName := strings.TrimSuffix(logicalMediaName, filepath.Ext(logicalMediaName)) + ".lrc"
-		if target, err := authorizedMediaSidecar(mediaTarget.LogicalPath, source, lrcName, currentUser); err == nil {
+		target, err := authorizedMediaSidecar(mediaTarget.LogicalPath, source, lrcName, currentUser)
+		if err == nil {
 			fileInfo.Metadata.HasLyrics = true
 			appendTarget(target)
+		} else if mediaSidecarStatus(err) != http.StatusNotFound {
+			fileInfo.Metadata.HasLyrics = false
 		}
 	}
 	return targets
@@ -300,6 +425,116 @@ func authenticatedMediaTargetsByLogicalName(targets []authenticatedReadTarget) m
 		byName[pathpkg.Base(target.LogicalPath)] = target
 	}
 	return byName
+}
+
+func authorizedPublicMediaSidecar(d *requestContext, media publicShareTarget, name string) (publicShareTarget, error) {
+	var target publicShareTarget
+	if d == nil || d.share == nil || d.shareUser == nil {
+		return target, commonerrors.ErrAccessDenied
+	}
+	sourceInfo, ok := config.Server.SourceMap[d.share.Source]
+	if !ok {
+		return target, commonerrors.ErrAccessDenied
+	}
+	sidecarPath, err := mediaSidecarIndexPath(media.LogicalPath, name)
+	if err != nil {
+		return target, err
+	}
+	candidatePath, err := filepath.Abs(filepath.Join(sourceInfo.Path, filepath.FromSlash(strings.TrimPrefix(sidecarPath, "/"))))
+	if err != nil {
+		return target, err
+	}
+	before, err := os.Lstat(candidatePath)
+	if err != nil {
+		return target, err
+	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
+		return target, errUnsafeMediaSidecar
+	}
+	target, err = resolvePublicShareLogicalTarget(d, sourceInfo.Path, sidecarPath)
+	if err != nil {
+		return publicShareTarget{}, err
+	}
+	if target.IsDir || !publicShareSameFileIdentity(before, target.info) {
+		return publicShareTarget{}, errUnsafeMediaSidecar
+	}
+	return target, nil
+}
+
+func reauthorizePublicMediaTarget(d *requestContext, checked publicShareTarget) (publicShareTarget, error) {
+	var target publicShareTarget
+	if d == nil || d.share == nil {
+		return target, commonerrors.ErrAccessDenied
+	}
+	sourceInfo, ok := config.Server.SourceMap[d.share.Source]
+	if !ok {
+		return target, commonerrors.ErrAccessDenied
+	}
+	target, err := reauthorizePublicShareTarget(d, sourceInfo.Path, checked)
+	if err != nil || target.IsDir || target.info == nil {
+		return publicShareTarget{}, commonerrors.ErrAccessDenied
+	}
+	before, err := os.Lstat(target.RealPath)
+	if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() ||
+		!publicShareSameFileIdentity(target.info, before) {
+		return publicShareTarget{}, commonerrors.ErrAccessDenied
+	}
+	return target, nil
+}
+
+func sanitizePublicMediaInfo(r *http.Request, d *requestContext, target publicShareTarget, info *iteminfo.ExtendedFileInfo, albumArt bool) error {
+	if info == nil {
+		return commonerrors.ErrAccessDenied
+	}
+	info.Content = ""
+	filtered := make([]utils.SubtitleTrack, 0, len(info.Subtitles))
+	for _, track := range info.Subtitles {
+		if track.Embedded {
+			filtered = append(filtered, track)
+			continue
+		}
+		if _, err := authorizedPublicMediaSidecar(d, target, track.Name); err == nil {
+			filtered = append(filtered, track)
+		}
+	}
+	info.Subtitles = filtered
+
+	if info.Metadata == nil {
+		return nil
+	}
+	info.Metadata.Lyrics = nil
+	if info.Metadata.HasLyrics {
+		if d == nil || !d.shareAccess.allows(publicShareReadOriginalViewer) {
+			info.Metadata.HasLyrics = false
+		} else {
+			lrcName := strings.TrimSuffix(filepath.Base(target.LogicalPath), filepath.Ext(target.LogicalPath)) + ".lrc"
+			if _, err := authorizedPublicMediaSidecar(d, target, lrcName); err != nil && mediaSidecarStatus(err) != http.StatusNotFound {
+				info.Metadata.HasLyrics = false
+			}
+		}
+	}
+	if !albumArt {
+		info.Metadata.AlbumArt = nil
+		return nil
+	}
+	if len(info.Metadata.AlbumArt) == 0 {
+		return nil
+	}
+	if target.info == nil {
+		return commonerrors.ErrAccessDenied
+	}
+	info.RealPath = target.RealPath
+	info.Source = config.Server.SourceMap[d.share.Source].Name
+	info.Path = target.ScopedPath
+	info.Size = target.info.Size()
+	info.ModTime = target.info.ModTime()
+	info.HasPreview = true
+	derived, err := preview.GetSafePreviewForFile(r.Context(), *info, "small", "", 0)
+	if err != nil {
+		return err
+	}
+	info.Metadata.AlbumArt = derived
+	return nil
 }
 
 // metadataHandler returns the same directory resource shape as GET /api/resources with metadata enabled,
@@ -606,6 +841,10 @@ func lyricsHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 // @Failure 404 {object} map[string]string "Not found"
 // @Router /public/api/media/lyrics [get]
 func publicLyricsHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+	if d == nil || d.share == nil || d.share.ShareType == "upload" ||
+		!d.shareAccess.allows(publicShareReadOriginalViewer) || len(d.shareTargets) != 1 {
+		return http.StatusForbidden, commonerrors.ErrAccessDenied
+	}
 	sourceCfg, ok := config.Server.SourceMap[d.share.Source]
 	if !ok {
 		return http.StatusNotFound, fmt.Errorf("source not found")
@@ -629,9 +868,30 @@ func publicLyricsHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 		return http.StatusNotFound, fmt.Errorf("file is not an audio file")
 	}
 
-	lyrics, err := files.ExtractLyrics(fileInfo.RealPath)
+	target, err := reauthorizePublicMediaTarget(d, d.shareTargets[0])
+	if err != nil {
+		return http.StatusForbidden, commonerrors.ErrAccessDenied
+	}
+	lrcName := strings.TrimSuffix(filepath.Base(target.LogicalPath), filepath.Ext(target.LogicalPath)) + ".lrc"
+	sidecarContent := ""
+	sidecar, sidecarErr := authorizedPublicMediaSidecar(d, target, lrcName)
+	if sidecarErr != nil {
+		if mediaSidecarStatus(sidecarErr) != http.StatusNotFound {
+			return mediaSidecarStatus(sidecarErr), errors.New("lyrics sidecar is not available")
+		}
+	} else {
+		sidecarContent, err = readAuthorizedPublicTextSidecar(sidecar.RealPath, sidecar.info)
+		if err != nil {
+			return mediaSidecarStatus(err), errors.New("lyrics sidecar is not available")
+		}
+	}
+
+	lyrics, err := files.ExtractLyrics(target.RealPath, sidecarContent)
 	if err != nil {
 		return http.StatusInternalServerError, errors.New("failed to extract lyrics")
+	}
+	if !consumePublicShareOriginalRead(d) {
+		return http.StatusForbidden, commonerrors.ErrAccessDenied
 	}
 	return renderJSON(w, r, map[string]any{"lyrics": lyrics})
 }

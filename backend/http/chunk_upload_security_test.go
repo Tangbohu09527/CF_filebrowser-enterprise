@@ -269,6 +269,9 @@ func TestChunkUploadSecurityFailures(t *testing.T) {
 		logChunkTemps(t, "after authenticated upload", authenticatedTemps)
 
 		shared := h.sharedChunk("/cross-entry.bin", 0, 96, strings.NewReader("SHARED"), false)
+		if shared.Code != http.StatusConflict {
+			t.Fatalf("share chunk status: expected %d, got %d; body=%s", http.StatusConflict, shared.Code, shared.Body.String())
+		}
 		afterShare := snapshotChunkTemps(t, finalPath)
 		logChunkTemps(t, "after share upload", afterShare)
 		t.Logf("responses: authenticated=%d share=%d", authenticated.Code, shared.Code)
@@ -304,6 +307,7 @@ func newChunkUploadSecurityHarness(t *testing.T) *chunkUploadSecurityHarness {
 		Permissions: users.Permissions{
 			Create: true,
 			Modify: true,
+			Share:  true,
 		},
 		Scopes: []users.SourceScope{
 			{Name: sourcePath, Scope: "/"},
@@ -328,6 +332,8 @@ func newChunkUploadSecurityHarness(t *testing.T) *chunkUploadSecurityHarness {
 			AllowCreate:       true,
 			AllowReplacements: true,
 		},
+		CapabilityVersion:   dbshare.CurrentCapabilityVersion,
+		CreatorCapabilities: dbshare.CapabilitiesFromPermissions(user.Permissions),
 	}
 	if err := store.Share.Save(link); err != nil {
 		t.Fatalf("save upload share: %v", err)

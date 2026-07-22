@@ -578,9 +578,11 @@ func TestPermissionReadSecurity_FileWatcherDoesNotBroadcastAcrossTokens(t *testi
 	configurePermissionReadAuth(t)
 	user := h.user(t, true, true, true)
 	user.Username = "permission-filewatch-token-isolation"
+	user.Permissions.Api = true
 	user.Permissions.Realtime = true
 	savePermissionReadUser(t, user)
 	token := issuePermissionReadAPIToken(t, user, "permission-filewatch-token-isolation", users.Permissions{
+		Api:      true,
 		Browse:   true,
 		Download: true,
 		Realtime: true,
@@ -636,9 +638,11 @@ func TestPermissionReadSecurity_FileWatcherRechecksTokenAfterAck(t *testing.T) {
 	configurePermissionReadAuth(t)
 	user := h.user(t, true, true, true)
 	user.Username = "permission-filewatch-ack-revoke"
+	user.Permissions.Api = true
 	user.Permissions.Realtime = true
 	savePermissionReadUser(t, user)
 	token := issuePermissionReadAPIToken(t, user, "permission-filewatch-ack-revoke", users.Permissions{
+		Api:      true,
 		Browse:   true,
 		Download: true,
 		Realtime: true,
@@ -685,9 +689,11 @@ func TestPermissionReadSecurity_FileWatcherRechecksTokenAfterContentWrite(t *tes
 	configurePermissionReadAuth(t)
 	user := h.user(t, true, true, true)
 	user.Username = "permission-filewatch-content-write-revoke"
+	user.Permissions.Api = true
 	user.Permissions.Realtime = true
 	savePermissionReadUser(t, user)
 	token := issuePermissionReadAPIToken(t, user, "permission-filewatch-content-write-revoke", users.Permissions{
+		Api:      true,
 		Browse:   true,
 		Download: true,
 		Realtime: true,
@@ -764,9 +770,11 @@ func TestPermissionReadSecurity_FileWatcherStopsAfterAuthorizationRevocation(t *
 			configurePermissionReadAuth(t)
 			user := h.user(t, true, true, true)
 			user.Username = "permission-filewatch-periodic-" + strings.ReplaceAll(tc.name, " ", "-")
+			user.Permissions.Api = true
 			user.Permissions.Realtime = true
 			savePermissionReadUser(t, user)
 			token := issuePermissionReadAPIToken(t, user, "permission-filewatch-periodic", users.Permissions{
+				Api:      true,
 				Browse:   true,
 				Download: true,
 				Realtime: true,
@@ -880,8 +888,10 @@ func TestPermissionReadSecurity_ToolTokenPermissionIntersection(t *testing.T) {
 			configurePermissionReadAuth(t)
 			user := h.user(t, true, true, true)
 			user.Username = "permission-tools-token-" + strings.ReplaceAll(tc.name, " ", "-")
+			user.Permissions.Api = true
 			savePermissionReadUser(t, user)
 			token := issuePermissionReadAPIToken(t, user, "permission-tools-token", users.Permissions{
+				Api:      true,
 				Browse:   tc.tokenBrowse,
 				Preview:  true,
 				Download: tc.tokenDownload,

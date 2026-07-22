@@ -544,9 +544,11 @@ func TestPermissionMediaSecurity_TokenPermissionIntersection(t *testing.T) {
 		h := newPermissionMediaSecurityHarness(t)
 		configurePermissionReadAuth(t)
 		user := h.user(true, true, true)
+		user.Permissions.Api = true
 		user.Username = "permission-media-full-token-user"
 		savePermissionReadUser(t, user)
 		token := issuePermissionReadAPIToken(t, user, "permission-media-full-token", users.Permissions{
+			Api:    true,
 			Browse: true,
 		})
 		router := permissionMediaAPIRouter()
@@ -575,10 +577,15 @@ func TestPermissionMediaSecurity_TokenPermissionIntersection(t *testing.T) {
 		h := newPermissionMediaSecurityHarness(t)
 		configurePermissionReadAuth(t)
 		user := h.user(true, true, true)
+		user.Permissions.Api = true
 		user.Username = "permission-media-minimal-token-user"
 		savePermissionReadUser(t, user)
-		token, _, err := auth.MakeSignedTokenAPI(user, "permission-media-minimal-token", time.Hour, users.Permissions{}, true)
+		const tokenName = "permission-media-minimal-token"
+		token, tokenMetadata, err := auth.MakeSignedTokenAPI(user, tokenName, time.Hour, users.Permissions{}, true)
 		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Users.AddApiToken(user.ID, tokenName, token, tokenMetadata); err != nil {
 			t.Fatal(err)
 		}
 		if err := store.Access.AddApiToken(token, user.ID); err != nil {

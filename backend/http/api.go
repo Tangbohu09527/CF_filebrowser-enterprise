@@ -1,6 +1,7 @@
 package http
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -9,8 +10,8 @@ import (
 	"time"
 
 	"github.com/gtsteffaniak/filebrowser/backend/auth"
+	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
-	"github.com/gtsteffaniak/go-logger/logger"
 )
 
 // createApiTokenHandler creates an API token for the user.
@@ -44,6 +45,9 @@ func createApiTokenHandler(w http.ResponseWriter, r *http.Request, d *requestCon
 
 	if !d.user.Permissions.Api {
 		return http.StatusForbidden, fmt.Errorf("user does not have permission to create api tokens")
+	}
+	if d.apiToken {
+		return http.StatusForbidden, fmt.Errorf("api tokens cannot create other tokens")
 	}
 
 	if name == "" || strings.HasPrefix(name, "WEB_TOKEN") {
@@ -92,12 +96,21 @@ func createApiTokenHandler(w http.ResponseWriter, r *http.Request, d *requestCon
 	// Store API token metadata in user's Tokens map
 	err = store.Users.AddApiToken(d.user.ID, name, tokenString, authToken)
 	if err != nil {
+		if errors.Is(err, users.ErrAPIPermissionRequired) {
+			return http.StatusForbidden, err
+		}
+		if strings.Contains(err.Error(), "key already exists with same name") {
+			return http.StatusConflict, err
+		}
 		return http.StatusInternalServerError, err
 	}
 
 	// Store token hash → user ID mapping in access storage for fast lookups
 	err = store.Access.AddApiToken(tokenString, d.user.ID)
 	if err != nil {
+		if rollbackErr := store.Users.DeleteApiToken(d.user.ID, name); rollbackErr != nil {
+			return http.StatusInternalServerError, fmt.Errorf("store api token mapping: %w (metadata rollback failed: %v)", err, rollbackErr)
+		}
 		return http.StatusInternalServerError, err
 	}
 
@@ -105,6 +118,7 @@ func createApiTokenHandler(w http.ResponseWriter, r *http.Request, d *requestCon
 		Message: "here is your token!",
 		Token:   tokenString,
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	return renderJSON(w, r, response)
 }
 
@@ -136,23 +150,26 @@ func deleteApiTokenHandler(w http.ResponseWriter, r *http.Request, d *requestCon
 		return http.StatusForbidden, fmt.Errorf("user does not have permission to delete api tokens")
 	}
 
-	tokenInfo, ok := d.user.Tokens[name]
-	if !ok {
+	tokenSecrets, err := store.Users.ApiTokenSecrets(d.user.ID, name)
+	if err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("load api token metadata: %w", err)
+	}
+	if len(tokenSecrets) == 0 {
 		return http.StatusNotFound, fmt.Errorf("api token not found")
 	}
 
-	// Perform the user update
-	err := store.Users.DeleteApiToken(d.user.ID, name)
-	if err != nil {
-		return http.StatusNotFound, err
+	for _, secret := range tokenSecrets {
+		if err := auth.RevokeApiToken(store.Access, secret); err != nil {
+			return http.StatusInternalServerError, fmt.Errorf("revoke api token: %w", err)
+		}
 	}
 
-	// Revoke the token (adds to RevokedTokens set)
-	if err := auth.RevokeApiToken(store.Access, tokenInfo.Token); err != nil {
-		logger.Errorf("Failed to revoke token: %v", err)
+	deleted, err := store.Users.DeleteApiTokens(d.user.ID, name)
+	if err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("delete revoked api token metadata: %w", err)
 	}
-	if err := store.Access.RemoveApiToken(tokenInfo.Token); err != nil {
-		logger.Errorf("Failed to remove api token: %v", err)
+	if !deleted {
+		return http.StatusNotFound, fmt.Errorf("api token metadata changed during deletion")
 	}
 
 	response := HttpResponse{
@@ -162,12 +179,54 @@ func deleteApiTokenHandler(w http.ResponseWriter, r *http.Request, d *requestCon
 }
 
 type AuthTokenFrontend struct {
-	Token              string            `json:"token"`
+	ID                 string            `json:"id"`
 	Name               string            `json:"name"`
+	Type               string            `json:"type"`
+	Fingerprint        string            `json:"fingerprint"`
 	IssuedAt           int64             `json:"issuedAt"`
 	ExpiresAt          int64             `json:"expiresAt"`
 	PermissionsVersion int               `json:"permissionsVersion,omitempty"`
 	Permissions        users.Permissions `json:"Permissions,omitempty"`
+}
+
+func authTokenFrontendType(token users.AuthToken) string {
+	switch {
+	case token.BelongsTo == 0:
+		return "minimal"
+	case token.Name != "" && token.PermissionsVersion == users.CurrentPermissionsVersion:
+		return "full"
+	default:
+		return "legacy"
+	}
+}
+
+func authTokenFrontend(name string, token users.AuthToken, current users.Permissions) AuthTokenFrontend {
+	digest := utils.HashSHA256(authTokenSecret(token))
+	fingerprint := digest
+	if len(fingerprint) > 16 {
+		fingerprint = fingerprint[:16]
+	}
+	permissions := token.Permissions
+	if token.BelongsTo == 0 {
+		permissions = current
+	}
+	return AuthTokenFrontend{
+		ID:                 digest,
+		Name:               name,
+		Type:               authTokenFrontendType(token),
+		Fingerprint:        "sha256:" + fingerprint,
+		IssuedAt:           authTokenIssuedUnix(token),
+		ExpiresAt:          authTokenExpiresUnix(token),
+		PermissionsVersion: token.PermissionsVersion,
+		Permissions:        permissions,
+	}
+}
+
+func authTokenSecret(token users.AuthToken) string {
+	if token.Token != "" {
+		return token.Token
+	}
+	return token.Key
 }
 
 // authTokenIssuedUnix returns iat from JWT claims when set, otherwise the persisted int64 (e.g. loaded from DB).
@@ -200,19 +259,20 @@ func listApiTokensHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 	if !d.user.Permissions.Api {
 		return http.StatusForbidden, fmt.Errorf("user does not have permission to list api tokens")
 	}
-	if len(d.user.Tokens) == 0 {
+	if len(d.user.Tokens) == 0 && len(d.user.ApiKeys) == 0 {
 		return http.StatusNotFound, fmt.Errorf("no api tokens found")
 	}
-	AuthTokensFrontend := make([]AuthTokenFrontend, 0, len(d.user.Tokens))
-	for name, token := range d.user.Tokens {
-		AuthTokensFrontend = append(AuthTokensFrontend, AuthTokenFrontend{
-			Token:              token.Token,
-			Name:               name,
-			IssuedAt:           authTokenIssuedUnix(token),
-			ExpiresAt:          authTokenExpiresUnix(token),
-			PermissionsVersion: token.PermissionsVersion,
-			Permissions:        token.Permissions,
-		})
+	AuthTokensFrontend := make([]AuthTokenFrontend, 0, len(d.user.Tokens)+len(d.user.ApiKeys))
+	seen := make(map[string]struct{}, len(d.user.Tokens)+len(d.user.ApiKeys))
+	for _, tokens := range []map[string]users.AuthToken{d.user.Tokens, d.user.ApiKeys} {
+		for name, token := range tokens {
+			entry := authTokenFrontend(name, token, d.user.Permissions)
+			if _, duplicate := seen[entry.ID]; duplicate {
+				continue
+			}
+			seen[entry.ID] = struct{}{}
+			AuthTokensFrontend = append(AuthTokensFrontend, entry)
+		}
 	}
 
 	sort.Slice(AuthTokensFrontend, func(i, j int) bool {
@@ -240,15 +300,11 @@ func getApiTokenHandler(w http.ResponseWriter, r *http.Request, d *requestContex
 	}
 	tokenInfo, ok := d.user.Tokens[name]
 	if !ok {
-		return http.StatusNotFound, fmt.Errorf("api token not found")
+		tokenInfo, ok = d.user.ApiKeys[name]
+		if !ok {
+			return http.StatusNotFound, fmt.Errorf("api token not found")
+		}
 	}
-	AuthTokenFrontendResponse := AuthTokenFrontend{
-		Token:              tokenInfo.Token,
-		Name:               name,
-		IssuedAt:           authTokenIssuedUnix(tokenInfo),
-		ExpiresAt:          authTokenExpiresUnix(tokenInfo),
-		PermissionsVersion: tokenInfo.PermissionsVersion,
-		Permissions:        tokenInfo.Permissions,
-	}
+	AuthTokenFrontendResponse := authTokenFrontend(name, tokenInfo, d.user.Permissions)
 	return renderJSON(w, r, AuthTokenFrontendResponse)
 }

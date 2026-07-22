@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	pathpkg "path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -24,6 +25,74 @@ import (
 	"github.com/gtsteffaniak/go-logger/logger"
 )
 
+func validateSharePolicy(common share.CommonShare, capabilities share.CapabilitySnapshot) error {
+	if !capabilities.Share {
+		return fmt.Errorf("share permission is required")
+	}
+	if common.ShareType == "upload" && !common.AllowCreate {
+		common.AllowCreate = true
+	}
+	if common.ShareType != "upload" {
+		if !capabilities.Browse {
+			return fmt.Errorf("browse permission is required for readable shares")
+		}
+		if (!common.DisableThumbnails || !common.DisableFileViewer || common.EnableOnlyOffice) && !capabilities.Preview {
+			return fmt.Errorf("preview permission is required by the share policy")
+		}
+		if (!common.DisableDownload || common.EnableOnlyOffice) && !capabilities.Download {
+			return fmt.Errorf("download permission is required by the share policy")
+		}
+	}
+	if common.AllowCreate && !capabilities.Create {
+		return fmt.Errorf("create permission is required by the share policy")
+	}
+	if (common.AllowModify || common.AllowReplacements) && !capabilities.Modify {
+		return fmt.Errorf("modify permission is required by the share policy")
+	}
+	if common.AllowDelete && !capabilities.Delete {
+		return fmt.Errorf("delete permission is required by the share policy")
+	}
+	return nil
+}
+
+func shareRequestCapabilities(d *requestContext) share.CapabilitySnapshot {
+	if d == nil || d.user == nil {
+		return share.CapabilitySnapshot{}
+	}
+	if d.user.Permissions.Admin && !d.apiToken {
+		return share.CapabilitySnapshot{
+			Share: true, Browse: true, Preview: true, Download: true,
+			Create: true, Modify: true, Delete: true,
+		}
+	}
+	return share.CapabilitiesFromPermissions(d.user.Permissions)
+}
+
+func validateShareRoot(link *share.Link, owner *users.User) error {
+	if link == nil || owner == nil || link.Path == "" {
+		return errors.ErrAccessDenied
+	}
+	sourceInfo, ok := config.Server.SourceMap[link.Source]
+	if !ok || sourceInfo.Config.Private {
+		return errors.ErrAccessDenied
+	}
+	ownerScope, err := owner.GetScopeForSourceName(sourceInfo.Name)
+	if err != nil || ownerScope == "" {
+		return errors.ErrAccessDenied
+	}
+	cleanScope, err := cleanPublicShareRelativePath(ownerScope)
+	if err != nil {
+		return errors.ErrAccessDenied
+	}
+	data := &requestContext{
+		share:      link,
+		shareUser:  owner,
+		shareScope: normalizePublicShareIndexPath(cleanScope),
+	}
+	_, err = resolvePublicShareLogicalTarget(data, sourceInfo.Path, link.Path)
+	return err
+}
+
 // ShareResponse represents a share with computed username field and download URL
 type ShareResponse struct {
 	*share.Link
@@ -35,7 +104,11 @@ type ShareResponse struct {
 // convertToFrontendShareResponse converts shares to response format with usernames
 func convertToFrontendShareResponse(r *http.Request, shares []*share.Link, user *users.User) ([]*ShareResponse, error) {
 	responses := make([]*ShareResponse, 0, len(shares))
-	for _, s := range shares {
+	for _, stored := range shares {
+		if stored == nil {
+			continue
+		}
+		s := stored.Clone()
 		// Look for the username of the user who created the share
 		creator, err := store.Users.Get(s.UserID)
 		username := ""
@@ -51,10 +124,8 @@ func convertToFrontendShareResponse(r *http.Request, shares []*share.Link, user 
 			if !ok {
 				continue
 			}
-			// Found by name - this is corrupted data, fix it
-			logger.Warning("Share has corrupted source - fixing", "hash", s.Hash, "from", s.Source, "to", sourceInfo.Path)
+			logger.Warning("Share has source stored by name", "source", s.Source)
 			s.Source = sourceInfo.Path
-			_ = store.Share.Save(s) // Best effort fix
 		}
 
 		// Check if the path exists on the filesystem
@@ -75,6 +146,20 @@ func convertToFrontendShareResponse(r *http.Request, shares []*share.Link, user 
 		})
 	}
 	return responses, nil
+}
+
+func filterSharesForCaller(shares []*share.Link, d *requestContext) []*share.Link {
+	if d == nil || !d.apiToken {
+		return shares
+	}
+	limit := shareRequestCapabilities(d)
+	filtered := make([]*share.Link, 0, len(shares))
+	for _, link := range shares {
+		if link != nil && link.CapabilityVersion == share.CurrentCapabilityVersion && link.CreatorCapabilities.IsSubsetOf(limit) {
+			filtered = append(filtered, link)
+		}
+	}
+	return filtered
 }
 
 // shareListHandler returns a list of all share links.
@@ -98,6 +183,7 @@ func shareListHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 		return http.StatusInternalServerError, err
 	}
 	shares = utils.NonNilSlice(shares)
+	shares = filterSharesForCaller(shares, d)
 	sharesWithUsernames, err := convertToFrontendShareResponse(r, shares, d.user)
 	if err != nil {
 		return http.StatusInternalServerError, err
@@ -138,6 +224,7 @@ func shareGetHandler(w http.ResponseWriter, r *http.Request, d *requestContext) 
 	if err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("error getting share info from server")
 	}
+	s = filterSharesForCaller(s, d)
 	sharesWithUsernames, err := convertToFrontendShareResponse(r, s, d.user)
 	if err != nil {
 		return http.StatusInternalServerError, err
@@ -206,11 +293,10 @@ func sharePatchHandler(w http.ResponseWriter, r *http.Request, d *requestContext
 		return http.StatusBadRequest, fmt.Errorf("hash and path are required")
 	}
 
-	sanitizedPath, err := utils.SanitizeUserPath(body.Path)
+	requestedPath, err := cleanPublicShareRelativePath(body.Path)
 	if err != nil {
 		return http.StatusBadRequest, fmt.Errorf("invalid path: %w", err)
 	}
-	body.Path = sanitizedPath
 
 	// only allow users to update their own shares
 	thisShare, err := store.Share.GetByHash(body.Hash)
@@ -220,8 +306,42 @@ func sharePatchHandler(w http.ResponseWriter, r *http.Request, d *requestContext
 	if thisShare.UserID != d.user.ID && !d.user.Permissions.Admin {
 		return http.StatusForbidden, fmt.Errorf("you are not allowed to update this share")
 	}
+	if thisShare.CapabilityVersion != share.CurrentCapabilityVersion {
+		return http.StatusForbidden, fmt.Errorf("legacy share capability state must be rebound before changing its path")
+	}
+	actorCapabilities := shareRequestCapabilities(d)
+	if err := validateSharePolicy(thisShare.CommonShare, thisShare.CreatorCapabilities.Intersect(actorCapabilities)); err != nil {
+		return http.StatusForbidden, fmt.Errorf("calling token cannot carry the existing share policy: %w", err)
+	}
+	owner, err := store.Users.Get(thisShare.UserID)
+	if err != nil {
+		return http.StatusNotFound, fmt.Errorf("share owner not found")
+	}
+	sourceInfo, ok := config.Server.SourceMap[thisShare.Source]
+	if !ok || sourceInfo.Config.Private {
+		return http.StatusForbidden, fmt.Errorf("share source is not available")
+	}
+	ownerScope, err := owner.GetScopeForSourceName(sourceInfo.Name)
+	if err != nil || ownerScope == "" {
+		return http.StatusForbidden, fmt.Errorf("share owner scope is not available")
+	}
+	cleanScope, err := cleanPublicShareRelativePath(ownerScope)
+	if err != nil {
+		return http.StatusForbidden, fmt.Errorf("share owner scope is invalid")
+	}
+	normalizedScope := normalizePublicShareIndexPath(cleanScope)
+	requestedAbsolute := normalizePublicShareIndexPath(requestedPath)
+	newPath := normalizePublicShareIndexPath(pathpkg.Join(normalizedScope, requestedPath))
+	if normalizedScope != "/" && publicSharePathWithin(normalizedScope, requestedAbsolute) {
+		newPath = requestedAbsolute
+	}
+	updatedCandidate := thisShare.Clone()
+	updatedCandidate.Path = utils.AddTrailingSlashIfNotExists(newPath)
+	if err := validateShareRoot(updatedCandidate, owner); err != nil {
+		return http.StatusForbidden, fmt.Errorf("new share path is not authorized")
+	}
 	// Update the share path
-	err = store.Share.UpdateSharePath(body.Hash, sanitizedPath)
+	err = store.Share.UpdateSharePath(body.Hash, updatedCandidate.Path)
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
@@ -262,6 +382,7 @@ func sharePostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 		}
 		defer r.Body.Close()
 	}
+	body.Capabilities = nil
 
 	// check if body.Hash is a valid hash
 	if body.Hash != "" {
@@ -323,30 +444,61 @@ func sharePostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 		stringHash = string(hash)
 	}
 	if s != nil {
+		existing := s
+		owner, ownerErr := store.Users.Get(s.UserID)
+		if ownerErr != nil {
+			return http.StatusNotFound, fmt.Errorf("share owner not found")
+		}
+		actorCapabilities := shareRequestCapabilities(d)
+		ownerCapabilities := share.CapabilitiesFromPermissions(owner.Permissions)
+		if s.CapabilityVersion > share.CurrentCapabilityVersion {
+			return http.StatusForbidden, fmt.Errorf("share capability version is not supported")
+		}
+		policyCapabilities := actorCapabilities
+		if s.CapabilityVersion == 0 {
+			s = s.Clone()
+			s.CapabilityVersion = share.CurrentCapabilityVersion
+			s.CreatorCapabilities = ownerCapabilities.Intersect(actorCapabilities)
+			policyCapabilities = s.CreatorCapabilities
+		}
+		if body.ShareType == "upload" && !body.AllowCreate {
+			body.AllowCreate = true
+		}
+		if err := validateSharePolicy(body.CommonShare, policyCapabilities); err != nil {
+			return http.StatusForbidden, err
+		}
 		// Check if downloads limit or per-user limit changed - reset counts if so
 		shouldResetCounts := s.DownloadsLimit != body.DownloadsLimit || s.PerUserDownloadLimit != body.PerUserDownloadLimit
 
-		s.Expire = expire
-		s.PasswordHash = stringHash
-		s.Token = token
+		candidate := s.Clone()
+		candidate.Expire = expire
+		candidate.PasswordHash = stringHash
+		candidate.Token = token
 		// Preserve immutable fields for updates. Path and Source should not change on edits.
 		// If the request attempts to provide empty values (or any values) for these,
 		// keep the existing ones from the stored share.
-		body.Path = s.Path
-		body.Source = s.Source
-		s.CommonShare = body.CommonShare
-		if s.ShareType == "upload" && !body.AllowCreate {
-			s.AllowCreate = true
+		body.Path = candidate.Path
+		body.Source = candidate.Source
+		candidate.CommonShare = body.CommonShare
+		if candidate.ShareType == "upload" && !body.AllowCreate {
+			candidate.AllowCreate = true
+		}
+		if err := validateShareRoot(candidate, owner); err != nil {
+			return http.StatusForbidden, fmt.Errorf("share root is no longer authorized")
 		}
 
 		// Reset download counts if limit settings changed
 		if shouldResetCounts {
-			s.ResetDownloadCounts()
+			candidate.ResetDownloadCounts()
 		}
 
-		if err = store.Share.Save(s); err != nil {
+		if err = store.Share.UpdateIfUnchanged(existing, candidate); err != nil {
+			if err == share.ErrConcurrentUpdate || err == errors.ErrNotExist {
+				return http.StatusConflict, fmt.Errorf("share changed while it was being updated")
+			}
 			return http.StatusInternalServerError, err
 		}
+		s = candidate
 		// Convert to ShareResponse format with username
 		var user *users.User
 		user, err = store.Users.Get(s.UserID)
@@ -376,8 +528,7 @@ func sharePostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 		return http.StatusInternalServerError, err
 	}
 	// validate source path exists
-	idx := indexing.GetIndex(source.Name)
-	if idx == nil {
+	if indexing.GetIndex(source.Name) == nil {
 		return http.StatusForbidden, fmt.Errorf("source with name not found: %s", body.Source)
 	}
 	userscope, err := d.user.GetScopeForSourceName(source.Name)
@@ -394,24 +545,27 @@ func sharePostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 
 	body.Path = utils.JoinPathAsUnix(userscope, cleanPath)
 	body.Path = utils.AddTrailingSlashIfNotExists(body.Path)
-	// validate path exists as file or folder
-	_, _, err = idx.GetRealPath(body.Path)
-	if err != nil {
-		return http.StatusForbidden, fmt.Errorf("path not found: %s", providedPath)
-	}
-
 	if body.ShareType == "upload" && !body.AllowCreate {
 		body.AllowCreate = true
 	}
+	creatorCapabilities := shareRequestCapabilities(d)
+	if err := validateSharePolicy(body.CommonShare, creatorCapabilities); err != nil {
+		return http.StatusForbidden, err
+	}
 	body.Source = source.Path // backend source is path
 	s = &share.Link{
-		Expire:       expire,
-		UserID:       d.user.ID,
-		Hash:         secure_hash,
-		PasswordHash: stringHash,
-		Token:        token,
-		CommonShare:  body.CommonShare,
-		Version:      1, // Set version for new shares
+		Expire:              expire,
+		UserID:              d.user.ID,
+		Hash:                secure_hash,
+		PasswordHash:        stringHash,
+		Token:               token,
+		CommonShare:         body.CommonShare,
+		Version:             1, // Set version for new shares
+		CapabilityVersion:   share.CurrentCapabilityVersion,
+		CreatorCapabilities: creatorCapabilities,
+	}
+	if err = validateShareRoot(s, d.user); err != nil {
+		return http.StatusForbidden, fmt.Errorf("share root is not authorized")
 	}
 	if err = store.Share.Save(s); err != nil {
 		return http.StatusInternalServerError, err
@@ -459,6 +613,10 @@ func shareDirectDownloadHandler(w http.ResponseWriter, r *http.Request, d *reque
 	if path == "" || source == "" {
 		return http.StatusBadRequest, fmt.Errorf("path and source are required")
 	}
+	creatorCapabilities := shareRequestCapabilities(d)
+	if !creatorCapabilities.Share || !creatorCapabilities.Browse || !creatorCapabilities.Download {
+		return http.StatusForbidden, fmt.Errorf("share, browse, and download permissions are required")
+	}
 
 	// Validate source exists
 	sourceInfo, ok := config.Server.NameToSource[source]
@@ -472,20 +630,16 @@ func shareDirectDownloadHandler(w http.ResponseWriter, r *http.Request, d *reque
 		return http.StatusForbidden, err
 	}
 
-	// Validate the path exists and is a file (not a folder)
+	cleanPath, err := cleanPublicShareRelativePath(path)
+	if err != nil || cleanPath == "" {
+		return http.StatusBadRequest, fmt.Errorf("invalid path")
+	}
+	scopePath := normalizePublicShareIndexPath(utils.JoinPathAsUnix(userscope, cleanPath))
+
+	// Resolve Scope, Access Rules and filesystem containment before consulting index metadata.
 	idx := indexing.GetIndex(source)
 	if idx == nil {
 		return http.StatusForbidden, fmt.Errorf("source with name not found: %s", source)
-	}
-
-	metadata, exists := idx.GetReducedMetadata(path, false)
-	if !exists {
-		return http.StatusBadRequest, fmt.Errorf("path is either not a file or not found: %s", path)
-	}
-
-	// Check if it's a file (not a directory)
-	if metadata.Type == "directory" {
-		return http.StatusBadRequest, fmt.Errorf("path must be a file, not a directory: %s", path)
 	}
 
 	// Set default duration to 60 minutes if not provided
@@ -524,31 +678,7 @@ func shareDirectDownloadHandler(w http.ResponseWriter, r *http.Request, d *reque
 		return http.StatusInternalServerError, err
 	}
 
-	// Create the scope path
-	scopePath := utils.JoinPathAsUnix(userscope, path)
-
-	// Check if an existing share already matches these parameters
-	existingShares, err := store.Share.Gets(scopePath, sourceInfo.Path, d.user.ID)
-	if err == nil && len(existingShares) > 0 {
-		// Look for a share that matches our parameters
-		for _, existing := range existingShares {
-			if existing.DownloadsLimit == downloadCount &&
-				existing.MaxBandwidth == downloadSpeed &&
-				existing.QuickDownload &&
-				(existing.Expire == 0 || existing.Expire >= expire) { // Existing expires later or never
-
-				response := DirectDownloadResponse{
-					Status:      "201",
-					Hash:        existing.Hash,
-					DownloadURL: getShareURL(r, existing.Hash, true, existing.Token),
-					ShareURL:    getShareURL(r, existing.Hash, false, existing.Token),
-				}
-				return renderJSON(w, r, response)
-			}
-		}
-	}
-
-	// No matching existing share found, create a new one
+	// Quick shares are always bound to the current caller's capability snapshot.
 	shareLink := &share.Link{
 		Expire:  expire,
 		UserID:  d.user.ID,
@@ -561,6 +691,21 @@ func shareDirectDownloadHandler(w http.ResponseWriter, r *http.Request, d *reque
 			MaxBandwidth:   downloadSpeed,
 			QuickDownload:  true, // Enable quick download for direct downloads
 		},
+		CapabilityVersion:   share.CurrentCapabilityVersion,
+		CreatorCapabilities: creatorCapabilities,
+	}
+	if err := validateShareRoot(shareLink, d.user); err != nil {
+		return http.StatusForbidden, fmt.Errorf("share root is not authorized")
+	}
+	metadata, exists := idx.GetReducedMetadata(scopePath, false)
+	if !exists {
+		return http.StatusBadRequest, fmt.Errorf("path is either not a file or not found: %s", path)
+	}
+	if metadata.Type == "directory" {
+		return http.StatusBadRequest, fmt.Errorf("path must be a file, not a directory: %s", path)
+	}
+	if sourceInfo.Config.Private {
+		return http.StatusForbidden, fmt.Errorf("the target source is private")
 	}
 
 	// Save the share
@@ -636,22 +781,26 @@ func shareInfoHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	if err != nil {
 		return http.StatusNotFound, fmt.Errorf("share hash not found")
 	}
+	if !publicShareAudienceAllowed(shareLink, d.user) {
+		return http.StatusForbidden, fmt.Errorf("share is not available to this user")
+	}
 	owner, err := store.Users.Get(shareLink.UserID)
 	if err != nil {
 		return http.StatusNotFound, fmt.Errorf("user for share no longer exists")
 	}
-	if shareLink.ShareType != "upload" {
-		access := calculatePublicShareAccess(shareLink, owner)
-		source, ok := config.Server.SourceMap[shareLink.Source]
-		if !ok {
-			return http.StatusNotFound, fmt.Errorf("source not found")
-		}
-		ownerScope, scopeErr := owner.GetScopeForSourceName(source.Name)
-		if scopeErr != nil || !access.allows(publicShareReadBrowse) || !publicSharePathsOverlap(shareLink.Path, ownerScope) {
+	access := calculatePublicShareAccess(shareLink, owner)
+	if err := validateShareRoot(shareLink, owner); err != nil {
+		return http.StatusForbidden, fmt.Errorf("public share access denied")
+	}
+	if shareLink.ShareType == "upload" {
+		if !access.create && !access.modify && !access.delete {
 			return http.StatusForbidden, fmt.Errorf("public share access denied")
 		}
+	} else if !access.allows(publicShareReadBrowse) {
+		return http.StatusForbidden, fmt.Errorf("public share access denied")
 	}
 	commonShare := shareLink.CommonShare
+	commonShare.Capabilities = access.frontendCapabilities()
 	commonShare.ShareURL = getShareURL(r, hash, false, "")
 	commonShare.BannerUrl = shareLink.BannerURL()
 	commonShare.FaviconUrl = shareLink.FaviconURL()

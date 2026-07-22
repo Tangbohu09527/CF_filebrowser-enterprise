@@ -503,20 +503,21 @@ func TestPermissionReadSecurity_MinimalAndFullTokenRefreshSemantics(t *testing.T
 	configurePermissionReadAuth(t)
 	user := h.user(t, false, false, false)
 	user.Username = "permission-token-refresh-user"
+	user.Permissions.Api = true
 	savePermissionReadUser(t, user)
 	initial := *user
 
-	minimalToken, _, err := auth.MakeSignedTokenAPI(user, "permission-minimal-refresh", time.Hour, users.Permissions{}, true)
+	minimalToken, minimalMetadata, err := auth.MakeSignedTokenAPI(user, "permission-minimal-refresh", time.Hour, users.Permissions{}, true)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if addTokenErr := store.Users.AddApiToken(user.ID, "permission-minimal-refresh", minimalToken, minimalMetadata); addTokenErr != nil {
+		t.Fatal(addTokenErr)
 	}
 	if addTokenErr := store.Access.AddApiToken(minimalToken, user.ID); addTokenErr != nil {
 		t.Fatal(addTokenErr)
 	}
-	fullToken, _, err := auth.MakeSignedTokenAPI(user, "permission-full-refresh", time.Hour, user.Permissions, false)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fullToken := issuePermissionReadAPIToken(t, user, "permission-full-refresh", user.Permissions)
 
 	updated := *user
 	updated.Permissions.Browse = true

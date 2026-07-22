@@ -7,6 +7,7 @@ import (
 	"compress/gzip"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,8 +23,11 @@ import (
 
 	"github.com/gtsteffaniak/filebrowser/backend/auth"
 	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
+	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	"github.com/gtsteffaniak/filebrowser/backend/database/access"
 	dbshare "github.com/gtsteffaniak/filebrowser/backend/database/share"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
+	"github.com/gtsteffaniak/filebrowser/backend/indexing/iteminfo"
 )
 
 const (
@@ -79,7 +83,8 @@ func TestPermissionShareSecurityFailures(t *testing.T) {
 			{name: "share favicon", path: "/share/image", query: url.Values{"favicon": {"true"}}, want: publicShareRoute{recognized: true, read: true, requirement: publicShareReadBrowse | publicShareReadThumbnail, targetMode: publicShareTargetImage, skipFileInfo: true}},
 			{name: "share banner", path: "/share/image", query: url.Values{"banner": {"true"}}, want: publicShareRoute{recognized: true, read: true, requirement: publicShareReadBrowse | publicShareReadThumbnail | publicShareReadViewer, targetMode: publicShareTargetImage, skipFileInfo: true}},
 			{name: "media metadata", path: "/media/metadata", want: publicShareRoute{recognized: true, read: true, requirement: publicShareReadBrowse | publicShareReadViewer, targetMode: publicShareTargetPath}},
-			{name: "media lyrics", path: "/media/lyrics", want: publicShareRoute{recognized: true, read: true, requirement: publicShareReadBrowse | publicShareReadViewer, targetMode: publicShareTargetPath}},
+			{name: "media subtitles", path: "/media/subtitles", want: publicShareRoute{recognized: true, read: true, requirement: publicShareReadOriginalViewer, targetMode: publicShareTargetPath}},
+			{name: "media lyrics", path: "/media/lyrics", want: publicShareRoute{recognized: true, read: true, requirement: publicShareReadOriginalViewer, targetMode: publicShareTargetPath}},
 			{name: "OnlyOffice config", path: "/office/config", want: publicShareRoute{recognized: true, read: true, requirement: publicShareReadOriginalViewer, targetMode: publicShareTargetPath}},
 		}
 		for _, tc := range cases {
@@ -106,12 +111,12 @@ func TestPermissionShareSecurityFailures(t *testing.T) {
 		}{
 			{name: "upload", method: http.MethodPost, path: "/resources", want: publicShareRoute{recognized: true, targetMode: publicShareTargetPath, skipFileInfo: true}},
 			{name: "pause upload", method: http.MethodPost, path: "/resources/pause", want: publicShareRoute{recognized: true, targetMode: publicShareTargetPath, skipFileInfo: true}},
-			{name: "put resource", method: http.MethodPut, path: "/resources", want: publicShareRoute{recognized: true, targetMode: publicShareTargetPath}},
-			{name: "patch resource", method: http.MethodPatch, path: "/resources", want: publicShareRoute{recognized: true, targetMode: publicShareTargetPath}},
-			{name: "delete resource", method: http.MethodDelete, path: "/resources", want: publicShareRoute{recognized: true, targetMode: publicShareTargetPath}},
-			{name: "bulk delete", method: http.MethodDelete, path: "/resources/bulk", want: publicShareRoute{recognized: true, targetMode: publicShareTargetPath}},
-			{name: "OnlyOffice GET callback", method: http.MethodGet, path: "/office/callback", want: publicShareRoute{recognized: true, targetMode: publicShareTargetPath}},
-			{name: "OnlyOffice POST callback", method: http.MethodPost, path: "/office/callback", want: publicShareRoute{recognized: true, targetMode: publicShareTargetPath}},
+			{name: "put resource", method: http.MethodPut, path: "/resources", want: publicShareRoute{recognized: true, targetMode: publicShareTargetPath, skipFileInfo: true}},
+			{name: "patch resource", method: http.MethodPatch, path: "/resources", want: publicShareRoute{recognized: true, targetMode: publicShareTargetPath, skipFileInfo: true}},
+			{name: "delete resource", method: http.MethodDelete, path: "/resources", want: publicShareRoute{recognized: true, targetMode: publicShareTargetPath, skipFileInfo: true}},
+			{name: "bulk delete", method: http.MethodDelete, path: "/resources/bulk", want: publicShareRoute{recognized: true, targetMode: publicShareTargetPath, skipFileInfo: true}},
+			{name: "OnlyOffice GET callback", method: http.MethodGet, path: "/office/callback", want: publicShareRoute{recognized: true, targetMode: publicShareTargetPath, skipFileInfo: true}},
+			{name: "OnlyOffice POST callback", method: http.MethodPost, path: "/office/callback", want: publicShareRoute{recognized: true, targetMode: publicShareTargetPath, skipFileInfo: true}},
 		}
 		for _, tc := range writeCases {
 			t.Run(tc.name, func(t *testing.T) {
@@ -304,6 +309,171 @@ func TestPermissionShareSecurityFailures(t *testing.T) {
 		assertPermissionShareReadDenied(t, "share image original after download limit", shareImage)
 	})
 
+	t.Run("content reads consume the download limit atomically", func(t *testing.T) {
+		owner := h.newOwner(t, "content-limit-concurrency-owner", users.Permissions{
+			Browse: true, Preview: true, Download: true,
+		})
+		link := h.saveShare(t, owner, "content-limit-concurrency-share", "/public", func(common *dbshare.CommonShare) {
+			common.DownloadsLimit = 1
+		})
+
+		originalFileInfoFaster := FileInfoFasterFunc
+		entered := make(chan struct{}, 2)
+		release := make(chan struct{})
+		FileInfoFasterFunc = func(options utils.FileOptions, accessStorage *access.Storage, user *users.User, shareStorage *dbshare.Storage) (*iteminfo.ExtendedFileInfo, error) {
+			entered <- struct{}{}
+			<-release
+			return originalFileInfoFaster(options, accessStorage, user, shareStorage)
+		}
+		defer func() { FileInfoFasterFunc = originalFileInfoFaster }()
+
+		invoke := func(result chan<- *httptest.ResponseRecorder) {
+			query := url.Values{
+				"hash": {link.Hash}, "path": {"/secret.txt"}, "content": {"true"},
+			}
+			request := httptest.NewRequest(http.MethodGet, "/public/api/resources?"+query.Encode(), nil)
+			response := httptest.NewRecorder()
+			h.router.ServeHTTP(response, request)
+			result <- response
+		}
+		results := make(chan *httptest.ResponseRecorder, 2)
+		go invoke(results)
+		go invoke(results)
+		for range 2 {
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				close(release)
+				t.Fatal("concurrent content reads did not reach the file lookup barrier")
+			}
+		}
+		close(release)
+
+		responses := []*httptest.ResponseRecorder{<-results, <-results}
+		successes := 0
+		denials := 0
+		for _, response := range responses {
+			switch response.Code {
+			case http.StatusOK:
+				successes++
+				if !strings.Contains(response.Body.String(), permissionShareSecret) {
+					t.Fatalf("successful content response omitted authorized body: %q", response.Body.String())
+				}
+			case http.StatusForbidden:
+				denials++
+				if strings.Contains(response.Body.String(), permissionShareSecret) {
+					t.Fatalf("denied content response exposed body: %q", response.Body.String())
+				}
+			default:
+				t.Fatalf("concurrent content response status: got %d, want 200 or 403", response.Code)
+			}
+		}
+		if successes != 1 || denials != 1 {
+			t.Fatalf("concurrent content results: successes=%d denials=%d", successes, denials)
+		}
+		link.Mu.Lock()
+		downloads := link.Downloads
+		link.Mu.Unlock()
+		if downloads != 1 {
+			t.Fatalf("concurrent content download count: got %d, want 1", downloads)
+		}
+	})
+
+	t.Run("content read rejects a target replaced after authorization", func(t *testing.T) {
+		owner := h.newOwner(t, "content-target-replacement-owner", users.Permissions{
+			Browse: true, Preview: true, Download: true,
+		})
+		h.saveShare(t, owner, "content-target-replacement-share", "/public", nil)
+		targetPath := filepath.Join(sourcePath, "public", "secret.txt")
+		originalContent, err := os.ReadFile(targetPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		outsidePath := filepath.Join(t.TempDir(), "outside-secret.txt")
+		const outsideSecret = "PUBLIC-CONTENT-TARGET-REPLACEMENT-SECRET"
+		if err := os.WriteFile(outsidePath, []byte(outsideSecret), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			_ = os.Remove(targetPath)
+			_ = os.WriteFile(targetPath, originalContent, 0o644)
+		}()
+
+		originalFileInfoFaster := FileInfoFasterFunc
+		replaced := false
+		FileInfoFasterFunc = func(options utils.FileOptions, accessStorage *access.Storage, user *users.User, shareStorage *dbshare.Storage) (*iteminfo.ExtendedFileInfo, error) {
+			if !replaced {
+				replaced = true
+				if err := os.Remove(targetPath); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outsidePath, targetPath); err != nil {
+					t.Skipf("symlink fixture is unavailable: %v", err)
+				}
+			}
+			return originalFileInfoFaster(options, accessStorage, user, shareStorage)
+		}
+		defer func() { FileInfoFasterFunc = originalFileInfoFaster }()
+
+		response := h.request(http.MethodGet, "/public/api/resources", url.Values{
+			"hash": {"content-target-replacement-share"}, "path": {"/secret.txt"}, "content": {"true"},
+		}, nil, nil)
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("replaced content target status: got %d, want %d", response.Code, http.StatusForbidden)
+		}
+		if strings.Contains(response.Body.String(), outsideSecret) {
+			t.Fatalf("replaced content target leaked outside data: %q", response.Body.String())
+		}
+	})
+
+	t.Run("original preview rejects a target replaced after file lookup", func(t *testing.T) {
+		owner := h.newOwner(t, "preview-target-replacement-owner", users.Permissions{
+			Browse: true, Preview: true, Download: true,
+		})
+		h.saveShare(t, owner, "preview-target-replacement-share", "/public", nil)
+		targetPath := filepath.Join(sourcePath, "public", "pixel.png")
+		originalContent, err := os.ReadFile(targetPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		outsidePath := filepath.Join(t.TempDir(), "outside-preview.png")
+		const outsideSecret = "PUBLIC-PREVIEW-TARGET-REPLACEMENT-SECRET"
+		if err := os.WriteFile(outsidePath, []byte(outsideSecret), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			_ = os.Remove(targetPath)
+			_ = os.WriteFile(targetPath, originalContent, 0o644)
+		}()
+
+		originalFileInfoFaster := FileInfoFasterFunc
+		replaced := false
+		FileInfoFasterFunc = func(options utils.FileOptions, accessStorage *access.Storage, user *users.User, shareStorage *dbshare.Storage) (*iteminfo.ExtendedFileInfo, error) {
+			fileInfo, infoErr := originalFileInfoFaster(options, accessStorage, user, shareStorage)
+			if infoErr == nil && !replaced {
+				replaced = true
+				if err := os.Remove(targetPath); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outsidePath, targetPath); err != nil {
+					t.Skipf("symlink fixture is unavailable: %v", err)
+				}
+			}
+			return fileInfo, infoErr
+		}
+		defer func() { FileInfoFasterFunc = originalFileInfoFaster }()
+
+		response := h.request(http.MethodGet, "/public/api/resources/preview", url.Values{
+			"hash": {"preview-target-replacement-share"}, "path": {"/pixel.png"}, "size": {"original"},
+		}, nil, nil)
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("replaced preview target status: got %d, want %d", response.Code, http.StatusForbidden)
+		}
+		if strings.Contains(response.Body.String(), outsideSecret) {
+			t.Fatalf("replaced preview target leaked outside data: %q", response.Body.String())
+		}
+	})
+
 	t.Run("DisableFileViewer and DisableThumbnails remain stricter", func(t *testing.T) {
 		owner := h.newOwner(t, "strict-share-flags-owner", users.Permissions{Download: true})
 		setPermissionSharePermissionIfPresent(&owner.Permissions, "Browse", true)
@@ -342,6 +512,11 @@ func TestPermissionShareSecurityFailures(t *testing.T) {
 				name:  "media metadata viewer",
 				path:  "/public/api/media/metadata",
 				query: url.Values{"hash": {"disable-viewer-share"}, "path": {"/pixel.png"}},
+			},
+			{
+				name:  "media subtitles viewer",
+				path:  "/public/api/media/subtitles",
+				query: url.Values{"hash": {"disable-viewer-share"}, "path": {"/secret.txt"}, "name": {"secret.srt"}, "embedded": {"false"}},
 			},
 			{
 				name:  "media lyrics viewer",
@@ -393,6 +568,49 @@ func TestPermissionShareSecurityFailures(t *testing.T) {
 		}
 		originalViewer := h.preview("disable-thumbnails-share", "original")
 		requirePermissionShareStatus(t, "DisableThumbnails original viewer", originalViewer, http.StatusOK)
+	})
+
+	t.Run("all Disable flag combinations keep independent capability classes", func(t *testing.T) {
+		owner := &users.User{Permissions: users.Permissions{
+			Share: true, Browse: true, Preview: true, Download: true,
+		}}
+		for mask := 0; mask < 8; mask++ {
+			disableThumbnails := mask&1 != 0
+			disableViewer := mask&2 != 0
+			disableDownload := mask&4 != 0
+			t.Run(fmt.Sprintf("thumbnail=%t viewer=%t download=%t", disableThumbnails, disableViewer, disableDownload), func(t *testing.T) {
+				link := &dbshare.Link{
+					CommonShare: dbshare.CommonShare{
+						ShareType:         "normal",
+						DisableThumbnails: disableThumbnails,
+						DisableFileViewer: disableViewer,
+						DisableDownload:   disableDownload,
+					},
+					CapabilityVersion:   dbshare.CurrentCapabilityVersion,
+					CreatorCapabilities: dbshare.CapabilitiesFromPermissions(owner.Permissions),
+				}
+				access := calculatePublicShareAccess(link, owner)
+				checks := []struct {
+					name        string
+					requirement publicShareReadRequirement
+					want        bool
+				}{
+					{name: "thumbnail", requirement: publicShareReadBrowse | publicShareReadThumbnail, want: !disableThumbnails},
+					{name: "viewer", requirement: publicShareReadBrowse | publicShareReadViewer, want: !disableViewer},
+					{name: "download", requirement: publicShareReadBrowse | publicShareReadDownload, want: !disableDownload},
+					{name: "original viewer", requirement: publicShareReadOriginalViewer, want: !disableViewer && !disableDownload},
+				}
+				for _, check := range checks {
+					if got := access.allows(check.requirement); got != check.want {
+						t.Errorf("%s capability: got %v, want %v", check.name, got, check.want)
+					}
+				}
+				frontend := access.frontendCapabilities()
+				if frontend.Preview != (!disableThumbnails || !disableViewer) {
+					t.Errorf("frontend preview: got %v", frontend.Preview)
+				}
+			})
+		}
 	})
 
 	t.Run("public read routes are exact and fail closed", func(t *testing.T) {
@@ -606,7 +824,7 @@ func TestPermissionShareSecurityFailures(t *testing.T) {
 	}
 
 	t.Run("upload shares do not acquire Browse Preview or Download", func(t *testing.T) {
-		owner := h.newOwner(t, "upload-read-owner", users.Permissions{Share: true})
+		owner := h.newOwner(t, "upload-read-owner", users.Permissions{Share: true, Create: true})
 		setPermissionSharePermissionIfPresent(&owner.Permissions, "Browse", false)
 		setPermissionSharePermissionIfPresent(&owner.Permissions, "Preview", false)
 		setPermissionSharePermissionIfPresent(&owner.Permissions, "Download", false)
@@ -697,6 +915,11 @@ func TestPermissionShareSecurityFailures(t *testing.T) {
 				headers: map[string]string{"Range": "bytes=0-3"},
 			},
 			{
+				name:  "media subtitles",
+				path:  "/public/api/media/subtitles",
+				query: url.Values{"hash": {created.Hash}, "path": {"/secret.txt"}, "name": {"secret.srt"}, "embedded": {"false"}},
+			},
+			{
 				name:  "media metadata",
 				path:  "/public/api/media/metadata",
 				query: url.Values{"hash": {created.Hash}, "path": {"/pixel.png"}},
@@ -716,7 +939,7 @@ func TestPermissionShareSecurityFailures(t *testing.T) {
 	})
 
 	t.Run("password protected upload share keeps the 501 initialization contract without Browse leakage", func(t *testing.T) {
-		owner := h.newOwner(t, "password-upload-owner", users.Permissions{})
+		owner := h.newOwner(t, "password-upload-owner", users.Permissions{Create: true, Modify: true})
 		link := h.saveShare(t, owner, "password-upload-share", "/public", func(common *dbshare.CommonShare) {
 			common.ShareType = "upload"
 			common.AllowCreate = true
@@ -1114,9 +1337,9 @@ func TestPermissionShareSecurityFailures(t *testing.T) {
 	})
 
 	t.Run("non-owner cannot update another share policy by hash", func(t *testing.T) {
-		owner := h.newOwner(t, "policy-owner", users.Permissions{Share: true})
-		attacker := h.newOwner(t, "policy-attacker", users.Permissions{Share: true})
-		admin := h.newOwner(t, "policy-admin", users.Permissions{Admin: true, Share: true})
+		owner := h.newOwner(t, "policy-owner", users.Permissions{Api: true, Share: true, Browse: true, Preview: true, Download: true})
+		attacker := h.newOwner(t, "policy-attacker", users.Permissions{Api: true, Share: true, Browse: true, Preview: true, Download: true})
+		admin := h.newOwner(t, "policy-admin", users.Permissions{Api: true, Admin: true, Share: true, Browse: true, Preview: true, Download: true})
 		link := h.saveShare(t, owner, "victim-policy-share", "/public", func(common *dbshare.CommonShare) {
 			common.Title = "owner policy"
 		})
@@ -1236,7 +1459,7 @@ func TestPermissionShareSecurityFailures(t *testing.T) {
 	})
 
 	t.Run("upload share replacement prohibition does not regress", func(t *testing.T) {
-		owner := h.newOwner(t, "no-replacement-owner", users.Permissions{})
+		owner := h.newOwner(t, "no-replacement-owner", users.Permissions{Create: true, Modify: true})
 		h.saveShare(t, owner, "no-replacement-share", "/public", func(common *dbshare.CommonShare) {
 			common.ShareType = "upload"
 			common.AllowCreate = true
@@ -1311,6 +1534,7 @@ func newPermissionShareSecurityHarness(t *testing.T, sourcePath string) *permiss
 	publicAPI.HandleFunc("GET /share/info", withOrWithoutUser(shareInfoHandler))
 	publicAPI.HandleFunc("GET /share/image", withHashFile(getShareImage))
 	publicAPI.HandleFunc("GET /media/metadata", withHashFile(publicMetadataHandler))
+	publicAPI.HandleFunc("GET /media/subtitles", withHashFile(publicSubtitlesHandler))
 	publicAPI.HandleFunc("GET /media/lyrics", withHashFile(publicLyricsHandler))
 	publicAPI.HandleFunc("GET /office/config", withHashFile(onlyofficeClientConfigGetHandler))
 	probeHandler := func(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
@@ -1331,6 +1555,7 @@ func newPermissionShareSecurityHarness(t *testing.T, sourcePath string) *permiss
 
 func (h *permissionShareSecurityHarness) newOwner(t *testing.T, username string, permissions users.Permissions) *users.User {
 	t.Helper()
+	permissions.Share = true
 	owner := &users.User{
 		Username:    username,
 		Permissions: permissions,
@@ -1365,9 +1590,11 @@ func (h *permissionShareSecurityHarness) saveShare(t *testing.T, owner *users.Us
 		configure(&common)
 	}
 	link := &dbshare.Link{
-		Hash:        hash,
-		UserID:      owner.ID,
-		CommonShare: common,
+		Hash:                hash,
+		UserID:              owner.ID,
+		CommonShare:         common,
+		CapabilityVersion:   dbshare.CurrentCapabilityVersion,
+		CreatorCapabilities: dbshare.CapabilitiesFromPermissions(owner.Permissions),
 	}
 	if err := store.Share.Save(link); err != nil {
 		t.Fatalf("save share %s: %v", hash, err)
@@ -1381,9 +1608,16 @@ func (h *permissionShareSecurityHarness) updateSharePolicy(t *testing.T, user *u
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, _, err := auth.MakeSignedTokenAPI(user, "permission-share-policy-"+user.Username, time.Hour, user.Permissions, false)
+	name := "permission-share-policy-" + user.Username + "-" + utils.InsecureRandomIdentifier(4)
+	token, metadata, err := auth.MakeSignedTokenAPI(user, name, time.Hour, user.Permissions, false)
 	if err != nil {
 		t.Fatalf("create policy token for %s: %v", user.Username, err)
+	}
+	if err := store.Users.AddApiToken(user.ID, name, token, metadata); err != nil {
+		t.Fatalf("persist policy token metadata for %s: %v", user.Username, err)
+	}
+	if err := store.Access.AddApiToken(token, user.ID); err != nil {
+		t.Fatalf("persist policy token mapping for %s: %v", user.Username, err)
 	}
 	return h.request(http.MethodPost, "/api/share", nil, bytes.NewReader(payload), map[string]string{
 		"Authorization": "Bearer " + token,

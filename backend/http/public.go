@@ -72,30 +72,19 @@ func publicDownloadHandler(w http.ResponseWriter, r *http.Request, d *requestCon
 	}
 	d.shareArchive = manifest
 
-	// Check global download limit (if not using per-user limits)
-	if !d.share.PerUserDownloadLimit && d.share.DownloadsLimit > 0 && d.share.Downloads >= d.share.DownloadsLimit {
+	archiveToken := d.shareQuery.Get("archiveToken")
+	isArchive := len(d.shareTargets) != 1 || d.shareTargets[0].IsDir
+	if archiveToken != "" && !isArchive {
+		invalidatePublicShareArchiveToken(archiveToken, d.share.Hash)
+		return http.StatusForbidden, fmt.Errorf("archiveToken is not valid for a single file")
+	}
+	if isArchive {
+		if _, err := archiveExtensionForAlgorithm(d.shareQuery.Get("algo")); err != nil {
+			return http.StatusInternalServerError, err
+		}
+	}
+	if archiveToken == "" && !consumePublicShareOriginalRead(d) {
 		return http.StatusForbidden, fmt.Errorf("share downloads limit reached")
-	}
-
-	// Check per-user download limit
-	if d.share.PerUserDownloadLimit {
-		// Block anonymous users
-		if d.user.Username == "anonymous" {
-			return http.StatusForbidden, fmt.Errorf("anonymous downloads are not allowed with per-user limits")
-		}
-		// Check if user has reached their limit
-		if d.share.HasReachedUserLimit(d.user.Username) {
-			return http.StatusForbidden, fmt.Errorf("user download limit reached for this share")
-		}
-	}
-
-	d.share.Mu.Lock()
-	d.share.Downloads++
-	d.share.Mu.Unlock()
-
-	// Track per-user download if enabled
-	if d.share.PerUserDownloadLimit {
-		d.share.IncrementUserDownload(d.user.Username)
 	}
 
 	var status int
@@ -124,6 +113,8 @@ type publicShareArchiveEntry struct {
 	RealPath      string
 	ArchivePath   string
 	IsDir         bool
+	ContentSHA256 [32]byte
+	info          os.FileInfo
 }
 
 func publicShareSameRealPath(first, second string) bool {
@@ -135,12 +126,22 @@ func publicShareSameRealPath(first, second string) bool {
 	return first == second
 }
 
+func publicShareSameFileIdentity(original, current os.FileInfo) bool {
+	if original == nil || current == nil || !os.SameFile(original, current) {
+		return false
+	}
+	return original.Mode().Type() == current.Mode().Type() &&
+		original.Size() == current.Size() &&
+		original.ModTime().Equal(current.ModTime())
+}
+
 func reauthorizePublicShareTarget(d *requestContext, sourcePath string, checked publicShareTarget) (publicShareTarget, error) {
 	current, err := resolvePublicShareLogicalTarget(d, sourcePath, checked.LogicalPath)
 	if err != nil {
 		return publicShareTarget{}, err
 	}
-	if current.CanonicalPath != checked.CanonicalPath || !publicShareSameRealPath(current.RealPath, checked.RealPath) || current.IsDir != checked.IsDir {
+	if current.CanonicalPath != checked.CanonicalPath || !publicShareSameRealPath(current.RealPath, checked.RealPath) ||
+		current.IsDir != checked.IsDir || !publicShareSameFileIdentity(checked.info, current.info) {
 		return publicShareTarget{}, errors.ErrAccessDenied
 	}
 	current.RequestedPath = checked.RequestedPath
@@ -160,6 +161,7 @@ func buildPublicShareArchiveManifest(d *requestContext, sourcePath string, targe
 				CanonicalPath: target.CanonicalPath,
 				RealPath:      target.RealPath,
 				ArchivePath:   filepath.Base(target.RealPath),
+				info:          target.info,
 			})
 			continue
 		}
@@ -184,6 +186,7 @@ func buildPublicShareArchiveManifest(d *requestContext, sourcePath string, targe
 				RealPath:      child.RealPath,
 				ArchivePath:   path.Join(baseName, filepath.ToSlash(relativePath)),
 				IsDir:         child.IsDir,
+				info:          child.info,
 			})
 			return nil
 		})
@@ -204,6 +207,7 @@ func reauthorizePublicShareArchiveEntry(d *requestContext, entry publicShareArch
 		CanonicalPath: entry.CanonicalPath,
 		RealPath:      entry.RealPath,
 		IsDir:         entry.IsDir,
+		info:          entry.info,
 	}
 	return reauthorizePublicShareTarget(d, sourceInfo.Path, checked)
 }
@@ -213,14 +217,20 @@ func servePublicShareFile(w http.ResponseWriter, r *http.Request, d *requestCont
 	if err != nil || target.IsDir {
 		return http.StatusForbidden, errors.ErrAccessDenied
 	}
+	before, err := os.Lstat(target.RealPath)
+	if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() ||
+		!publicShareSameFileIdentity(target.info, before) {
+		return http.StatusForbidden, errors.ErrAccessDenied
+	}
 	file, err := os.Open(target.RealPath)
 	if err != nil {
 		return http.StatusNotFound, err
 	}
 	defer file.Close()
 	info, err := file.Stat()
-	if err != nil || info.IsDir() {
-		return http.StatusNotFound, fmt.Errorf("public share target is not a file")
+	if err != nil || !info.Mode().IsRegular() || !os.SameFile(before, info) ||
+		!publicShareSameFileIdentity(target.info, info) {
+		return http.StatusForbidden, errors.ErrAccessDenied
 	}
 
 	fileName := filepath.Base(target.LogicalPath)
@@ -269,7 +279,7 @@ func filterPublicShareFileInfo(d *requestContext, parent publicShareTarget, file
 	}
 }
 
-func populatePublicShareMetadata(d *requestContext, albumArt bool) error {
+func populatePublicShareMetadata(r *http.Request, d *requestContext, albumArt bool) error {
 	if len(d.shareTargets) != 1 {
 		return errors.ErrAccessDenied
 	}
@@ -295,6 +305,9 @@ func populatePublicShareMetadata(d *requestContext, albumArt bool) error {
 			FollowSymlinks:           true,
 		}, store.Access, d.shareUser, store.Share)
 		if err != nil {
+			return err
+		}
+		if err := sanitizePublicMediaInfo(r, d, current, metadata, albumArt); err != nil {
 			return err
 		}
 		d.fileInfo.Metadata = metadata.Metadata
@@ -324,6 +337,9 @@ func populatePublicShareMetadata(d *requestContext, albumArt bool) error {
 			FollowSymlinks: true,
 		}, store.Access, d.shareUser, store.Share)
 		if err == nil {
+			if sanitizeErr := sanitizePublicMediaInfo(r, d, current, metadata, albumArt); sanitizeErr != nil {
+				return sanitizeErr
+			}
 			child.Metadata = metadata.Metadata
 		}
 	}
@@ -331,7 +347,14 @@ func populatePublicShareMetadata(d *requestContext, albumArt bool) error {
 }
 
 func publicVerifiedMetadataHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
-	if err := populatePublicShareMetadata(d, d.shareQuery.Get("albumArt") == "true"); err != nil {
+	if !d.shareAccess.allows(publicShareReadBrowse | publicShareReadViewer) {
+		return http.StatusForbidden, errors.ErrAccessDenied
+	}
+	albumArt := d.shareQuery.Get("albumArt") == "true"
+	if albumArt && config.Server.DisablePreviews {
+		return http.StatusNotImplemented, fmt.Errorf("preview is disabled")
+	}
+	if err := populatePublicShareMetadata(r, d, albumArt); err != nil {
 		return http.StatusNotFound, fmt.Errorf("metadata is not available")
 	}
 	return renderJSON(w, r, d.fileInfo)
@@ -358,7 +381,7 @@ func publicGetResourceHandler(w http.ResponseWriter, r *http.Request, d *request
 		return http.StatusNotImplemented, fmt.Errorf("browsing is disabled for upload shares")
 	}
 	if d.shareQuery.Get("metadata") == "true" {
-		if err := populatePublicShareMetadata(d, d.shareQuery.Get("albumArt") == "true"); err != nil {
+		if err := populatePublicShareMetadata(r, d, d.shareQuery.Get("albumArt") == "true"); err != nil {
 			return http.StatusNotFound, fmt.Errorf("metadata is not available")
 		}
 	}
@@ -458,6 +481,14 @@ func publicPreviewHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 			!consumePublicShareOriginalRead(d) {
 			return http.StatusForbidden, fmt.Errorf("public share access denied")
 		}
+		if !d.fileInfo.HasPreview || len(d.shareTargets) != 1 {
+			return http.StatusBadRequest, fmt.Errorf("this item does not have a preview")
+		}
+		sourceInfo, ok := config.Server.SourceMap[d.share.Source]
+		if !ok {
+			return http.StatusNotFound, fmt.Errorf("source not found")
+		}
+		return servePublicShareFile(w, r, d, sourceInfo.Path, d.shareTargets[0])
 	}
 	status, err := previewHelperFunc(w, r, d)
 	if err != nil {
@@ -536,7 +567,12 @@ func publicShareDirectoryPreviewFile(r *http.Request, d *requestContext) (*itemi
 	if err != nil {
 		return nil, err
 	}
+	target, err = reauthorizePublicShareTarget(d, sourceInfo.Path, target)
+	if err != nil {
+		return nil, errors.ErrAccessDenied
+	}
 	file.RealPath = target.RealPath
+	d.shareTargets = []publicShareTarget{target}
 	return file, nil
 }
 
@@ -569,29 +605,18 @@ func publicPreviewServesOriginal(r *http.Request, file iteminfo.ExtendedFileInfo
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /public/api/resources [put]
 func publicPutHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
-	// update path to be the source path
-	if !d.share.AllowModify {
-		return http.StatusForbidden, fmt.Errorf("create is not allowed for this share")
+	if len(d.shareTargets) != 1 || !d.shareAccess.modify {
+		return http.StatusForbidden, fmt.Errorf("edit permission not allowed for this share")
+	}
+	target := d.shareTargets[0]
+	if target.info == nil || target.IsDir || !publicShareWriteTargetUnchanged(target) {
+		return http.StatusForbidden, fmt.Errorf("public share access denied")
 	}
 	sourceName := d.share.GetSourceName()
 	if sourceName == "" {
 		return http.StatusNotFound, fmt.Errorf("source not available")
 	}
-
-	if !d.share.AllowModify {
-		return http.StatusForbidden, fmt.Errorf("edit permission not allowed for this share")
-	}
-	// Go automatically decodes query params
-	path := r.URL.Query().Get("path")
-
-	// Rule 1: Validate user-provided path to prevent path traversal
-	cleanPath, err := utils.SanitizeUserPath(path)
-	if err != nil {
-		return http.StatusBadRequest, err
-	}
-
-	resolvedPath := utils.JoinPathAsUnix(d.share.Path, cleanPath)
-	err = files.WriteFile(sourceName, resolvedPath, r.Body)
+	err := files.WriteFile(sourceName, target.CanonicalPath, r.Body)
 	// hide the error
 	if err != nil {
 		logger.Errorf("public put handler: error updating resource with error %v", err)
@@ -602,18 +627,31 @@ func publicPutHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 
 // deprecated -- see publicBulkDeleteHandler
 func publicDeleteHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
-	if !d.share.AllowDelete {
+	if len(d.shareTargets) != 1 || !d.shareAccess.delete {
 		return http.StatusForbidden, fmt.Errorf("delete is not allowed for this share")
+	}
+	target := d.shareTargets[0]
+	if target.info == nil || !publicShareWriteTargetUnchanged(target) {
+		return http.StatusForbidden, fmt.Errorf("public share access denied")
+	}
+	sourceInfo, ok := config.Server.SourceMap[d.share.Source]
+	if !ok {
+		return http.StatusNotFound, fmt.Errorf("source not found")
+	}
+	manifest, err := buildPublicShareDeleteManifest(d, sourceInfo.Path, target)
+	if err != nil || !publicShareWriteManifestUnchanged(manifest) {
+		return http.StatusForbidden, fmt.Errorf("public share access denied")
 	}
 	fileInfo, err := files.FileInfoFaster(utils.FileOptions{
 		FollowSymlinks: true,
-		Path:           d.IndexPath,
+		Path:           target.ScopedPath,
 		Source:         d.share.Source,
 	}, store.Access, d.shareUser, store.Share)
 	if err != nil {
 		return http.StatusNotFound, fmt.Errorf("resource not available")
 	}
-	err = files.DeleteFiles(d.share.Source, fileInfo.RealPath, fileInfo.Type == "directory")
+	fileInfo.RealPath = target.RealPath
+	err = files.DeleteFiles(d.share.Source, target.RealPath, target.IsDir)
 	if err != nil {
 		logger.Errorf("public delete handler: error deleting resource with error %v", err)
 		return http.StatusInternalServerError, fmt.Errorf("an error occured while deleting the resource")
@@ -621,6 +659,57 @@ func publicDeleteHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 	// delete thumbnails
 	preview.DelThumbs(r.Context(), *fileInfo)
 	return http.StatusOK, nil
+}
+
+func publicShareWriteTargetUnchanged(target publicShareTarget) bool {
+	if target.info == nil {
+		return false
+	}
+	current, err := os.Lstat(target.RealPath)
+	return err == nil && current.Mode()&os.ModeSymlink == 0 &&
+		current.Mode().Type() == target.info.Mode().Type() && os.SameFile(target.info, current)
+}
+
+func buildPublicShareDeleteManifest(d *requestContext, sourcePath string, root publicShareTarget) ([]publicShareTarget, error) {
+	manifest := []publicShareTarget{root}
+	if !root.IsDir {
+		return manifest, nil
+	}
+	err := filepath.WalkDir(root.RealPath, func(currentPath string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relativePath, err := filepath.Rel(root.RealPath, currentPath)
+		if err != nil || relativePath == "." {
+			return err
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return errors.ErrAccessDenied
+		}
+		requestedPath := path.Join(root.RequestedPath, filepath.ToSlash(relativePath))
+		child, exists, err := authorizePublicShareWriteTarget(d, sourcePath, requestedPath)
+		if err != nil || !exists || !publicShareWriteTargetUnchanged(child) {
+			return errors.ErrAccessDenied
+		}
+		if !child.IsDir && (child.info == nil || !child.info.Mode().IsRegular()) {
+			return errors.ErrAccessDenied
+		}
+		manifest = append(manifest, child)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return manifest, nil
+}
+
+func publicShareWriteManifestUnchanged(manifest []publicShareTarget) bool {
+	for _, target := range manifest {
+		if !publicShareWriteTargetUnchanged(target) {
+			return false
+		}
+	}
+	return true
 }
 
 // publicBulkDeleteHandler deletes multiple resources from a public share in a single request.
@@ -638,16 +727,143 @@ func publicDeleteHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 // @Failure 500 {object} map[string]string "Internal server error - all deletions failed"
 // @Router /public/api/resources/bulk [delete]
 func publicBulkDeleteHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
-	if !d.share.AllowDelete {
+	if !d.shareAccess.delete {
 		return http.StatusForbidden, fmt.Errorf("delete is not allowed for this share")
 	}
-	// hide the error
-	status, err := resourceBulkDeleteHandler(w, r, d)
-	if err != nil {
-		logger.Errorf("public bulk delete handler: error deleting resources with error %v", err)
-		return http.StatusInternalServerError, fmt.Errorf("an error occurred while processing the request")
+	var items []BulkDeleteItem
+	if err := json.NewDecoder(r.Body).Decode(&items); err != nil {
+		return http.StatusBadRequest, fmt.Errorf("invalid JSON body")
 	}
-	return status, nil
+	if len(items) == 0 {
+		return http.StatusBadRequest, fmt.Errorf("items array cannot be empty")
+	}
+	sourceInfo, ok := config.Server.SourceMap[d.share.Source]
+	if !ok {
+		return http.StatusNotFound, fmt.Errorf("source not found")
+	}
+	targets := make([]publicShareTarget, 0, len(items))
+	manifests := make([][]publicShareTarget, 0, len(items))
+	for i := range items {
+		target, exists, err := authorizePublicShareWriteTarget(d, sourceInfo.Path, items[i].Path)
+		if err != nil || !exists || target.RequestedPath == "" || !publicShareWriteTargetUnchanged(target) {
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
+		for _, planned := range targets {
+			if publicSharePathsOverlap(planned.CanonicalPath, target.CanonicalPath) {
+				return http.StatusConflict, fmt.Errorf("delete targets overlap")
+			}
+		}
+		manifest, err := buildPublicShareDeleteManifest(d, sourceInfo.Path, target)
+		if err != nil {
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
+		items[i].Path = target.RequestedPath
+		targets = append(targets, target)
+		manifests = append(manifests, manifest)
+	}
+	for _, manifest := range manifests {
+		if !publicShareWriteManifestUnchanged(manifest) {
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
+	}
+
+	fileInfos := make([]*iteminfo.ExtendedFileInfo, len(targets))
+	for i, target := range targets {
+		fileInfo, err := files.FileInfoFaster(utils.FileOptions{
+			FollowSymlinks: true,
+			Path:           target.ScopedPath,
+			Source:         d.share.Source,
+			ShowHidden:     true,
+		}, store.Access, d.shareUser, store.Share)
+		if err != nil || !publicShareWriteTargetUnchanged(target) {
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
+		fileInfo.RealPath = target.RealPath
+		fileInfos[i] = fileInfo
+	}
+
+	response := BulkDeleteResponse{Succeeded: make([]BulkDeleteItem, 0, len(items)), Failed: []BulkDeleteItem{}}
+	for i, target := range targets {
+		if err := files.DeleteFiles(d.share.Source, target.RealPath, target.IsDir); err != nil {
+			logger.Errorf("public bulk delete handler: error deleting resource with error %v", err)
+			response.Failed = append(response.Failed, BulkDeleteItem{Message: "error deleting resource"})
+			continue
+		}
+		preview.DelThumbs(r.Context(), *fileInfos[i])
+		response.Succeeded = append(response.Succeeded, items[i])
+	}
+	status := http.StatusOK
+	if len(response.Failed) != 0 {
+		status = http.StatusMultiStatus
+	}
+	return renderJSON(w, r, response, status)
+}
+
+type publicSharePatchPlan struct {
+	from     publicShareTarget
+	to       publicShareTarget
+	toExists bool
+}
+
+func publicShareVersionedRequest(requestedPath string, counter int) string {
+	directory, name := path.Split(requestedPath)
+	extension := path.Ext(name)
+	base := strings.TrimSuffix(name, extension)
+	return path.Join(directory, fmt.Sprintf("%s(%d)%s", base, counter, extension))
+}
+
+func publicShareDestinationCollision(reserved []publicShareTarget, candidate publicShareTarget) (exact, overlap bool) {
+	for _, existing := range reserved {
+		if !publicSharePathsOverlap(existing.CanonicalPath, candidate.CanonicalPath) {
+			continue
+		}
+		if publicSharePathWithin(existing.CanonicalPath, candidate.CanonicalPath) &&
+			publicSharePathWithin(candidate.CanonicalPath, existing.CanonicalPath) {
+			return true, true
+		}
+		return false, true
+	}
+	return false, false
+}
+
+func authorizePublicSharePatchTree(d *requestContext, sourcePath string, plan publicSharePatchPlan, overwrite bool) error {
+	if !plan.from.IsDir {
+		return nil
+	}
+	return filepath.WalkDir(plan.from.RealPath, func(currentPath string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relativePath, err := filepath.Rel(plan.from.RealPath, currentPath)
+		if err != nil || relativePath == "." {
+			return err
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return errors.ErrAccessDenied
+		}
+		fromRequest := path.Join(plan.from.RequestedPath, filepath.ToSlash(relativePath))
+		fromTarget, exists, err := authorizePublicShareWriteTarget(d, sourcePath, fromRequest)
+		if err != nil || !exists || !publicShareWriteTargetUnchanged(fromTarget) {
+			return errors.ErrAccessDenied
+		}
+		if !fromTarget.IsDir && (fromTarget.info == nil || !fromTarget.info.Mode().IsRegular()) {
+			return errors.ErrAccessDenied
+		}
+
+		toRequest := path.Join(plan.to.RequestedPath, filepath.ToSlash(relativePath))
+		toTarget, toExists, err := authorizePublicShareWriteTarget(d, sourcePath, toRequest)
+		if err != nil {
+			return errors.ErrAccessDenied
+		}
+		if toExists {
+			if !overwrite || !d.shareAccess.replace || !publicShareWriteTargetUnchanged(toTarget) {
+				return errors.ErrAccessDenied
+			}
+		} else if !d.shareAccess.create {
+			return errors.ErrAccessDenied
+		}
+		return nil
+	})
 }
 
 // publicPatchHandler performs a patch operation (e.g., move, copy, rename) on resources in a public share.
@@ -666,7 +882,7 @@ func publicBulkDeleteHandler(w http.ResponseWriter, r *http.Request, d *requestC
 // @Failure 500 {object} MoveCopyResponse "Internal server error"
 // @Router /public/api/resources [patch]
 func publicPatchHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
-	if !d.share.AllowModify {
+	if !d.shareAccess.modify {
 		return http.StatusForbidden, fmt.Errorf("edit permission not allowed for this share")
 	}
 
@@ -689,29 +905,116 @@ func publicPatchHandler(w http.ResponseWriter, r *http.Request, d *requestContex
 		return http.StatusBadRequest, fmt.Errorf("invalid JSON body: %v", err)
 	}
 
-	if req.Action == "" {
+	if req.Action != "copy" && req.Action != "move" && req.Action != "rename" {
 		return http.StatusBadRequest, fmt.Errorf("action is required (copy, move, or rename)")
 	}
-
-	// Transform the request: prepend share path and add source to each item
-	// This normalizes the request to look like a regular user request
-	// Note: Share paths are absolute, so we don't strip user scope here
-	// resourcePatchHandler will skip adding scope for shares
-	for i := range req.Items {
-		var sanitizedPath string
-		sanitizedPath, err = utils.SanitizeUserPath(req.Items[i].FromPath)
-		if err != nil {
-			return http.StatusBadRequest, fmt.Errorf("invalid from path: %w", err)
-		}
-		req.Items[i].FromSource = sourceName
-		req.Items[i].FromPath = utils.JoinPathAsUnix(d.share.Path, sanitizedPath)
-		sanitizedPath, err = utils.SanitizeUserPath(req.Items[i].ToPath)
-		if err != nil {
-			return http.StatusBadRequest, fmt.Errorf("invalid to path: %w", err)
-		}
-		req.Items[i].ToSource = sourceName
-		req.Items[i].ToPath = utils.JoinPathAsUnix(d.share.Path, sanitizedPath)
+	if len(req.Items) == 0 {
+		return http.StatusBadRequest, fmt.Errorf("items array cannot be empty")
 	}
+	if (req.Action == "move" || req.Action == "rename") && !d.shareAccess.delete {
+		return http.StatusForbidden, fmt.Errorf("delete permission not allowed for this share")
+	}
+
+	sourceInfo, ok := config.Server.SourceMap[d.share.Source]
+	if !ok {
+		return http.StatusNotFound, fmt.Errorf("source not found")
+	}
+	autoRename := req.Rename
+	plans := make([]publicSharePatchPlan, 0, len(req.Items))
+	reservedDestinations := make([]publicShareTarget, 0, len(req.Items))
+	// Authorize and freeze every top-level source and destination before mutation.
+	for i := range req.Items {
+		fromTarget, fromExists, authorizeErr := authorizePublicShareWriteTarget(d, sourceInfo.Path, req.Items[i].FromPath)
+		if authorizeErr != nil || !fromExists || fromTarget.RequestedPath == "" || !publicShareWriteTargetUnchanged(fromTarget) {
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
+		toTarget, toExists, authorizeErr := authorizePublicShareWriteTarget(d, sourceInfo.Path, req.Items[i].ToPath)
+		if authorizeErr != nil || toTarget.RequestedPath == "" {
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
+		reserved, overlapsReserved := publicShareDestinationCollision(reservedDestinations, toTarget)
+		if overlapsReserved && !reserved {
+			return http.StatusConflict, fmt.Errorf("destination overlaps another destination")
+		}
+		if toExists || reserved {
+			if !autoRename {
+				if reserved || !req.Overwrite {
+					return http.StatusConflict, fmt.Errorf("destination already exists or overlaps another destination")
+				}
+				if !d.shareAccess.replace || !publicShareWriteTargetUnchanged(toTarget) {
+					return http.StatusForbidden, fmt.Errorf("public share access denied")
+				}
+			} else {
+				originalRequest := toTarget.RequestedPath
+				for counter := 1; ; counter++ {
+					alternateRequest := publicShareVersionedRequest(originalRequest, counter)
+					candidate, candidateExists, candidateErr := authorizePublicShareWriteTarget(d, sourceInfo.Path, alternateRequest)
+					if candidateErr != nil {
+						return http.StatusForbidden, fmt.Errorf("public share access denied")
+					}
+					exactCollision, overlapCollision := publicShareDestinationCollision(reservedDestinations, candidate)
+					if overlapCollision && !exactCollision {
+						return http.StatusConflict, fmt.Errorf("destination overlaps another destination")
+					}
+					if candidateExists || exactCollision {
+						continue
+					}
+					toTarget = candidate
+					toExists = false
+					break
+				}
+			}
+		} else if !d.shareAccess.create {
+			return http.StatusForbidden, fmt.Errorf("create permission not allowed for this share")
+		}
+		if !toExists && !d.shareAccess.create {
+			return http.StatusForbidden, fmt.Errorf("create permission not allowed for this share")
+		}
+		if _, collision := publicShareDestinationCollision(reservedDestinations, toTarget); collision {
+			return http.StatusConflict, fmt.Errorf("destination overlaps another destination")
+		}
+		for _, planned := range plans {
+			if (fromTarget.IsDir || planned.from.IsDir) && publicSharePathsOverlap(fromTarget.CanonicalPath, planned.from.CanonicalPath) {
+				return http.StatusConflict, fmt.Errorf("source trees overlap")
+			}
+		}
+		if fromTarget.IsDir && publicSharePathsOverlap(fromTarget.CanonicalPath, toTarget.CanonicalPath) {
+			return http.StatusConflict, fmt.Errorf("destination overlaps source tree")
+		}
+		if publicShareWriteTargetUnchanged(fromTarget) && toExists && publicShareWriteTargetUnchanged(toTarget) &&
+			os.SameFile(fromTarget.info, toTarget.info) {
+			return http.StatusBadRequest, fmt.Errorf("source and destination must differ")
+		}
+		plans = append(plans, publicSharePatchPlan{from: fromTarget, to: toTarget, toExists: toExists})
+		reservedDestinations = append(reservedDestinations, toTarget)
+		req.Items[i].FromSource = sourceName
+		req.Items[i].FromPath = fromTarget.CanonicalPath
+		req.Items[i].ToSource = sourceName
+		req.Items[i].ToPath = toTarget.CanonicalPath
+	}
+	for _, destinationPlan := range plans {
+		for _, sourcePlan := range plans {
+			if !publicSharePathsOverlap(destinationPlan.to.CanonicalPath, sourcePlan.from.CanonicalPath) {
+				continue
+			}
+			exact := publicSharePathWithin(destinationPlan.to.CanonicalPath, sourcePlan.from.CanonicalPath) &&
+				publicSharePathWithin(sourcePlan.from.CanonicalPath, destinationPlan.to.CanonicalPath)
+			if exact || destinationPlan.from.IsDir || sourcePlan.from.IsDir {
+				return http.StatusConflict, fmt.Errorf("destination overlaps a source tree")
+			}
+		}
+	}
+	for _, plan := range plans {
+		if err := authorizePublicSharePatchTree(d, sourceInfo.Path, plan, req.Overwrite); err != nil {
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
+		if !publicShareWriteTargetUnchanged(plan.from) || (plan.toExists && !publicShareWriteTargetUnchanged(plan.to)) {
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
+	}
+	// Every automatic destination is now fixed and authorized. Do not let the shared
+	// handler select a different path if filesystem state changes before mutation.
+	req.Rename = false
 	d.Data = req
 
 	// Call the regular handler (will treat this like a normal user request now)

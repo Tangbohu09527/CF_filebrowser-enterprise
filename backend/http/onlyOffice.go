@@ -1,25 +1,31 @@
 package http
 
 import (
-	"encoding/base64"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	jwt "github.com/golang-jwt/jwt/v4"
 	"github.com/gtsteffaniak/filebrowser/backend/adapters/fs/files"
 	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	"github.com/gtsteffaniak/filebrowser/backend/database/share"
+	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing/iteminfo"
+	"github.com/gtsteffaniak/go-cache/cache"
 	"github.com/gtsteffaniak/go-logger/logger"
+	"golang.org/x/net/http/httpguts"
 )
 
 const (
@@ -31,12 +37,194 @@ const (
 	onlyOfficeStatusForceSaveError                  = 7
 
 	onlyOfficeDownloadTimeout = 10 * time.Second
+	onlyOfficeCapabilityTTL   = 30 * time.Minute
+	onlyOfficeCallbackMaxBody = 1 << 20
+
+	onlyOfficeDownloadAudience = "filebrowser-onlyoffice-download"
+	onlyOfficeCallbackAudience = "filebrowser-onlyoffice-callback"
 )
+
+var errOnlyOfficeCallbackTooLarge = errors.New("OnlyOffice callback body is too large")
+var errOnlyOfficeWriteAuthorizationChanged = errors.New("OnlyOffice write authorization changed")
+
+type onlyOfficeCapabilityClaims struct {
+	jwt.RegisteredClaims
+	Purpose           string `json:"purpose"`
+	Method            string `json:"method"`
+	Source            string `json:"source"`
+	Path              string `json:"path"`
+	LogicalPath       string `json:"logicalPath,omitempty"`
+	CanonicalPath     string `json:"canonicalPath,omitempty"`
+	ShareHash         string `json:"shareHash,omitempty"`
+	UserID            uint   `json:"userId"`
+	RequesterID       uint   `json:"requesterId,omitempty"`
+	RequesterUsername string `json:"requesterUsername"`
+	DocumentKey       string `json:"documentKey"`
+	Browse            bool   `json:"browse"`
+	Download          bool   `json:"download"`
+	CanEdit           bool   `json:"canEdit"`
+}
+
+type onlyOfficeCapabilityState struct {
+	Purpose            string
+	Source             string
+	Path               string
+	ShareHash          string
+	ShareLink          *share.Link
+	UserID             uint
+	RequesterID        uint
+	RequesterUsername  string
+	ParentAPITokenHash string
+	DocumentKey        string
+	RealPath           string
+	FileInfo           os.FileInfo
+	ContentSHA256      [sha256.Size]byte
+}
+
+var onlyOfficeCapabilityCache = cache.NewCache[onlyOfficeCapabilityState](onlyOfficeCapabilityTTL)
+var onlyOfficeCapabilityUseMu sync.Mutex
+var onlyOfficeCallbackInFlight = make(map[string]struct{})
 
 // onlyOfficeDownloadClient fetches saved documents from the OnlyOffice document server.
 // A bounded timeout avoids hanging goroutines when the server is unreachable.
 var onlyOfficeDownloadClient = &http.Client{
 	Timeout: onlyOfficeDownloadTimeout,
+}
+
+func onlyOfficeCapabilityExpiry(d *requestContext) time.Time {
+	expires := time.Now().Add(onlyOfficeCapabilityTTL)
+	if d == nil || d.token == "" {
+		return expires
+	}
+	var parent users.AuthToken
+	if _, _, err := new(jwt.Parser).ParseUnverified(d.token, &parent); err == nil &&
+		parent.RegisteredClaims.ExpiresAt != nil && parent.RegisteredClaims.ExpiresAt.Time.Before(expires) {
+		expires = parent.RegisteredClaims.ExpiresAt.Time
+	}
+	return expires
+}
+
+func onlyOfficeFileState(realPath string) (onlyOfficeCapabilityState, error) {
+	var state onlyOfficeCapabilityState
+	if realPath == "" {
+		return state, errors.New("document path is missing")
+	}
+	file, err := os.Open(realPath)
+	if err != nil {
+		return state, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return state, err
+	}
+	if !info.Mode().IsRegular() {
+		return state, errors.New("document is not a regular file")
+	}
+	hasher := sha256.New()
+	if _, err = io.Copy(hasher, file); err != nil {
+		return state, err
+	}
+	after, err := file.Stat()
+	if err != nil || !publicShareSameFileIdentity(info, after) {
+		return state, errors.New("document changed while reading")
+	}
+	state.RealPath = realPath
+	state.FileInfo = after
+	state.ContentSHA256 = [sha256.Size]byte(hasher.Sum(nil))
+	return state, nil
+}
+
+func issueOnlyOfficeCapability(d *requestContext, claims onlyOfficeCapabilityClaims, state onlyOfficeCapabilityState) (string, error) {
+	if settings.Config.Auth.Key == "" {
+		return "", errors.New("authentication signing key is not configured")
+	}
+	expires := onlyOfficeCapabilityExpiry(d)
+	now := time.Now()
+	if !expires.After(now) {
+		return "", errors.New("parent credential has expired")
+	}
+	jti, err := utils.RandomHex(16)
+	if err != nil {
+		return "", err
+	}
+	claims.RegisteredClaims = jwt.RegisteredClaims{
+		Audience:  jwt.ClaimStrings{claims.Purpose},
+		ExpiresAt: jwt.NewNumericDate(expires),
+		IssuedAt:  jwt.NewNumericDate(now),
+		NotBefore: jwt.NewNumericDate(now.Add(-time.Second)),
+		Issuer:    "FileBrowser Quantum OnlyOffice",
+		ID:        jti,
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, &claims)
+	signed, err := token.SignedString([]byte(settings.Config.Auth.Key))
+	if err != nil {
+		return "", err
+	}
+	state.Purpose = claims.Purpose
+	state.Source = claims.Source
+	state.Path = claims.Path
+	state.ShareHash = claims.ShareHash
+	if claims.ShareHash != "" {
+		if d == nil || d.share == nil || d.share.Hash != claims.ShareHash {
+			return "", errors.New("capability share state is unavailable")
+		}
+		state.ShareLink = d.share
+	} else if d != nil && d.share != nil {
+		return "", errors.New("capability share state is inconsistent")
+	}
+	state.UserID = claims.UserID
+	state.RequesterID = claims.RequesterID
+	state.RequesterUsername = claims.RequesterUsername
+	if d != nil && d.apiToken && d.token != "" {
+		state.ParentAPITokenHash = utils.HashSHA256(d.token)
+	}
+	state.DocumentKey = claims.DocumentKey
+	onlyOfficeCapabilityCache.SetWithExp(jti, state, time.Until(expires))
+	return signed, nil
+}
+
+func parseOnlyOfficeCapability(r *http.Request, purpose, method string) (*onlyOfficeCapabilityClaims, error) {
+	query := r.URL.Query()
+	for key := range query {
+		if key != "capability" {
+			return nil, errors.New("unexpected capability parameter")
+		}
+	}
+	raw := query.Get("capability")
+	if raw == "" || settings.Config.Auth.Key == "" {
+		return nil, errors.New("missing capability")
+	}
+	claims := &onlyOfficeCapabilityClaims{}
+	token, err := jwt.ParseWithClaims(raw, claims, func(token *jwt.Token) (interface{}, error) {
+		if token.Method != jwt.SigningMethodHS256 {
+			return nil, errors.New("unexpected capability signing method")
+		}
+		return []byte(settings.Config.Auth.Key), nil
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+	if err != nil || !token.Valid {
+		return nil, errors.New("invalid or expired capability")
+	}
+	if claims.Issuer != "FileBrowser Quantum OnlyOffice" || claims.ID == "" ||
+		claims.Purpose != purpose || claims.Method != method || r.Method != method ||
+		!claims.VerifyAudience(purpose, true) || claims.Source == "" || claims.Path == "" ||
+		claims.UserID == 0 || claims.RequesterUsername == "" || claims.DocumentKey == "" ||
+		(claims.RequesterID == 0 && claims.RequesterUsername != "anonymous") {
+		return nil, errors.New("capability scope mismatch")
+	}
+	return claims, nil
+}
+
+func onlyOfficeCapabilityStateForClaims(claims *onlyOfficeCapabilityClaims) (onlyOfficeCapabilityState, error) {
+	state, ok := onlyOfficeCapabilityCache.Get(claims.ID)
+	if !ok || state.Purpose != claims.Purpose || state.Source != claims.Source || state.Path != claims.Path ||
+		state.ShareHash != claims.ShareHash || state.UserID != claims.UserID || state.DocumentKey != claims.DocumentKey ||
+		state.RequesterID != claims.RequesterID || state.RequesterUsername != claims.RequesterUsername ||
+		(claims.ShareHash == "") != (state.ShareLink == nil) ||
+		state.FileInfo == nil || state.RealPath == "" || state.ContentSHA256 == ([sha256.Size]byte{}) {
+		return onlyOfficeCapabilityState{}, errors.New("capability state is not available")
+	}
+	return state, nil
 }
 
 type OnlyOfficeCallback struct {
@@ -93,8 +281,16 @@ func onlyofficeClientConfigGetHandler(w http.ResponseWriter, r *http.Request, d 
 	if d.share == nil && (d.user == nil || !d.user.Permissions.Browse || !d.user.Permissions.Download) {
 		return http.StatusForbidden, errors.New("browse and download permissions are required")
 	}
-	if config.Integrations.OnlyOffice.Url == "" {
-		return http.StatusInternalServerError, errors.New("only-office integration must be configured in settings")
+	if d.share != nil && (d.shareUser == nil || !d.share.EnableOnlyOffice || len(d.shareTargets) != 1 ||
+		!d.shareAccess.allows(publicShareReadOriginalViewer)) {
+		return http.StatusForbidden, errors.New("public share does not allow OnlyOffice")
+	}
+	if config.Integrations.OnlyOffice.Url == "" || config.Integrations.OnlyOffice.Secret == "" {
+		return http.StatusInternalServerError, errors.New("only-office URL and callback signing secret must be configured")
+	}
+	onlyOfficeURLBase := onlyOfficeBaseURL(r)
+	if onlyOfficeURLBase == "" {
+		return http.StatusInternalServerError, errors.New("only-office callback origin is not valid")
 	}
 
 	// Extract clean parameters from request
@@ -169,9 +365,10 @@ func onlyofficeClientConfigGetHandler(w http.ResponseWriter, r *http.Request, d 
 
 	// Determine modify permissions based on whether this is a share or regular request
 	var modifyPerms bool
-	if d.fileInfo.Hash != "" && d.share != nil {
-		// Share request - check share permissions
-		modifyPerms = d.share.AllowModify
+	if d.share != nil {
+		modifyPerms = d.share.CapabilityVersion == share.CurrentCapabilityVersion &&
+			d.shareUser.Permissions.Share && d.shareUser.Permissions.Modify &&
+			d.share.CreatorCapabilities.Share && d.share.CreatorCapabilities.Modify && d.share.AllowModify
 	} else {
 		// Regular user request - check user permissions
 		modifyPerms = d.user.Permissions.Modify
@@ -193,8 +390,8 @@ func onlyofficeClientConfigGetHandler(w http.ResponseWriter, r *http.Request, d 
 	}
 
 	shareHash := ""
-	if d.fileInfo.Hash != "" {
-		shareHash = d.fileInfo.Hash
+	if d.share != nil {
+		shareHash = d.share.Hash
 	}
 
 	logContext := createOnlyOfficeLogContext(
@@ -211,11 +408,57 @@ func onlyofficeClientConfigGetHandler(w http.ResponseWriter, r *http.Request, d 
 	// Send initial log event with detailed path information
 	sendOnlyOfficeLogEvent(logContext, "INFO", "config", fmt.Sprintf("OnlyOffice session started for document: %s ", path))
 
-	// Build download URL that OnlyOffice server will use
-	downloadURL := buildOnlyOfficeDownloadURL(r, source, providedPath, d.fileInfo.Hash, d.token)
+	state, err := onlyOfficeFileState(d.fileInfo.RealPath)
+	if err != nil {
+		return http.StatusNotFound, fmt.Errorf("document is no longer available")
+	}
+	capabilityPath := path
+	capabilityUserID := d.user.ID
+	logicalPath := ""
+	canonicalPath := ""
+	capabilityBrowse := d.user.Permissions.Browse
+	capabilityDownload := d.user.Permissions.Download
+	if d.share != nil {
+		target := d.shareTargets[0]
+		capabilityPath = target.ScopedPath
+		capabilityUserID = d.shareUser.ID
+		logicalPath = target.LogicalPath
+		canonicalPath = target.CanonicalPath
+		capabilityBrowse = d.shareAccess.browse
+		capabilityDownload = d.shareAccess.download
+	}
+	baseCapability := onlyOfficeCapabilityClaims{
+		Source:            source,
+		Path:              capabilityPath,
+		LogicalPath:       logicalPath,
+		CanonicalPath:     canonicalPath,
+		ShareHash:         shareHash,
+		UserID:            capabilityUserID,
+		RequesterID:       d.user.ID,
+		RequesterUsername: d.user.Username,
+		DocumentKey:       documentId,
+		Browse:            capabilityBrowse,
+		Download:          capabilityDownload,
+		CanEdit:           canEdit && !config.Integrations.OnlyOffice.ViewOnly,
+	}
+	downloadClaims := baseCapability
+	downloadClaims.Purpose = onlyOfficeDownloadAudience
+	downloadClaims.Method = http.MethodGet
+	downloadCapability, err := issueOnlyOfficeCapability(d, downloadClaims, state)
+	if err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("failed to create OnlyOffice download capability")
+	}
+	callbackClaims := baseCapability
+	callbackClaims.Purpose = onlyOfficeCallbackAudience
+	callbackClaims.Method = http.MethodPost
+	callbackCapability, err := issueOnlyOfficeCapability(d, callbackClaims, state)
+	if err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("failed to create OnlyOffice callback capability")
+	}
 
-	// Build callback URL for OnlyOffice to notify us of changes
-	callbackURL := buildOnlyOfficeCallbackURL(r, source, providedPath, d.fileInfo.Hash, d.token)
+	// Build scoped URLs that do not contain the parent FileBrowser bearer.
+	downloadURL := buildOnlyOfficeCapabilityURL(onlyOfficeURLBase, "/api/office/download", downloadCapability)
+	callbackURL := buildOnlyOfficeCapabilityURL(onlyOfficeURLBase, "/api/office/callback", callbackCapability)
 
 	// Build OnlyOffice client configuration
 	clientConfig := map[string]interface{}{
@@ -260,106 +503,333 @@ func onlyofficeClientConfigGetHandler(w http.ResponseWriter, r *http.Request, d 
 	return renderJSON(w, r, clientConfig)
 }
 
-// buildOnlyOfficeDownloadURL constructs the download URL that OnlyOffice server will use to fetch the file
-func buildOnlyOfficeDownloadURL(r *http.Request, source, path, hash, token string) string {
-	// Determine base URL (internal URL takes priority for OnlyOffice server communication)
-	var baseURL string
-	if config.Server.InternalUrl != "" {
-		// InternalUrl is a full URL (e.g., http://localhost:8080), so use it directly
-		internalURL := strings.TrimSuffix(config.Server.InternalUrl, "/")
-		baseURLPath := strings.TrimPrefix(config.Server.BaseURL, "/")
-		if baseURLPath != "" {
-			baseURL = internalURL + "/" + baseURLPath
-		} else {
-			baseURL = internalURL
-		}
-	} else {
-		// Extract scheme and host from request (respecting X-Forwarded-* headers)
-		var host string
-		var scheme string
-
-		if forwardedHost := r.Header.Get("X-Forwarded-Host"); forwardedHost != "" {
-			host = forwardedHost
-			// Use X-Forwarded-Proto if available, otherwise default to https for proxied requests
-			if forwardedProto := r.Header.Get("X-Forwarded-Proto"); forwardedProto != "" {
-				scheme = forwardedProto
-			} else {
-				scheme = "https"
-			}
-		} else {
-			// Fallback to simple approach
-			host = r.Host
-			scheme = getScheme(r)
-		}
-		baseURL = fmt.Sprintf("%s://%s%s", scheme, host, config.Server.BaseURL)
+func onlyOfficeValidHost(host string) bool {
+	if host == "" || strings.Contains(host, ",") || strings.HasSuffix(host, ":") || !httpguts.ValidHostHeader(host) {
+		return false
 	}
-
-	escapedPath := url.QueryEscape(path)
-	downloadURL := fmt.Sprintf("%s/api/resources/download?file=%s&auth=%s&source=%s",
-		strings.TrimSuffix(baseURL, "/"), escapedPath, token, url.QueryEscape(source))
-	if hash != "" {
-		downloadURL = fmt.Sprintf("%s/public/api/resources/download?file=%s&auth=%s&hash=%s",
-			strings.TrimSuffix(baseURL, "/"), escapedPath, token, hash)
+	parsed, err := url.Parse("http://" + host)
+	if err != nil || parsed.User != nil || parsed.Host != host || parsed.Hostname() == "" ||
+		parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
 	}
-	return downloadURL
+	if port := parsed.Port(); port != "" {
+		value, err := strconv.Atoi(port)
+		if err != nil || value < 1 || value > 65535 {
+			return false
+		}
+	}
+	return true
 }
 
-// buildOnlyOfficeCallbackURL constructs the callback URL that OnlyOffice server will use to notify us of changes
-func buildOnlyOfficeCallbackURL(r *http.Request, source, path, hash, token string) string {
-	// Determine base URL (internal URL takes priority for OnlyOffice server communication)
-	var baseURL string
-	if config.Server.InternalUrl != "" {
-		// InternalUrl is a full URL (e.g., http://localhost:8080), so use it directly
-		internalURL := strings.TrimSuffix(config.Server.InternalUrl, "/")
-		baseURLPath := strings.TrimPrefix(config.Server.BaseURL, "/")
-		if baseURLPath != "" {
-			baseURL = internalURL + "/" + baseURLPath
-		} else {
-			baseURL = internalURL
+func onlyOfficeValidatedBaseURL(raw string) (*url.URL, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Opaque != "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
+		parsed.RawPath != "" || strings.ContainsAny(parsed.Path, "\\\r\n\t") ||
+		!isAllowedOnlyOfficeScheme(strings.ToLower(parsed.Scheme)) || !onlyOfficeValidHost(parsed.Host) {
+		return nil, errors.New("invalid OnlyOffice base URL")
+	}
+	for _, segment := range strings.Split(parsed.Path, "/") {
+		if segment == "." || segment == ".." {
+			return nil, errors.New("invalid OnlyOffice base URL path")
 		}
-	} else {
-		// Extract scheme and host from request (respecting X-Forwarded-* headers)
-		var host string
-		var scheme string
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
+	return parsed, nil
+}
 
-		if forwardedHost := r.Header.Get("X-Forwarded-Host"); forwardedHost != "" {
-			host = forwardedHost
-			// Use X-Forwarded-Proto if available, otherwise default to https for proxied requests
-			if forwardedProto := r.Header.Get("X-Forwarded-Proto"); forwardedProto != "" {
-				scheme = forwardedProto
-			} else {
-				scheme = "https"
+func onlyOfficeBaseURL(r *http.Request) string {
+	configured := config.Server.InternalUrl
+	if configured == "" {
+		configured = config.Server.ExternalUrl
+	}
+	var base *url.URL
+	var err error
+	if configured != "" {
+		base, err = onlyOfficeValidatedBaseURL(configured)
+	} else {
+		if r == nil {
+			return ""
+		}
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		if config.Http.TrustedHeaders["x-forwarded-proto"] {
+			if forwardedProto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwardedProto != "" {
+				scheme = strings.ToLower(forwardedProto)
 			}
-		} else {
-			// Fallback to simple approach
-			host = r.Host
-			scheme = getScheme(r)
 		}
-		baseURL = fmt.Sprintf("%s://%s%s", scheme, host, config.Server.BaseURL)
+		host := strings.TrimSpace(r.Host)
+		if config.Http.TrustedHeaders["x-forwarded-host"] {
+			if forwardedHost := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); forwardedHost != "" {
+				host = forwardedHost
+			}
+		}
+		base, err = onlyOfficeValidatedBaseURL(scheme + "://" + host)
 	}
+	if err != nil {
+		return ""
+	}
+	basePath := strings.Trim(config.Server.BaseURL, "/")
+	if basePath != "" {
+		base.Path = strings.TrimSuffix(base.Path, "/") + "/" + basePath
+	}
+	return strings.TrimSuffix(base.String(), "/")
+}
 
-	var callbackURL string
-	if hash != "" {
-		// Share callback URL - use public API and don't expose source, use path relative to share
-		params := url.Values{}
-		params.Set("hash", hash)
-		params.Set("path", path) // This should be the path relative to the share, not the full filesystem path
-		params.Set("auth", token)
+func buildOnlyOfficeCapabilityURL(baseURL, endpoint, capability string) string {
+	if baseURL == "" || capability == "" {
+		return ""
+	}
+	params := url.Values{"capability": {capability}}
+	return strings.TrimSuffix(baseURL, "/") + endpoint + "?" + params.Encode()
+}
 
-		callbackURL = fmt.Sprintf("%s/public/api/office/callback?%s",
-			strings.TrimSuffix(baseURL, "/"), params.Encode())
+// buildOnlyOfficeDownloadURL constructs the capability-scoped download URL.
+func buildOnlyOfficeDownloadURL(r *http.Request, capability string) string {
+	return buildOnlyOfficeCapabilityURL(onlyOfficeBaseURL(r), "/api/office/download", capability)
+}
+
+// buildOnlyOfficeCallbackURL constructs the capability-scoped callback URL.
+func buildOnlyOfficeCallbackURL(r *http.Request, capability string) string {
+	return buildOnlyOfficeCapabilityURL(onlyOfficeBaseURL(r), "/api/office/callback", capability)
+}
+
+func onlyOfficePublicEditAllowed(d *requestContext) bool {
+	return d != nil && d.share != nil && d.shareUser != nil &&
+		d.share.CapabilityVersion == share.CurrentCapabilityVersion &&
+		d.shareUser.Permissions.Share && d.shareUser.Permissions.Modify &&
+		d.share.CreatorCapabilities.Share && d.share.CreatorCapabilities.Modify && d.share.AllowModify
+}
+
+func onlyOfficeCapabilityRequester(claims *onlyOfficeCapabilityClaims) (*users.User, error) {
+	if claims.RequesterID == 0 {
+		if claims.RequesterUsername != "anonymous" {
+			return nil, errors.New("capability requester is invalid")
+		}
+		requester := &users.User{Username: "anonymous"}
+		settings.ApplyUserDefaults(requester)
+		return requester, nil
+	}
+	requester, err := store.Users.Get(claims.RequesterID)
+	if err != nil || requester.Username == "" || requester.Username != claims.RequesterUsername {
+		return nil, errors.New("capability requester is not available")
+	}
+	return requester, nil
+}
+
+func onlyOfficeUserHasAPITokenHash(user *users.User, tokenHash string) bool {
+	if user == nil || tokenHash == "" {
+		return false
+	}
+	for _, tokens := range []map[string]users.AuthToken{user.Tokens, user.ApiKeys} {
+		for _, token := range tokens {
+			secret := token.Token
+			if secret == "" {
+				secret = token.Key
+			}
+			if secret != "" && utils.HashSHA256(secret) == tokenHash {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func onlyOfficeParentAPITokenActive(state onlyOfficeCapabilityState, requester *users.User) bool {
+	if state.ParentAPITokenHash == "" {
+		return true
+	}
+	return store.Access != nil && requester != nil &&
+		store.Access.IsApiTokenHashActive(state.ParentAPITokenHash, requester.ID) &&
+		onlyOfficeUserHasAPITokenHash(requester, state.ParentAPITokenHash)
+}
+
+func resolveOnlyOfficeCapability(claims *onlyOfficeCapabilityClaims, requireEdit bool) (*requestContext, onlyOfficeCapabilityState, error) {
+	state, err := onlyOfficeCapabilityStateForClaims(claims)
+	if err != nil {
+		return nil, state, err
+	}
+	owner, err := store.Users.Get(claims.UserID)
+	if err != nil || owner.Username == "" {
+		return nil, state, errors.New("capability user is not available")
+	}
+	requester, err := onlyOfficeCapabilityRequester(claims)
+	if err != nil || !onlyOfficeParentAPITokenActive(state, requester) {
+		return nil, state, errors.New("capability requester credential is no longer available")
+	}
+	if requireEdit && config.Integrations.OnlyOffice.ViewOnly {
+		return nil, state, errors.New("OnlyOffice is now view-only")
+	}
+	d := &requestContext{user: requester}
+	var fileInfo *iteminfo.ExtendedFileInfo
+	if claims.ShareHash != "" {
+		link, err := store.Share.GetByHash(claims.ShareHash)
+		if err != nil || link != state.ShareLink || link.UserID != owner.ID || !link.EnableOnlyOffice {
+			return nil, state, errors.New("capability share is not available")
+		}
+		if !publicShareAudienceAllowed(link, requester) ||
+			(link.PerUserDownloadLimit && requester.Username == "anonymous") {
+			return nil, state, errors.New("capability requester is no longer allowed")
+		}
+		sourceInfo, ok := config.Server.SourceMap[link.Source]
+		if !ok || sourceInfo.Config.Private || sourceInfo.Name != claims.Source {
+			return nil, state, errors.New("capability source is not available")
+		}
+		access := calculatePublicShareAccess(link, owner)
+		if !claims.Browse || !claims.Download || !access.allows(publicShareReadOriginalViewer) {
+			return nil, state, errors.New("capability read permission is no longer available")
+		}
+		if requireEdit && (!claims.CanEdit || !onlyOfficePublicEditAllowed(&requestContext{share: link, shareUser: owner})) {
+			return nil, state, errors.New("capability edit permission is no longer available")
+		}
+		ownerScope, err := owner.GetScopeForSourceName(sourceInfo.Name)
+		if err != nil || ownerScope == "" {
+			return nil, state, errors.New("capability owner scope is not available")
+		}
+		cleanScope, err := cleanPublicShareRelativePath(ownerScope)
+		if err != nil {
+			return nil, state, errors.New("capability owner scope is invalid")
+		}
+		d.share = link
+		d.shareUser = owner
+		d.shareAccess = access
+		d.shareScope = normalizePublicShareIndexPath(cleanScope)
+		target, err := resolvePublicShareLogicalTarget(d, sourceInfo.Path, claims.LogicalPath)
+		if err != nil || target.IsDir || target.CanonicalPath != claims.CanonicalPath || target.ScopedPath != claims.Path {
+			return nil, state, errors.New("capability target is no longer available")
+		}
+		fileInfo, err = files.FileInfoFaster(utils.FileOptions{
+			Path:           target.ScopedPath,
+			Source:         sourceInfo.Name,
+			Expand:         false,
+			FollowSymlinks: true,
+		}, store.Access, owner, store.Share)
+		if err != nil {
+			return nil, state, errors.New("capability target is no longer available")
+		}
+		fileInfo.RealPath = target.RealPath
+		fileInfo.Hash = link.Hash
+		d.IndexPath = target.ScopedPath
+		d.shareTargets = []publicShareTarget{target}
 	} else {
-		// Regular callback URL - include source for non-share requests
-		params := url.Values{}
-		params.Set("source", source)
-		params.Set("path", path)
-		params.Set("auth", token)
-
-		callbackURL = fmt.Sprintf("%s/api/office/callback?%s",
-			strings.TrimSuffix(baseURL, "/"), params.Encode())
+		if requester.ID != owner.ID || requester.Username != owner.Username {
+			return nil, state, errors.New("capability requester does not match its owner")
+		}
+		if !claims.Browse || !claims.Download || !owner.Permissions.Browse || !owner.Permissions.Download {
+			return nil, state, errors.New("capability read permission is no longer available")
+		}
+		if requireEdit && (!claims.CanEdit || !owner.Permissions.Modify) {
+			return nil, state, errors.New("capability edit permission is no longer available")
+		}
+		sourceInfo, ok := config.Server.NameToSource[claims.Source]
+		if !ok || store.Access == nil {
+			return nil, state, errors.New("capability source is not available")
+		}
+		userScope, err := owner.GetScopeForSourceName(sourceInfo.Name)
+		if err != nil || userScope == "" {
+			return nil, state, errors.New("capability user scope is not available")
+		}
+		logicalPath := utils.JoinPathAsUnix(userScope, claims.Path)
+		if !store.Access.PermittedFresh(sourceInfo.Path, logicalPath, owner.Username) {
+			return nil, state, errors.New("capability access rule is no longer available")
+		}
+		fileInfo, err = files.FileInfoFaster(utils.FileOptions{
+			Path:           claims.Path,
+			Source:         claims.Source,
+			Expand:         false,
+			FollowSymlinks: true,
+		}, store.Access, owner, store.Share)
+		if err != nil {
+			return nil, state, errors.New("capability target is no longer available")
+		}
+		d.IndexPath = claims.Path
 	}
+	if fileInfo == nil || fileInfo.RealPath == "" || fileInfo.Type == "directory" {
+		return nil, state, errors.New("capability target is not a file")
+	}
+	current, err := onlyOfficeFileState(fileInfo.RealPath)
+	if err != nil || !publicShareSameRealPath(current.RealPath, state.RealPath) ||
+		!publicShareSameFileIdentity(state.FileInfo, current.FileInfo) || current.ContentSHA256 != state.ContentSHA256 {
+		return nil, state, errors.New("capability file identity changed")
+	}
+	documentKey, ok := utils.OnlyOfficeCache.Get(fileInfo.RealPath)
+	if !ok || documentKey != claims.DocumentKey {
+		return nil, state, errors.New("capability document key is no longer valid")
+	}
+	d.fileInfo = *fileInfo
+	return d, state, nil
+}
 
-	return callbackURL
+func onlyOfficeCapabilityDownloadHandler(w http.ResponseWriter, r *http.Request, _ *requestContext) (int, error) {
+	claims, err := parseOnlyOfficeCapability(r, onlyOfficeDownloadAudience, http.MethodGet)
+	if err != nil {
+		return http.StatusForbidden, errors.New("invalid OnlyOffice download capability")
+	}
+	d, state, err := resolveOnlyOfficeCapability(claims, false)
+	if err != nil {
+		return http.StatusForbidden, errors.New("OnlyOffice download capability is no longer authorized")
+	}
+	file, err := os.Open(d.fileInfo.RealPath)
+	if err != nil {
+		return http.StatusNotFound, errors.New("OnlyOffice document is not available")
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !publicShareSameFileIdentity(state.FileInfo, info) {
+		return http.StatusForbidden, errors.New("OnlyOffice document changed")
+	}
+	hasher := sha256.New()
+	if _, err = io.Copy(hasher, file); err != nil {
+		return http.StatusForbidden, errors.New("OnlyOffice document could not be verified")
+	}
+	after, err := file.Stat()
+	if err != nil || !publicShareSameFileIdentity(info, after) ||
+		[sha256.Size]byte(hasher.Sum(nil)) != state.ContentSHA256 {
+		return http.StatusForbidden, errors.New("OnlyOffice document changed")
+	}
+	if _, err = file.Seek(0, io.SeekStart); err != nil {
+		return http.StatusInternalServerError, errors.New("OnlyOffice document could not be read")
+	}
+	onlyOfficeCapabilityUseMu.Lock()
+	if _, err := onlyOfficeCapabilityStateForClaims(claims); err != nil {
+		onlyOfficeCapabilityUseMu.Unlock()
+		return http.StatusForbidden, errors.New("OnlyOffice download capability was already used")
+	}
+	if d.share != nil && !consumePublicShareOriginalRead(d) {
+		onlyOfficeCapabilityUseMu.Unlock()
+		return http.StatusForbidden, errors.New("OnlyOffice public download limit reached")
+	}
+	onlyOfficeCapabilityCache.Delete(claims.ID)
+	onlyOfficeCapabilityUseMu.Unlock()
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	http.ServeContent(w, r, d.fileInfo.Name, after.ModTime(), file)
+	return http.StatusOK, nil
+}
+
+func beginOnlyOfficeCallbackUse(claims *onlyOfficeCapabilityClaims) error {
+	onlyOfficeCapabilityUseMu.Lock()
+	defer onlyOfficeCapabilityUseMu.Unlock()
+	if _, inFlight := onlyOfficeCallbackInFlight[claims.DocumentKey]; inFlight {
+		return errors.New("OnlyOffice callback capability is already in use")
+	}
+	if _, err := onlyOfficeCapabilityStateForClaims(claims); err != nil {
+		return err
+	}
+	onlyOfficeCallbackInFlight[claims.DocumentKey] = struct{}{}
+	return nil
+}
+
+func finishOnlyOfficeCallbackUse(claims *onlyOfficeCapabilityClaims, consume bool) {
+	onlyOfficeCapabilityUseMu.Lock()
+	delete(onlyOfficeCallbackInFlight, claims.DocumentKey)
+	if consume {
+		onlyOfficeCapabilityCache.Delete(claims.ID)
+	}
+	onlyOfficeCapabilityUseMu.Unlock()
 }
 
 // resolveOnlyOfficeDownloadURL validates a callback document URL against
@@ -378,20 +848,20 @@ func resolveOnlyOfficeDownloadURL(rawURL string) string {
 	}
 
 	parsedURL, err := url.Parse(rawURL)
-	if err != nil {
-		logger.Warningf("OnlyOffice callback: could not parse document URL (%q): %v", rawURL, err)
+	if err != nil || parsedURL.Opaque != "" || parsedURL.User != nil || parsedURL.Fragment != "" ||
+		!isAllowedOnlyOfficeScheme(parsedURL.Scheme) || !onlyOfficeValidHost(parsedURL.Host) {
+		logger.Warning("OnlyOffice callback: document URL is invalid")
 		return ""
 	}
 
-	publicURL, err := url.Parse(publicBase)
+	publicURL, err := onlyOfficeValidatedBaseURL(publicBase)
 	if err != nil {
-		logger.Warningf("OnlyOffice callback: could not parse integrations.office.url (%q): %v", publicBase, err)
+		logger.Warning("OnlyOffice callback: integrations.office.url is invalid")
 		return ""
 	}
 
 	if !onlyOfficeURLHostsMatch(parsedURL, publicURL) {
-		logger.Warningf("OnlyOffice callback: rejecting document URL with untrusted host %q (expected %q)",
-			parsedURL.Host, publicURL.Host)
+		logger.Warning("OnlyOffice callback: rejecting document URL with an untrusted origin")
 		return ""
 	}
 
@@ -400,13 +870,9 @@ func resolveOnlyOfficeDownloadURL(rawURL string) string {
 		return rawURL
 	}
 
-	internalURL, err := url.Parse(internalBase)
+	internalURL, err := onlyOfficeValidatedBaseURL(internalBase)
 	if err != nil {
-		logger.Warningf("OnlyOffice callback: could not parse integrations.office.internalUrl (%q): %v", internalBase, err)
-		return ""
-	}
-	if !isAllowedOnlyOfficeScheme(internalURL.Scheme) || internalURL.Host == "" {
-		logger.Warningf("OnlyOffice callback: invalid integrations.office.internalUrl (%q)", internalBase)
+		logger.Warning("OnlyOffice callback: integrations.office.internalUrl is invalid")
 		return ""
 	}
 
@@ -415,13 +881,13 @@ func resolveOnlyOfficeDownloadURL(rawURL string) string {
 	rewritten.Host = internalURL.Host
 	result := rewritten.String()
 	if result != rawURL {
-		logger.Debugf("OnlyOffice callback: rewrote URL from %s to %s", rawURL, result)
+		logger.Debug("OnlyOffice callback: using configured internal document server URL")
 	}
 	return result
 }
 
 func isAllowedOnlyOfficeScheme(scheme string) bool {
-	return scheme == "http" || scheme == "https"
+	return strings.EqualFold(scheme, "http") || strings.EqualFold(scheme, "https")
 }
 
 func onlyOfficeEffectivePort(u *url.URL) string {
@@ -441,7 +907,9 @@ func onlyOfficeEffectivePort(u *url.URL) string {
 // onlyOfficeURLHostsMatch reports whether callback and configured URLs refer to the same
 // OnlyOffice host, comparing hostname and effective port (so office.local matches office.local:80).
 func onlyOfficeURLHostsMatch(callback, configured *url.URL) bool {
-	if !isAllowedOnlyOfficeScheme(callback.Scheme) || !isAllowedOnlyOfficeScheme(configured.Scheme) {
+	if callback == nil || configured == nil || callback.User != nil || configured.User != nil ||
+		!isAllowedOnlyOfficeScheme(callback.Scheme) || !isAllowedOnlyOfficeScheme(configured.Scheme) ||
+		!onlyOfficeValidHost(callback.Host) || !onlyOfficeValidHost(configured.Host) {
 		return false
 	}
 	if callback.Hostname() == "" || configured.Hostname() == "" {
@@ -453,8 +921,49 @@ func onlyOfficeURLHostsMatch(callback, configured *url.URL) bool {
 	return onlyOfficeEffectivePort(callback) == onlyOfficeEffectivePort(configured)
 }
 
+func onlyOfficeRedirectAllowed(target *url.URL) bool {
+	for _, configured := range []string{config.Integrations.OnlyOffice.Url, config.Integrations.OnlyOffice.InternalUrl} {
+		if configured == "" {
+			continue
+		}
+		base, err := url.Parse(configured)
+		if err == nil && onlyOfficeURLHostsMatch(target, base) {
+			return true
+		}
+	}
+	return false
+}
+
+func onlyOfficeCheckRedirect(request *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("too many OnlyOffice redirects")
+	}
+	if !onlyOfficeRedirectAllowed(request.URL) {
+		return errors.New("OnlyOffice redirect target is not trusted")
+	}
+	return nil
+}
+
+func onlyOfficeOriginForLog(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || !isAllowedOnlyOfficeScheme(parsed.Scheme) || !onlyOfficeValidHost(parsed.Host) {
+		return "[redacted]"
+	}
+	return strings.ToLower(parsed.Scheme) + "://" + parsed.Host
+}
+
+func logOnlyOfficeDownloadError(err error) {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		logger.Errorf("OnlyOffice callback: failed to download updated document from %s (%T)",
+			onlyOfficeOriginForLog(urlErr.URL), urlErr.Err)
+		return
+	}
+	logger.Errorf("OnlyOffice callback: failed to download updated document (%T)", err)
+}
+
 // processOnlyOfficeCallback handles the common callback processing logic for both GET and POST requests
-func processOnlyOfficeCallback(w http.ResponseWriter, r *http.Request, d *requestContext, data *OnlyOfficeCallback) (int, error) {
+func processOnlyOfficeCallback(w http.ResponseWriter, r *http.Request, d *requestContext, data *OnlyOfficeCallback, authorizeWrite func() error) (int, error) {
 	// Extract clean parameters from query string
 	source := r.URL.Query().Get("source")
 	path := r.URL.Query().Get("path")
@@ -478,28 +987,6 @@ func processOnlyOfficeCallback(w http.ResponseWriter, r *http.Request, d *reques
 		return returnOnlyOfficeError(w, r, 400, err.Error())
 	}
 	path = cleanPath
-
-	// Handle document closure - clean up document key cache
-	if data.Status == onlyOfficeStatusDocumentClosedWithChanges ||
-		data.Status == onlyOfficeStatusDocumentClosedWithNoChanges {
-		// Refer to OnlyOffice documentation:
-		// - https://api.onlyoffice.com/editors/coedit
-		// - https://api.onlyoffice.com/editors/callback
-		//
-		// When the document is fully closed by all editors,
-		// the document key should no longer be re-used.
-		deleteOfficeId(source, path)
-
-		// Send log event for document closure and clean up log context
-		if logContext := getOnlyOfficeLogContext(data.Key); logContext != nil {
-			statusMsg := "Document closed with changes"
-			if data.Status == onlyOfficeStatusDocumentClosedWithNoChanges {
-				statusMsg = "Document closed with no changes"
-			}
-			sendOnlyOfficeLogEvent(logContext, "INFO", "callback", statusMsg)
-			removeOnlyOfficeLogContext(data.Key)
-		}
-	}
 
 	// Handle document being edited (status 1) - just log for now
 	if data.Status == onlyOfficeStatusDocumentBeingEdited {
@@ -554,8 +1041,8 @@ func processOnlyOfficeCallback(w http.ResponseWriter, r *http.Request, d *reques
 			statusDesc = "force save error"
 		}
 
-		logger.Debugf("OnlyOffice callback: processing save operation - %s, key=%s, url=%s, forcesavetype=%d",
-			statusDesc, data.Key, data.URL, data.ForceSaveType)
+		logger.Debugf("OnlyOffice callback: processing save operation - %s, key=%s, forcesavetype=%d",
+			statusDesc, data.Key, data.ForceSaveType)
 
 		// Send log event for save operation
 		if logContext := getOnlyOfficeLogContext(data.Key); logContext != nil {
@@ -570,14 +1057,14 @@ func processOnlyOfficeCallback(w http.ResponseWriter, r *http.Request, d *reques
 			}
 		}
 		if data.ChangesURL != "" {
-			logger.Debugf("OnlyOffice callback: received changes URL: %s", data.ChangesURL)
+			logger.Debug("OnlyOffice callback: received changes URL")
 			if logContext := getOnlyOfficeLogContext(data.Key); logContext != nil {
 				sendOnlyOfficeLogEvent(logContext, "DEBUG", "callback", "Received changes URL for document history")
 			}
 		}
 
-		// For status 3 (saving error), don't attempt to save the file
-		if data.Status == onlyOfficeStatusDocumentSavingError {
+		// Error statuses acknowledge the callback but never fetch or write document bytes.
+		if data.Status == onlyOfficeStatusDocumentSavingError || data.Status == onlyOfficeStatusForceSaveError {
 			logger.Warningf("OnlyOffice callback: document saving error occurred, not attempting to save")
 			return returnOnlyOfficeSuccess(w, r)
 		}
@@ -603,9 +1090,11 @@ func processOnlyOfficeCallback(w http.ResponseWriter, r *http.Request, d *reques
 			logger.Errorf("OnlyOffice callback: missing or untrusted document URL in callback payload")
 			return returnOnlyOfficeError(w, r, 500, "missing or untrusted document URL in callback payload")
 		}
-		doc, err := onlyOfficeDownloadClient.Get(downloadURL)
+		client := *onlyOfficeDownloadClient
+		client.CheckRedirect = onlyOfficeCheckRedirect
+		doc, err := client.Get(downloadURL)
 		if err != nil {
-			logger.Errorf("OnlyOffice callback: failed to download updated document: %v", err)
+			logOnlyOfficeDownloadError(err)
 			return returnOnlyOfficeError(w, r, 500, "failed to download updated document")
 		}
 		defer doc.Body.Close()
@@ -650,8 +1139,15 @@ func processOnlyOfficeCallback(w http.ResponseWriter, r *http.Request, d *reques
 		}
 		fullIndexPath := utils.JoinPathAsUnix(userScope, path)
 
-		writeErr := files.WriteFile(source, fullIndexPath, doc.Body)
+		reader := io.Reader(doc.Body)
+		if authorizeWrite != nil {
+			reader = &onlyOfficeAuthorizedReader{reader: reader, authorize: authorizeWrite}
+		}
+		writeErr := files.WriteFile(source, fullIndexPath, reader)
 		if writeErr != nil {
+			if errors.Is(writeErr, errOnlyOfficeWriteAuthorizationChanged) {
+				return returnOnlyOfficeError(w, r, http.StatusForbidden, "OnlyOffice write authorization changed")
+			}
 			logger.Errorf("OnlyOffice callback: failed to write updated document to path=%s: %v",
 				path, writeErr)
 
@@ -671,9 +1167,37 @@ func processOnlyOfficeCallback(w http.ResponseWriter, r *http.Request, d *reques
 			sendOnlyOfficeLogEvent(logContext, "INFO", "callback", fmt.Sprintf("Document saved successfully to path: %s", path))
 		}
 	}
+	if data.Status == onlyOfficeStatusDocumentClosedWithChanges || data.Status == onlyOfficeStatusDocumentClosedWithNoChanges {
+		deleteOfficeId(source, path)
+		if logContext := getOnlyOfficeLogContext(data.Key); logContext != nil {
+			statusMsg := "Document closed with changes"
+			if data.Status == onlyOfficeStatusDocumentClosedWithNoChanges {
+				statusMsg = "Document closed with no changes"
+			}
+			sendOnlyOfficeLogEvent(logContext, "INFO", "callback", statusMsg)
+			removeOnlyOfficeLogContext(data.Key)
+		}
+	}
 
 	// Return success response to OnlyOffice server
 	return returnOnlyOfficeSuccess(w, r)
+}
+
+type onlyOfficeAuthorizedReader struct {
+	reader     io.Reader
+	authorize  func() error
+	authorized bool
+}
+
+func (reader *onlyOfficeAuthorizedReader) Read(buffer []byte) (int, error) {
+	n, err := reader.reader.Read(buffer)
+	if err == io.EOF && !reader.authorized {
+		reader.authorized = true
+		if authErr := reader.authorize(); authErr != nil {
+			return n, errOnlyOfficeWriteAuthorizationChanged
+		}
+	}
+	return n, err
 }
 
 // onlyofficeCallbackHandler handles OnlyOffice document server callbacks
@@ -690,34 +1214,66 @@ func processOnlyOfficeCallback(w http.ResponseWriter, r *http.Request, d *reques
 // @Failure 400 {object} map[string]string "Invalid callback data"
 // @Failure 500 {object} map[string]string "Server error"
 // @Router /api/office/callback [post]
-// @Router /api/office/callback [get]
 // @Security ApiKeyAuth
-func onlyofficeCallbackHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
-	// Parse callback data based on request method
-	var callbackData *OnlyOfficeCallback
-	var err error
-	if r.Method == "GET" {
-		// OnlyOffice sends callback data in Authorization header as JWT
-		callbackData, err = parseOnlyOfficeCallbackFromJWT(r)
-	} else if r.Method == "POST" {
-		// OnlyOffice sends callback data in request body as JSON
-		callbackData, err = parseOnlyOfficeCallbackFromJSON(r)
-	} else {
-		return returnOnlyOfficeError(w, r, 405, fmt.Sprintf("unsupported method: %s", r.Method))
-	}
-
+func onlyofficeCallbackHandler(w http.ResponseWriter, r *http.Request, _ *requestContext) (int, error) {
+	// Capability and payload signatures are verified before any store, file, cache, or network access.
+	claims, err := parseOnlyOfficeCapability(r, onlyOfficeCallbackAudience, http.MethodPost)
 	if err != nil {
-		logger.Errorf("OnlyOffice callback: failed to parse callback data: %v", err)
-		return returnOnlyOfficeError(w, r, 400, "failed to parse callback data")
+		return http.StatusForbidden, errors.New("invalid OnlyOffice callback capability")
 	}
-
-	if callbackData == nil {
-		logger.Errorf("OnlyOffice callback: parsed callback data is nil")
-		return returnOnlyOfficeError(w, r, 400, "parsed callback data is nil")
+	callbackData, err := parseOnlyOfficeCallbackFromJSON(r)
+	if errors.Is(err, errOnlyOfficeCallbackTooLarge) {
+		return http.StatusRequestEntityTooLarge, errOnlyOfficeCallbackTooLarge
 	}
-
-	// Process the callback data using shared logic
-	return processOnlyOfficeCallback(w, r, d, callbackData)
+	if err != nil || callbackData == nil {
+		return http.StatusForbidden, errors.New("invalid OnlyOffice callback payload")
+	}
+	if err := verifyOnlyOfficeCallbackBody(r, callbackData); err != nil {
+		return http.StatusForbidden, errors.New("invalid OnlyOffice callback signature")
+	}
+	if callbackData.Key != claims.DocumentKey {
+		return http.StatusForbidden, errors.New("OnlyOffice callback document key mismatch")
+	}
+	if err := beginOnlyOfficeCallbackUse(claims); err != nil {
+		return http.StatusForbidden, errors.New("OnlyOffice callback capability is already in use or unavailable")
+	}
+	consumeCapability := false
+	defer func() { finishOnlyOfficeCallbackUse(claims, consumeCapability) }()
+	requireEdit := callbackData.Status == onlyOfficeStatusDocumentClosedWithChanges ||
+		callbackData.Status == onlyOfficeStatusForceSaveWhileDocumentStillOpen
+	d, state, err := resolveOnlyOfficeCapability(claims, requireEdit)
+	if err != nil {
+		return http.StatusForbidden, errors.New("OnlyOffice callback capability is no longer authorized")
+	}
+	query := url.Values{"source": {claims.Source}, "path": {claims.Path}}
+	r.URL.RawQuery = query.Encode()
+	authorizeWrite := func() error {
+		if _, _, authErr := resolveOnlyOfficeCapability(claims, true); authErr != nil {
+			return errOnlyOfficeWriteAuthorizationChanged
+		}
+		return nil
+	}
+	status, processErr := processOnlyOfficeCallback(w, r, d, callbackData, authorizeWrite)
+	if processErr == nil && status < http.StatusBadRequest {
+		switch callbackData.Status {
+		case onlyOfficeStatusDocumentClosedWithChanges, onlyOfficeStatusDocumentClosedWithNoChanges:
+			consumeCapability = true
+		case onlyOfficeStatusForceSaveWhileDocumentStillOpen:
+			updated, stateErr := onlyOfficeFileState(d.fileInfo.RealPath)
+			if stateErr != nil {
+				onlyOfficeCapabilityCache.Delete(claims.ID)
+			} else {
+				state.RealPath = updated.RealPath
+				state.FileInfo = updated.FileInfo
+				state.ContentSHA256 = updated.ContentSHA256
+				remaining := time.Until(claims.ExpiresAt.Time)
+				if remaining > 0 {
+					onlyOfficeCapabilityCache.SetWithExp(claims.ID, state, remaining)
+				}
+			}
+		}
+	}
+	return status, processErr
 }
 
 // parseOnlyOfficeCallbackFromJWT extracts callback data from JWT in Authorization header
@@ -738,9 +1294,12 @@ func parseOnlyOfficeCallbackFromJWT(r *http.Request) (*OnlyOfficeCallback, error
 
 // parseOnlyOfficeCallbackFromJSON extracts callback data from JSON request body
 func parseOnlyOfficeCallbackFromJSON(r *http.Request) (*OnlyOfficeCallback, error) {
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, onlyOfficeCallbackMaxBody+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read request body: %v", err)
+	}
+	if len(body) > onlyOfficeCallbackMaxBody {
+		return nil, errOnlyOfficeCallbackTooLarge
 	}
 	var data OnlyOfficeCallback
 	err = json.Unmarshal(body, &data)
@@ -771,72 +1330,53 @@ func deleteOfficeId(source, path string) {
 	utils.OnlyOfficeCache.Delete(realpath)
 }
 
-// parseOnlyOfficeJWT parses the JWT token from OnlyOffice callback
+// parseOnlyOfficeJWT verifies and parses the JWT token from an OnlyOffice callback.
 func parseOnlyOfficeJWT(tokenString string) (*OnlyOfficeCallback, error) {
-	// Parse the JWT token without signature verification since OnlyOffice uses different signing
-	// We'll parse it manually to avoid signature validation issues
-	parts := strings.Split(tokenString, ".")
-	if len(parts) != 3 {
-		return nil, fmt.Errorf("invalid JWT format")
+	if config.Integrations.OnlyOffice.Secret == "" {
+		return nil, errors.New("OnlyOffice callback signing secret is not configured")
 	}
-
-	// Decode the payload (second part) with fallback to standard base64
-	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		// Fallback to standard base64 decoding
-		payloadBytes, err = base64.StdEncoding.DecodeString(parts[1])
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode JWT payload: %v", err)
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		if token.Method != jwt.SigningMethodHS256 {
+			return nil, errors.New("unexpected OnlyOffice signing method")
 		}
+		return []byte(config.Integrations.OnlyOffice.Secret), nil
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+	if err != nil || !token.Valid {
+		return nil, errors.New("invalid OnlyOffice callback signature")
 	}
-
-	var claims jwt.MapClaims
-	err = json.Unmarshal(payloadBytes, &claims)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal JWT claims: %v", err)
-	}
-
-	// Extract payload from claims with fallback
-	payload, ok := claims["payload"].(map[string]interface{})
+	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
-		// Fallback: try to use claims directly if no payload wrapper
-		payload = map[string]interface{}(claims)
+		return nil, errors.New("invalid OnlyOffice callback claims")
 	}
-
-	// Convert to OnlyOfficeCallback struct with safe type assertions
+	payload := any(claims)
+	if wrapped, exists := claims["payload"]; exists {
+		payload = wrapped
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, errors.New("invalid OnlyOffice callback payload")
+	}
 	callback := &OnlyOfficeCallback{}
-
-	// Extract key with validation
-	if key, ok := payload["key"].(string); ok && key != "" {
-		callback.Key = key
-	} else {
-		logger.Warningf("OnlyOffice callback: missing or empty key in JWT payload")
+	if err := json.Unmarshal(payloadBytes, callback); err != nil {
+		return nil, errors.New("invalid OnlyOffice callback payload")
 	}
-
-	// Extract status with validation
-	if status, ok := payload["status"].(float64); ok {
-		callback.Status = int(status)
-	} else {
-		logger.Warningf("OnlyOffice callback: missing or invalid status in JWT payload")
-		callback.Status = 0 // Default to unknown status
-	}
-
-	// Extract users with safe array handling
-	if users, ok := payload["users"].([]interface{}); ok {
-		callback.Users = make([]string, 0, len(users))
-		for _, user := range users {
-			if userStr, ok := user.(string); ok && userStr != "" {
-				callback.Users = append(callback.Users, userStr)
-			}
-		}
-	}
-
-	// Validate essential fields
 	if callback.Key == "" {
-		return nil, fmt.Errorf("missing document key in JWT payload")
+		return nil, errors.New("missing document key in OnlyOffice callback")
 	}
-
 	return callback, nil
+}
+
+func verifyOnlyOfficeCallbackBody(r *http.Request, body *OnlyOfficeCallback) error {
+	signed, err := parseOnlyOfficeCallbackFromJWT(r)
+	if err != nil {
+		return err
+	}
+	if body == nil || signed.Key != body.Key || signed.Status != body.Status ||
+		signed.URL != body.URL || signed.ChangesURL != body.ChangesURL ||
+		signed.ForceSaveType != body.ForceSaveType || signed.FileType != body.FileType {
+		return errors.New("OnlyOffice callback body does not match its signature")
+	}
+	return nil
 }
 
 // returnOnlyOfficeSuccess returns a success response to OnlyOffice server
@@ -871,7 +1411,5 @@ func returnOnlyOfficeError(w http.ResponseWriter, r *http.Request, statusCode in
 	// Log the error for debugging
 	logger.Errorf("OnlyOffice callback error (HTTP %d): %s", statusCode, message)
 
-	// Set the appropriate HTTP status code
-	w.WriteHeader(statusCode)
-	return renderJSON(w, r, resp)
+	return renderJSON(w, r, resp, statusCode)
 }

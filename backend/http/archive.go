@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"compress/gzip"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	commonerrors "github.com/gtsteffaniak/filebrowser/backend/common/errors"
 	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	"github.com/gtsteffaniak/filebrowser/backend/database/share"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing"
 	"github.com/gtsteffaniak/go-cache/cache"
@@ -54,6 +56,7 @@ type archiveSpoolSession struct {
 	memberPaths      []string
 	memberTargets    []authenticatedReadTarget
 	shareHash        string
+	shareLink        *share.Link
 	archiveExtension string
 	shareTargets     []publicShareTarget
 	shareMembers     []publicShareArchiveEntry
@@ -999,20 +1002,16 @@ func addSingleFile(realPath, archivePath string, zipWriter *zip.Writer, tarWrite
 	return nil
 }
 
-func addPublicShareArchiveEntry(d *requestContext, entry publicShareArchiveEntry, tarWriter *tar.Writer, zipWriter *zip.Writer) error {
-	target, err := reauthorizePublicShareArchiveEntry(d, entry)
+func addPublicShareArchiveEntry(d *requestContext, entry *publicShareArchiveEntry, tarWriter *tar.Writer, zipWriter *zip.Writer) error {
+	target, err := reauthorizePublicShareArchiveEntry(d, *entry)
 	if err != nil {
 		return err
 	}
-	info, err := os.Stat(target.RealPath)
-	if err != nil || info.IsDir() != entry.IsDir {
-		return fmt.Errorf("public archive member changed")
-	}
 	archivePath := filepath.ToSlash(entry.ArchivePath)
-	if info.IsDir() {
+	if target.IsDir {
 		archivePath = strings.TrimSuffix(archivePath, "/") + "/"
 		if tarWriter != nil {
-			header, err := tar.FileInfoHeader(info, "")
+			header, err := tar.FileInfoHeader(target.info, "")
 			if err != nil {
 				return err
 			}
@@ -1020,7 +1019,7 @@ func addPublicShareArchiveEntry(d *requestContext, entry publicShareArchiveEntry
 			return tarWriter.WriteHeader(header)
 		}
 		if zipWriter != nil {
-			header, err := zip.FileInfoHeader(info)
+			header, err := zip.FileInfoHeader(target.info)
 			if err != nil {
 				return err
 			}
@@ -1031,13 +1030,61 @@ func addPublicShareArchiveEntry(d *requestContext, entry publicShareArchiveEntry
 		}
 		return nil
 	}
-	return addSingleFile(target.RealPath, archivePath, zipWriter, tarWriter)
+
+	file, err := os.Open(target.RealPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || info.IsDir() || !publicShareSameFileIdentity(target.info, info) {
+		return fmt.Errorf("public archive member changed")
+	}
+
+	hasher := sha256.New()
+	var writer io.Writer
+	if tarWriter != nil {
+		header, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		header.Name = archivePath
+		if err = tarWriter.WriteHeader(header); err != nil {
+			return err
+		}
+		writer = tarWriter
+	} else if zipWriter != nil {
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		header.Name = archivePath
+		writer, err = zipWriter.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+	} else {
+		return fmt.Errorf("public archive writer is missing")
+	}
+	if _, err = io.Copy(io.MultiWriter(writer, hasher), file); err != nil {
+		return err
+	}
+	after, err := file.Stat()
+	if err != nil || !publicShareSameFileIdentity(info, after) {
+		return fmt.Errorf("public archive member changed while reading")
+	}
+	digest := [sha256.Size]byte(hasher.Sum(nil))
+	if entry.ContentSHA256 != ([sha256.Size]byte{}) && entry.ContentSHA256 != digest {
+		return fmt.Errorf("public archive member content changed")
+	}
+	entry.ContentSHA256 = digest
+	return nil
 }
 
 func createPublicShareZip(d *requestContext, w io.Writer) error {
 	zipWriter := zip.NewWriter(w)
-	for _, entry := range d.shareArchive {
-		if err := addPublicShareArchiveEntry(d, entry, nil, zipWriter); err != nil {
+	for i := range d.shareArchive {
+		if err := addPublicShareArchiveEntry(d, &d.shareArchive[i], nil, zipWriter); err != nil {
 			_ = zipWriter.Close()
 			return err
 		}
@@ -1048,8 +1095,8 @@ func createPublicShareZip(d *requestContext, w io.Writer) error {
 func createPublicShareTarGz(d *requestContext, w io.Writer) error {
 	gzipWriter := gzip.NewWriter(w)
 	tarWriter := tar.NewWriter(gzipWriter)
-	for _, entry := range d.shareArchive {
-		if err := addPublicShareArchiveEntry(d, entry, tarWriter, nil); err != nil {
+	for i := range d.shareArchive {
+		if err := addPublicShareArchiveEntry(d, &d.shareArchive[i], tarWriter, nil); err != nil {
 			_ = tarWriter.Close()
 			_ = gzipWriter.Close()
 			return err
@@ -1060,6 +1107,59 @@ func createPublicShareTarGz(d *requestContext, w io.Writer) error {
 		return err
 	}
 	return gzipWriter.Close()
+}
+
+func validatePublicShareArchiveEntryContent(d *requestContext, entry publicShareArchiveEntry) error {
+	target, err := reauthorizePublicShareArchiveEntry(d, entry)
+	if err != nil {
+		return err
+	}
+	if target.IsDir {
+		return nil
+	}
+	if entry.ContentSHA256 == ([sha256.Size]byte{}) {
+		return fmt.Errorf("public archive member digest is missing")
+	}
+	file, err := os.Open(target.RealPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || info.IsDir() || !publicShareSameFileIdentity(target.info, info) {
+		return fmt.Errorf("public archive member changed")
+	}
+	hasher := sha256.New()
+	if _, err = io.Copy(hasher, file); err != nil {
+		return err
+	}
+	after, err := file.Stat()
+	if err != nil || !publicShareSameFileIdentity(info, after) {
+		return fmt.Errorf("public archive member changed while reading")
+	}
+	if [sha256.Size]byte(hasher.Sum(nil)) != entry.ContentSHA256 {
+		return fmt.Errorf("public archive member content changed")
+	}
+	return nil
+}
+
+func publicShareArchiveManifestMatches(current, original []publicShareArchiveEntry) bool {
+	if len(current) != len(original) {
+		return false
+	}
+	for i := range original {
+		currentEntry := current[i]
+		originalEntry := original[i]
+		if currentEntry.LogicalPath != originalEntry.LogicalPath ||
+			currentEntry.CanonicalPath != originalEntry.CanonicalPath ||
+			!publicShareSameRealPath(currentEntry.RealPath, originalEntry.RealPath) ||
+			currentEntry.ArchivePath != originalEntry.ArchivePath ||
+			currentEntry.IsDir != originalEntry.IsDir ||
+			!publicShareSameFileIdentity(currentEntry.info, originalEntry.info) {
+			return false
+		}
+	}
+	return true
 }
 
 func publicShareArchiveSize(d *requestContext) (int64, error) {
@@ -1158,6 +1258,17 @@ func createTarGzWithLevel(d *requestContext, source string, w io.Writer, level i
 	return nil
 }
 
+func archiveExtensionForAlgorithm(algo string) (string, error) {
+	switch algo {
+	case "zip", "true", "":
+		return ".zip", nil
+	case "tar.gz":
+		return ".tar.gz", nil
+	default:
+		return "", errors.New("format not implemented")
+	}
+}
+
 // BuildAndStreamArchive builds a zip or tar.gz for multi-file/directory download.
 // Plain GET without Range streams the archive straight to the response (no temp file), matching
 // clients with chunked downloads disabled. HEAD or Range builds a temp file under cacheDir downloads,
@@ -1178,15 +1289,9 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 		}
 		shareRealPath = d.shareTargets[0].RealPath
 	}
-	algo := r.URL.Query().Get("algo")
-	var extension string
-	switch algo {
-	case "zip", "true", "":
-		extension = ".zip"
-	case "tar.gz":
-		extension = ".tar.gz"
-	default:
-		return http.StatusInternalServerError, errors.New("format not implemented")
+	extension, err := archiveExtensionForAlgorithm(r.URL.Query().Get("algo"))
+	if err != nil {
+		return http.StatusInternalServerError, err
 	}
 	var shareOriginalFileName string
 	if d.share != nil {
@@ -1203,8 +1308,10 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 			return http.StatusGone, fmt.Errorf("invalid or expired archiveToken")
 		}
 		if d.share != nil {
-			if session.shareHash != d.share.Hash || session.source != source || session.archiveExtension != extension ||
-				session.originalFileName != shareOriginalFileName || len(session.shareTargets) != len(d.shareTargets) {
+			if session.shareHash != d.share.Hash || session.shareLink == nil || session.shareLink != d.share ||
+				session.source != source || session.archiveExtension != extension ||
+				session.originalFileName != shareOriginalFileName || len(session.shareTargets) != len(d.shareTargets) ||
+				d.user == nil || session.userID != d.user.ID || session.username != d.user.Username {
 				removeSpooledArchiveNow(token, session.tmpPath)
 				return http.StatusForbidden, fmt.Errorf("archiveToken is not valid for this share")
 			}
@@ -1225,8 +1332,12 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 					return http.StatusForbidden, fmt.Errorf("public archive target authorization changed")
 				}
 			}
+			if !publicShareArchiveManifestMatches(d.shareArchive, session.shareMembers) {
+				removeSpooledArchiveNow(token, session.tmpPath)
+				return http.StatusForbidden, fmt.Errorf("public archive members changed")
+			}
 			for _, member := range session.shareMembers {
-				if _, authErr := reauthorizePublicShareArchiveEntry(d, member); authErr != nil {
+				if authErr := validatePublicShareArchiveEntryContent(d, member); authErr != nil {
 					removeSpooledArchiveNow(token, session.tmpPath)
 					return http.StatusForbidden, fmt.Errorf("public archive authorization changed")
 				}
@@ -1305,7 +1416,6 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 		}
 	}
 	var realPath string
-	var err error
 	if d.share != nil {
 		realPath = shareRealPath
 	} else {
@@ -1454,17 +1564,16 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 		memberTargets:    append([]authenticatedReadTarget(nil), memberTracker.targets...),
 		archiveExtension: extension,
 		lifecycle:        &archiveSpoolLifecycle{active: 1},
+		userID:           d.user.ID,
+		username:         d.user.Username,
 	}
 	if d.share != nil {
 		session.shareHash = d.share.Hash
+		session.shareLink = d.share
 		session.shareTargets = append([]publicShareTarget(nil), d.shareTargets...)
 		session.shareMembers = append([]publicShareArchiveEntry(nil), d.shareArchive...)
-	} else {
-		session.userID = d.user.ID
-		session.username = d.user.Username
-		if authErr := reauthorizeAuthenticatedArchiveMembers(d, source, session.memberPaths, session.memberTargets); authErr != nil {
-			return http.StatusForbidden, commonerrors.ErrAccessDenied
-		}
+	} else if authErr := reauthorizeAuthenticatedArchiveMembers(d, source, session.memberPaths, session.memberTargets); authErr != nil {
+		return http.StatusForbidden, commonerrors.ErrAccessDenied
 	}
 	archiveSpoolCache.SetWithExp(newTok, session, archiveSpoolActiveCacheTTL)
 	released := false

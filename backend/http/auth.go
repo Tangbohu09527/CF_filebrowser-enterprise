@@ -24,14 +24,28 @@ import (
 	"github.com/gtsteffaniak/go-logger/logger"
 )
 
-// first checks for cookie
-// then checks for header Authorization as Bearer token
-// then checks for query parameter
+// Authorization is authoritative. Cookie and the legacy auth query parameter are
+// retained as compatibility fallbacks when no Authorization header is present.
 func extractToken(r *http.Request) (string, error) {
-	hasToken := false
+	authHeader := r.Header.Get("Authorization")
+	if authHeader != "" {
+		parts := strings.Fields(authHeader)
+		if len(parts) == 2 {
+			switch strings.ToLower(parts[0]) {
+			case "bearer":
+				return parts[1], nil
+			case "basic":
+				_, token, ok := r.BasicAuth()
+				if ok {
+					return token, nil
+				}
+			}
+		}
+		return "", fmt.Errorf("invalid token provided")
+	}
+
 	tokenObj, err := r.Cookie("filebrowser_quantum_jwt")
 	if err == nil {
-		hasToken = true
 		token := tokenObj.Value
 		// Checks if the token isn't empty and if it contains two dots.
 		// The former prevents incompatibility with URLs that previously
@@ -43,35 +57,9 @@ func extractToken(r *http.Request) (string, error) {
 
 	auth := r.URL.Query().Get("auth")
 	if auth != "" {
-		hasToken = true
 		if strings.Count(auth, ".") == 2 {
 			return auth, nil
 		}
-	}
-
-	// Check for Authorization header
-	authHeader := r.Header.Get("Authorization")
-	if authHeader != "" {
-		hasToken = true
-		// Split the header to get "Bearer {token}"
-		parts := strings.Split(authHeader, " ")
-		if len(parts) > 1 {
-			// some clients don't respect RFC regarding cases
-			switch strings.ToLower(parts[0]) {
-			case "bearer":
-				return parts[1], nil
-			case "basic":
-				// compatibility for basic auth
-				// user ignored, password is token
-				_, token, ok := r.BasicAuth()
-				if ok {
-					return token, nil
-				}
-			}
-		}
-	}
-
-	if hasToken {
 		return "", fmt.Errorf("invalid token provided")
 	}
 
@@ -249,24 +237,12 @@ func loginHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (in
 // @Router /api/auth/logout [post]
 func logoutHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
 	if err := auth.RevokeApiToken(store.Access, d.token); err != nil {
-		logger.Errorf("Failed to revoke token on logout: %v", err)
+		return http.StatusInternalServerError, fmt.Errorf("revoke token on logout: %w", err)
 	}
 
-	// Clear the authentication cookie by setting it to expire in the past
-	// Get the correct domain for cookie - prefer X-Forwarded-Host from reverse proxy
-	host := r.Header.Get("X-Forwarded-Host")
-	if host == "" {
-		host = r.Host
-	}
-	cookie := &http.Cookie{
-		Name:     "filebrowser_quantum_jwt",
-		Value:    "",
-		Domain:   strings.Split(host, ":")[0],
-		Path:     "/",
-		SameSite: http.SameSiteStrictMode,
-		Expires:  time.Unix(0, 0), // Expire immediately
-		MaxAge:   -1,              // Delete cookie
-	}
+	// Clear the authentication cookie with the same host-only security attributes used at creation.
+	cookie := newSessionCookie(r, "", time.Unix(0, 0))
+	cookie.MaxAge = -1
 	http.SetCookie(w, cookie)
 
 	logoutUrl := fmt.Sprintf("%vlogin", config.Server.BaseURL) // Default fallback
@@ -362,7 +338,9 @@ func signupHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /api/auth/renew [post]
 func renewHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
-	// check if x-auth header is present and token is
+	if d.apiToken {
+		return http.StatusForbidden, fmt.Errorf("api tokens cannot be renewed as web sessions")
+	}
 	return printToken(w, r, d.user)
 }
 
@@ -435,20 +413,19 @@ func authenticateShareRequest(r *http.Request, l *share.Link) (int, error) {
 	return 200, nil
 }
 
-// setSessionCookie - sets the authentication token as an HTTP cookie
-// Get the correct domain for cookie - prefer X-Forwarded-Host from reverse proxy
 func setSessionCookie(w http.ResponseWriter, r *http.Request, token string, expiresTime time.Time) {
-	host := r.Header.Get("X-Forwarded-Host")
-	if host == "" {
-		host = r.Host
-	}
-	cookie := &http.Cookie{
+	http.SetCookie(w, newSessionCookie(r, token, expiresTime))
+}
+
+func newSessionCookie(r *http.Request, token string, expiresTime time.Time) *http.Cookie {
+	secure := r != nil && (r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https"))
+	return &http.Cookie{
 		Name:     "filebrowser_quantum_jwt",
 		Value:    token,
-		Domain:   strings.Split(host, ":")[0], // Set domain to the host without port
 		Path:     "/",
-		SameSite: http.SameSiteStrictMode, // strict mode prevents cookie from being sent to other domains
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteStrictMode,
 		Expires:  expiresTime,
 	}
-	http.SetCookie(w, cookie)
 }

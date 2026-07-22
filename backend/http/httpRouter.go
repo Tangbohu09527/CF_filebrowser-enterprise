@@ -162,7 +162,7 @@ func StartHttp(ctx context.Context, storage *bolt.BoltStore, shutdownComplete ch
 	// ========================================
 	api.HandleFunc("GET /share/list", withPermShare(shareListHandler))
 	api.HandleFunc("GET /share/direct", withPermShare(shareDirectDownloadHandler))
-	api.HandleFunc("GET /share", withUser(shareGetHandler))
+	api.HandleFunc("GET /share", withPermShare(shareGetHandler))
 	api.HandleFunc("POST /share", withPermShare(sharePostHandler))
 	api.HandleFunc("PATCH /share", withPermShare(sharePatchHandler))
 	api.HandleFunc("DELETE /share", withPermShare(shareDeleteHandler))
@@ -190,6 +190,7 @@ func StartHttp(ctx context.Context, storage *bolt.BoltStore, shutdownComplete ch
 	api.HandleFunc("GET /media/subtitles", withUser(subtitlesHandler))
 	api.HandleFunc("GET /media/metadata", withUser(metadataHandler))
 	api.HandleFunc("GET /media/lyrics", withUser(lyricsHandler))
+	publicApi.HandleFunc("GET /media/subtitles", withHashFile(publicSubtitlesHandler))
 	publicApi.HandleFunc("GET /media/metadata", withHashFile(publicMetadataHandler))
 	publicApi.HandleFunc("GET /media/lyrics", withHashFile(publicLyricsHandler))
 
@@ -197,10 +198,9 @@ func StartHttp(ctx context.Context, storage *bolt.BoltStore, shutdownComplete ch
 	// OnlyOffice Routes - /api/office/ (with public routes)
 	// ========================================
 	api.HandleFunc("GET /office/config", withUser(onlyofficeClientConfigGetHandler))
-	api.HandleFunc("POST /office/callback", withUser(onlyofficeCallbackHandler))
-	api.HandleFunc("GET /office/callback", withUser(onlyofficeCallbackHandler))
-	publicApi.HandleFunc("POST /office/callback", withHashFile(onlyofficeCallbackHandler))
-	publicApi.HandleFunc("GET /office/callback", withHashFile(onlyofficeCallbackHandler))
+	api.HandleFunc("GET /office/download", withoutUser(onlyOfficeCapabilityDownloadHandler))
+	api.HandleFunc("POST /office/callback", withoutUser(onlyofficeCallbackHandler))
+	publicApi.HandleFunc("POST /office/callback", withoutUser(onlyofficeCallbackHandler))
 	publicApi.HandleFunc("GET /office/config", withHashFile(onlyofficeClientConfigGetHandler))
 
 	// ========================================

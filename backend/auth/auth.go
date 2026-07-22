@@ -8,6 +8,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
+	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	"github.com/gtsteffaniak/filebrowser/backend/database/access"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 )
@@ -20,10 +21,17 @@ type Auther interface {
 
 const FB_ISSUER = "FileBrowser Quantum" // don't change
 
+const (
+	TokenTypeHeader  = "fb_token_type"
+	TokenNonceHeader = "fb_nonce"
+	TokenTypeWeb     = "web"
+	TokenTypeAPI     = "api"
+)
+
 // IsRevokedApiToken checks if a token is in the revoked list.
 func IsRevokedApiToken(accessStore *access.Storage, token string) bool {
 	if accessStore == nil {
-		return false
+		return true
 	}
 	return accessStore.IsTokenRevoked(token)
 }
@@ -60,7 +68,17 @@ func MakeSignedTokenAPI(user *users.User, name string, duration time.Duration, p
 			claim.Name = name
 		}
 	}
+	tokenType := TokenTypeAPI
+	if !minimal && strings.HasPrefix(name, "WEB_TOKEN") {
+		tokenType = TokenTypeWeb
+	}
+	nonce, err := utils.RandomHex(16)
+	if err != nil {
+		return "", users.AuthToken{}, fmt.Errorf("generate token nonce: %w", err)
+	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claim)
+	token.Header[TokenTypeHeader] = tokenType
+	token.Header[TokenNonceHeader] = nonce
 	tokenString, err := token.SignedString([]byte(settings.Config.Auth.Key))
 	if err != nil {
 		return "", users.AuthToken{}, err

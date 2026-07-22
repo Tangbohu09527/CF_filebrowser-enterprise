@@ -7,10 +7,47 @@ import (
 
 	"github.com/asdine/storm/v3"
 	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
+	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	"github.com/gtsteffaniak/filebrowser/backend/database/access"
 	boltusers "github.com/gtsteffaniak/filebrowser/backend/database/storage/bolt"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 )
+
+func TestApiTokenHashActive(t *testing.T) {
+	storage := access.NewStorage(nil, nil)
+	const token = "access-hash-active-token"
+	const userID uint = 42
+	if err := storage.AddApiToken(token, userID); err != nil {
+		t.Fatal(err)
+	}
+	hash := utils.HashSHA256(token)
+	if !storage.IsApiTokenHashActive(hash, userID) {
+		t.Fatal("active token hash was not recognized")
+	}
+	if storage.IsApiTokenHashActive(hash, userID+1) {
+		t.Fatal("token hash was accepted for the wrong owner")
+	}
+	if err := storage.RevokeToken(token); err != nil {
+		t.Fatal(err)
+	}
+	if storage.IsApiTokenHashActive(hash, userID) {
+		t.Fatal("revoked token hash remained active")
+	}
+}
+
+func TestApiTokenOwnerCollisionFailsClosed(t *testing.T) {
+	storage := access.NewStorage(nil, nil)
+	const token = "colliding-api-token"
+	if err := storage.AddApiToken(token, 41); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.AddApiToken(token, 42); err == nil {
+		t.Fatal("same API token bearer was reassigned to a different user")
+	}
+	if userID, ok := storage.GetUserIDFromToken(token); !ok || userID != 41 {
+		t.Fatalf("original token owner changed after collision: userID=%d present=%v", userID, ok)
+	}
+}
 
 func createTestStorage(t *testing.T) (*access.Storage, *users.Storage) {
 	dir := t.TempDir()
@@ -19,6 +56,11 @@ func createTestStorage(t *testing.T) (*access.Storage, *users.Storage) {
 	if err != nil {
 		t.Fatalf("failed to open storm db: %v", err)
 	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("failed to close test database: %v", err)
+		}
+	})
 	userStore := users.NewStorage(boltusers.NewUsersBackend(db))
 	return access.NewStorage(db, userStore), userStore
 }

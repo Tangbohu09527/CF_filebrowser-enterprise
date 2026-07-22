@@ -1,12 +1,17 @@
 package users
 
 import (
+	stderrors "errors"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gtsteffaniak/filebrowser/backend/common/errors"
 	"github.com/gtsteffaniak/filebrowser/backend/database/crud"
 )
+
+var ErrAPIPermissionRequired = stderrors.New("API permission is required to store a token")
 
 // StorageBackend is the interface to implement for a users storage.
 type StorageBackend interface {
@@ -66,10 +71,11 @@ func (c *crudBackend) DeleteByID(id any) error {
 
 // Storage is a users storage using generics.
 type Storage struct {
-	Generic *crud.Storage[User]
-	back    StorageBackend
-	updated map[uint]int64
-	mux     sync.RWMutex
+	Generic  *crud.Storage[User]
+	back     StorageBackend
+	updated  map[uint]int64
+	mux      sync.RWMutex
+	tokenMux sync.Mutex
 }
 
 // NewStorage creates a users storage from a backend.
@@ -103,6 +109,26 @@ func (s *Storage) Gets() ([]*User, error) {
 
 // Update updates a user in the database.
 func (s *Storage) Update(user *User, adminIActor bool, fields ...string) error {
+	if userUpdateIncludesPermissions(fields) {
+		s.tokenMux.Lock()
+		defer s.tokenMux.Unlock()
+
+		current, err := s.Get(user.ID)
+		if err != nil {
+			return err
+		}
+		if !user.Permissions.Api && (len(current.Tokens) != 0 || len(current.ApiKeys) != 0) {
+			updated := *user
+			updated.Tokens = make(map[string]AuthToken)
+			updated.ApiKeys = make(map[string]AuthToken)
+			user = &updated
+			fields = appendUserUpdateFields(fields, "Tokens", "ApiKeys")
+		}
+	}
+	return s.update(user, adminIActor, fields...)
+}
+
+func (s *Storage) update(user *User, adminIActor bool, fields ...string) error {
 	err := s.back.Update(user, adminIActor, fields...)
 	if err != nil {
 		return err
@@ -114,18 +140,58 @@ func (s *Storage) Update(user *User, adminIActor bool, fields ...string) error {
 	return nil
 }
 
+func userUpdateIncludesPermissions(fields []string) bool {
+	if len(fields) == 0 {
+		return true
+	}
+	for _, field := range fields {
+		if strings.EqualFold(field, "Permissions") || strings.EqualFold(field, "All") {
+			return true
+		}
+	}
+	return false
+}
+
+func appendUserUpdateFields(fields []string, additional ...string) []string {
+	if len(fields) == 0 {
+		return fields
+	}
+	for _, field := range additional {
+		present := false
+		for _, existing := range fields {
+			if strings.EqualFold(existing, field) {
+				present = true
+				break
+			}
+		}
+		if !present {
+			fields = append(fields, field)
+		}
+	}
+	return fields
+}
+
 func (s *Storage) AddApiToken(userID uint, name string, tokenString string, metadata AuthToken) error {
+	s.tokenMux.Lock()
+	defer s.tokenMux.Unlock()
 	user, err := s.Get(userID)
 	if err != nil {
 		return err
 	}
-	// Initialize the TokenHashes map if it is nil
-	if user.Tokens == nil {
-		user.Tokens = make(map[string]AuthToken)
+	if !user.Permissions.Api {
+		return ErrAPIPermissionRequired
 	}
+	if _, exists := user.Tokens[name]; exists {
+		return fmt.Errorf("key already exists with same name %v ", name)
+	}
+	if _, exists := user.ApiKeys[name]; exists {
+		return fmt.Errorf("key already exists with same name %v ", name)
+	}
+	updated := *user
+	updated.Tokens = cloneAuthTokens(user.Tokens)
 	metadata.Token = tokenString
-	user.Tokens[name] = metadata
-	err = s.Update(user, true, "Tokens")
+	updated.Tokens[name] = metadata
+	err = s.update(&updated, true, "Tokens")
 	if err != nil {
 		return err
 	}
@@ -134,21 +200,67 @@ func (s *Storage) AddApiToken(userID uint, name string, tokenString string, meta
 }
 
 func (s *Storage) DeleteApiToken(userID uint, name string) error {
+	_, err := s.DeleteApiTokens(userID, name)
+	return err
+}
+
+func (s *Storage) ApiTokenSecrets(userID uint, name string) ([]string, error) {
+	s.tokenMux.Lock()
+	defer s.tokenMux.Unlock()
 	user, err := s.Get(userID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	// Initialize the Tokens map if it is nil
-	if user.Tokens == nil {
-		user.Tokens = make(map[string]AuthToken)
+	seen := make(map[string]struct{}, 4)
+	secrets := make([]string, 0, 4)
+	for _, tokens := range []map[string]AuthToken{user.Tokens, user.ApiKeys} {
+		token, ok := tokens[name]
+		if !ok {
+			continue
+		}
+		for _, secret := range []string{token.Token, token.Key} {
+			if secret == "" {
+				continue
+			}
+			if _, exists := seen[secret]; !exists {
+				seen[secret] = struct{}{}
+				secrets = append(secrets, secret)
+			}
+		}
 	}
-	delete(user.Tokens, name)
-	err = s.Update(user, true, "Tokens")
-	if err != nil {
-		return err
-	}
+	return secrets, nil
+}
 
-	return nil
+func (s *Storage) DeleteApiTokens(userID uint, name string) (bool, error) {
+	s.tokenMux.Lock()
+	defer s.tokenMux.Unlock()
+	user, err := s.Get(userID)
+	if err != nil {
+		return false, err
+	}
+	_, modern := user.Tokens[name]
+	_, legacy := user.ApiKeys[name]
+	if !modern && !legacy {
+		return false, nil
+	}
+	updated := *user
+	updated.Tokens = cloneAuthTokens(user.Tokens)
+	updated.ApiKeys = cloneAuthTokens(user.ApiKeys)
+	delete(updated.Tokens, name)
+	delete(updated.ApiKeys, name)
+	err = s.update(&updated, true, "Tokens", "ApiKeys")
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func cloneAuthTokens(tokens map[string]AuthToken) map[string]AuthToken {
+	cloned := make(map[string]AuthToken, len(tokens))
+	for name, token := range tokens {
+		cloned[name] = token
+	}
+	return cloned
 }
 
 // Save saves the user in a storage.
