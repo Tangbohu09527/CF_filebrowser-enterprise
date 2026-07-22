@@ -26,6 +26,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"sort"
 	"testing"
 	"time"
 
@@ -166,9 +167,10 @@ func setupTestUsers(t *testing.T) *users.Storage {
 	return storage
 }
 
-// measureAuthTime measures the time taken to authenticate with given credentials
+// measureAuthTime measures the average time taken to authenticate with given credentials.
 func measureAuthTime(t *testing.T, auther auth.JSONAuth, userStore *users.Storage, username, password string) time.Duration {
 	t.Helper()
+	const attemptsPerSample = 5
 
 	// Create a mock HTTP request
 	req, err := http.NewRequest("POST", "/api/auth/login?username="+url.QueryEscape(username), nil)
@@ -178,8 +180,10 @@ func measureAuthTime(t *testing.T, auther auth.JSONAuth, userStore *users.Storag
 	req.Header.Set("X-Password", url.QueryEscape(password))
 
 	start := time.Now()
-	_, _ = auther.Auth(req, userStore)
-	elapsed := time.Since(start)
+	for i := 0; i < attemptsPerSample; i++ {
+		_, _ = auther.Auth(req, userStore)
+	}
+	elapsed := time.Since(start) / attemptsPerSample
 
 	return elapsed
 }
@@ -203,7 +207,7 @@ func TestJSONAuth_NoTimingAttack(t *testing.T) {
 	}
 
 	// Number of samples per test case for statistical analysis
-	samplesPerCase := 5
+	samplesPerCase := 25
 
 	// Collect timing measurements
 	measurements := make(map[string][]time.Duration)
@@ -212,9 +216,10 @@ func TestJSONAuth_NoTimingAttack(t *testing.T) {
 	}
 
 	// Run multiple iterations to gather statistical data
-	for i := 0; i < samplesPerCase; i++ {
-		// Randomize order to avoid cache effects
-		for _, tc := range testCases {
+	for sample := 0; sample < samplesPerCase; sample++ {
+		// Rotate the order so each case occupies every position across the samples.
+		for offset := range testCases {
+			tc := testCases[(sample+offset)%len(testCases)]
 			elapsed := measureAuthTime(t, auther, storage, tc.username, "wrongpassword123")
 			measurements[tc.username] = append(measurements[tc.username], elapsed)
 		}
@@ -223,6 +228,7 @@ func TestJSONAuth_NoTimingAttack(t *testing.T) {
 	// Calculate statistics for each test case
 	type stats struct {
 		mean   time.Duration
+		median time.Duration
 		stddev time.Duration
 		min    time.Duration
 		max    time.Duration
@@ -239,6 +245,17 @@ func TestJSONAuth_NoTimingAttack(t *testing.T) {
 			sum += d
 		}
 		mean := sum / time.Duration(len(durations))
+
+		// Calculate median using a copy so the original sample order is preserved.
+		sortedDurations := append([]time.Duration(nil), durations...)
+		sort.Slice(sortedDurations, func(i, j int) bool {
+			return sortedDurations[i] < sortedDurations[j]
+		})
+		middle := len(sortedDurations) / 2
+		median := sortedDurations[middle]
+		if len(sortedDurations)%2 == 0 {
+			median = (sortedDurations[middle-1] + sortedDurations[middle]) / 2
+		}
 
 		// Calculate standard deviation
 		var variance float64
@@ -261,7 +278,7 @@ func TestJSONAuth_NoTimingAttack(t *testing.T) {
 			}
 		}
 
-		return stats{mean: mean, stddev: stddev, min: min, max: max}
+		return stats{mean: mean, median: median, stddev: stddev, min: min, max: max}
 	}
 
 	// Analyze results
@@ -271,9 +288,10 @@ func TestJSONAuth_NoTimingAttack(t *testing.T) {
 	t.Log("\n=== Timing Analysis Results ===")
 	for _, tc := range testCases {
 		s := calculateStats(measurements[tc.username])
-		t.Logf("%s (valid=%v): mean=%.4fms, stddev=%.4fms, min=%.4fms, max=%.4fms",
+		t.Logf("%s (valid=%v): mean=%.4fms, median=%.4fms, stddev=%.4fms, min=%.4fms, max=%.4fms",
 			tc.username, tc.isValid,
 			float64(s.mean.Microseconds())/1000.0,
+			float64(s.median.Microseconds())/1000.0,
 			float64(s.stddev.Microseconds())/1000.0,
 			float64(s.min.Microseconds())/1000.0,
 			float64(s.max.Microseconds())/1000.0)
@@ -286,24 +304,24 @@ func TestJSONAuth_NoTimingAttack(t *testing.T) {
 	}
 
 	// Calculate overall statistics for valid vs invalid users
-	var validMeanSum, invalidMeanSum time.Duration
+	var validMedianSum, invalidMedianSum time.Duration
 	for _, s := range validUserStats {
-		validMeanSum += s.mean
+		validMedianSum += s.median
 	}
 	for _, s := range invalidUserStats {
-		invalidMeanSum += s.mean
+		invalidMedianSum += s.median
 	}
 
-	validAvgMean := validMeanSum / time.Duration(len(validUserStats))
-	invalidAvgMean := invalidMeanSum / time.Duration(len(invalidUserStats))
+	validAvgMedian := validMedianSum / time.Duration(len(validUserStats))
+	invalidAvgMedian := invalidMedianSum / time.Duration(len(invalidUserStats))
 
 	t.Logf("\n=== Summary ===")
-	t.Logf("Valid users average: %.4fms", float64(validAvgMean.Microseconds())/1000.0)
-	t.Logf("Invalid users average: %.4fms", float64(invalidAvgMean.Microseconds())/1000.0)
+	t.Logf("Valid users median average: %.4fms", float64(validAvgMedian.Microseconds())/1000.0)
+	t.Logf("Invalid users median average: %.4fms", float64(invalidAvgMedian.Microseconds())/1000.0)
 
 	// Calculate the percentage difference
-	diff := float64(validAvgMean - invalidAvgMean)
-	percentDiff := math.Abs(diff) / float64(validAvgMean) * 100.0
+	diff := float64(validAvgMedian - invalidAvgMedian)
+	percentDiff := math.Abs(diff) / float64(validAvgMedian) * 100.0
 	t.Logf("Difference: %.4fms (%.2f%%)", diff/1e6, percentDiff)
 
 	// Assert: The timing difference should be less than 20%
@@ -322,22 +340,22 @@ func TestJSONAuth_NoTimingAttack(t *testing.T) {
 	// Additional check: Ensure no individual case is an obvious outlier
 	// Check if any single user's timing is significantly faster than bcrypt operations
 	allStats := append(validUserStats, invalidUserStats...)
-	var allMeansSum time.Duration
+	var allMediansSum time.Duration
 	for _, s := range allStats {
-		allMeansSum += s.mean
+		allMediansSum += s.median
 	}
-	overallMean := allMeansSum / time.Duration(len(allStats))
+	overallMedian := allMediansSum / time.Duration(len(allStats))
 
 	for _, tc := range testCases {
 		s := calculateStats(measurements[tc.username])
-		deviation := math.Abs(float64(s.mean-overallMean)) / float64(overallMean) * 100.0
+		deviation := math.Abs(float64(s.median-overallMedian)) / float64(overallMedian) * 100.0
 
-		// If any user is more than 30% faster/slower than average, it's suspicious
+		// If any user is more than 30% faster/slower than the overall median, it's suspicious
 		if deviation > 30.0 {
-			t.Errorf("OUTLIER DETECTED: %s deviates by %.2f%% from overall mean (%.4fms vs %.4fms)",
+			t.Errorf("OUTLIER DETECTED: %s deviates by %.2f%% from overall median (%.4fms vs %.4fms)",
 				tc.username, deviation,
-				float64(s.mean.Microseconds())/1000.0,
-				float64(overallMean.Microseconds())/1000.0)
+				float64(s.median.Microseconds())/1000.0,
+				float64(overallMedian.Microseconds())/1000.0)
 		}
 	}
 }
