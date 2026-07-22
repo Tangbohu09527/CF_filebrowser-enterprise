@@ -42,6 +42,11 @@ func createTestUsersBackend(t *testing.T) users.StorageBackend {
 	if err != nil {
 		t.Fatalf("failed to open storm db: %v", err)
 	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("failed to close storm db: %v", err)
+		}
+	})
 	return NewUsersBackend(db)
 }
 
