@@ -82,11 +82,30 @@ func Test_GetRealPath(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			realPath, isDir, _ := idx.GetRealPath(tt.paths...)
-			adjustedRealPath := strings.TrimPrefix(realPath, trimPrefix)
+			adjustedRealPath := filepath.ToSlash(strings.TrimPrefix(realPath, trimPrefix))
 			if tt.want.path != adjustedRealPath || tt.want.isDir != isDir {
 				t.Errorf("expected %v:%v but got: %v:%v", tt.want.path, tt.want.isDir, adjustedRealPath, isDir)
 			}
 		})
+	}
+}
+
+func setupTestIndexDB(t *testing.T, name string) func() {
+	t.Helper()
+	previousIndexDB := indexing.GetIndexDB()
+	indexDB, _, err := dbsql.NewIndexDB(name, "OFF", 1000, 32, false)
+	if err != nil {
+		t.Fatalf("Failed to create test database: %v", err)
+	}
+	indexing.SetIndexDBForTesting(indexDB)
+
+	return func() {
+		indexing.StopAllScanners()
+		indexing.ClearTestIndices()
+		indexing.SetIndexDBForTesting(previousIndexDB)
+		if err := indexDB.Close(); err != nil {
+			t.Errorf("Failed to close test database: %v", err)
+		}
 	}
 }
 
@@ -99,18 +118,17 @@ func TestWriteFilePreservesExecutableBit(t *testing.T) {
 
 	fileutils.SetFsPermissions(0o644, 0o755)
 
-	if indexing.GetIndexDB() == nil {
-		db, _, err := dbsql.NewIndexDB("test_writefile_exec", "OFF", 1000, 32, false)
-		if err != nil {
-			t.Fatalf("Failed to create test database: %v", err)
-		}
-		indexing.SetIndexDBForTesting(db)
-	}
+	cleanupIndexDB := setupTestIndexDB(t, "test_writefile_exec")
+	defer cleanupIndexDB()
 
 	root := t.TempDir()
 	scriptName := "backupscript.sh"
 	scriptAbs := filepath.Join(root, scriptName)
 	if err := os.WriteFile(scriptAbs, []byte("#!/bin/sh\necho hi\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	originalStat, err := os.Stat(scriptAbs)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -137,13 +155,9 @@ func TestWriteFilePreservesExecutableBit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Mode()&0o111 == 0 {
-		t.Fatalf("executable bits cleared after save: mode=%v", st.Mode())
+	if got, want := st.Mode().Perm(), originalStat.Mode().Perm(); got != want {
+		t.Fatalf("file permission bits changed after save: got=%v want=%v", got, want)
 	}
-
-	indexing.StopAllScanners()
-	time.Sleep(50 * time.Millisecond)
-	indexing.ClearTestIndices()
 }
 
 func TestWriteFileRejectsExistingDirectory(t *testing.T) {
@@ -154,13 +168,8 @@ func TestWriteFileRejectsExistingDirectory(t *testing.T) {
 
 	fileutils.SetFsPermissions(0o644, 0o755)
 
-	if indexing.GetIndexDB() == nil {
-		db, _, err := dbsql.NewIndexDB("test_writefile_isdir", "OFF", 1000, 32, false)
-		if err != nil {
-			t.Fatalf("Failed to create test database: %v", err)
-		}
-		indexing.SetIndexDBForTesting(db)
-	}
+	cleanupIndexDB := setupTestIndexDB(t, "test_writefile_isdir")
+	defer cleanupIndexDB()
 
 	root := t.TempDir()
 	dirName := "folder"
@@ -189,10 +198,6 @@ func TestWriteFileRejectsExistingDirectory(t *testing.T) {
 	if !errors.Is(err, liberrors.ErrIsDirectory) {
 		t.Fatalf("expected ErrIsDirectory, got: %v", err)
 	}
-
-	indexing.StopAllScanners()
-	time.Sleep(50 * time.Millisecond)
-	indexing.ClearTestIndices()
 }
 
 func TestSortItems(t *testing.T) {
@@ -315,14 +320,8 @@ func TestOverrideDirectoryToFile(t *testing.T) {
 		fileutils.SetFsPermissions(0644, 0755)
 	}
 
-	// Initialize the database first (use test helper to avoid permission issues)
-	if indexing.GetIndexDB() == nil {
-		db, _, err := dbsql.NewIndexDB("test_file", "OFF", 1000, 32, false)
-		if err != nil {
-			t.Fatalf("Failed to create test database: %v", err)
-		}
-		indexing.SetIndexDBForTesting(db)
-	}
+	cleanupIndexDB := setupTestIndexDB(t, "test_file")
+	defer cleanupIndexDB()
 
 	// Initialize the index with scanning disabled to prevent background scanner interference
 	indexing.Initialize(&settings.Source{
@@ -425,14 +424,8 @@ func TestOverrideFileToDirectory(t *testing.T) {
 		fileutils.SetFsPermissions(0644, 0755)
 	}
 
-	// Initialize the database first (use test helper to avoid permission issues)
-	if indexing.GetIndexDB() == nil {
-		db, _, err := dbsql.NewIndexDB("test_file", "OFF", 1000, 32, false)
-		if err != nil {
-			t.Fatalf("Failed to create test database: %v", err)
-		}
-		indexing.SetIndexDBForTesting(db)
-	}
+	cleanupIndexDB := setupTestIndexDB(t, "test_file")
+	defer cleanupIndexDB()
 
 	// Initialize the index in mock mode (no filesystem operations)
 	indexing.Initialize(&settings.Source{
@@ -537,14 +530,8 @@ func TestDeleteFilesRootProtection(t *testing.T) {
 		fileutils.SetFsPermissions(0644, 0755)
 	}
 
-	// Initialize the database
-	if indexing.GetIndexDB() == nil {
-		db, _, err := dbsql.NewIndexDB("test_root_protection", "OFF", 1000, 32, false)
-		if err != nil {
-			t.Fatalf("Failed to create test database: %v", err)
-		}
-		indexing.SetIndexDBForTesting(db)
-	}
+	cleanupIndexDB := setupTestIndexDB(t, "test_root_protection")
+	defer cleanupIndexDB()
 
 	// Create a real temporary directory to use as source root
 	realTmpDir := t.TempDir()
@@ -629,13 +616,8 @@ func runDeleteFilesSubfolderWithRaceStress(t *testing.T, iter int) {
 		fileutils.SetFsPermissions(0644, 0755)
 	}
 
-	if indexing.GetIndexDB() == nil {
-		db, _, err := dbsql.NewIndexDB("test_subfolder_rootname", "OFF", 1000, 32, false)
-		if err != nil {
-			t.Fatalf("Failed to create test database: %v", err)
-		}
-		indexing.SetIndexDBForTesting(db)
-	}
+	cleanupIndexDB := setupTestIndexDB(t, "test_subfolder_rootname")
+	defer cleanupIndexDB()
 
 	realTmpDir := t.TempDir()
 	subfolderName := filepath.Base(realTmpDir)
@@ -682,12 +664,6 @@ func runDeleteFilesSubfolderWithRaceStress(t *testing.T, iter int) {
 	if _, err := os.Stat(realTmpDir); os.IsNotExist(err) {
 		t.Fatal("Root directory should NOT have been deleted")
 	}
-
-	indexing.StopAllScanners()
-	// Give scanners time to finish their cleanup (defer blocks in executeScan)
-	time.Sleep(100 * time.Millisecond)
-	indexing.ClearTestIndices()
-	t.Logf("iteration %d: cleaned scanners and indices", iter)
 }
 
 func waitForScannerReady(t *testing.T, idx *indexing.Index) {
@@ -696,7 +672,7 @@ func waitForScannerReady(t *testing.T, idx *indexing.Index) {
 	// The initial scan can take longer than the test timeout, but DeleteFiles will work
 	// as long as the scanners are initialized and running
 	time.Sleep(500 * time.Millisecond)
-	
+
 	// Verify scanners exist
 	status := idx.GetScannerStatus()
 	if totalScanners, ok := status["totalScanners"].(int); !ok || totalScanners == 0 {
