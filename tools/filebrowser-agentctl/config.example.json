@@ -1,0 +1,31 @@
+{
+  "base_url": "https://files.example.internal/filebrowser/",
+  "token_file": "./secrets/hermes-agent.token",
+  "audit_log": "./logs/filebrowser-agentctl.audit.jsonl",
+  "allowed_sources": {
+    "enterprise-files": {
+      "read_roots": [
+        "/supplier-materials"
+      ],
+      "write_roots": [
+        "/supplier-materials/organized"
+      ]
+    }
+  },
+  "local_read_roots": [
+    "./upload-staging"
+  ],
+  "local_write_roots": [
+    "./downloads"
+  ],
+  "timeout_seconds": 30,
+  "max_download_bytes": 16777216,
+  "max_inline_bytes": 1048576,
+  "max_checksum_bytes": 67108864,
+  "max_upload_bytes": 268435456,
+  "search_default_limit": 25,
+  "search_max_limit": 100,
+  "max_retries": 2,
+  "retry_delay_millis": 100,
+  "max_retry_delay_seconds": 2
+}
