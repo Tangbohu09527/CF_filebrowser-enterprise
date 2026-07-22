@@ -2,6 +2,7 @@ package settings
 
 import (
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -63,7 +64,7 @@ type Auth struct {
 `
 	tmpFile, cleanup := createTestSourceFile(t, sourceContent)
 	defer cleanup()
-	sourcePath := tmpFile[:strings.LastIndex(tmpFile, "/")]
+	sourcePath := filepath.Dir(tmpFile)
 
 	// Create real Settings with string values to test quoting
 	settings := &Settings{
@@ -206,7 +207,7 @@ type UserDefaults struct {
 `
 	tmpFile, cleanup := createTestSourceFile(t, sourceContent)
 	defer cleanup()
-	sourcePath := tmpFile[:strings.LastIndex(tmpFile, "/")]
+	sourcePath := filepath.Dir(tmpFile)
 
 	// Create a config with both default and non-default values
 	trueVal := true
