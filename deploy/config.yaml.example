@@ -1,0 +1,79 @@
+server:
+  port: 8080
+  listen: "0.0.0.0"
+  baseURL: "/"
+  externalUrl: "https://files.internal.example.invalid"
+  internalUrl: "http://filebrowser-enterprise:8080"
+  database: "/var/lib/filebrowser-enterprise/database.db"
+  cacheDir: "/var/cache/filebrowser-enterprise"
+  cacheDirCleanup: false
+  disableUpdateCheck: true
+  maxArchiveSize: 20
+  disableWebDAV: true
+  numImageProcessors: 4
+  filesystem:
+    createFilePermission: "640"
+    createDirectoryPermission: "750"
+  indexSqlConfig:
+    batchSize: 1000
+    cacheSizeMB: 64
+    walMode: false
+    disableReuse: false
+    startupIntegrityCheck: "quickCheck"
+  logging:
+    - levels: "info|warning|error"
+      apiLevels: "disabled"
+      output: "stdout"
+      noColors: true
+      json: true
+      utc: true
+  sources:
+    - path: "/srv/filebrowser/files"
+      name: "enterprise-files"
+      config:
+        private: true
+        readOnly: false
+        denyByDefault: false
+        defaultEnabled: true
+        defaultUserScope: "/"
+        useLogicalSize: false
+
+auth:
+  tokenExpirationHours: 2
+  key: ""
+  adminUsername: "bootstrap-admin"
+  adminPassword: ""
+  totpSecret: ""
+  methods:
+    noauth: false
+    password:
+      enabled: true
+      minLength: 14
+      signup: false
+      enforcedOtp: false
+    passkey:
+      enabled: false
+
+frontend:
+  name: "FileBrowser Enterprise"
+
+userDefaults:
+  fileLoading:
+    maxConcurrentUpload: 4
+    uploadChunkSizeMb: 10
+    downloadChunkSizeMb: 0
+  account:
+    permissions:
+      api: false
+      admin: false
+      modify: false
+      share: false
+      realtime: false
+      delete: false
+      create: false
+      browse: true
+      preview: true
+      download: true
+    lockPassword: false
+    disableSettings: false
+    disableUpdateNotifications: true

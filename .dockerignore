@@ -1,6 +1,14 @@
 backend/**.db
 **.crt
 **.key
+.git
+.git/**
+.env
+.env.*
+**/.env
+**/.env.*
+**/*.env
+**/*.env.*
 backend/tmp
 backend/dist
 backend/backend*
@@ -10,3 +18,20 @@ backend/vendor/**
 frontend/dist/**
 frontend/node_modules/**
 frontend/pkg/**
+
+# Browser test authentication state must not enter application images.
+**/.auth/**
+**/playwright/.auth/**
+**/loginAuth.json
+**/noauth.json
+**/previews.json
+**/sharePrepStorage.json
+
+# Deployment runtime material must never enter the repository build context.
+deploy/.env
+deploy/secrets/**
+deploy/tls/**
+deploy/backups/**
+**/*.pem
+**/*.p12
+**/*.pfx

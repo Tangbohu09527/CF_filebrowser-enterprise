@@ -1,0 +1,3 @@
+deploy/** text eol=lf
+scripts/** text eol=lf
+.github/workflows/deployment-assets.yaml text eol=lf

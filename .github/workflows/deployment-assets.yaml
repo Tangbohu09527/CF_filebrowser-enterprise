@@ -1,0 +1,64 @@
+name: deployment-assets
+
+on:
+  pull_request:
+    paths:
+      - "deploy/**"
+      - "scripts/**"
+      - ".github/workflows/deployment-assets.yaml"
+      - ".dockerignore"
+      - ".gitignore"
+      - ".gitattributes"
+      - "makefile"
+      - "docs/DEPLOYMENT.md"
+  push:
+    paths:
+      - "deploy/**"
+      - "scripts/**"
+      - ".github/workflows/deployment-assets.yaml"
+      - ".dockerignore"
+      - ".gitignore"
+      - ".gitattributes"
+      - "makefile"
+      - "docs/DEPLOYMENT.md"
+
+permissions:
+  contents: read
+
+jobs:
+  validate-deployment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deployment validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends gettext-base nginx python3-yaml ripgrep shellcheck systemd
+
+      - name: Validate deployment assets
+        run: make validate-deployment
+
+      - name: Validate rendered Nginx configuration
+        run: ./scripts/tests/nginx-static-test.sh
+
+      - name: Validate systemd units
+        run: |
+          sudo install -d -m 0755 /opt/filebrowser-enterprise/scripts /opt/filebrowser-enterprise/scripts/lib
+          sudo install -m 0755 scripts/*.sh /opt/filebrowser-enterprise/scripts/
+          sudo install -m 0644 scripts/lib/deployment-common.sh /opt/filebrowser-enterprise/scripts/lib/
+          systemd-analyze verify \
+            deploy/systemd/filebrowser-enterprise.service \
+            deploy/systemd/filebrowser-enterprise-backup.service \
+            deploy/systemd/filebrowser-enterprise-backup.timer
+
+      - name: Validate Dockerfile build checks
+        run: |
+          docker buildx build --check \
+            --build-arg VERSION=ci-validation \
+            --build-arg REVISION="${GITHUB_SHA}" \
+            -f _docker/Dockerfile .
+
+      - name: Confirm validators did not modify tracked files
+        run: git diff --exit-code
