@@ -526,16 +526,15 @@ func userPutHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (
 		tokens := make(map[string]struct{}, len(oldUser.Tokens)+len(oldUser.ApiKeys))
 		for _, tokenSet := range []map[string]users.AuthToken{oldUser.Tokens, oldUser.ApiKeys} {
 			for _, tokenInfo := range tokenSet {
-				for _, tokenString := range []string{tokenInfo.Token, tokenInfo.Key} {
-					if tokenString != "" {
-						tokens[tokenString] = struct{}{}
-					}
+				for _, tokenHash := range tokenInfo.TokenHashes() {
+					tokens[tokenHash] = struct{}{}
 				}
 			}
 		}
-		for tokenString := range tokens {
-			if err := auth.RevokeApiToken(store.Access, tokenString); err != nil {
-				return http.StatusInternalServerError, fmt.Errorf("revoke api token after permission removal: %w", err)
+		for tokenHash := range tokens {
+			revokeErr := auth.RevokeApiTokenHash(store.Access, tokenHash)
+			if revokeErr != nil {
+				return http.StatusInternalServerError, fmt.Errorf("revoke api token after permission removal: %w", revokeErr)
 			}
 		}
 	}

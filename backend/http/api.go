@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/gtsteffaniak/filebrowser/backend/auth"
-	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 )
 
@@ -150,17 +149,18 @@ func deleteApiTokenHandler(w http.ResponseWriter, r *http.Request, d *requestCon
 		return http.StatusForbidden, fmt.Errorf("user does not have permission to delete api tokens")
 	}
 
-	tokenSecrets, err := store.Users.ApiTokenSecrets(d.user.ID, name)
+	tokenHashes, err := store.Users.ApiTokenHashes(d.user.ID, name)
 	if err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("load api token metadata: %w", err)
 	}
-	if len(tokenSecrets) == 0 {
+	if len(tokenHashes) == 0 {
 		return http.StatusNotFound, fmt.Errorf("api token not found")
 	}
 
-	for _, secret := range tokenSecrets {
-		if err := auth.RevokeApiToken(store.Access, secret); err != nil {
-			return http.StatusInternalServerError, fmt.Errorf("revoke api token: %w", err)
+	for _, tokenHash := range tokenHashes {
+		revokeErr := auth.RevokeApiTokenHash(store.Access, tokenHash)
+		if revokeErr != nil {
+			return http.StatusInternalServerError, fmt.Errorf("revoke api token: %w", revokeErr)
 		}
 	}
 
@@ -190,6 +190,12 @@ type AuthTokenFrontend struct {
 }
 
 func authTokenFrontendType(token users.AuthToken) string {
+	if token.TokenHash != "" {
+		if token.Permissions == (users.Permissions{}) {
+			return "minimal"
+		}
+		return "full"
+	}
 	switch {
 	case token.BelongsTo == 0:
 		return "minimal"
@@ -201,19 +207,20 @@ func authTokenFrontendType(token users.AuthToken) string {
 }
 
 func authTokenFrontend(name string, token users.AuthToken, current users.Permissions) AuthTokenFrontend {
-	digest := utils.HashSHA256(authTokenSecret(token))
+	digest := authTokenHash(token)
 	fingerprint := digest
 	if len(fingerprint) > 16 {
 		fingerprint = fingerprint[:16]
 	}
+	tokenType := authTokenFrontendType(token)
 	permissions := token.Permissions
-	if token.BelongsTo == 0 {
+	if tokenType == "minimal" {
 		permissions = current
 	}
 	return AuthTokenFrontend{
 		ID:                 digest,
 		Name:               name,
-		Type:               authTokenFrontendType(token),
+		Type:               tokenType,
 		Fingerprint:        "sha256:" + fingerprint,
 		IssuedAt:           authTokenIssuedUnix(token),
 		ExpiresAt:          authTokenExpiresUnix(token),
@@ -222,11 +229,12 @@ func authTokenFrontend(name string, token users.AuthToken, current users.Permiss
 	}
 }
 
-func authTokenSecret(token users.AuthToken) string {
-	if token.Token != "" {
-		return token.Token
+func authTokenHash(token users.AuthToken) string {
+	hashes := token.TokenHashes()
+	if len(hashes) == 0 {
+		return ""
 	}
-	return token.Key
+	return hashes[0]
 }
 
 // authTokenIssuedUnix returns iat from JWT claims when set, otherwise the persisted int64 (e.g. loaded from DB).

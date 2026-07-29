@@ -69,11 +69,11 @@ func TestNewFullTokenStoresVersionedReadPermissionSnapshot(t *testing.T) {
 		"browse,preview,download",
 	)
 
-	if stored.PermissionsVersion != users.CurrentPermissionsVersion {
-		t.Fatalf("persisted permissions version: got %d, want %d", stored.PermissionsVersion, users.CurrentPermissionsVersion)
-	}
 	if stored.Permissions != wantSnapshot {
 		t.Fatalf("persisted full token permissions: got %+v, want %+v", stored.Permissions, wantSnapshot)
+	}
+	if stored.TokenHash == "" || stored.Token != "" || stored.Key != "" {
+		t.Fatalf("persisted full token is not hash-only: %+v", stored)
 	}
 
 	var claim users.AuthToken
@@ -89,14 +89,14 @@ func TestNewFullTokenStoresVersionedReadPermissionSnapshot(t *testing.T) {
 	if claim.PermissionsVersion != users.CurrentPermissionsVersion {
 		t.Fatalf("claim permissions version: got %d, want %d", claim.PermissionsVersion, users.CurrentPermissionsVersion)
 	}
-	if claim.PermissionsVersion != stored.PermissionsVersion {
-		t.Fatalf("permissions version differs between claim and metadata: claim=%d metadata=%d", claim.PermissionsVersion, stored.PermissionsVersion)
-	}
-	if claim.Name != "versioned-full-token-snapshot" || stored.Name != claim.Name {
-		t.Fatalf("full token generation marker: claim=%q metadata=%q", claim.Name, stored.Name)
+	if claim.Name != "versioned-full-token-snapshot" {
+		t.Fatalf("full token generation marker: claim=%q", claim.Name)
 	}
 	if claim.Permissions != wantSnapshot {
 		t.Fatalf("full token claim permissions: got %+v, want %+v", claim.Permissions, wantSnapshot)
+	}
+	if effective := authenticatePermissionContractToken(t, tokenString); effective != wantSnapshot {
+		t.Fatalf("full token effective permissions: got %+v, want %+v", effective, wantSnapshot)
 	}
 }
 
@@ -193,14 +193,18 @@ func TestExplicitEmptyFullTokenKeepsEmptyPermissionSnapshot(t *testing.T) {
 	})
 	tokenString, stored := issuePermissionContractTokenWithMode(t, user, "empty-full-token-snapshot", "", false)
 
-	if stored.BelongsTo != user.ID {
-		t.Fatalf("empty full token belongsTo: got %d, want %d", stored.BelongsTo, user.ID)
-	}
-	if stored.PermissionsVersion != users.CurrentPermissionsVersion {
-		t.Fatalf("empty full token permissions version: got %d, want %d", stored.PermissionsVersion, users.CurrentPermissionsVersion)
-	}
 	if stored.Permissions != (users.Permissions{}) {
 		t.Fatalf("empty full token snapshot: got %+v, want no permissions", stored.Permissions)
+	}
+	var claim users.AuthToken
+	parsed, err := jwt.ParseWithClaims(tokenString, &claim, func(*jwt.Token) (interface{}, error) {
+		return []byte(settings.Config.Auth.Key), nil
+	})
+	if err != nil || !parsed.Valid {
+		t.Fatalf("parse empty full token claim: valid=%v err=%v", parsed != nil && parsed.Valid, err)
+	}
+	if claim.BelongsTo != user.ID || claim.PermissionsVersion != users.CurrentPermissionsVersion || claim.Name != "empty-full-token-snapshot" {
+		t.Fatalf("empty full token signed identity is invalid: %+v", claim)
 	}
 	if effective := authenticatePermissionContractToken(t, tokenString); effective != (users.Permissions{}) {
 		t.Fatalf("empty full token effective permissions: got %+v, want no permissions", effective)
@@ -607,15 +611,14 @@ func storeLegacyFullToken(t *testing.T, user *users.User, name string, download 
 		t.Fatalf("sign legacy full token: %v", err)
 	}
 	metadata := users.AuthToken{
+		Token:     tokenString,
 		BelongsTo: user.ID,
 		Permissions: users.Permissions{
 			Api:      true,
 			Download: download,
 		},
 	}
-	if err := store.Users.AddApiToken(user.ID, name, tokenString, metadata); err != nil {
-		t.Fatalf("persist legacy full token metadata: %v", err)
-	}
+	storeLegacyAuthToken(t, user, name, metadata)
 	return tokenString
 }
 
@@ -650,10 +653,33 @@ func storeFullTokenWithVersions(
 	}
 	metadata := claim
 	metadata.PermissionsVersion = metadataVersion
-	if err := store.Users.AddApiToken(user.ID, storageName, tokenString, metadata); err != nil {
-		t.Fatalf("persist versioned full token metadata: %v", err)
+	if claimName != "" && metadataVersion == users.CurrentPermissionsVersion {
+		if err := store.Users.AddApiToken(user.ID, storageName, tokenString, metadata); err != nil {
+			t.Fatalf("persist hash-only versioned token metadata: %v", err)
+		}
+		return tokenString
 	}
+	metadata.Token = tokenString
+	storeLegacyAuthToken(t, user, storageName, metadata)
 	return tokenString
+}
+
+func storeLegacyAuthToken(t *testing.T, user *users.User, name string, metadata users.AuthToken) {
+	t.Helper()
+
+	storedUser, err := store.Users.Get(user.ID)
+	if err != nil {
+		t.Fatalf("load legacy token owner: %v", err)
+	}
+	updated := *storedUser
+	updated.Tokens = make(map[string]users.AuthToken, len(storedUser.Tokens)+1)
+	for storedName, storedToken := range storedUser.Tokens {
+		updated.Tokens[storedName] = storedToken
+	}
+	updated.Tokens[name] = metadata
+	if err := store.Users.Update(&updated, true, "Tokens"); err != nil {
+		t.Fatalf("persist legacy token metadata: %v", err)
+	}
 }
 
 func assertPermissionContractTokenRejected(t *testing.T, tokenString string) {

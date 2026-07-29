@@ -6,17 +6,93 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 )
 
-func TestCurrentUserMigrationVersionIsFour(t *testing.T) {
-	if got := users.CurrentUserMigrationVersion; got != 4 {
-		t.Fatalf("CurrentUserMigrationVersion = %d, want 4", got)
+func TestMigrateUserV4HashesLegacyTokens(t *testing.T) {
+	tokenPermissions := users.Permissions{Api: true, Browse: true}
+	keyPermissions := users.Permissions{Api: true, Download: true}
+	alreadyHashed := users.AuthToken{
+		TokenHash:   utils.HashSHA256("already-hashed-secret"),
+		TokenPrefix: "already-",
+		IssuedAt:    500,
+		ExpiresAt:   600,
+		Permissions: users.Permissions{Api: true, Preview: true},
+	}
+	u := &users.User{
+		Version: 4,
+		Tokens: map[string]users.AuthToken{
+			"token-field": {
+				Token:              "legacy-token-secret",
+				Name:               "legacy-token-name",
+				BelongsTo:          42,
+				IssuedAt:           100,
+				ExpiresAt:          200,
+				PermissionsVersion: users.CurrentPermissionsVersion,
+				Permissions:        tokenPermissions,
+			},
+		},
+		ApiKeys: map[string]users.AuthToken{
+			"key-field": {
+				Key:         "legacy-key-secret",
+				IssuedAt:    300,
+				ExpiresAt:   400,
+				Permissions: keyPermissions,
+			},
+			"already-hashed": alreadyHashed,
+		},
+	}
+
+	if !migrateUser(u) {
+		t.Fatal("migrateUser returned false for a V4 user with legacy tokens")
+	}
+	if u.Version != 5 {
+		t.Fatalf("Version = %d, want 5", u.Version)
+	}
+	assertMigratedTokenHashOnly(t, u.Tokens["token-field"], "legacy-token-secret", 100, 200, tokenPermissions)
+	assertMigratedTokenHashOnly(t, u.ApiKeys["key-field"], "legacy-key-secret", 300, 400, keyPermissions)
+	if got := u.ApiKeys["already-hashed"]; !reflect.DeepEqual(got, alreadyHashed) {
+		t.Fatalf("already hash-only token changed: got %#v want %#v", got, alreadyHashed)
+	}
+
+	afterFirst := migrationTestUserJSON(t, u)
+	if migrateUser(u) {
+		t.Fatal("second migrateUser call returned true")
+	}
+	if afterSecond := migrationTestUserJSON(t, u); afterSecond != afterFirst {
+		t.Fatalf("second migration changed the user:\nfirst:  %s\nsecond: %s", afterFirst, afterSecond)
 	}
 }
 
-func TestMigrateUserUpgradesEveryLegacyVersionToV4(t *testing.T) {
-	for version := 0; version < 4; version++ {
+func assertMigratedTokenHashOnly(t *testing.T, got users.AuthToken, secret string, issuedAt, expiresAt int64, permissions users.Permissions) {
+	t.Helper()
+	wantPrefix := secret
+	if len(wantPrefix) > 8 {
+		wantPrefix = wantPrefix[:8]
+	}
+	if got.TokenHash != utils.HashSHA256(secret) || got.TokenPrefix != wantPrefix {
+		t.Errorf("migrated token identity: hash=%q prefix=%q", got.TokenHash, got.TokenPrefix)
+	}
+	if got.Token != "" || got.Key != "" {
+		t.Errorf("migrated token retained plaintext: Token=%q Key=%q", got.Token, got.Key)
+	}
+	if got.IssuedAt != issuedAt || got.ExpiresAt != expiresAt || got.Permissions != permissions {
+		t.Errorf("migrated token metadata = %+v", got)
+	}
+	if got.Name != "" || got.BelongsTo != 0 || got.PermissionsVersion != 0 {
+		t.Errorf("migrated token retained non-hash metadata: %+v", got)
+	}
+}
+
+func TestCurrentUserMigrationVersionIsFive(t *testing.T) {
+	if got := users.CurrentUserMigrationVersion; got != 5 {
+		t.Fatalf("CurrentUserMigrationVersion = %d, want 5", got)
+	}
+}
+
+func TestMigrateUserUpgradesEveryLegacyVersionToV5(t *testing.T) {
+	for version := 0; version < 5; version++ {
 		for _, download := range []bool{false, true} {
 			t.Run(fmt.Sprintf("v%d_download_%t", version, download), func(t *testing.T) {
 				permissions := users.Permissions{Share: true}
@@ -71,11 +147,12 @@ func TestMigrateUserUpgradesEveryLegacyVersionToV4(t *testing.T) {
 				if !migrateUser(u) {
 					t.Fatal("migrateUser returned false for a legacy user")
 				}
-				if u.Version != 4 {
-					t.Fatalf("Version = %d, want 4", u.Version)
+				if u.Version != 5 {
+					t.Fatalf("Version = %d, want 5", u.Version)
 				}
-				if !u.Permissions.Browse || !u.Permissions.Preview {
-					t.Fatalf("legacy read permissions = {Browse:%t Preview:%t}, want both true", u.Permissions.Browse, u.Permissions.Preview)
+				wantLegacyReadDefaults := version < 4
+				if u.Permissions.Browse != wantLegacyReadDefaults || u.Permissions.Preview != wantLegacyReadDefaults {
+					t.Fatalf("read permissions = {Browse:%t Preview:%t}, want both %t for v%d user", u.Permissions.Browse, u.Permissions.Preview, wantLegacyReadDefaults, version)
 				}
 				if u.Permissions.Download != download {
 					t.Fatalf("Download = %t, want legacy value %t", u.Permissions.Download, download)
@@ -91,25 +168,19 @@ func TestMigrateUserUpgradesEveryLegacyVersionToV4(t *testing.T) {
 				}
 
 				if version <= 1 {
-					if len(u.ApiKeys) != 1 || !reflect.DeepEqual(u.ApiKeys["legacy"], legacyAPIKey) {
-						t.Fatalf("ApiKeys changed during migration: %#v", u.ApiKeys)
+					if len(u.ApiKeys) != 1 {
+						t.Fatalf("ApiKeys length = %d, want 1", len(u.ApiKeys))
 					}
+					assertMigratedTokenHashOnly(t, u.ApiKeys["legacy"], legacyAPIKey.Key, 100, 200, legacySnapshot)
 					if len(u.Tokens) != 2 {
 						t.Fatalf("Tokens length = %d, want 2 after ApiKeys merge", len(u.Tokens))
 					}
-					if got := u.Tokens["existing"]; !reflect.DeepEqual(got, existingToken) {
-						t.Fatalf("existing Token changed: got %#v want %#v", got, existingToken)
-					}
+					assertMigratedTokenHashOnly(t, u.Tokens["existing"], existingToken.Token, 300, 400, existingSnapshot)
 					migratedToken, ok := u.Tokens["legacy"]
 					if !ok {
 						t.Fatal("legacy ApiKey was not merged into Tokens")
 					}
-					if migratedToken.Token != legacyAPIKey.Key {
-						t.Fatalf("migrated Token = %q, want legacy Key %q", migratedToken.Token, legacyAPIKey.Key)
-					}
-					if !reflect.DeepEqual(migratedToken.Permissions, legacySnapshot) {
-						t.Fatalf("migrated permission snapshot changed: got %#v want %#v", migratedToken.Permissions, legacySnapshot)
-					}
+					assertMigratedTokenHashOnly(t, migratedToken, legacyAPIKey.Key, 100, 200, legacySnapshot)
 				}
 			})
 		}
@@ -193,22 +264,17 @@ func TestMigrateUserMergesApiKeysWithoutReplacingTokens(t *testing.T) {
 	if !migrateUser(u) {
 		t.Fatal("migrateUser returned false for a v1 user")
 	}
-	if len(u.ApiKeys) != 2 || !reflect.DeepEqual(u.ApiKeys["legacy-only"], legacyOnly) || !reflect.DeepEqual(u.ApiKeys["collision"], legacyCollision) {
-		t.Fatalf("ApiKeys changed during migration: %#v", u.ApiKeys)
+	if len(u.ApiKeys) != 2 {
+		t.Fatalf("ApiKeys length = %d, want 2", len(u.ApiKeys))
 	}
+	assertMigratedTokenHashOnly(t, u.ApiKeys["legacy-only"], legacyOnly.Key, 10, 20, legacySnapshot)
+	assertMigratedTokenHashOnly(t, u.ApiKeys["collision"], legacyCollision.Key, 0, 0, legacySnapshot)
 	if len(u.Tokens) != 2 {
 		t.Fatalf("Tokens length = %d, want 2", len(u.Tokens))
 	}
-	if got := u.Tokens["collision"]; !reflect.DeepEqual(got, existingCollision) {
-		t.Fatalf("existing Token was replaced by an ApiKey: got %#v want %#v", got, existingCollision)
-	}
+	assertMigratedTokenHashOnly(t, u.Tokens["collision"], existingCollision.Token, 30, 40, existingSnapshot)
 	migrated := u.Tokens["legacy-only"]
-	if migrated.Token != legacyOnly.Key {
-		t.Fatalf("migrated Token = %q, want %q", migrated.Token, legacyOnly.Key)
-	}
-	if !reflect.DeepEqual(migrated.Permissions, legacyOnly.Permissions) {
-		t.Fatalf("migrated permission snapshot changed: got %#v want %#v", migrated.Permissions, legacyOnly.Permissions)
-	}
+	assertMigratedTokenHashOnly(t, migrated, legacyOnly.Key, 10, 20, legacyOnly.Permissions)
 }
 
 func TestMigrateUserIsIdempotent(t *testing.T) {
@@ -245,7 +311,7 @@ func TestMigrateUserIsIdempotent(t *testing.T) {
 	}
 
 	current := &users.User{
-		Version: 4,
+		Version: 5,
 		Permissions: users.Permissions{
 			Browse:   false,
 			Preview:  false,

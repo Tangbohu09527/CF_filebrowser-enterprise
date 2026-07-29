@@ -44,6 +44,14 @@ func RevokeApiToken(accessStore *access.Storage, token string) error {
 	return accessStore.RevokeToken(token)
 }
 
+// RevokeApiTokenHash revokes an API token without requiring its bearer secret.
+func RevokeApiTokenHash(accessStore *access.Storage, tokenHash string) error {
+	if accessStore == nil {
+		return fmt.Errorf("access storage not available")
+	}
+	return accessStore.RevokeTokenHash(tokenHash)
+}
+
 func MakeSignedTokenAPI(user *users.User, name string, duration time.Duration, perms users.Permissions, minimal bool) (string, users.AuthToken, error) {
 	if _, ok := user.Tokens[name]; ok {
 		return "", users.AuthToken{}, fmt.Errorf("key already exists with same name %v ", name)

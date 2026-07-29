@@ -8,10 +8,13 @@ import (
 	"time"
 
 	"github.com/gtsteffaniak/filebrowser/backend/common/errors"
+	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	"github.com/gtsteffaniak/filebrowser/backend/database/crud"
 )
 
 var ErrAPIPermissionRequired = stderrors.New("API permission is required to store a token")
+
+const apiTokenPrefixLength = 8
 
 // StorageBackend is the interface to implement for a users storage.
 type StorageBackend interface {
@@ -189,8 +192,7 @@ func (s *Storage) AddApiToken(userID uint, name string, tokenString string, meta
 	}
 	updated := *user
 	updated.Tokens = cloneAuthTokens(user.Tokens)
-	metadata.Token = tokenString
-	updated.Tokens[name] = metadata
+	updated.Tokens[name] = hashOnlyAuthToken(tokenString, metadata)
 	err = s.update(&updated, true, "Tokens")
 	if err != nil {
 		return err
@@ -204,7 +206,29 @@ func (s *Storage) DeleteApiToken(userID uint, name string) error {
 	return err
 }
 
-func (s *Storage) ApiTokenSecrets(userID uint, name string) ([]string, error) {
+func hashOnlyAuthToken(tokenString string, metadata AuthToken) AuthToken {
+	prefix := tokenString
+	if len(prefix) > apiTokenPrefixLength {
+		prefix = prefix[:apiTokenPrefixLength]
+	}
+	issuedAt := metadata.IssuedAt
+	if metadata.RegisteredClaims.IssuedAt != nil {
+		issuedAt = metadata.RegisteredClaims.IssuedAt.Unix()
+	}
+	expiresAt := metadata.ExpiresAt
+	if metadata.RegisteredClaims.ExpiresAt != nil {
+		expiresAt = metadata.RegisteredClaims.ExpiresAt.Unix()
+	}
+	return AuthToken{
+		TokenHash:   utils.HashSHA256(tokenString),
+		TokenPrefix: prefix,
+		IssuedAt:    issuedAt,
+		ExpiresAt:   expiresAt,
+		Permissions: metadata.Permissions,
+	}
+}
+
+func (s *Storage) ApiTokenHashes(userID uint, name string) ([]string, error) {
 	s.tokenMux.Lock()
 	defer s.tokenMux.Unlock()
 	user, err := s.Get(userID)
@@ -212,23 +236,20 @@ func (s *Storage) ApiTokenSecrets(userID uint, name string) ([]string, error) {
 		return nil, err
 	}
 	seen := make(map[string]struct{}, 4)
-	secrets := make([]string, 0, 4)
+	hashes := make([]string, 0, 4)
 	for _, tokens := range []map[string]AuthToken{user.Tokens, user.ApiKeys} {
 		token, ok := tokens[name]
 		if !ok {
 			continue
 		}
-		for _, secret := range []string{token.Token, token.Key} {
-			if secret == "" {
-				continue
-			}
-			if _, exists := seen[secret]; !exists {
-				seen[secret] = struct{}{}
-				secrets = append(secrets, secret)
+		for _, tokenHash := range token.TokenHashes() {
+			if _, exists := seen[tokenHash]; !exists {
+				seen[tokenHash] = struct{}{}
+				hashes = append(hashes, tokenHash)
 			}
 		}
 	}
-	return secrets, nil
+	return hashes, nil
 }
 
 func (s *Storage) DeleteApiTokens(userID uint, name string) (bool, error) {

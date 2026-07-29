@@ -8,6 +8,7 @@ import (
 
 	"github.com/gtsteffaniak/filebrowser/backend/adapters/fs/fileutils"
 	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
+	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 	"github.com/gtsteffaniak/go-logger/logger"
 )
@@ -59,7 +60,7 @@ func validateUserInfo(newDB bool) {
 					logger.Fatalf("Unable to create automatic backup of database due to error: %v", err)
 				}
 			}
-			fields := []string{"Scopes", "SidebarLinks", "Tokens", "Permissions", "Preview", "ShowFirstLogin", "LoginMethod", "ShowToolsInSidebar", "Version"}
+			fields := []string{"Scopes", "SidebarLinks", "Tokens", "ApiKeys", "Permissions", "Preview", "ShowFirstLogin", "LoginMethod", "ShowToolsInSidebar", "Version"}
 			if changePass {
 				fields = append(fields, "Password")
 			}
@@ -149,6 +150,8 @@ func migrateUser(user *users.User) bool {
 			updateShowToolsInSidebar(user)
 		case user.Version < 4:
 			updateReadPermissions(user)
+		case user.Version < 5:
+			updateTokenHashes(user)
 		}
 		if user.Version == previousVersion {
 			break
@@ -280,5 +283,57 @@ func updateTokens(user *users.User) bool {
 		}
 	}
 	user.Version = 2
+	return true
+}
+
+func updateTokenHashes(user *users.User) bool {
+	if user.Version >= 5 {
+		return false
+	}
+	migrateTokenMap := func(tokens map[string]users.AuthToken) {
+		for name, token := range tokens {
+			secret := token.Token
+			if secret == "" {
+				secret = token.Key
+			}
+			if token.TokenHash == "" && secret == "" {
+				continue
+			}
+
+			tokenHash := token.TokenHash
+			tokenPrefix := token.TokenPrefix
+			if secret != "" {
+				if tokenHash == "" {
+					tokenHash = utils.HashSHA256(secret)
+				}
+				if tokenPrefix == "" {
+					tokenPrefix = secret
+					if len(tokenPrefix) > 8 {
+						tokenPrefix = tokenPrefix[:8]
+					}
+				}
+			}
+
+			issuedAt := token.IssuedAt
+			if token.RegisteredClaims.IssuedAt != nil {
+				issuedAt = token.RegisteredClaims.IssuedAt.Unix()
+			}
+			expiresAt := token.ExpiresAt
+			if token.RegisteredClaims.ExpiresAt != nil {
+				expiresAt = token.RegisteredClaims.ExpiresAt.Unix()
+			}
+			tokens[name] = users.AuthToken{
+				TokenHash:   tokenHash,
+				TokenPrefix: tokenPrefix,
+				IssuedAt:    issuedAt,
+				ExpiresAt:   expiresAt,
+				Permissions: token.Permissions,
+			}
+		}
+	}
+
+	migrateTokenMap(user.Tokens)
+	migrateTokenMap(user.ApiKeys)
+	user.Version = 5
 	return true
 }

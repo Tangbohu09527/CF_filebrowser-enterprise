@@ -5,10 +5,11 @@ import (
 	"strings"
 
 	jwt "github.com/golang-jwt/jwt/v4"
+	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 )
 
 // CurrentUserMigrationVersion is persisted for newly created accounts and after legacy migrations finish.
-const CurrentUserMigrationVersion = 4
+const CurrentUserMigrationVersion = 5
 
 // CurrentPermissionsVersion identifies permission snapshots that include Browse, Preview, and Download.
 const CurrentPermissionsVersion = 4
@@ -54,14 +55,53 @@ type WebAuthnCredential struct {
 
 type AuthToken struct {
 	MinimalAuthToken
-	Key                string      `json:"key,omitempty"` // for backward compatibility
-	Token              string      `json:"token,omitempty"`
+	TokenHash          string      `json:"tokenHash,omitempty"`
+	TokenPrefix        string      `json:"tokenPrefix,omitempty"`
+	Key                string      `json:"key,omitempty"`   // legacy database field
+	Token              string      `json:"token,omitempty"` // legacy database field
 	Name               string      `json:"name,omitempty"`
 	BelongsTo          uint        `json:"belongsTo,omitempty"`
 	IssuedAt           int64       `json:"issuedAt,omitempty"`
 	ExpiresAt          int64       `json:"expiresAt,omitempty"`
 	PermissionsVersion int         `json:"permissionsVersion,omitempty"`
 	Permissions        Permissions `json:"Permissions,omitempty"`
+}
+
+// TokenHashes returns persisted hashes and hashes derived from legacy bearer fields.
+func (t AuthToken) TokenHashes() []string {
+	hashes := make([]string, 0, 3)
+	seen := make(map[string]struct{}, 3)
+	add := func(hash string) {
+		if hash == "" {
+			return
+		}
+		if _, exists := seen[hash]; exists {
+			return
+		}
+		seen[hash] = struct{}{}
+		hashes = append(hashes, hash)
+	}
+	add(t.TokenHash)
+	if t.Token != "" {
+		add(utils.HashSHA256(t.Token))
+	}
+	if t.Key != "" {
+		add(utils.HashSHA256(t.Key))
+	}
+	return hashes
+}
+
+// MatchesTokenHash supports hash-only records and legacy Token/Key records.
+func (t AuthToken) MatchesTokenHash(tokenHash string) bool {
+	if tokenHash == "" {
+		return false
+	}
+	for _, storedHash := range t.TokenHashes() {
+		if storedHash == tokenHash {
+			return true
+		}
+	}
+	return false
 }
 
 // MinimalAuthToken is used for tokens that only include JWT standard claims

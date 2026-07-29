@@ -625,11 +625,7 @@ func onlyOfficeUserHasAPITokenHash(user *users.User, tokenHash string) bool {
 	}
 	for _, tokens := range []map[string]users.AuthToken{user.Tokens, user.ApiKeys} {
 		for _, token := range tokens {
-			secret := token.Token
-			if secret == "" {
-				secret = token.Key
-			}
-			if secret != "" && utils.HashSHA256(secret) == tokenHash {
+			if token.MatchesTokenHash(tokenHash) {
 				return true
 			}
 		}

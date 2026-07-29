@@ -1352,11 +1352,18 @@ func (s *Storage) UpdateRulePath(sourcePath, oldPath, newPath string) error {
 }
 
 // RevokeToken adds a token hash to the revoked list and persists to DB.
-func (s *Storage) RevokeToken(tokenHash string) error {
+func (s *Storage) RevokeToken(tokenString string) error {
+	return s.RevokeTokenHash(utils.HashSHA256(tokenString))
+}
+
+// RevokeTokenHash revokes an API token when only its persisted hash is available.
+func (s *Storage) RevokeTokenHash(tokenHash string) error {
+	if tokenHash == "" {
+		return fmt.Errorf("api token hash is required")
+	}
 	s.mux.Lock()
 	defer s.mux.Unlock()
 
-	tokenHash = utils.HashSHA256(tokenHash)
 	s.RevokedTokens[tokenHash] = struct{}{}
 	// Also remove from HashedTokens to prevent future lookups
 	delete(s.HashedTokens, tokenHash)

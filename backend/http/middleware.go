@@ -1288,9 +1288,10 @@ func withUserHelper(fn handleFunc) handleFunc {
 			logger.Errorf("Failed to get user with ID %v: %v", tk.BelongsTo, err)
 			return http.StatusInternalServerError, err
 		}
+		presentedTokenHash := utils.HashSHA256(data.token)
 		findAPIToken := func(tokens map[string]users.AuthToken) (string, users.AuthToken, bool) {
 			for name, apiToken := range tokens {
-				if apiToken.Token == data.token || apiToken.Key == data.token {
+				if apiToken.MatchesTokenHash(presentedTokenHash) {
 					return name, apiToken, true
 				}
 			}
@@ -1311,7 +1312,8 @@ func withUserHelper(fn handleFunc) handleFunc {
 			}
 			data.apiToken = true
 			if minimalToken {
-				if storedToken.BelongsTo != 0 || storedToken.PermissionsVersion != 0 {
+				if storedToken.BelongsTo != 0 || storedToken.PermissionsVersion != 0 ||
+					(storedToken.TokenHash != "" && storedToken.Permissions != (users.Permissions{})) {
 					return http.StatusUnauthorized, fmt.Errorf("invalid minimal API token metadata")
 				}
 				break
@@ -1319,10 +1321,14 @@ func withUserHelper(fn handleFunc) handleFunc {
 			var tokenPermissions users.Permissions
 			switch {
 			case tk.Name != "":
-				if !stored || storedName != tk.Name || storedToken.Name != tk.Name ||
+				invalidMetadata := storedName != tk.Name ||
 					tk.PermissionsVersion != users.CurrentPermissionsVersion ||
-					storedToken.PermissionsVersion != users.CurrentPermissionsVersion ||
-					storedToken.Permissions != tk.Permissions {
+					storedToken.Permissions != tk.Permissions
+				if storedToken.TokenHash == "" {
+					invalidMetadata = invalidMetadata || storedToken.Name != tk.Name ||
+						storedToken.PermissionsVersion != users.CurrentPermissionsVersion
+				}
+				if invalidMetadata {
 					return http.StatusUnauthorized, fmt.Errorf("invalid API token permissions version")
 				}
 				tokenPermissions = tk.Permissions

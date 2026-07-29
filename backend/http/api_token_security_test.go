@@ -15,10 +15,90 @@ import (
 	jwt "github.com/golang-jwt/jwt/v4"
 	"github.com/gtsteffaniak/filebrowser/backend/auth"
 	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
+	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 )
 
 func TestAPITokenSecurityLifecycle(t *testing.T) {
+	t.Run("new token metadata is persisted hash only", func(t *testing.T) {
+		setupPermissionContractHTTPTest(t)
+		user := savePermissionContractUser(t, "token-hash-only", users.Permissions{Api: true, Browse: true})
+		secret, _ := issuePermissionContractToken(t, user, "hash-only", "api,browse")
+
+		persistedUser, err := store.Users.Get(user.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		metadata, ok := persistedUser.Tokens["hash-only"]
+		if !ok {
+			t.Fatal("hash-only token metadata was not persisted")
+		}
+		encoded, err := json.Marshal(metadata)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("persisted token metadata contains bearer secret: %s", encoded)
+		}
+
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(encoded, &fields); err != nil {
+			t.Fatal(err)
+		}
+		allowed := map[string]struct{}{
+			"tokenHash":   {},
+			"tokenPrefix": {},
+			"issuedAt":    {},
+			"expiresAt":   {},
+			"Permissions": {},
+		}
+		for field := range fields {
+			if _, ok := allowed[field]; !ok {
+				t.Errorf("persisted token metadata contains unexpected field %q: %s", field, encoded)
+			}
+		}
+		for field := range allowed {
+			if _, ok := fields[field]; !ok {
+				t.Errorf("persisted token metadata is missing %q: %s", field, encoded)
+			}
+		}
+
+		var tokenHash, tokenPrefix string
+		var issuedAt, expiresAt int64
+		var permissions users.Permissions
+		if err := json.Unmarshal(fields["tokenHash"], &tokenHash); err != nil {
+			t.Errorf("decode token hash: %v", err)
+		}
+		if err := json.Unmarshal(fields["tokenPrefix"], &tokenPrefix); err != nil {
+			t.Errorf("decode token prefix: %v", err)
+		}
+		if err := json.Unmarshal(fields["issuedAt"], &issuedAt); err != nil {
+			t.Errorf("decode issued time: %v", err)
+		}
+		if err := json.Unmarshal(fields["expiresAt"], &expiresAt); err != nil {
+			t.Errorf("decode expiry time: %v", err)
+		}
+		if err := json.Unmarshal(fields["Permissions"], &permissions); err != nil {
+			t.Errorf("decode permissions: %v", err)
+		}
+		if tokenHash != utils.HashSHA256(secret) {
+			t.Errorf("persisted token hash = %q, want SHA-256 of bearer", tokenHash)
+		}
+		if tokenPrefix == "" || tokenPrefix == secret || !strings.HasPrefix(secret, tokenPrefix) {
+			t.Errorf("persisted token prefix %q is not a redacted bearer prefix", tokenPrefix)
+		}
+		if issuedAt <= 0 || expiresAt <= issuedAt {
+			t.Errorf("persisted token lifetime is invalid: issuedAt=%d expiresAt=%d", issuedAt, expiresAt)
+		}
+		if want := (users.Permissions{Api: true, Browse: true}); permissions != want {
+			t.Errorf("persisted permissions = %+v, want %+v", permissions, want)
+		}
+		currentPermissions := users.Permissions{Api: true, Admin: true, Browse: true, Download: true}
+		if frontend := authTokenFrontend("hash-only", metadata, currentPermissions); frontend.Permissions != permissions {
+			t.Errorf("full token management permissions = %+v, want stored snapshot %+v", frontend.Permissions, permissions)
+		}
+	})
+
 	t.Run("secret is returned only at creation", func(t *testing.T) {
 		setupPermissionContractHTTPTest(t)
 		user := savePermissionContractUser(t, "token-secret-once", users.Permissions{Api: true, Browse: true})
@@ -295,7 +375,8 @@ func TestAPITokenSecurityLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(stored.Tokens) != 1 || stored.Tokens["single-name"].Token == "" {
+		tokenMetadata := stored.Tokens["single-name"]
+		if len(stored.Tokens) != 1 || tokenMetadata.TokenHash == "" || tokenMetadata.Token != "" || tokenMetadata.Key != "" {
 			t.Fatalf("concurrent token metadata is not singular and manageable: %+v", stored.Tokens)
 		}
 	})
@@ -402,7 +483,7 @@ func TestAPITokenSecurityLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if stored, ok := reloaded.Tokens["created-after-delete-snapshot"]; !ok || authTokenSecret(stored) != second {
+		if stored, ok := reloaded.Tokens["created-after-delete-snapshot"]; !ok || !stored.MatchesTokenHash(utils.HashSHA256(second)) {
 			t.Fatalf("later token metadata was lost: %+v", reloaded.Tokens)
 		}
 		request = httptest.NewRequest(http.MethodGet, "/api/probe", nil)
@@ -658,10 +739,9 @@ func TestAPITokenSecurityLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		metadata.Token = primary
 		metadata.Key = legacyKey
-		if err := store.Users.AddApiToken(user.ID, "dual-secret-fields", primary, metadata); err != nil {
-			t.Fatal(err)
-		}
+		storeLegacyAuthToken(t, user, "dual-secret-fields", metadata)
 		if err := store.Access.AddApiToken(primary, user.ID); err != nil {
 			t.Fatal(err)
 		}
