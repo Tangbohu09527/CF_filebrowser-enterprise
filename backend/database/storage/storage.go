@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,7 +33,7 @@ func InitializeDb(path string) (*bolt.BoltStore, bool, error) {
 	}
 	store, err := bolt.NewStorage(db)
 	if err != nil {
-		return nil, exists, err
+		return nil, exists, errors.Join(err, db.Close())
 	}
 	// Load access rules from DB on startup
 	// ignoring errors because
@@ -40,10 +41,6 @@ func InitializeDb(path string) (*bolt.BoltStore, bool, error) {
 	// Load share cache from DB so shareByHash/shareByPath are populated at startup
 	store.Share.LoadShareCacheFromDB()
 	userStore = store.Users
-	err = bolt.Save(db, "version", 2)
-	if err != nil {
-		return nil, exists, err
-	}
 	if !exists {
 		if settings.Env.IsPlaywright || settings.Env.IsDevMode {
 			settings.Env.IsFirstLoad = false
@@ -53,7 +50,7 @@ func InitializeDb(path string) (*bolt.BoltStore, bool, error) {
 		quickSetup(store)
 	}
 
-	return store, exists, err
+	return store, exists, nil
 }
 
 func dbExists(path string) (bool, error) {
