@@ -183,12 +183,26 @@ func walkAuthenticatedArchiveMembers(
 	flatten bool,
 	visit func(authenticatedArchiveMember) error,
 ) error {
+	return walkAuthenticatedArchiveMembersWithPolicy(d, source, indexPath, flatten, false, visit)
+}
+
+func walkAuthenticatedArchiveMembersWithPolicy(
+	d *requestContext,
+	source string,
+	indexPath string,
+	flatten bool,
+	failOnDenied bool,
+	visit func(authenticatedArchiveMember) error,
+) error {
 	root, err := resolveCurrentAuthenticatedArchiveTarget(d, source, indexPath)
 	if err != nil {
 		return err
 	}
 	if root.Info == nil {
 		return commonerrors.ErrAccessDenied
+	}
+	if failOnDenied && authenticatedReadPathContainsSymlink(root.SourcePath, root.LogicalPath) {
+		return fmt.Errorf("archive delete source %q traverses a symlink: %w", indexPath, commonerrors.ErrAccessDenied)
 	}
 
 	baseName := authenticatedReadTargetName(root, filepath.Base(root.RealPath))
@@ -226,6 +240,9 @@ func walkAuthenticatedArchiveMembers(
 				return err
 			}
 			if errors.Is(err, commonerrors.ErrAccessDenied) {
+				if failOnDenied {
+					return fmt.Errorf("archive delete source member %q is not accessible: %w", memberPath, commonerrors.ErrAccessDenied)
+				}
 				if fileInfo.IsDir() {
 					return filepath.SkipDir
 				}
@@ -248,6 +265,42 @@ func walkAuthenticatedArchiveMembers(
 			target:      memberTarget,
 		})
 	})
+}
+
+func snapshotArchiveDeleteSources(d *requestContext, source string, paths []string) (*archiveMemberTracker, error) {
+	tracker := &archiveMemberTracker{}
+	for _, indexPath := range paths {
+		err := walkAuthenticatedArchiveMembersWithPolicy(d, source, indexPath, false, true, func(member authenticatedArchiveMember) error {
+			if member.target.Info == nil {
+				return commonerrors.ErrAccessDenied
+			}
+			tracker.add(member.indexPath, member.target)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return tracker, nil
+}
+
+func sameArchiveMemberTrackers(original, current *archiveMemberTracker) bool {
+	if original == nil || current == nil || len(original.paths) != len(current.paths) || len(original.targets) != len(current.targets) {
+		return false
+	}
+	for i := range original.paths {
+		if original.paths[i] != current.paths[i] || !sameArchiveTargetSnapshot(original.targets[i], current.targets[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameArchiveTargetSnapshot(original, current authenticatedReadTarget) bool {
+	return sameAuthenticatedReadTarget(original, current) &&
+		original.Info.Size() == current.Info.Size() &&
+		original.Info.Mode() == current.Info.Mode() &&
+		original.Info.ModTime().Equal(current.Info.ModTime())
 }
 
 // archiveSpoolCache maps archiveToken to the scoped read session used to build the spool.
@@ -561,11 +614,9 @@ func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 	if d.share != nil {
 		return http.StatusForbidden, fmt.Errorf("archive create not allowed for shares")
 	}
-	if !d.user.Permissions.Browse || !d.user.Permissions.Download {
-		return http.StatusForbidden, fmt.Errorf("user is not allowed to browse and download archive members")
-	}
-	if !d.user.Permissions.Create {
-		return http.StatusForbidden, fmt.Errorf("user is not allowed to create resources")
+	currentUser, authErr := currentAuthenticatedArchiveUser(d)
+	if authErr != nil {
+		return errToStatus(authErr), authErr
 	}
 
 	var req archiveCreateRequest
@@ -574,6 +625,9 @@ func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 	}
 	if req.FromSource == "" || len(req.Paths) == 0 || req.Destination == "" {
 		return http.StatusBadRequest, fmt.Errorf("fromSource, paths, and destination are required")
+	}
+	if req.DeleteAfter && !currentUser.Permissions.Delete {
+		return http.StatusForbidden, fmt.Errorf("user is not allowed to delete archive sources")
 	}
 
 	destClean, err := sanitizeAuthenticatedReadPath(req.Destination)
@@ -601,41 +655,22 @@ func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 	if idx == nil {
 		return http.StatusNotFound, fmt.Errorf("source %s not found", req.FromSource)
 	}
-	userScope, err := d.user.GetScopeForSourceName(req.FromSource)
+	userScope, err := currentUser.GetScopeForSourceName(req.FromSource)
 	if err != nil {
 		return http.StatusForbidden, err
 	}
 
 	// Resolve destination on ToSource (or Source if not set)
-	idxTo := indexing.GetIndex(destSource)
-	if idxTo == nil {
+	if indexing.GetIndex(destSource) == nil {
 		return http.StatusNotFound, fmt.Errorf("source %s not found", destSource)
 	}
-	userScopeTo, err := d.user.GetScopeForSourceName(destSource)
+	destinationTarget, err := resolveAuthenticatedWriteTarget(currentUser, destSource, req.Destination)
 	if err != nil {
-		return http.StatusForbidden, err
+		return errToStatus(err), fmt.Errorf("destination path is unavailable: %w", err)
 	}
-	fullDestFile := utils.JoinPathAsUnix(userScopeTo, req.Destination)
-	if store.Access != nil && !store.Access.Permitted(idxTo.Path, fullDestFile, d.user.Username) {
-		return http.StatusForbidden, fmt.Errorf("access denied to destination %s", req.Destination)
+	if permissionErr := requireArchiveDestinationPermission(currentUser.Permissions, destinationTarget); permissionErr != nil {
+		return archiveWritePreflightStatus(permissionErr), permissionErr
 	}
-	fullDestParent := utils.GetParentDirectoryPath(fullDestFile)
-	if store.Access != nil && fullDestParent != fullDestFile && !store.Access.Permitted(idxTo.Path, fullDestParent, d.user.Username) {
-		return http.StatusForbidden, fmt.Errorf("access denied to destination parent of %s", req.Destination)
-	}
-	parentReal, _, err := idxTo.GetRealPath(fullDestParent)
-	if err != nil {
-		return http.StatusBadRequest, fmt.Errorf("destination parent path invalid: %v", err)
-	}
-	if err = os.MkdirAll(parentReal, fileutils.EffectiveDirPerm()); err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("cannot create destination parent directory: %v", err)
-	}
-	destRel := strings.TrimLeft(filepath.ToSlash(req.Destination), "/")
-	fileName := path.Base(destRel)
-	if fileName == "." || fileName == "/" {
-		return http.StatusBadRequest, fmt.Errorf("invalid destination file name")
-	}
-	destFileReal := filepath.Join(parentReal, fileName)
 
 	format := strings.ToLower(strings.TrimSpace(req.Format))
 	if format == "" {
@@ -659,12 +694,14 @@ func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 
 	// Build full paths for items (same source)
 	itemPaths := make([]string, 0, len(req.Paths))
+	itemTargets := make([]authenticatedReadTarget, 0, len(req.Paths))
 	if _, authErr := currentAuthenticatedArchiveUser(d); authErr != nil {
 		return errToStatus(authErr), authErr
 	}
 	for _, it := range req.Paths {
 		full := utils.JoinPathAsUnix(userScope, it)
-		if _, authErr := resolveCurrentAuthenticatedArchiveTarget(d, req.FromSource, full); authErr != nil {
+		sourceTarget, authErr := resolveCurrentAuthenticatedArchiveTarget(d, req.FromSource, full)
+		if authErr != nil {
 			if errors.Is(authErr, errAuthenticatedArchiveReadPermissions) {
 				return errToStatus(authErr), authErr
 			}
@@ -674,6 +711,7 @@ func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 			return errToStatus(authErr), authErr
 		}
 		itemPaths = append(itemPaths, full)
+		itemTargets = append(itemTargets, sourceTarget)
 	}
 	if len(itemPaths) == 0 {
 		return http.StatusBadRequest, fmt.Errorf("no paths accessible; add at least one path you have access to")
@@ -691,35 +729,116 @@ func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 			return http.StatusRequestEntityTooLarge, fmt.Errorf("archive size would exceed the maximum allowed size (maxArchiveSize: %d GB)", config.Server.MaxArchiveSizeGB)
 		}
 	}
+	if req.DeleteAfter {
+		if _, err = snapshotArchiveDeleteSources(d, req.FromSource, itemPaths); err != nil {
+			return errToStatus(err), err
+		}
+	}
 
-	var createErr error
-	file, err := os.OpenFile(destFileReal, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fileutils.EffectiveFilePerm())
+	tempFile, err := os.CreateTemp("", "filebrowser-server-archive-*")
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
-	defer file.Close()
+	tempPath := tempFile.Name()
+	tempClosed := false
+	defer func() {
+		if !tempClosed {
+			_ = tempFile.Close()
+		}
+		_ = os.Remove(tempPath)
+	}()
 
+	var (
+		createErr            error
+		archivedDeleteSource *archiveMemberTracker
+	)
+	if req.DeleteAfter {
+		archivedDeleteSource = &archiveMemberTracker{}
+	}
 	if format == "zip" {
-		createErr = createZip(d, req.FromSource, file, itemPaths...)
+		createErr = createZipTracked(d, req.FromSource, tempFile, archivedDeleteSource, itemPaths...)
 	} else {
-		createErr = createTarGzWithLevel(d, req.FromSource, file, compression, itemPaths...)
+		createErr = createTarGzWithLevelTracked(d, req.FromSource, tempFile, compression, archivedDeleteSource, itemPaths...)
 	}
 	if createErr != nil {
 		return errToStatus(createErr), createErr
 	}
+	if err = tempFile.Sync(); err != nil {
+		return http.StatusInternalServerError, err
+	}
+	if err = tempFile.Close(); err != nil {
+		return http.StatusInternalServerError, err
+	}
+	tempClosed = true
 
-	if req.DeleteAfter && d.user.Permissions.Delete {
+	currentUser, authErr = currentAuthenticatedArchiveUser(d)
+	if authErr != nil {
+		return errToStatus(authErr), authErr
+	}
+	if req.DeleteAfter && !currentUser.Permissions.Delete {
+		return http.StatusForbidden, fmt.Errorf("user is not allowed to delete archive sources")
+	}
+	if req.DeleteAfter {
+		currentDeleteSources, snapshotErr := snapshotArchiveDeleteSources(d, req.FromSource, itemPaths)
+		if snapshotErr != nil {
+			return errToStatus(snapshotErr), snapshotErr
+		}
+		if !sameArchiveMemberTrackers(archivedDeleteSource, currentDeleteSources) {
+			return http.StatusConflict, fmt.Errorf("archive sources changed during creation")
+		}
+		for i, full := range itemPaths {
+			currentTarget, targetErr := resolveCurrentAuthenticatedArchiveTarget(d, req.FromSource, full)
+			if targetErr != nil {
+				return errToStatus(targetErr), targetErr
+			}
+			if !sameAuthenticatedReadTarget(itemTargets[i], currentTarget) {
+				return http.StatusConflict, fmt.Errorf("archive source changed before delete")
+			}
+			itemTargets[i] = currentTarget
+		}
+	}
+	destinationTarget, err = resolveAuthenticatedWriteTarget(currentUser, destSource, req.Destination)
+	if err != nil {
+		return errToStatus(err), fmt.Errorf("destination path is unavailable: %w", err)
+	}
+	if permissionErr := requireArchiveDestinationPermission(currentUser.Permissions, destinationTarget); permissionErr != nil {
+		return archiveWritePreflightStatus(permissionErr), permissionErr
+	}
+	completedArchive, err := os.Open(tempPath)
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	writeErr := files.WriteFile(destSource, destinationTarget.CanonicalPath, completedArchive)
+	closeErr := completedArchive.Close()
+	if writeErr != nil {
+		return errToStatus(writeErr), writeErr
+	}
+	if closeErr != nil {
+		return http.StatusInternalServerError, closeErr
+	}
+
+	if req.DeleteAfter {
+		currentUser, authErr = currentAuthenticatedArchiveUser(d)
+		if authErr != nil {
+			return errToStatus(authErr), authErr
+		}
+		if !currentUser.Permissions.Delete {
+			return http.StatusForbidden, fmt.Errorf("user is not allowed to delete archive sources")
+		}
+		currentDeleteSources, snapshotErr := snapshotArchiveDeleteSources(d, req.FromSource, itemPaths)
+		if snapshotErr != nil {
+			return errToStatus(snapshotErr), snapshotErr
+		}
+		if !sameArchiveMemberTrackers(archivedDeleteSource, currentDeleteSources) {
+			return http.StatusConflict, fmt.Errorf("archive sources changed before delete")
+		}
 		type itemToDelete struct {
 			realPath string
 			isDir    bool
 		}
 		var toDelete []itemToDelete
-		for _, full := range itemPaths {
-			realPath, isDir, err := idx.GetRealPath(full)
-			if err != nil {
-				continue
-			}
-			toDelete = append(toDelete, itemToDelete{realPath: realPath, isDir: isDir})
+		for _, target := range itemTargets {
+			toDelete = append(toDelete, itemToDelete{realPath: target.RealPath, isDir: target.Info.IsDir()})
 		}
 		for i := 0; i < len(toDelete); i++ {
 			for j := i + 1; j < len(toDelete); j++ {
@@ -764,8 +883,9 @@ func unarchiveHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	if d.share != nil {
 		return http.StatusForbidden, fmt.Errorf("unarchive not allowed for shares")
 	}
-	if !d.user.Permissions.Create {
-		return http.StatusForbidden, fmt.Errorf("user is not allowed to create resources")
+	currentUser, authErr := currentAuthenticatedReadUser(d.user, d.token)
+	if authErr != nil {
+		return http.StatusForbidden, authErr
 	}
 
 	var req unarchiveRequest
@@ -774,6 +894,9 @@ func unarchiveHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	}
 	if req.FromSource == "" || req.Path == "" || req.Destination == "" {
 		return http.StatusBadRequest, fmt.Errorf("fromSource, path, and destination are required")
+	}
+	if req.DeleteAfter && !currentUser.Permissions.Delete {
+		return http.StatusForbidden, fmt.Errorf("user is not allowed to delete the source archive")
 	}
 	if req.ToSource == "" {
 		req.ToSource = req.FromSource
@@ -790,56 +913,35 @@ func unarchiveHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	req.Path = pathClean
 	req.Destination = destClean
 
-	idxFrom := indexing.GetIndex(req.FromSource)
-	if idxFrom == nil {
+	if indexing.GetIndex(req.FromSource) == nil {
 		return http.StatusNotFound, fmt.Errorf("source %s not found", req.FromSource)
 	}
-	userScopeFrom, err := d.user.GetScopeForSourceName(req.FromSource)
+	archiveTarget, err := resolveAuthenticatedReadTarget(currentUser, req.FromSource, req.Path)
 	if err != nil {
-		return http.StatusForbidden, err
+		return errToStatus(err), fmt.Errorf("archive path is unavailable: %w", err)
 	}
+	if req.DeleteAfter && authenticatedReadPathContainsSymlink(archiveTarget.SourcePath, archiveTarget.LogicalPath) {
+		return http.StatusForbidden, fmt.Errorf("source archive path traverses a symlink: %w", commonerrors.ErrAccessDenied)
+	}
+	archiveReal := archiveTarget.RealPath
 
-	fullArchivePath := utils.JoinPathAsUnix(userScopeFrom, req.Path)
-	if store.Access != nil && !store.Access.Permitted(idxFrom.Path, fullArchivePath, d.user.Username) {
-		return http.StatusForbidden, fmt.Errorf("access denied to archive %s", req.Path)
-	}
-	archiveReal, _, err := idxFrom.GetRealPath(fullArchivePath)
-	if err != nil {
-		return http.StatusNotFound, fmt.Errorf("archive path not found: %v", err)
-	}
-
-	idxTo := indexing.GetIndex(req.ToSource)
-	if idxTo == nil {
+	if indexing.GetIndex(req.ToSource) == nil {
 		return http.StatusNotFound, fmt.Errorf("source %s not found", req.ToSource)
 	}
-	userScopeTo, err := d.user.GetScopeForSourceName(req.ToSource)
+	destinationTarget, err := resolveAuthenticatedReadTarget(currentUser, req.ToSource, req.Destination)
 	if err != nil {
-		return http.StatusForbidden, err
-	}
-	fullDestPath := utils.JoinPathAsUnix(userScopeTo, req.Destination)
-	if store.Access != nil && !store.Access.Permitted(idxTo.Path, fullDestPath, d.user.Username) {
-		return http.StatusForbidden, fmt.Errorf("access denied to destination %s", req.Destination)
-	}
-	destReal, _, err := idxTo.GetRealPath(fullDestPath)
-	if err != nil {
-		return http.StatusBadRequest, fmt.Errorf("destination path invalid: %v", err)
-	}
-	destInfo, err := os.Stat(destReal)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return http.StatusBadRequest, fmt.Errorf("destination directory does not exist: %s", req.Destination)
+		if errors.Is(err, commonerrors.ErrAccessDenied) {
+			return http.StatusForbidden, fmt.Errorf("destination path is unavailable: %w", err)
 		}
-		return http.StatusInternalServerError, fmt.Errorf("destination: %v", err)
+		return http.StatusBadRequest, fmt.Errorf("destination path is unavailable: %w", err)
 	}
-	if !destInfo.IsDir() {
+	if destinationTarget.Info == nil || !destinationTarget.Info.IsDir() {
 		return http.StatusBadRequest, fmt.Errorf("destination must be a directory: %s", req.Destination)
 	}
+	destReal := destinationTarget.RealPath
 
-	info, err := os.Stat(archiveReal)
-	if err != nil {
-		return http.StatusNotFound, fmt.Errorf("archive not found: %v", err)
-	}
-	if info.IsDir() {
+	info := archiveTarget.Info
+	if info == nil || info.IsDir() {
 		return http.StatusBadRequest, fmt.Errorf("path is not an archive file: %s", req.Path)
 	}
 
@@ -852,20 +954,86 @@ func unarchiveHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	}
 
 	lower := strings.ToLower(archiveReal)
-	var extractErr error
-	if strings.HasSuffix(lower, ".zip") {
-		extractErr = extractZip(archiveReal, destReal)
-	} else if strings.HasSuffix(lower, ".tar.gz") || (strings.HasSuffix(lower, ".tgz")) {
-		extractErr = extractTarGz(archiveReal, destReal)
-	} else {
+	isZip := strings.HasSuffix(lower, ".zip")
+	isTarGz := strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz")
+	if !isZip && !isTarGz {
 		return http.StatusBadRequest, fmt.Errorf("unsupported archive format (use .zip or .tar.gz)")
 	}
+	archiveSnapshot, _, cleanupArchiveSnapshot, snapshotErr := snapshotAuthenticatedReadTarget(archiveTarget)
+	if snapshotErr != nil {
+		return errToStatus(snapshotErr), fmt.Errorf("archive snapshot is unavailable: %w", snapshotErr)
+	}
+	defer cleanupArchiveSnapshot()
+	var (
+		extractionPlan *archiveExtractionPlan
+		preflightErr   error
+	)
+	if isZip {
+		extractionPlan, preflightErr = scanZipExtractionPlan(archiveSnapshot, destReal)
+	} else {
+		extractionPlan, preflightErr = scanTarGzExtractionPlan(archiveSnapshot, destReal)
+	}
+	if preflightErr != nil {
+		return archiveExtractionPreflightStatus(preflightErr), preflightErr
+	}
+	currentUser, authErr = currentAuthenticatedReadUser(d.user, d.token)
+	if authErr != nil {
+		return http.StatusForbidden, authErr
+	}
+	if req.DeleteAfter && !currentUser.Permissions.Delete {
+		return http.StatusForbidden, fmt.Errorf("user is not allowed to delete the source archive")
+	}
+	currentArchiveTarget, targetErr := resolveAuthenticatedReadTarget(currentUser, req.FromSource, req.Path)
+	if targetErr != nil {
+		return errToStatus(targetErr), fmt.Errorf("archive path is unavailable: %w", targetErr)
+	}
+	if !sameArchiveTargetSnapshot(archiveTarget, currentArchiveTarget) {
+		return http.StatusConflict, fmt.Errorf("source archive changed during preflight")
+	}
+	currentDestinationTarget, targetErr := resolveAuthenticatedReadTarget(currentUser, req.ToSource, req.Destination)
+	if targetErr != nil {
+		return errToStatus(targetErr), fmt.Errorf("destination path is unavailable: %w", targetErr)
+	}
+	if !sameAuthenticatedReadTarget(destinationTarget, currentDestinationTarget) {
+		return http.StatusConflict, fmt.Errorf("extraction destination changed during preflight")
+	}
+	archiveTarget = currentArchiveTarget
+	destinationTarget = currentDestinationTarget
+	archiveReal = archiveTarget.RealPath
+	destReal = destinationTarget.RealPath
+	if preflightErr = authorizeArchiveExtractionPlan(currentUser, destinationTarget, extractionPlan); preflightErr != nil {
+		return archiveExtractionPreflightStatus(preflightErr), preflightErr
+	}
+
+	var extractErr error
+	if isZip {
+		extractErr = extractZipWithPlan(archiveSnapshot, destReal, extractionPlan)
+	} else {
+		extractErr = extractTarGzWithPlan(archiveSnapshot, destReal, extractionPlan)
+	}
 	if extractErr != nil {
+		if errors.Is(extractErr, errArchiveExtractionConflict) {
+			return http.StatusConflict, extractErr
+		}
 		return http.StatusInternalServerError, extractErr
 	}
 
 	if req.DeleteAfter {
-		if err := os.Remove(archiveReal); err != nil {
+		currentUser, authErr = currentAuthenticatedReadUser(d.user, d.token)
+		if authErr != nil || !currentUser.Permissions.Delete {
+			return http.StatusForbidden, fmt.Errorf("user is not allowed to delete the source archive")
+		}
+		currentArchiveTarget, targetErr = resolveAuthenticatedReadTarget(currentUser, req.FromSource, req.Path)
+		if targetErr != nil {
+			return errToStatus(targetErr), fmt.Errorf("archive path is unavailable: %w", targetErr)
+		}
+		if !sameArchiveTargetSnapshot(archiveTarget, currentArchiveTarget) {
+			return http.StatusConflict, fmt.Errorf("source archive changed before delete")
+		}
+		if authenticatedReadPathContainsSymlink(currentArchiveTarget.SourcePath, currentArchiveTarget.LogicalPath) {
+			return http.StatusForbidden, fmt.Errorf("source archive path traverses a symlink: %w", commonerrors.ErrAccessDenied)
+		}
+		if err := os.Remove(currentArchiveTarget.RealPath); err != nil {
 			logger.Errorf("Failed to delete archive after extract: %v", err)
 		}
 	}
@@ -1231,6 +1399,10 @@ func createTarGzTracked(d *requestContext, source string, w io.Writer, tracker *
 
 // createTarGzWithLevel writes a tar.gz archive into w with the given gzip compression level (0=default, 1-9).
 func createTarGzWithLevel(d *requestContext, source string, w io.Writer, level int, filenames ...string) error {
+	return createTarGzWithLevelTracked(d, source, w, level, nil, filenames...)
+}
+
+func createTarGzWithLevelTracked(d *requestContext, source string, w io.Writer, level int, tracker *archiveMemberTracker, filenames ...string) error {
 	var gzWriter *gzip.Writer
 	if level >= 1 && level <= 9 {
 		var err error
@@ -1246,7 +1418,7 @@ func createTarGzWithLevel(d *requestContext, source string, w io.Writer, level i
 	defer tarWriter.Close()
 
 	for _, filepath := range filenames {
-		err := addFile(source, filepath, d, tarWriter, nil, false, nil)
+		err := addFile(source, filepath, d, tarWriter, nil, false, tracker)
 		if err != nil {
 			logger.Errorf("Failed to add %s to TAR.GZ: %v", filepath, err)
 			return err
@@ -1629,6 +1801,332 @@ type unarchiveRequest struct {
 	DeleteAfter bool `json:"deleteAfter"`
 }
 
+var errArchiveExtractionConflict = errors.New("archive extraction target conflict")
+
+const maxArchiveSymlinkTargetBytes = 4096
+
+type archiveExtractionEntryKind uint8
+
+const (
+	archiveExtractionDirectory archiveExtractionEntryKind = iota + 1
+	archiveExtractionRegularFile
+	archiveExtractionSymlink
+)
+
+type archiveExtractionPlanEntry struct {
+	relative      string
+	kind          archiveExtractionEntryKind
+	explicit      bool
+	symlinkTarget string
+	existingInfo  os.FileInfo
+}
+
+type archiveExtractionPlan struct {
+	entries map[string]*archiveExtractionPlanEntry
+}
+
+func requireArchiveDestinationPermission(permissions users.Permissions, target authenticatedReadTarget) error {
+	if target.Info == nil {
+		if !permissions.Create {
+			return fmt.Errorf("user is not allowed to create the destination archive: %w", commonerrors.ErrAccessDenied)
+		}
+		return nil
+	}
+	if !target.Info.Mode().IsRegular() {
+		return fmt.Errorf("destination archive path is not a regular file: %w", errArchiveExtractionConflict)
+	}
+	if !permissions.Modify {
+		return fmt.Errorf("user is not allowed to modify the destination archive: %w", commonerrors.ErrAccessDenied)
+	}
+	return nil
+}
+
+func archiveWritePreflightStatus(err error) int {
+	if errors.Is(err, commonerrors.ErrAccessDenied) {
+		return http.StatusForbidden
+	}
+	if errors.Is(err, errArchiveExtractionConflict) {
+		return http.StatusConflict
+	}
+	return errToStatus(err)
+}
+
+func archiveExtractionPreflightStatus(err error) int {
+	if errors.Is(err, commonerrors.ErrAccessDenied) {
+		return http.StatusForbidden
+	}
+	if errors.Is(err, errArchiveExtractionConflict) {
+		return http.StatusConflict
+	}
+	return http.StatusBadRequest
+}
+
+func archiveExtractionPlanKey(relative string) string {
+	return strings.ToLower(path.Clean(strings.ReplaceAll(relative, "\\", "/")))
+}
+
+func (plan *archiveExtractionPlan) add(relative string, kind archiveExtractionEntryKind) error {
+	parts := strings.Split(relative, "/")
+	for i := 1; i < len(parts); i++ {
+		if err := plan.addOne(strings.Join(parts[:i], "/"), archiveExtractionDirectory, false); err != nil {
+			return err
+		}
+	}
+	return plan.addOne(relative, kind, true)
+}
+
+func (plan *archiveExtractionPlan) addOne(relative string, kind archiveExtractionEntryKind, explicit bool) error {
+	if plan.entries == nil {
+		plan.entries = make(map[string]*archiveExtractionPlanEntry)
+	}
+	key := archiveExtractionPlanKey(relative)
+	if existing, ok := plan.entries[key]; ok {
+		if existing.relative != relative || existing.kind != kind || (explicit && existing.explicit) {
+			return fmt.Errorf("conflicting archive entries at %q: %w", relative, errArchiveExtractionConflict)
+		}
+		existing.explicit = existing.explicit || explicit
+		return nil
+	}
+	plan.entries[key] = &archiveExtractionPlanEntry{
+		relative: relative,
+		kind:     kind,
+		explicit: explicit,
+	}
+	return nil
+}
+
+func (plan *archiveExtractionPlan) sortedEntries() []*archiveExtractionPlanEntry {
+	entries := make([]*archiveExtractionPlanEntry, 0, len(plan.entries))
+	for _, entry := range plan.entries {
+		entries = append(entries, entry)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].relative < entries[j].relative
+	})
+	return entries
+}
+
+func readZipArchiveSymlinkTarget(entry *zip.File) (string, error) {
+	if entry.UncompressedSize64 > maxArchiveSymlinkTargetBytes {
+		return "", fmt.Errorf("symlink target for %q is too large: %w", entry.Name, errArchiveExtractionConflict)
+	}
+	entryReader, err := entry.Open()
+	if err != nil {
+		return "", err
+	}
+	target, readErr := io.ReadAll(io.LimitReader(entryReader, maxArchiveSymlinkTargetBytes+1))
+	closeErr := entryReader.Close()
+	if readErr != nil {
+		return "", readErr
+	}
+	if closeErr != nil {
+		return "", closeErr
+	}
+	if len(target) > maxArchiveSymlinkTargetBytes {
+		return "", fmt.Errorf("symlink target for %q is too large: %w", entry.Name, errArchiveExtractionConflict)
+	}
+	return strings.TrimSpace(string(target)), nil
+}
+
+func scanZipExtractionPlan(archivePath, destDir string) (*archiveExtractionPlan, error) {
+	reader, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	plan := &archiveExtractionPlan{entries: make(map[string]*archiveExtractionPlanEntry)}
+	for _, entry := range reader.File {
+		relative, normalizeErr := normalizeArchiveEntryName(entry.Name)
+		if normalizeErr != nil {
+			return nil, fmt.Errorf("invalid entry path %q: %w", entry.Name, normalizeErr)
+		}
+		destPath, pathErr := safeExtractPath(destDir, entry.Name)
+		if pathErr != nil {
+			return nil, pathErr
+		}
+
+		mode := entry.FileInfo().Mode()
+		trailingSeparator := strings.HasSuffix(entry.Name, "/") || strings.HasSuffix(entry.Name, "\\")
+		var kind archiveExtractionEntryKind
+		switch {
+		case mode.Type() == fs.ModeSymlink:
+			kind = archiveExtractionSymlink
+			target, targetErr := readZipArchiveSymlinkTarget(entry)
+			if targetErr != nil {
+				return nil, targetErr
+			}
+			if targetErr = symlinkTargetStaysUnderDest(destDir, destPath, target); targetErr != nil {
+				return nil, targetErr
+			}
+			if addErr := plan.add(relative, kind); addErr != nil {
+				return nil, addErr
+			}
+			plan.entries[archiveExtractionPlanKey(relative)].symlinkTarget = target
+			continue
+		case mode.Type() == fs.ModeDir:
+			kind = archiveExtractionDirectory
+		case mode.IsRegular() && trailingSeparator:
+			kind = archiveExtractionDirectory
+		case mode.IsRegular():
+			kind = archiveExtractionRegularFile
+		default:
+			return nil, fmt.Errorf("unsupported ZIP entry type for %q (%s): %w", entry.Name, mode.Type(), errArchiveExtractionConflict)
+		}
+		if addErr := plan.add(relative, kind); addErr != nil {
+			return nil, addErr
+		}
+	}
+	if err := validateArchiveSymlinkPlan(destDir, plan); err != nil {
+		return nil, err
+	}
+	return plan, nil
+}
+
+func scanTarGzExtractionPlan(archivePath, destDir string) (*archiveExtractionPlan, error) {
+	file, err := os.Open(archivePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	gzipReader, err := gzip.NewReader(file)
+	if err != nil {
+		return nil, err
+	}
+	defer gzipReader.Close()
+
+	plan := &archiveExtractionPlan{entries: make(map[string]*archiveExtractionPlanEntry)}
+	tarReader := tar.NewReader(gzipReader)
+	for {
+		header, nextErr := tarReader.Next()
+		if nextErr == io.EOF {
+			break
+		}
+		if nextErr != nil {
+			return nil, nextErr
+		}
+		relative, normalizeErr := normalizeArchiveEntryName(header.Name)
+		if normalizeErr != nil {
+			return nil, fmt.Errorf("invalid entry path %q: %w", header.Name, normalizeErr)
+		}
+		destPath, pathErr := safeExtractPath(destDir, header.Name)
+		if pathErr != nil {
+			return nil, pathErr
+		}
+
+		var kind archiveExtractionEntryKind
+		switch header.Typeflag {
+		case tar.TypeDir:
+			kind = archiveExtractionDirectory
+		case tar.TypeReg, tar.TypeRegA:
+			kind = archiveExtractionRegularFile
+		case tar.TypeSymlink:
+			kind = archiveExtractionSymlink
+			if targetErr := symlinkTargetStaysUnderDest(destDir, destPath, strings.TrimSpace(header.Linkname)); targetErr != nil {
+				return nil, targetErr
+			}
+			if addErr := plan.add(relative, kind); addErr != nil {
+				return nil, addErr
+			}
+			plan.entries[archiveExtractionPlanKey(relative)].symlinkTarget = strings.TrimSpace(header.Linkname)
+			continue
+		default:
+			return nil, fmt.Errorf("unsupported TAR entry type for %q (%#x): %w", header.Name, header.Typeflag, errArchiveExtractionConflict)
+		}
+		if addErr := plan.add(relative, kind); addErr != nil {
+			return nil, addErr
+		}
+	}
+	if err := validateArchiveSymlinkPlan(destDir, plan); err != nil {
+		return nil, err
+	}
+	return plan, nil
+}
+
+func validateArchiveSymlinkPlan(destDir string, plan *archiveExtractionPlan) error {
+	for _, entry := range plan.entries {
+		if entry.kind != archiveExtractionSymlink {
+			continue
+		}
+		destPath, err := safeExtractPath(destDir, entry.relative)
+		if err != nil {
+			return err
+		}
+		targetRelative, err := resolveArchiveSymlinkTargetRelative(destDir, destPath, entry.symlinkTarget)
+		if err != nil {
+			return err
+		}
+		parts := strings.Split(targetRelative, "/")
+		for i := 1; i <= len(parts); i++ {
+			planned, ok := plan.entries[archiveExtractionPlanKey(strings.Join(parts[:i], "/"))]
+			if !ok {
+				continue
+			}
+			if planned.kind == archiveExtractionSymlink || (i < len(parts) && planned.kind != archiveExtractionDirectory) {
+				return fmt.Errorf("symlink %q targets an unsafe planned path: %w", entry.relative, errArchiveExtractionConflict)
+			}
+		}
+	}
+	return nil
+}
+
+func authorizeArchiveExtractionPlan(user *users.User, destination authenticatedReadTarget, plan *archiveExtractionPlan) error {
+	if user == nil || destination.Index == nil || destination.Info == nil || !destination.Info.IsDir() || store.Access == nil {
+		return commonerrors.ErrAccessDenied
+	}
+	for _, entry := range plan.sortedEntries() {
+		logicalPath := normalizePublicShareIndexPath(path.Join(destination.LogicalPath, entry.relative))
+		canonicalPath := normalizePublicShareIndexPath(path.Join(destination.CanonicalPath, entry.relative))
+		if !publicSharePathWithin(destination.UserScope, logicalPath) ||
+			!publicSharePathWithin(destination.UserScope, canonicalPath) ||
+			!store.Access.PermittedFresh(destination.Index.Path, logicalPath, user.Username) ||
+			!store.Access.PermittedFresh(destination.Index.Path, canonicalPath, user.Username) {
+			return fmt.Errorf("access denied to extraction path %q: %w", entry.relative, commonerrors.ErrAccessDenied)
+		}
+
+		realPath, err := safeExtractPath(destination.RealPath, entry.relative)
+		if err != nil {
+			return err
+		}
+		info, statErr := os.Lstat(realPath)
+		if os.IsNotExist(statErr) {
+			entry.existingInfo = nil
+			if !user.Permissions.Create {
+				return fmt.Errorf("user is not allowed to create extraction path %q: %w", entry.relative, commonerrors.ErrAccessDenied)
+			}
+			continue
+		}
+		if statErr != nil {
+			return statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 || (!info.Mode().IsRegular() && !info.IsDir()) {
+			return fmt.Errorf("existing extraction path %q has an unsafe type: %w", entry.relative, errArchiveExtractionConflict)
+		}
+		entry.existingInfo = info
+
+		switch entry.kind {
+		case archiveExtractionDirectory:
+			if !info.IsDir() {
+				return fmt.Errorf("existing extraction path %q is not a directory: %w", entry.relative, errArchiveExtractionConflict)
+			}
+			if entry.explicit && !user.Permissions.Modify {
+				return fmt.Errorf("user is not allowed to modify extraction directory %q: %w", entry.relative, commonerrors.ErrAccessDenied)
+			}
+		case archiveExtractionRegularFile:
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("existing extraction path %q is not a regular file: %w", entry.relative, errArchiveExtractionConflict)
+			}
+			if !user.Permissions.Modify {
+				return fmt.Errorf("user is not allowed to modify extraction file %q: %w", entry.relative, commonerrors.ErrAccessDenied)
+			}
+		case archiveExtractionSymlink:
+			return fmt.Errorf("existing extraction path %q cannot be replaced by a symlink: %w", entry.relative, errArchiveExtractionConflict)
+		}
+	}
+	return nil
+}
+
 // normalizeArchiveEntryName turns a raw zip/tar name into a safe relative path (slash-separated).
 // Many Windows zips use backslashes; some start with a leading backslash, which would make
 // filepath.Join drop destDir and write under the drive root. Backslashes are not path separators
@@ -1727,32 +2225,117 @@ func applyArchivedTimesAndPerm(path string, mode fs.FileMode, modTime time.Time)
 	}
 }
 
-// symlinkTargetStaysUnderDest rejects absolute targets and paths that would resolve outside destRoot.
-func symlinkTargetStaysUnderDest(destRoot, destPath, linkname string) error {
-	if linkname == "" {
-		return fmt.Errorf("empty symlink target")
+func archiveRelativePathUnderRoot(root, target string) (string, error) {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
 	}
-	if filepath.IsAbs(linkname) {
-		return fmt.Errorf("symlink has absolute target")
+	targetAbs, err := filepath.Abs(target)
+	if err != nil {
+		return "", err
 	}
-	destAbs, err := filepath.Abs(destRoot)
+	relative, err := filepath.Rel(rootAbs, targetAbs)
+	if err != nil || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path escapes extraction destination: %w", errArchiveExtractionConflict)
+	}
+	return relative, nil
+}
+
+func ensureArchivePathHasNoSymlink(root, target string, includeLeaf bool) error {
+	relative, err := archiveRelativePathUnderRoot(root, target)
 	if err != nil {
 		return err
 	}
-	resolved := filepath.Clean(filepath.Join(filepath.Dir(destPath), linkname))
-	resAbs, err := filepath.Abs(resolved)
+	rootAbs, err := filepath.Abs(root)
 	if err != nil {
 		return err
 	}
-	sep := string(filepath.Separator)
-	if resAbs != destAbs && !strings.HasPrefix(resAbs, destAbs+sep) {
-		return fmt.Errorf("symlink target escapes destination directory")
+	rootInfo, err := os.Lstat(rootAbs)
+	if err != nil {
+		return err
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return fmt.Errorf("extraction destination root has an unsafe type: %w", errArchiveExtractionConflict)
+	}
+	if relative == "." {
+		return nil
+	}
+	parts := strings.Split(filepath.Clean(relative), string(filepath.Separator))
+	limit := len(parts)
+	if !includeLeaf {
+		limit--
+	}
+	current := rootAbs
+	for i := 0; i < limit; i++ {
+		current = filepath.Join(current, parts[i])
+		info, statErr := os.Lstat(current)
+		if os.IsNotExist(statErr) {
+			return nil
+		}
+		if statErr != nil {
+			return statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("path %q traverses a symlink: %w", current, errArchiveExtractionConflict)
+		}
+		if i < len(parts)-1 && !info.IsDir() {
+			return fmt.Errorf("path ancestor %q is not a directory: %w", current, errArchiveExtractionConflict)
+		}
 	}
 	return nil
 }
 
+func resolveArchiveSymlinkTargetRelative(destRoot, destPath, linkname string) (string, error) {
+	linkname = strings.TrimSpace(linkname)
+	if linkname == "" {
+		return "", fmt.Errorf("empty symlink target: %w", errArchiveExtractionConflict)
+	}
+	if len(linkname) > maxArchiveSymlinkTargetBytes {
+		return "", fmt.Errorf("symlink target is too large: %w", errArchiveExtractionConflict)
+	}
+	if strings.IndexByte(linkname, 0) >= 0 {
+		return "", fmt.Errorf("symlink target contains a NUL byte: %w", errArchiveExtractionConflict)
+	}
+	portableTarget := strings.ReplaceAll(linkname, "\\", "/")
+	if strings.HasPrefix(portableTarget, "/") ||
+		(len(portableTarget) >= 2 && portableTarget[1] == ':' &&
+			(('A' <= portableTarget[0] && portableTarget[0] <= 'Z') || ('a' <= portableTarget[0] && portableTarget[0] <= 'z'))) {
+		return "", fmt.Errorf("symlink has an absolute target: %w", errArchiveExtractionConflict)
+	}
+	destRelative, err := archiveRelativePathUnderRoot(destRoot, destPath)
+	if err != nil {
+		return "", err
+	}
+	resolvedRelative := path.Clean(path.Join(path.Dir(filepath.ToSlash(destRelative)), portableTarget))
+	if resolvedRelative == ".." || strings.HasPrefix(resolvedRelative, "../") {
+		return "", fmt.Errorf("symlink target escapes destination directory: %w", errArchiveExtractionConflict)
+	}
+	return resolvedRelative, nil
+}
+
+// symlinkTargetStaysUnderDest rejects targets that escape lexically or through an existing symlink.
+func symlinkTargetStaysUnderDest(destRoot, destPath, linkname string) error {
+	resolvedRelative, err := resolveArchiveSymlinkTargetRelative(destRoot, destPath, linkname)
+	if err != nil {
+		return err
+	}
+	resolvedPath := filepath.Join(destRoot, filepath.FromSlash(resolvedRelative))
+	return ensureArchivePathHasNoSymlink(destRoot, resolvedPath, true)
+}
+
 // extractArchivedDir creates a directory from an archive entry and reapplies mode and mtime.
-func extractArchivedDir(destPath string, mode fs.FileMode, modTime time.Time) error {
+func extractArchivedDir(destRoot, destPath string, mode fs.FileMode, modTime time.Time) error {
+	if err := ensureArchivePathHasNoSymlink(destRoot, destPath, false); err != nil {
+		return err
+	}
+	if info, err := os.Lstat(destPath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("directory target %q changed type: %w", destPath, errArchiveExtractionConflict)
+		}
+		return applyArchivedTimesAndPerm(destPath, mode, modTime)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	perm := mode.Perm()
 	if perm == 0 {
 		perm = fileutils.EffectiveDirPerm()
@@ -1760,38 +2343,119 @@ func extractArchivedDir(destPath string, mode fs.FileMode, modTime time.Time) er
 	if err := os.MkdirAll(destPath, perm); err != nil {
 		return fmt.Errorf("mkdir %q: %w", destPath, err)
 	}
+	if info, err := os.Lstat(destPath); err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("directory target %q changed type: %w", destPath, errArchiveExtractionConflict)
+	}
 	return applyArchivedTimesAndPerm(destPath, mode, modTime)
 }
 
-// extractArchivedRegularFile writes one regular file from src (closed by this function) and reapplies mode and mtime.
-func extractArchivedRegularFile(destPath string, mode fs.FileMode, modTime time.Time, src io.ReadCloser) error {
+// extractArchivedRegularFile stages one regular file beside its target before replacing it.
+func extractArchivedRegularFile(destRoot, destPath string, mode fs.FileMode, modTime time.Time, expectedInfo os.FileInfo, enforceExpected bool, src io.ReadCloser) (returnErr error) {
 	defer func() { _ = src.Close() }()
+	if err := ensureArchivePathHasNoSymlink(destRoot, destPath, false); err != nil {
+		return err
+	}
 	parent := filepath.Dir(destPath)
 	if err := os.MkdirAll(parent, fileutils.EffectiveDirPerm()); err != nil {
 		return fmt.Errorf("mkdir %q: %w", parent, err)
+	}
+	if err := ensureArchivePathHasNoSymlink(destRoot, destPath, false); err != nil {
+		return err
+	}
+	var originalInfo os.FileInfo
+	if info, err := os.Lstat(destPath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("file target %q changed type: %w", destPath, errArchiveExtractionConflict)
+		}
+		originalInfo = info
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if enforceExpected {
+		if expectedInfo == nil && originalInfo != nil {
+			return fmt.Errorf("new file target %q appeared after authorization: %w", destPath, errArchiveExtractionConflict)
+		}
+		if expectedInfo != nil && (originalInfo == nil || !os.SameFile(expectedInfo, originalInfo) ||
+			expectedInfo.Size() != originalInfo.Size() || expectedInfo.Mode() != originalInfo.Mode() ||
+			!expectedInfo.ModTime().Equal(originalInfo.ModTime())) {
+			return fmt.Errorf("existing file target %q changed after authorization: %w", destPath, errArchiveExtractionConflict)
+		}
 	}
 	perm := mode.Perm()
 	if perm == 0 {
 		perm = fileutils.EffectiveFilePerm()
 	}
-	out, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	out, err := os.CreateTemp(parent, ".filebrowser-extract-*")
 	if err != nil {
 		return err
 	}
+	tempPath := out.Name()
+	committed := false
+	defer func() {
+		if out != nil {
+			if closeErr := out.Close(); closeErr != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("close extraction temporary file: %w", closeErr))
+			}
+		}
+		if !committed {
+			if removeErr := os.Remove(tempPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				returnErr = errors.Join(returnErr, fmt.Errorf("remove extraction temporary file: %w", removeErr))
+			}
+		}
+	}()
+
 	_, copyErr := io.Copy(out, src)
-	cerr := out.Close()
 	if copyErr != nil {
 		return copyErr
 	}
-	if cerr != nil {
-		return cerr
+	if err := applyArchivedTimesAndPerm(tempPath, perm, modTime); err != nil {
+		return err
 	}
-	return applyArchivedTimesAndPerm(destPath, mode, modTime)
+	if err := out.Sync(); err != nil {
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	out = nil
+
+	if err := ensureArchivePathHasNoSymlink(destRoot, destPath, false); err != nil {
+		return err
+	}
+	currentInfo, statErr := os.Lstat(destPath)
+	if originalInfo == nil {
+		if statErr == nil {
+			return fmt.Errorf("new file target %q appeared during extraction: %w", destPath, errArchiveExtractionConflict)
+		}
+		if !os.IsNotExist(statErr) {
+			return statErr
+		}
+	} else {
+		if statErr != nil {
+			return fmt.Errorf("existing file target %q changed during extraction: %w", destPath, errArchiveExtractionConflict)
+		}
+		if currentInfo.Mode()&os.ModeSymlink != 0 || !currentInfo.Mode().IsRegular() ||
+			!os.SameFile(originalInfo, currentInfo) || originalInfo.Size() != currentInfo.Size() ||
+			!originalInfo.ModTime().Equal(currentInfo.ModTime()) {
+			return fmt.Errorf("existing file target %q changed during extraction: %w", destPath, errArchiveExtractionConflict)
+		}
+	}
+	if err := os.Rename(tempPath, destPath); err != nil {
+		return fmt.Errorf("replace extracted file %q: %w", destPath, err)
+	}
+	committed = true
+	return nil
 }
 
 // extractArchivedSymlink creates a symlink after validating the target stays under destRoot.
 func extractArchivedSymlink(destRoot, destPath, target string, modTime time.Time) error {
 	target = strings.TrimSpace(target)
+	if err := ensureArchivePathHasNoSymlink(destRoot, destPath, false); err != nil {
+		return err
+	}
 	symParent := filepath.Dir(destPath)
 	if err := os.MkdirAll(symParent, fileutils.EffectiveDirPerm()); err != nil {
 		return fmt.Errorf("mkdir %q: %w", symParent, err)
@@ -1799,7 +2463,12 @@ func extractArchivedSymlink(destRoot, destPath, target string, modTime time.Time
 	if err := symlinkTargetStaysUnderDest(destRoot, destPath, target); err != nil {
 		return err
 	}
-	if err := os.Remove(destPath); err != nil && !os.IsNotExist(err) {
+	if err := ensureArchivePathHasNoSymlink(destRoot, destPath, false); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(destPath); err == nil {
+		return fmt.Errorf("symlink target %q already exists: %w", destPath, errArchiveExtractionConflict)
+	} else if !os.IsNotExist(err) {
 		return err
 	}
 	if err := os.Symlink(target, destPath); err != nil {
@@ -1808,7 +2477,22 @@ func extractArchivedSymlink(destRoot, destPath, target string, modTime time.Time
 	return applyArchivedTimesAndPerm(destPath, fs.ModeSymlink, modTime)
 }
 
+func requireArchiveExtractionPlanEntry(plan *archiveExtractionPlan, relative string, kind archiveExtractionEntryKind) (*archiveExtractionPlanEntry, error) {
+	if plan == nil {
+		return nil, nil
+	}
+	entry, ok := plan.entries[archiveExtractionPlanKey(relative)]
+	if !ok || entry.relative != relative || entry.kind != kind {
+		return nil, fmt.Errorf("archive entry %q changed after preflight: %w", relative, errArchiveExtractionConflict)
+	}
+	return entry, nil
+}
+
 func extractZip(archivePath, destDir string) error {
+	return extractZipWithPlan(archivePath, destDir, nil)
+}
+
+func extractZipWithPlan(archivePath, destDir string, plan *archiveExtractionPlan) error {
 	r, err := zip.OpenReader(archivePath)
 	if err != nil {
 		return err
@@ -1856,33 +2540,35 @@ func extractZip(archivePath, destDir string) error {
 
 		fi := f.FileInfo()
 		mode := fi.Mode()
-		isDirEntry := mode.Type() == fs.ModeDir || strings.HasSuffix(f.Name, "/") || strings.HasSuffix(f.Name, "\\")
-		if isDirEntry {
-			if err = extractArchivedDir(destPath, mode, f.Modified); err != nil {
-				return err
-			}
-			continue
-		}
-
+		trailingSeparator := strings.HasSuffix(f.Name, "/") || strings.HasSuffix(f.Name, "\\")
 		if mode.Type() == fs.ModeSymlink {
-			var rc io.ReadCloser
-			rc, err = f.Open()
-			if err != nil {
+			if _, err = requireArchiveExtractionPlanEntry(plan, o.rel, archiveExtractionSymlink); err != nil {
 				return err
 			}
-			buf, rerr := io.ReadAll(rc)
-			rc.Close()
-			if rerr != nil {
-				return rerr
+			target, targetErr := readZipArchiveSymlinkTarget(f)
+			if targetErr != nil {
+				return targetErr
 			}
-			if err = extractArchivedSymlink(destDir, destPath, string(buf), f.Modified); err != nil {
+			if err = extractArchivedSymlink(destDir, destPath, target, f.Modified); err != nil {
 				return err
 			}
 			continue
 		}
-
-		if !mode.IsRegular() {
+		if mode.Type() == fs.ModeDir || (mode.IsRegular() && trailingSeparator) {
+			if _, err = requireArchiveExtractionPlanEntry(plan, o.rel, archiveExtractionDirectory); err != nil {
+				return err
+			}
+			if err = extractArchivedDir(destDir, destPath, mode, f.Modified); err != nil {
+				return err
+			}
 			continue
+		}
+		if !mode.IsRegular() {
+			return fmt.Errorf("unsupported ZIP entry type for %q (%s): %w", f.Name, mode.Type(), errArchiveExtractionConflict)
+		}
+		plannedEntry, planErr := requireArchiveExtractionPlanEntry(plan, o.rel, archiveExtractionRegularFile)
+		if planErr != nil {
+			return planErr
 		}
 
 		var rc io.ReadCloser
@@ -1890,7 +2576,11 @@ func extractZip(archivePath, destDir string) error {
 		if err != nil {
 			return err
 		}
-		if err = extractArchivedRegularFile(destPath, mode, f.Modified, rc); err != nil {
+		var expectedInfo os.FileInfo
+		if plannedEntry != nil {
+			expectedInfo = plannedEntry.existingInfo
+		}
+		if err = extractArchivedRegularFile(destDir, destPath, mode, f.Modified, expectedInfo, plannedEntry != nil, rc); err != nil {
 			return err
 		}
 	}
@@ -1898,6 +2588,10 @@ func extractZip(archivePath, destDir string) error {
 }
 
 func extractTarGz(archivePath, destDir string) error {
+	return extractTarGzWithPlan(archivePath, destDir, nil)
+}
+
+func extractTarGzWithPlan(archivePath, destDir string, plan *archiveExtractionPlan) error {
 	f, err := os.Open(archivePath)
 	if err != nil {
 		return err
@@ -1919,6 +2613,10 @@ func extractTarGz(archivePath, destDir string) error {
 		if err != nil {
 			return err
 		}
+		relative, normalizeErr := normalizeArchiveEntryName(h.Name)
+		if normalizeErr != nil {
+			return normalizeErr
+		}
 		var destPath string
 		destPath, err = safeExtractPath(destDir, h.Name)
 		if err != nil {
@@ -1927,25 +2625,35 @@ func extractTarGz(archivePath, destDir string) error {
 
 		switch h.Typeflag {
 		case tar.TypeDir:
-			mode := h.FileInfo().Mode()
-			if err = extractArchivedDir(destPath, mode, h.ModTime); err != nil {
+			if _, err = requireArchiveExtractionPlanEntry(plan, relative, archiveExtractionDirectory); err != nil {
 				return err
 			}
-		case tar.TypeReg:
 			mode := h.FileInfo().Mode()
-			if err = extractArchivedRegularFile(destPath, mode, h.ModTime, io.NopCloser(tr)); err != nil {
+			if err = extractArchivedDir(destDir, destPath, mode, h.ModTime); err != nil {
+				return err
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			plannedEntry, planErr := requireArchiveExtractionPlanEntry(plan, relative, archiveExtractionRegularFile)
+			if planErr != nil {
+				return planErr
+			}
+			mode := h.FileInfo().Mode()
+			var expectedInfo os.FileInfo
+			if plannedEntry != nil {
+				expectedInfo = plannedEntry.existingInfo
+			}
+			if err = extractArchivedRegularFile(destDir, destPath, mode, h.ModTime, expectedInfo, plannedEntry != nil, io.NopCloser(tr)); err != nil {
 				return err
 			}
 		case tar.TypeSymlink:
+			if _, err = requireArchiveExtractionPlanEntry(plan, relative, archiveExtractionSymlink); err != nil {
+				return err
+			}
 			if err = extractArchivedSymlink(destDir, destPath, h.Linkname, h.ModTime); err != nil {
 				return err
 			}
 		default:
-			if h.Size > 0 {
-				if _, err = io.CopyN(io.Discard, tr, h.Size); err != nil {
-					return err
-				}
-			}
+			return fmt.Errorf("unsupported TAR entry type for %q (%#x): %w", h.Name, h.Typeflag, errArchiveExtractionConflict)
 		}
 	}
 	return nil
