@@ -1,32 +1,19 @@
 <template>
   <div class="card-content api-content">
-    <!-- API Token Section -->
-    <div class="api-section">
-      <button
-        type="button"
-        class="action api-key-button"
-        @click.stop="copyToClipboard(name)"
-        :aria-label="$t('buttons.copyToClipboard')"
-        :title="$t('buttons.copyToClipboard')"
-      >
-        <span class="api-key-name">{{ name }}</span>
-        <i class="material-symbols">content_paste</i>
-      </button>
-      <button
-        type="button"
-        class="action api-key-value-button"
-        @click.stop="copyToClipboard(info.token)"
-        :aria-label="$t('api.clickToCopyKey')"
-        :title="$t('api.clickToCopyKey')"
-      >
-        <span class="api-key-value">{{ $t('api.clickToCopyKey') }}</span>
-        <i class="material-symbols">content_paste</i>
-      </button>
-    </div>
-
-    <!-- Information Section -->
     <div class="api-section">
       <h3 class="section-title">{{ $t('general.info') }}</h3>
+      <div class="info-item">
+        <span class="info-label">{{ $t('general.name') }}</span>
+        <span class="info-value">{{ name }}</span>
+      </div>
+      <div class="info-item">
+        <span class="info-label">{{ $t('general.type') }}</span>
+        <span class="info-value">{{ info.type }}</span>
+      </div>
+      <div class="info-item">
+        <span class="info-label">TokenPrefix</span> <!-- eslint-disable-line @intlify/vue-i18n/no-raw-text -->
+        <code class="info-value">{{ info.tokenPrefix || '-' }}</code> <!-- eslint-disable-line @intlify/vue-i18n/no-raw-text -->
+      </div>
       <div class="info-item">
         <span class="info-label">{{ $t('api.createdAt') }}</span>
         <span class="info-value">{{ formatTime(info.issuedAt) }}</span>
@@ -37,25 +24,9 @@
       </div>
     </div>
 
-    <!-- Token Type or Permissions Section -->
-    <div class="api-section" v-if="isMinimalToken">
-      <p class="minimal-info">{{ $t('api.minimalInfo') }}</p>
-    </div>
-
-    <div class="api-section" v-else>
+    <div class="api-section">
       <h3 class="section-title">{{ $t('api.permissions') }}</h3>
-      <div class="permissions-grid">
-        <div
-          v-for="(isEnabled, permission) in info.Permissions"
-          :key="permission"
-          class="permission-item"
-        >
-          <span class="permission-name">{{ permission }}</span>
-          <span class="permission-status" :class="{ enabled: isEnabled, disabled: !isEnabled }">
-            {{ isEnabled ? '✓' : '✗' }} <!-- eslint-disable-line @intlify/vue-i18n/no-raw-text -->
-          </span>
-        </div>
-      </div>
+      <p class="capabilities">{{ capabilityNames }}</p>
     </div>
   </div>
 
@@ -64,6 +35,7 @@
       type="button"
       class="button button--flat button--red"
       @click="deleteApi"
+      :disabled="deleting"
       :title="$t('general.delete')"
     >
       {{ $t('general.delete') }}
@@ -76,10 +48,14 @@ import { mutations } from "@/store";
 import { notify } from "@/notify";
 import { authApi } from "@/api";
 import { eventBus } from "@/store/eventBus";
-import { copyToClipboard } from "@/utils/clipboard";
 
 export default {
   name: "ActionApi",
+  data() {
+    return {
+      deleting: false,
+    };
+  },
   props: {
     name: {
       type: String,
@@ -91,15 +67,14 @@ export default {
     },
   },
   computed: {
-    isMinimalToken() {
-      // A minimal token has no Permissions object or all permissions are false
-      return !this.info.Permissions || Object.values(this.info.Permissions).every(v => !v);
+    capabilityNames() {
+      const names = Object.entries(this.info.Permissions || {})
+        .filter(([, enabled]) => enabled)
+        .map(([name]) => name);
+      return names.join(", ") || "-";
     },
   },
   methods: {
-    async copyToClipboard(text) {
-      await copyToClipboard(text);
-    },
     formatTime(timestamp) {
       return new Date(timestamp * 1000).toLocaleDateString("en-US", {
         year: "numeric",
@@ -108,17 +83,19 @@ export default {
       });
     },
     async deleteApi() {
-      // Dummy delete function, to be filled in later
+      if (this.deleting) {
+        return;
+      }
+      this.deleting = true;
       try {
-        authApi.deleteApiKey({ name: this.name });
-        // Emit event to refresh API tokens list
-        setTimeout(() => {
-          eventBus.emit('apiKeysChanged');
-        }, 10);
+        await authApi.deleteApiKey({ name: this.name });
+        eventBus.emit('apiKeysChanged');
         mutations.closeTopPrompt();
         notify.showSuccessToast(this.$t("api.apiKeyDeleted"));
-      } catch (error) {
-        console.error(error);
+      } catch (_error) {
+        // The API layer reports the error; keep this prompt open for retry.
+      } finally {
+        this.deleting = false;
       }
     },
   },
@@ -146,56 +123,6 @@ export default {
   border-bottom: 1px solid var(--divider);
 }
 
-.api-key-title {
-  margin-top: 1.5em;
-}
-
-.api-key-button,
-.api-key-value-button {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  width: 100%;
-  padding: 0.75em 1em;
-  margin-top: 0.5em;
-  background-color: var(--surfaceSecondary);
-  border: 1px solid var(--divider);
-  border-radius: 4px;
-  transition: background-color 0.2s;
-  cursor: pointer;
-}
-
-.api-key-button:hover,
-.api-key-value-button:hover {
-  background-color: var(--surfaceTertiary);
-}
-
-.api-key-name {
-  font-family: monospace;
-  font-size: 0.9em;
-  font-weight: 500;
-  color: var(--textPrimary);
-  word-break: break-all;
-  flex: 1;
-  margin-right: 0.5em;
-}
-
-.api-key-value {
-  font-size: 0.9em;
-  font-weight: 500;
-  color: var(--textSecondary);
-  flex: 1;
-  margin-right: 0.5em;
-  font-style: italic;
-}
-
-.api-key-button .material-symbols,
-.api-key-value-button .material-symbols {
-  font-size: 1.2em;
-  color: var(--textSecondary);
-  flex-shrink: 0;
-}
-
 .info-item {
   display: flex;
   align-items: center;
@@ -221,66 +148,14 @@ export default {
   text-align: right;
 }
 
-.minimal-info {
-  font-style: italic;
-  color: var(--textSecondary);
-  margin-top: 0.75em;
-  padding: 0.75em;
-  background-color: var(--surfaceSecondary);
-  border-radius: 4px;
-  line-height: 1.5;
-  font-size: 0.9em;
-}
-
-.permissions-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-  gap: 0.5em;
-  margin-top: 0.5em;
-}
-
-.permission-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0.75em;
-  background-color: var(--surfaceSecondary);
-  border: 1px solid var(--divider);
-  border-radius: 4px;
-  transition: background-color 0.2s;
-}
-
-.permission-item:hover {
-  background-color: var(--surfaceTertiary);
-}
-
-.permission-name {
-  font-size: 0.9em;
+.capabilities {
+  margin: 0;
   color: var(--textPrimary);
-  flex: 1;
-}
-
-.permission-status {
-  font-size: 1.1em;
-  font-weight: 600;
-  min-width: 1.5em;
-  text-align: center;
-}
-
-.permission-status.enabled {
-  color: #4caf50;
-}
-
-.permission-status.disabled {
-  color: #f44336;
+  overflow-wrap: anywhere;
 }
 
 /* Responsive adjustments */
 @media (max-width: 768px) {
-  .permissions-grid {
-    grid-template-columns: 1fr;
-  }
-
   .info-item {
     flex-direction: column;
     align-items: flex-start;

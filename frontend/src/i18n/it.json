@@ -614,17 +614,14 @@
     "permissionNote": "Scegli almeno un permesso. L'utente deve possedere tale permesso.",
     "createKeyFailed": "Creazione token API fallita.",
     "createKeySuccess": "Token API creato con successo.",
+    "oneTimeTokenWarning": "Copia subito questo token. Viene mostrato una sola volta e non potrà più essere visualizzato dopo la chiusura di questa finestra.",
     "apiKeyDeleted": "Token API eliminato!",
     "description": "I token API si basano sull'utente che li crea.",
     "swaggerLinkText": "pagina swagger",
     "created": "Creato",
     "actions": "Azioni",
-    "enabled": "Abilitato",
-    "disabled": "Disabilitato",
-    "clickToCopyKey": "Clicca per copiare il token (nascosto)",
     "customizeToken": "Personalizza Token",
-    "customizeTokenInfo": "Personalizza permessi e attributi. Potrebbe generare token lunghi non supportati da alcuni client WebDAV.",
-    "minimalInfo": "Esclude personalizzazioni, i permessi coincideranno con l'utente associato."
+    "customizeTokenInfo": "Personalizza permessi e attributi. Potrebbe generare token lunghi non supportati da alcuni client WebDAV."
   },
   "index": {
     "unknown": "Sconosciuto",

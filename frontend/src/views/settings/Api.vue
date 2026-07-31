@@ -28,20 +28,10 @@
     >
         <template #cell-issuedAt="{ row }">{{ formatTime(row.issuedAt) }}</template>
         <template #cell-expiresAt="{ row }">{{ formatTime(row.expiresAt) }}</template>
-        <template #cell-permissions="{ row }">
-          <template v-if="!row.minimal">
-            <span
-              v-for="(value, permission) in row.Permissions"
-              :key="permission"
-              :title="`${permission}: ${value ? $t('api.enabled') : $t('api.disabled')}`"
-              class="clickable"
-              @click.prevent="infoPrompt(row.name, row)"
-            >
-              {{ showResult(value) }}
-            </span>
-          </template>
-          <span v-else>-</span> <!-- eslint-disable-line @intlify/vue-i18n/no-raw-text -->
+        <template #cell-tokenPrefix="{ row }">
+          <code>{{ row.tokenPrefix || '-' }}</code> <!-- eslint-disable-line @intlify/vue-i18n/no-raw-text -->
         </template>
+        <template #cell-capabilities="{ row }">{{ capabilityNames(row) }}</template>
         <template #cell-actions="{ row }">
           <div class="api-table-actions">
             <button
@@ -53,15 +43,6 @@
             >
               <i class="material-symbols">info</i>
             </button>
-            <button
-              type="button"
-              class="action"
-              @click.stop="copyToClipboard(row.token)"
-              :aria-label="$t('buttons.copyToClipboard')"
-              :title="$t('buttons.copyToClipboard')"
-            >
-              <i class="material-symbols">content_paste</i>
-            </button>
           </div>
         </template>
     </settings-table>
@@ -72,7 +53,6 @@
 <script>
 import { authApi } from "@/api";
 import { state, mutations } from "@/store";
-import { copyToClipboard } from "@/utils/clipboard";
 import Errors from "@/views/Errors.vue";
 import SettingsTable from "@/components/settings/Table.vue";
 import { eventBus } from "@/store/eventBus";
@@ -113,6 +93,8 @@ export default {
     apiTableColumns() {
       return [
         { key: "name", label: this.$t("general.name"), sortable: true },
+        { key: "type", label: this.$t("general.type"), sortable: true },
+        { key: "tokenPrefix", label: "TokenPrefix", sortable: true },
         {
           key: "issuedAt",
           label: this.$t("api.created"),
@@ -127,7 +109,7 @@ export default {
           sortFn: (a, b) =>
             ((a?.expiresAt ?? 0) - (b?.expiresAt ?? 0)),
         },
-        { key: "permissions", label: this.$t("settings.permissions-name") },
+        { key: "capabilities", label: this.$t("api.permissions") },
         {
           key: "actions",
           label: this.$t("api.actions"),
@@ -138,9 +120,6 @@ export default {
     },
   },
   methods: {
-    async copyToClipboard(text) {
-      await copyToClipboard(text);
-    },
     async reloadApiKeys() {
       this.loading = true;
       try {
@@ -148,16 +127,21 @@ export default {
         this.links = await authApi.getApiKeys();
         this.error = null; // Clear errors
       } catch (e) {
-        // ignore 404 errors
-        if (e.status !== 404) {
+        if (e.status === 404) {
+          this.links = [];
+          this.error = null;
+        } else {
           this.error = e;
         }
       } finally {
         this.loading = false;
       }
     },
-    showResult(value) {
-      return value ? "✓" : "✗";
+    capabilityNames(row) {
+      const names = Object.entries(row.Permissions || {})
+        .filter(([, enabled]) => enabled)
+        .map(([name]) => name);
+      return names.join(", ") || "-";
     },
     createPrompt() {
       mutations.showPrompt({
@@ -179,34 +163,6 @@ export default {
 };
 </script>
 <style>
-.permissions-cell {
-  position: relative;
-  display: inline-block;
-}
-
-.permissions-placeholder {
-  color: #888;
-  /* Styling for the placeholder text */
-}
-
-.permissions-list {
-  display: none;
-  position: absolute;
-  top: 100%;
-  /* Position the popup below the cell */
-  left: 0;
-  background-color: white;
-  border: 1px solid #ccc;
-  padding: 8px;
-  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-  z-index: 10;
-  width: max-content;
-}
-
-.permissions-cell:hover .permissions-list {
-  display: block;
-}
-
 .api-table-actions {
   display: inline-flex;
   flex-direction: row;

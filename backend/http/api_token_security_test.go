@@ -97,6 +97,9 @@ func TestAPITokenSecurityLifecycle(t *testing.T) {
 		if frontend := authTokenFrontend("hash-only", metadata, currentPermissions); frontend.Permissions != permissions {
 			t.Errorf("full token management permissions = %+v, want stored snapshot %+v", frontend.Permissions, permissions)
 		}
+		if frontend := authTokenFrontend("hash-only", metadata, currentPermissions); frontend.TokenPrefix != tokenPrefix {
+			t.Errorf("full token management prefix = %q, want %q", frontend.TokenPrefix, tokenPrefix)
+		}
 	})
 
 	t.Run("secret is returned only at creation", func(t *testing.T) {
@@ -842,9 +845,13 @@ func assertTokenManagementResponseRedacted(t *testing.T, body []byte, secret str
 	if _, present := entry["token"]; present {
 		t.Fatalf("token management response retained token field: %v", entry)
 	}
-	for _, field := range []string{"id", "name", "type", "fingerprint", "issuedAt", "expiresAt", "Permissions"} {
+	for _, field := range []string{"id", "name", "type", "fingerprint", "tokenPrefix", "issuedAt", "expiresAt", "Permissions"} {
 		if _, present := entry[field]; !present {
 			t.Errorf("token management response missing %q: %v", field, entry)
 		}
+	}
+	tokenPrefix, ok := entry["tokenPrefix"].(string)
+	if !ok || tokenPrefix == "" || tokenPrefix == secret || !strings.HasPrefix(secret, tokenPrefix) {
+		t.Errorf("token management response prefix %q is not a redacted bearer prefix", tokenPrefix)
 	}
 }

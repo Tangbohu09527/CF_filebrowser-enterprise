@@ -183,6 +183,7 @@ type AuthTokenFrontend struct {
 	Name               string            `json:"name"`
 	Type               string            `json:"type"`
 	Fingerprint        string            `json:"fingerprint"`
+	TokenPrefix        string            `json:"tokenPrefix"`
 	IssuedAt           int64             `json:"issuedAt"`
 	ExpiresAt          int64             `json:"expiresAt"`
 	PermissionsVersion int               `json:"permissionsVersion,omitempty"`
@@ -222,6 +223,7 @@ func authTokenFrontend(name string, token users.AuthToken, current users.Permiss
 		Name:               name,
 		Type:               tokenType,
 		Fingerprint:        "sha256:" + fingerprint,
+		TokenPrefix:        token.TokenPrefix,
 		IssuedAt:           authTokenIssuedUnix(token),
 		ExpiresAt:          authTokenExpiresUnix(token),
 		PermissionsVersion: token.PermissionsVersion,

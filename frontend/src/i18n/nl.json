@@ -614,17 +614,14 @@
     "permissionNote": "Kies minstens één machtiging voor de sleutel. Uw gebruiker moet deze rechten ook hebben.",
     "createKeyFailed": "API-sleutel is niet aangemaakt.",
     "createKeySuccess": "API-sleutel met succes aangemaakt.",
+    "oneTimeTokenWarning": "Kopieer dit token nu. Het wordt slechts één keer weergegeven en kan niet opnieuw worden bekeken nadat u dit venster sluit.",
     "apiKeyDeleted": "API-sleutel verwijderd!",
     "description": "API-sleutels zijn gebaseerd op de gebruiker die ze aanmaakt. Zie",
     "swaggerLinkText": "branie-pagina",
     "created": "Aangemaakt op",
     "actions": "Acties",
-    "enabled": "Ingeschakeld",
-    "disabled": "Uitgeschakeld",
-    "clickToCopyKey": "Klik om sleutel te kopiëren (verborgen)",
     "customizeToken": "Token aanpassen",
-    "customizeTokenInfo": "Pas de tokenpermissies en -attributen aan. Dit zal een langer token aanmaken dat mogelijk niet werkt bij sommige WebDAV-clients.",
-    "minimalInfo": "Sluit tokenaanpassingen uit om een kleinere tokenlengte te creëren. Exacte overeenkomst met de rechten van de bijbehorende gebruiker."
+    "customizeTokenInfo": "Pas de tokenpermissies en -attributen aan. Dit zal een langer token aanmaken dat mogelijk niet werkt bij sommige WebDAV-clients."
   },
   "index": {
     "unknown": "Onbekend",

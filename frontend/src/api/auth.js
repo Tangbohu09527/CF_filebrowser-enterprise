@@ -161,11 +161,11 @@ export async function getApiKeys() {
   }
 }
 
-// PUT /api/auth/token
+// POST /api/auth/token
 export async function createApiKey(params) {
   try {
     const apiPath = getApiPath('auth/token', params)
-    await fetchURL(apiPath, {
+    return await fetchJSON(apiPath, {
       method: 'POST'
     })
   } catch (err) {
@@ -175,10 +175,10 @@ export async function createApiKey(params) {
 }
 
 // DELETE /api/auth/token
-export function deleteApiKey(params) {
+export async function deleteApiKey(params) {
   try {
     const apiPath = getApiPath('auth/token', params)
-    fetchURL(apiPath, {
+    await fetchURL(apiPath, {
       method: 'DELETE'
     })
   } catch (err) {

@@ -419,19 +419,16 @@
     "swaggerLinkText": "page swagger",
     "created": "Créée",
     "actions": "Actions",
-    "enabled": "Activée",
-    "disabled": "Désactivée",
     "title": "Jetons API",
     "createKeyFailed": "Échec de la création d'un jeton API.",
     "createKeySuccess": "Le jeton API a été créé avec succès.",
+    "oneTimeTokenWarning": "Copiez ce jeton maintenant. Il n'est affiché qu'une seule fois et ne pourra plus être consulté après la fermeture de cette fenêtre.",
     "apiKeyDeleted": "Jeton API supprimé !",
     "description": "Les jetons d'API sont basés sur l'utilisateur qui les crée.",
     "customizeToken": "Personnaliser le jeton",
     "createTitle": "Créer un jeton API",
     "keyNamePlaceholder": "Entrez un nom unique pour le jeton API",
-    "customizeTokenInfo": "Personnalisez les permissions et les attributs du jeton. Cela créera un jeton plus long qui pourrait ne pas fonctionner avec certains clients WebDAV.",
-    "clickToCopyKey": "Cliquez pour copier la clé (cachée)",
-    "minimalInfo": "Exclut les personnalisations du jeton afin de réduire la longueur du jeton. Les autorisations correspondent exactement à celles de l'utilisateur associé."
+    "customizeTokenInfo": "Personnalisez les permissions et les attributs du jeton. Cela créera un jeton plus long qui pourrait ne pas fonctionner avec certains clients WebDAV."
   },
   "index": {
     "assessment": "Évaluation",

@@ -614,17 +614,14 @@
     "permissionNote": "Choose at least one permission for the key. Your user must also have the permission.",
     "createKeyFailed": "Failed to create API token.",
     "createKeySuccess": "API token created successfully.",
+    "oneTimeTokenWarning": "Copy this token now. It is shown only once and cannot be viewed again after you close this window.",
     "apiKeyDeleted": "API token deleted!",
     "description": "API tokens are based on the user that creates them.",
     "swaggerLinkText": "swagger page",
     "created": "Created",
     "actions": "Actions",
-    "enabled": "Enabled",
-    "disabled": "Disabled",
-    "clickToCopyKey": "Click to copy token (hidden)",
     "customizeToken": "Customize Token",
-    "customizeTokenInfo": "Customize the token permissions and attributes. This will create a longer token which may not work some WebDAV clients.",
-    "minimalInfo": "Excludes token customizations, permissions will match the associated user and have no other attributes."
+    "customizeTokenInfo": "Customize the token permissions and attributes. This will create a longer token which may not work some WebDAV clients."
   },
   "index": {
     "unknown": "Unknown",
