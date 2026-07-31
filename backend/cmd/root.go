@@ -141,7 +141,9 @@ func StartFilebrowser() {
 	for _, source := range settings.Config.Server.SourceMap {
 		go indexing.Initialize(source, false, isNewDb)
 	}
-	validateUserInfo(!dbExists)
+	if err := validateUserInfo(!dbExists); err != nil {
+		logger.Fatalf("Mandatory user migration failed: %v", err)
+	}
 	validateOfficeIntegration()
 	validateAccessRules()
 	validateShareInfo()

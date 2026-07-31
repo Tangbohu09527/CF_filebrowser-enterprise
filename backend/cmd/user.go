@@ -15,20 +15,24 @@ import (
 
 var createBackup = false
 
-func validateUserInfo(newDB bool) {
+func validateUserInfo(newDB bool) error {
 	// update source info for users if names/sources/paths might have changed
 	usersList, err := store.Users.Gets()
 	if err != nil {
-		logger.Fatalf("could not load users: %v", err)
+		return fmt.Errorf("could not load users for mandatory migration: %w", err)
 	}
 	for _, user := range usersList {
 		changePass := false
 		updateUser := false
+		migrationRequired := user.Version < users.CurrentUserMigrationVersion
 		if updateUserScopes(user) {
 			updateUser = true
 		}
 		if migrateUser(user) {
 			updateUser = true
+		}
+		if migrationRequired && user.Version != users.CurrentUserMigrationVersion {
+			return fmt.Errorf("mandatory migration for user %q stopped at version %d", user.Username, user.Version)
 		}
 		if updatePreviewSettings(user) {
 			updateUser = true
@@ -57,7 +61,7 @@ func validateUserInfo(newDB bool) {
 				logger.Warning("Incompatible user settings detected, creating backup of database before converting.")
 				err = fileutils.CopyFile(settings.Config.Server.Database, fmt.Sprintf("%s.bak", settings.Config.Server.Database))
 				if err != nil {
-					logger.Fatalf("Unable to create automatic backup of database due to error: %v", err)
+					return fmt.Errorf("unable to create automatic user migration backup: %w", err)
 				}
 			}
 			fields := []string{"Scopes", "SidebarLinks", "Tokens", "ApiKeys", "Permissions", "Preview", "ShowFirstLogin", "LoginMethod", "ShowToolsInSidebar", "Version"}
@@ -66,10 +70,11 @@ func validateUserInfo(newDB bool) {
 			}
 			err := store.Users.Update(user, true, fields...)
 			if err != nil {
-				logger.Errorf("could not update user: %v", err)
+				return fmt.Errorf("could not persist mandatory migration for user %q: %w", user.Username, err)
 			}
 		}
 	}
+	return nil
 }
 
 func updateUserScopes(user *users.User) bool {

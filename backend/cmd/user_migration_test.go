@@ -2,11 +2,15 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	"github.com/gtsteffaniak/filebrowser/backend/database/storage/bolt"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 )
 
@@ -327,6 +331,125 @@ func TestMigrateUserIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestValidateUserInfoPersistsV5TokenMigration(t *testing.T) {
+	const (
+		tokenSecret = "legacy-token-secret-for-validation"
+		keySecret   = "legacy-key-secret-for-validation"
+	)
+	backend := newMigrationUserBackend(migrationValidationUser(1, "legacy-user", tokenSecret, keySecret))
+	useMigrationUserBackend(t, backend)
+
+	if err := validateUserInfo(false); err != nil {
+		t.Fatalf("validateUserInfo returned an error: %v", err)
+	}
+
+	persisted := backend.persistedUser(1)
+	if persisted.Version != users.CurrentUserMigrationVersion {
+		t.Fatalf("Version = %d, want %d", persisted.Version, users.CurrentUserMigrationVersion)
+	}
+	assertMigratedTokenHashOnly(t, persisted.Tokens["legacy-token"], tokenSecret, 100, 200, users.Permissions{Api: true, Download: true})
+	assertMigratedTokenHashOnly(t, persisted.ApiKeys["legacy-key"], keySecret, 300, 400, users.Permissions{Api: true, Preview: true})
+	if got := backend.updateCalls[1]; got != 1 {
+		t.Fatalf("user update calls = %d, want 1", got)
+	}
+}
+
+func TestValidateUserInfoReturnsMigrationPersistenceError(t *testing.T) {
+	const (
+		tokenSecret = "token-secret-must-not-leak"
+		keySecret   = "key-secret-must-not-leak"
+	)
+	persistErr := errors.New("forced user update failure")
+	backend := newMigrationUserBackend(migrationValidationUser(1, "failing-user", tokenSecret, keySecret))
+	backend.updateErrors[1] = persistErr
+	useMigrationUserBackend(t, backend)
+
+	err := validateUserInfo(false)
+	if err == nil {
+		t.Fatal("validateUserInfo returned nil for a failed mandatory migration update")
+	}
+	if !errors.Is(err, persistErr) {
+		t.Fatalf("validateUserInfo error = %v, want wrapped persistence error", err)
+	}
+	if !strings.Contains(err.Error(), "failing-user") {
+		t.Fatalf("validateUserInfo error does not identify the affected user: %v", err)
+	}
+	for _, secret := range []string{tokenSecret, keySecret} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("validateUserInfo error leaked a legacy secret")
+		}
+	}
+	if got := backend.persistedUser(1).Version; got != 4 {
+		t.Fatalf("failed update persisted Version = %d, want 4", got)
+	}
+}
+
+func TestValidateUserInfoMigrationRetryIsIdempotent(t *testing.T) {
+	first := migrationValidationUser(1, "first-user", "first-token-secret", "")
+	second := migrationValidationUser(2, "second-user", "second-token-secret", "second-key-secret")
+	persistErr := errors.New("forced second user update failure")
+	backend := newMigrationUserBackend(first, second)
+	backend.updateErrors[2] = persistErr
+	useMigrationUserBackend(t, backend)
+
+	if err := validateUserInfo(false); !errors.Is(err, persistErr) {
+		t.Fatalf("first validateUserInfo error = %v, want persistence error", err)
+	}
+	if got := backend.persistedUser(1).Version; got != users.CurrentUserMigrationVersion {
+		t.Fatalf("first user Version = %d, want %d", got, users.CurrentUserMigrationVersion)
+	}
+	if got := backend.persistedUser(2).Version; got != 4 {
+		t.Fatalf("second user Version = %d after failed update, want 4", got)
+	}
+
+	if err := validateUserInfo(false); !errors.Is(err, persistErr) {
+		t.Fatalf("retry validateUserInfo error = %v, want persistence error", err)
+	}
+	if got := backend.updateCalls[1]; got != 1 {
+		t.Fatalf("already migrated first user update calls = %d, want 1", got)
+	}
+
+	delete(backend.updateErrors, 2)
+	if err := validateUserInfo(false); err != nil {
+		t.Fatalf("validateUserInfo after repairing storage returned an error: %v", err)
+	}
+	if got := backend.updateCalls[1]; got != 1 {
+		t.Fatalf("first user was rewritten after retry: update calls = %d, want 1", got)
+	}
+	persistedSecond := backend.persistedUser(2)
+	if persistedSecond.Version != users.CurrentUserMigrationVersion {
+		t.Fatalf("second user Version = %d, want %d", persistedSecond.Version, users.CurrentUserMigrationVersion)
+	}
+	assertMigratedTokenHashOnly(t, persistedSecond.Tokens["legacy-token"], "second-token-secret", 100, 200, users.Permissions{Api: true, Download: true})
+	assertMigratedTokenHashOnly(t, persistedSecond.ApiKeys["legacy-key"], "second-key-secret", 300, 400, users.Permissions{Api: true, Preview: true})
+}
+
+func TestValidateUserInfoDoesNotRewriteV5User(t *testing.T) {
+	current := migrationValidationUser(1, "current-user", "", "")
+	current.Version = users.CurrentUserMigrationVersion
+	backend := newMigrationUserBackend(current)
+	useMigrationUserBackend(t, backend)
+
+	if err := validateUserInfo(false); err != nil {
+		t.Fatalf("validateUserInfo returned an error: %v", err)
+	}
+	if got := backend.updateCalls[1]; got != 0 {
+		t.Fatalf("current user update calls = %d, want 0", got)
+	}
+}
+
+func TestValidateUserInfoReturnsUserLoadError(t *testing.T) {
+	loadErr := errors.New("forced user load failure")
+	backend := newMigrationUserBackend()
+	backend.getsErr = loadErr
+	useMigrationUserBackend(t, backend)
+
+	err := validateUserInfo(false)
+	if !errors.Is(err, loadErr) {
+		t.Fatalf("validateUserInfo error = %v, want wrapped load error", err)
+	}
+}
+
 func migrationTestUserJSON(t *testing.T, u *users.User) string {
 	t.Helper()
 	b, err := json.Marshal(u)
@@ -334,4 +457,155 @@ func migrationTestUserJSON(t *testing.T, u *users.User) string {
 		t.Fatalf("marshal user: %v", err)
 	}
 	return string(b)
+}
+
+type migrationUserBackend struct {
+	usersByID    map[uint]*users.User
+	order        []uint
+	updateErrors map[uint]error
+	updateCalls  map[uint]int
+	getsErr      error
+}
+
+func newMigrationUserBackend(initial ...*users.User) *migrationUserBackend {
+	backend := &migrationUserBackend{
+		usersByID:    make(map[uint]*users.User, len(initial)),
+		updateErrors: make(map[uint]error),
+		updateCalls:  make(map[uint]int),
+	}
+	for _, user := range initial {
+		backend.order = append(backend.order, user.ID)
+		backend.usersByID[user.ID] = cloneMigrationUser(user)
+	}
+	return backend
+}
+
+func (b *migrationUserBackend) GetBy(id interface{}) (*users.User, error) {
+	switch value := id.(type) {
+	case uint:
+		if user, ok := b.usersByID[value]; ok {
+			return cloneMigrationUser(user), nil
+		}
+	case string:
+		for _, user := range b.usersByID {
+			if user.Username == value {
+				return cloneMigrationUser(user), nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("migration test user not found")
+}
+
+func (b *migrationUserBackend) Gets() ([]*users.User, error) {
+	if b.getsErr != nil {
+		return nil, b.getsErr
+	}
+	result := make([]*users.User, 0, len(b.order))
+	for _, id := range b.order {
+		result = append(result, cloneMigrationUser(b.usersByID[id]))
+	}
+	return result, nil
+}
+
+func (b *migrationUserBackend) Save(user *users.User, _ bool, _ bool) error {
+	b.usersByID[user.ID] = cloneMigrationUser(user)
+	return nil
+}
+
+func (b *migrationUserBackend) Update(user *users.User, _ bool, _ ...string) error {
+	b.updateCalls[user.ID]++
+	if err := b.updateErrors[user.ID]; err != nil {
+		return err
+	}
+	b.usersByID[user.ID] = cloneMigrationUser(user)
+	return nil
+}
+
+func (b *migrationUserBackend) DeleteByID(id uint) error {
+	delete(b.usersByID, id)
+	return nil
+}
+
+func (b *migrationUserBackend) DeleteByUsername(username string) error {
+	for id, user := range b.usersByID {
+		if user.Username == username {
+			delete(b.usersByID, id)
+			return nil
+		}
+	}
+	return nil
+}
+
+func (b *migrationUserBackend) persistedUser(id uint) *users.User {
+	return cloneMigrationUser(b.usersByID[id])
+}
+
+func migrationValidationUser(id uint, username, tokenSecret, keySecret string) *users.User {
+	user := &users.User{
+		ID:          id,
+		Username:    username,
+		Version:     4,
+		LoginMethod: users.LoginMethodPassword,
+		Permissions: users.Permissions{Api: true},
+		Tokens:      make(map[string]users.AuthToken),
+		ApiKeys:     make(map[string]users.AuthToken),
+		Scopes:      []users.SourceScope{},
+	}
+	if tokenSecret != "" {
+		user.Tokens["legacy-token"] = users.AuthToken{
+			Token:       tokenSecret,
+			IssuedAt:    100,
+			ExpiresAt:   200,
+			Permissions: users.Permissions{Api: true, Download: true},
+		}
+	}
+	if keySecret != "" {
+		user.ApiKeys["legacy-key"] = users.AuthToken{
+			Key:         keySecret,
+			IssuedAt:    300,
+			ExpiresAt:   400,
+			Permissions: users.Permissions{Api: true, Preview: true},
+		}
+	}
+	return user
+}
+
+func cloneMigrationUser(user *users.User) *users.User {
+	if user == nil {
+		return nil
+	}
+	cloned := *user
+	cloned.Tokens = make(map[string]users.AuthToken, len(user.Tokens))
+	for name, token := range user.Tokens {
+		cloned.Tokens[name] = token
+	}
+	cloned.ApiKeys = make(map[string]users.AuthToken, len(user.ApiKeys))
+	for name, token := range user.ApiKeys {
+		cloned.ApiKeys[name] = token
+	}
+	if user.Scopes != nil {
+		cloned.Scopes = append(make([]users.SourceScope, 0, len(user.Scopes)), user.Scopes...)
+	}
+	if user.SidebarLinks != nil {
+		cloned.SidebarLinks = append(make([]users.SidebarLink, 0, len(user.SidebarLinks)), user.SidebarLinks...)
+	}
+	return &cloned
+}
+
+func useMigrationUserBackend(t *testing.T, backend *migrationUserBackend) {
+	t.Helper()
+	previousStore := store
+	previousConfig := settings.Config
+	previousCreateBackup := createBackup
+	t.Setenv("FILEBROWSER_DISABLE_AUTOMATIC_BACKUP", "true")
+	settings.Config = settings.Settings{}
+	settings.InitializeUserResolvers()
+	createBackup = false
+	store = &bolt.BoltStore{Users: users.NewStorage(backend)}
+	t.Cleanup(func() {
+		store = previousStore
+		settings.Config = previousConfig
+		settings.InitializeUserResolvers()
+		createBackup = previousCreateBackup
+	})
 }
