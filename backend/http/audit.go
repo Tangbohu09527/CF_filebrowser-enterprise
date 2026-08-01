@@ -12,7 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	auditdb "github.com/gtsteffaniak/filebrowser/backend/database/audit"
+	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 )
 
 const auditRequestIDHeader = "X-Request-ID"
@@ -36,9 +38,17 @@ const (
 )
 
 const (
-	auditErrorCodeClientCancelled     = "client_cancelled"
-	auditErrorCodeResponseWriteFailed = "response_write_failed"
-	auditErrorCodeInternalError       = "internal_error"
+	auditErrorCodeClientCancelled        = "client_cancelled"
+	auditErrorCodeResponseWriteFailed    = "response_write_failed"
+	auditErrorCodeInternalError          = "internal_error"
+	auditErrorCodeAuthenticationRequired = "authentication_required"
+	auditErrorCodeAPIPermissionRequired  = "api_permission_required"
+	auditErrorCodeTokenChainingDenied    = "token_chaining_denied"
+	auditErrorCodeInvalidTokenRequest    = "invalid_token_request"
+	auditErrorCodeTokenNotFound          = "token_not_found"
+	auditErrorCodeTokenCreateFailed      = "token_create_failed"
+	auditErrorCodeTokenRevokeFailed      = "token_revoke_failed"
+	auditErrorCodeAuditUnavailable       = "audit_unavailable"
 )
 
 // AuditService adds a thread-safe degraded state to the persistent Audit Store.
@@ -152,10 +162,12 @@ type AuditRecorder struct {
 	service   *AuditService
 	startedAt time.Time
 
-	mu        sync.Mutex
-	event     auditdb.Event
-	reserved  bool
-	finalized bool
+	mu                sync.Mutex
+	event             auditdb.Event
+	errorCode         string
+	reserved          bool
+	reservationFailed bool
+	finalized         bool
 
 	finalizeOnce sync.Once
 	finalizeErr  error
@@ -279,6 +291,34 @@ func (recorder *AuditRecorder) SetEffectivePermissions(permissions *auditdb.Perm
 	})
 }
 
+func (recorder *AuditRecorder) SetErrorCode(errorCode string) error {
+	if recorder == nil || !validAuditFinalizationErrorCode(errorCode) {
+		return ErrAuditInvalidFinalization
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if recorder.finalized {
+		return ErrAuditFinalized
+	}
+	recorder.errorCode = errorCode
+	return nil
+}
+
+func (recorder *AuditRecorder) setErrorCodeIfEmpty(errorCode string) error {
+	if recorder == nil || !validAuditFinalizationErrorCode(errorCode) {
+		return ErrAuditInvalidFinalization
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if recorder.finalized {
+		return ErrAuditFinalized
+	}
+	if recorder.errorCode == "" {
+		recorder.errorCode = errorCode
+	}
+	return nil
+}
+
 func (recorder *AuditRecorder) MergeMetadata(metadata *auditdb.MetadataV1) error {
 	if recorder == nil {
 		return ErrAuditInvalidState
@@ -307,6 +347,9 @@ func (recorder *AuditRecorder) ReservePending() error {
 	if recorder.reserved {
 		return nil
 	}
+	if recorder.reservationFailed {
+		return ErrAuditUnavailable
+	}
 	if recorder.finalized {
 		return ErrAuditFinalized
 	}
@@ -318,6 +361,7 @@ func (recorder *AuditRecorder) ReservePending() error {
 		return ErrAuditInvalidState
 	}
 	if err := recorder.service.CreatePending(pending); err != nil {
+		recorder.reservationFailed = true
 		return err
 	}
 	recorder.reserved = true
@@ -362,7 +406,11 @@ func (recorder *AuditRecorder) finalize(finalization AuditFinalization) error {
 		recorder.mu.Unlock()
 		return nil
 	}
-	if finalization.Bytes < 0 || !validAuditFinalizationErrorCode(finalization.ErrorCode) {
+	errorCode := finalization.ErrorCode
+	if errorCode == "" {
+		errorCode = recorder.errorCode
+	}
+	if finalization.Bytes < 0 || !validAuditFinalizationErrorCode(errorCode) {
 		recorder.mu.Unlock()
 		return ErrAuditInvalidFinalization
 	}
@@ -390,7 +438,7 @@ func (recorder *AuditRecorder) finalize(finalization AuditFinalization) error {
 		status := finalization.HTTPStatus
 		event.HTTPStatus = &status
 	}
-	event.ErrorCode = finalization.ErrorCode
+	event.ErrorCode = errorCode
 	if event.ErrorCode == "" {
 		switch {
 		case finalization.ClientCancelled:
@@ -401,8 +449,12 @@ func (recorder *AuditRecorder) finalize(finalization AuditFinalization) error {
 	}
 	event.Metadata = auditdb.MergeMetadataV1(event.Metadata, terminalMetadata)
 	reserved := recorder.reserved
+	reservationFailed := recorder.reservationFailed
 	recorder.mu.Unlock()
 
+	if reservationFailed {
+		return ErrAuditUnavailable
+	}
 	if err := event.Validate(); err != nil {
 		return ErrAuditInvalidFinalization
 	}
@@ -422,10 +474,83 @@ func (recorder *AuditRecorder) finalize(finalization AuditFinalization) error {
 
 func validAuditFinalizationErrorCode(errorCode string) bool {
 	switch errorCode {
-	case "", auditErrorCodeClientCancelled, auditErrorCodeResponseWriteFailed, auditErrorCodeInternalError:
+	case "", auditErrorCodeClientCancelled, auditErrorCodeResponseWriteFailed, auditErrorCodeInternalError,
+		auditErrorCodeAuthenticationRequired, auditErrorCodeAPIPermissionRequired,
+		auditErrorCodeTokenChainingDenied, auditErrorCodeInvalidTokenRequest,
+		auditErrorCodeTokenNotFound, auditErrorCodeTokenCreateFailed,
+		auditErrorCodeTokenRevokeFailed, auditErrorCodeAuditUnavailable:
 		return true
 	default:
 		return false
+	}
+}
+
+func withAuditDefaultAction(action auditdb.Action, fn handleFunc) stdhttp.HandlerFunc {
+	return wrapHandler(func(writer stdhttp.ResponseWriter, request *stdhttp.Request, data *requestContext) (int, error) {
+		recorder := AuditRecorderFromRequest(request)
+		if recorder == nil {
+			return stdhttp.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		if err := recorder.SetAction(action); err != nil {
+			return stdhttp.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		if err := recorder.SetAuthMethod(auditdb.AuthMethodAnonymous); err != nil {
+			return stdhttp.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		status, err := fn(writer, request, data)
+		if status == stdhttp.StatusUnauthorized || status == stdhttp.StatusForbidden {
+			if codeErr := recorder.setErrorCodeIfEmpty(auditErrorCodeAuthenticationRequired); codeErr != nil {
+				return stdhttp.StatusServiceUnavailable, ErrAuditUnavailable
+			}
+		}
+		return status, err
+	})
+}
+
+func withAuditAuthenticatedUser(fn handleFunc) handleFunc {
+	return func(writer stdhttp.ResponseWriter, request *stdhttp.Request, data *requestContext) (int, error) {
+		recorder := AuditRecorderFromRequest(request)
+		if recorder == nil || data.user == nil || data.user.ID == 0 || data.user.Username == "" {
+			return stdhttp.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		if err := recorder.SetActor(&data.user.ID, data.user.Username); err != nil {
+			return stdhttp.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		authMethod := auditdb.AuthMethodSession
+		tokenRef := ""
+		if data.apiToken {
+			authMethod = auditdb.AuthMethodToken
+			tokenRef = auditdb.DeriveTokenRef(utils.HashSHA256(data.token))
+			if tokenRef == "" {
+				return stdhttp.StatusServiceUnavailable, ErrAuditUnavailable
+			}
+		}
+		if err := recorder.SetAuthMethod(authMethod); err != nil {
+			return stdhttp.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		if err := recorder.SetTokenRef(tokenRef); err != nil {
+			return stdhttp.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		permissions := auditPermissions(data.user.Permissions)
+		if err := recorder.SetEffectivePermissions(&permissions); err != nil {
+			return stdhttp.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		return fn(writer, request, data)
+	}
+}
+
+func auditPermissions(permissions users.Permissions) auditdb.Permissions {
+	return auditdb.Permissions{
+		API:      permissions.Api,
+		Admin:    permissions.Admin,
+		Modify:   permissions.Modify,
+		Share:    permissions.Share,
+		Realtime: permissions.Realtime,
+		Delete:   permissions.Delete,
+		Create:   permissions.Create,
+		Browse:   permissions.Browse,
+		Preview:  permissions.Preview,
+		Download: permissions.Download,
 	}
 }
 

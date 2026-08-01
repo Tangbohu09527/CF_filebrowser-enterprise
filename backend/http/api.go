@@ -10,8 +10,22 @@ import (
 	"time"
 
 	"github.com/gtsteffaniak/filebrowser/backend/auth"
+	auditdb "github.com/gtsteffaniak/filebrowser/backend/database/audit"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 )
+
+func registerAPITokenRoutes(api *http.ServeMux) {
+	api.HandleFunc("POST /auth/token", withAuditDefaultAction(
+		auditdb.ActionTokenDenied,
+		withUserHelper(withAuditAuthenticatedUser(withRateLimitChain(AuthRateLimitAuthenticated, createApiTokenHandler))),
+	))
+	api.HandleFunc("DELETE /auth/token", withAuditDefaultAction(
+		auditdb.ActionTokenDenied,
+		withUserHelper(withAuditAuthenticatedUser(withRateLimitChain(AuthRateLimitAuthenticated, deleteApiTokenHandler))),
+	))
+	api.HandleFunc("GET /auth/token/list", withUser(withRateLimitChain(AuthRateLimitAuthenticated, listApiTokensHandler)))
+	api.HandleFunc("GET /auth/token", withUser(withRateLimitChain(AuthRateLimitAuthenticated, getApiTokenHandler)))
+}
 
 // createApiTokenHandler creates an API token for the user.
 // @Summary Create API Token
@@ -33,27 +47,36 @@ func createApiTokenHandler(w http.ResponseWriter, r *http.Request, d *requestCon
 	name := r.URL.Query().Get("name")
 	durationStr := r.URL.Query().Get("days")
 	permissionsStr := r.URL.Query().Get("permissions")
+
+	if !d.user.Permissions.Api {
+		return failAPITokenAudit(r, http.StatusForbidden, auditErrorCodeAPIPermissionRequired,
+			fmt.Errorf("user does not have permission to create api tokens"))
+	}
+	if d.apiToken {
+		return failAPITokenAudit(r, http.StatusForbidden, auditErrorCodeTokenChainingDenied,
+			fmt.Errorf("api tokens cannot create other tokens"))
+	}
+	if err := setAPITokenAuditAction(r, auditdb.ActionTokenCreate); err != nil {
+		return failAPITokenAudit(r, http.StatusServiceUnavailable, auditErrorCodeAuditUnavailable, ErrAuditUnavailable)
+	}
+
 	minimal := permissionsStr == ""
 	if minimalStr := r.URL.Query().Get("minimal"); minimalStr != "" {
 		parsedMinimal, err := strconv.ParseBool(minimalStr)
 		if err != nil {
-			return http.StatusBadRequest, fmt.Errorf("invalid minimal value: %w", err)
+			return failAPITokenAudit(r, http.StatusBadRequest, auditErrorCodeInvalidTokenRequest,
+				fmt.Errorf("invalid minimal value: %w", err))
 		}
 		minimal = parsedMinimal
 	}
 
-	if !d.user.Permissions.Api {
-		return http.StatusForbidden, fmt.Errorf("user does not have permission to create api tokens")
-	}
-	if d.apiToken {
-		return http.StatusForbidden, fmt.Errorf("api tokens cannot create other tokens")
-	}
-
 	if name == "" || strings.HasPrefix(name, "WEB_TOKEN") {
-		return http.StatusBadRequest, fmt.Errorf("api token name must be valid")
+		return failAPITokenAudit(r, http.StatusBadRequest, auditErrorCodeInvalidTokenRequest,
+			fmt.Errorf("api token name must be valid"))
 	}
 	if durationStr == "" {
-		return http.StatusBadRequest, fmt.Errorf("api token duration must be valid")
+		return failAPITokenAudit(r, http.StatusBadRequest, auditErrorCodeInvalidTokenRequest,
+			fmt.Errorf("api token duration must be valid"))
 	}
 
 	// For full tokens (minimal=false), permissions are required in the claim
@@ -79,38 +102,43 @@ func createApiTokenHandler(w http.ResponseWriter, r *http.Request, d *requestCon
 	// Convert the duration string to an int64
 	durationInt, err := strconv.ParseInt(durationStr, 10, 64) // Base 10 and bit size of 64
 	if err != nil {
-		return http.StatusBadRequest, fmt.Errorf("invalid duration value: %w", err)
+		return failAPITokenAudit(r, http.StatusBadRequest, auditErrorCodeInvalidTokenRequest,
+			fmt.Errorf("invalid duration value: %w", err))
 	}
 
 	// Here we assume the duration is in seconds; convert to time.Duration
 	duration := time.Duration(durationInt) * time.Hour * 24
+	if err := reserveAPITokenAudit(r); err != nil {
+		return failAPITokenAudit(r, http.StatusServiceUnavailable, auditErrorCodeAuditUnavailable, ErrAuditUnavailable)
+	}
 	tokenString, authToken, err := auth.MakeSignedTokenAPI(d.user, name, duration, permissions, minimal)
 	if err != nil {
 		if strings.Contains(err.Error(), "key already exists with same name") {
-			return http.StatusConflict, err
+			return failAPITokenAudit(r, http.StatusConflict, auditErrorCodeInvalidTokenRequest, err)
 		}
-		return http.StatusInternalServerError, err
+		return failAPITokenAudit(r, http.StatusInternalServerError, auditErrorCodeTokenCreateFailed, err)
 	}
 
 	// Store API token metadata in user's Tokens map
 	err = store.Users.AddApiToken(d.user.ID, name, tokenString, authToken)
 	if err != nil {
 		if errors.Is(err, users.ErrAPIPermissionRequired) {
-			return http.StatusForbidden, err
+			return failAPITokenAudit(r, http.StatusForbidden, auditErrorCodeAPIPermissionRequired, err)
 		}
 		if strings.Contains(err.Error(), "key already exists with same name") {
-			return http.StatusConflict, err
+			return failAPITokenAudit(r, http.StatusConflict, auditErrorCodeInvalidTokenRequest, err)
 		}
-		return http.StatusInternalServerError, err
+		return failAPITokenAudit(r, http.StatusInternalServerError, auditErrorCodeTokenCreateFailed, err)
 	}
 
 	// Store token hash → user ID mapping in access storage for fast lookups
 	err = store.Access.AddApiToken(tokenString, d.user.ID)
 	if err != nil {
 		if rollbackErr := store.Users.DeleteApiToken(d.user.ID, name); rollbackErr != nil {
-			return http.StatusInternalServerError, fmt.Errorf("store api token mapping: %w (metadata rollback failed: %v)", err, rollbackErr)
+			return failAPITokenAudit(r, http.StatusInternalServerError, auditErrorCodeTokenCreateFailed,
+				fmt.Errorf("store api token mapping: %w (metadata rollback failed: %v)", err, rollbackErr))
 		}
-		return http.StatusInternalServerError, err
+		return failAPITokenAudit(r, http.StatusInternalServerError, auditErrorCodeTokenCreateFailed, err)
 	}
 
 	response := HttpResponse{
@@ -146,36 +174,78 @@ func parsePermissionNames(value string) map[string]bool {
 func deleteApiTokenHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
 	name := r.URL.Query().Get("name")
 	if !d.user.Permissions.Api {
-		return http.StatusForbidden, fmt.Errorf("user does not have permission to delete api tokens")
+		return failAPITokenAudit(r, http.StatusForbidden, auditErrorCodeAPIPermissionRequired,
+			fmt.Errorf("user does not have permission to delete api tokens"))
+	}
+	if err := setAPITokenAuditAction(r, auditdb.ActionTokenRevoke); err != nil {
+		return failAPITokenAudit(r, http.StatusServiceUnavailable, auditErrorCodeAuditUnavailable, ErrAuditUnavailable)
+	}
+	if name == "" {
+		return failAPITokenAudit(r, http.StatusBadRequest, auditErrorCodeInvalidTokenRequest,
+			fmt.Errorf("api token name must be valid"))
 	}
 
 	tokenHashes, err := store.Users.ApiTokenHashes(d.user.ID, name)
 	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("load api token metadata: %w", err)
+		return failAPITokenAudit(r, http.StatusInternalServerError, auditErrorCodeTokenRevokeFailed,
+			fmt.Errorf("load api token metadata: %w", err))
 	}
 	if len(tokenHashes) == 0 {
-		return http.StatusNotFound, fmt.Errorf("api token not found")
+		return failAPITokenAudit(r, http.StatusNotFound, auditErrorCodeTokenNotFound,
+			fmt.Errorf("api token not found"))
+	}
+	if err := reserveAPITokenAudit(r); err != nil {
+		return failAPITokenAudit(r, http.StatusServiceUnavailable, auditErrorCodeAuditUnavailable, ErrAuditUnavailable)
 	}
 
 	for _, tokenHash := range tokenHashes {
 		revokeErr := auth.RevokeApiTokenHash(store.Access, tokenHash)
 		if revokeErr != nil {
-			return http.StatusInternalServerError, fmt.Errorf("revoke api token: %w", revokeErr)
+			return failAPITokenAudit(r, http.StatusInternalServerError, auditErrorCodeTokenRevokeFailed,
+				fmt.Errorf("revoke api token: %w", revokeErr))
 		}
 	}
 
 	deleted, err := store.Users.DeleteApiTokens(d.user.ID, name)
 	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("delete revoked api token metadata: %w", err)
+		return failAPITokenAudit(r, http.StatusInternalServerError, auditErrorCodeTokenRevokeFailed,
+			fmt.Errorf("delete revoked api token metadata: %w", err))
 	}
 	if !deleted {
-		return http.StatusNotFound, fmt.Errorf("api token metadata changed during deletion")
+		return failAPITokenAudit(r, http.StatusNotFound, auditErrorCodeTokenRevokeFailed,
+			fmt.Errorf("api token metadata changed during deletion"))
 	}
 
 	response := HttpResponse{
 		Message: "successfully deleted api token from user",
 	}
 	return renderJSON(w, r, response)
+}
+
+func setAPITokenAuditAction(request *http.Request, action auditdb.Action) error {
+	recorder := AuditRecorderFromRequest(request)
+	if recorder == nil {
+		return nil
+	}
+	return recorder.SetAction(action)
+}
+
+func reserveAPITokenAudit(request *http.Request) error {
+	recorder := AuditRecorderFromRequest(request)
+	if recorder == nil {
+		return nil
+	}
+	return recorder.ReservePending()
+}
+
+func failAPITokenAudit(request *http.Request, status int, errorCode string, err error) (int, error) {
+	recorder := AuditRecorderFromRequest(request)
+	if recorder != nil {
+		if setErr := recorder.SetErrorCode(errorCode); setErr != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+	}
+	return status, err
 }
 
 type AuthTokenFrontend struct {
