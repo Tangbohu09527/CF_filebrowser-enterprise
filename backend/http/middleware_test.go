@@ -215,7 +215,7 @@ func TestPublicShareHandlerAuthentication(t *testing.T) {
 			expectedStatusCode: http.StatusUnauthorized,
 		},
 		{
-			name: "Private share, valid token",
+			name: "Private share, stored token cannot replace password",
 			share: &share.Link{
 				Hash:         "token_hash",
 				UserID:       1,
@@ -227,7 +227,7 @@ func TestPublicShareHandlerAuthentication(t *testing.T) {
 				},
 			},
 			token:              "123",
-			expectedStatusCode: http.StatusOK, // zero means 200 on helpers
+			expectedStatusCode: http.StatusUnauthorized,
 		},
 		{
 			name: "Private share, invalid password",

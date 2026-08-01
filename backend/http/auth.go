@@ -1,9 +1,6 @@
 package http
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	libError "errors"
 	"fmt"
@@ -371,36 +368,6 @@ func printToken(w http.ResponseWriter, r *http.Request, user *users.User) (int, 
 func authenticateShareRequest(r *http.Request, l *share.Link) (int, error) {
 	if l.PasswordHash == "" {
 		return 200, nil
-	}
-
-	tokenParam := r.URL.Query().Get("token")
-	if tokenParam != "" {
-		// Verify the token signature if it's in the new signed format
-		if strings.Contains(tokenParam, ".") {
-			parts := strings.Split(tokenParam, ".")
-			if len(parts) == 2 {
-				payload := parts[0]
-				signature := parts[1]
-
-				// Verify HMAC signature
-				mac := hmac.New(sha256.New, []byte(config.Auth.Key))
-				mac.Write([]byte(payload))
-				expectedSignature := base64.URLEncoding.EncodeToString(mac.Sum(nil))
-
-				// Use constant-time comparison to prevent timing attacks
-				if hmac.Equal([]byte(signature), []byte(expectedSignature)) {
-					// Token signature is valid, now check if it matches stored token
-					if tokenParam == l.Token {
-						return 200, nil
-					}
-				}
-			}
-		} else {
-			// Legacy token format (plain base64) - direct comparison
-			if tokenParam == l.Token {
-				return 200, nil
-			}
-		}
 	}
 
 	password := r.Header.Get("X-SHARE-PASSWORD")

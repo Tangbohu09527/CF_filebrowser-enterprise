@@ -1,14 +1,11 @@
 package http
 
 import (
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	pathpkg "path"
 	"path/filepath"
 	"strconv"
@@ -68,37 +65,154 @@ func shareRequestCapabilities(d *requestContext) share.CapabilitySnapshot {
 	return share.CapabilitiesFromPermissions(d.user.Permissions)
 }
 
-func validateShareRoot(link *share.Link, owner *users.User) error {
+func resolveShareRoot(link *share.Link, owner *users.User) (publicShareTarget, error) {
+	var target publicShareTarget
 	if link == nil || owner == nil || link.Path == "" {
-		return errors.ErrAccessDenied
+		return target, errors.ErrAccessDenied
 	}
 	sourceInfo, ok := config.Server.SourceMap[link.Source]
 	if !ok || sourceInfo.Config.Private {
-		return errors.ErrAccessDenied
+		return target, errors.ErrAccessDenied
 	}
 	ownerScope, err := owner.GetScopeForSourceName(sourceInfo.Name)
 	if err != nil || ownerScope == "" {
-		return errors.ErrAccessDenied
+		return target, errors.ErrAccessDenied
 	}
 	cleanScope, err := cleanPublicShareRelativePath(ownerScope)
 	if err != nil {
-		return errors.ErrAccessDenied
+		return target, errors.ErrAccessDenied
 	}
 	data := &requestContext{
 		share:      link,
 		shareUser:  owner,
 		shareScope: normalizePublicShareIndexPath(cleanScope),
 	}
-	_, err = resolvePublicShareLogicalTarget(data, sourceInfo.Path, link.Path)
+	return resolvePublicShareLogicalTarget(data, sourceInfo.Path, link.Path)
+}
+
+func validateShareRoot(link *share.Link, owner *users.User) error {
+	_, err := resolveShareRoot(link, owner)
 	return err
 }
 
-// ShareResponse represents a share with computed username field and download URL
+type ManagementShareCapabilities struct {
+	Browse    bool `json:"browse"`
+	Preview   bool `json:"preview"`
+	Download  bool `json:"download"`
+	Thumbnail bool `json:"thumbnail"`
+	Viewer    bool `json:"viewer"`
+	Create    bool `json:"create"`
+	Modify    bool `json:"modify"`
+	Delete    bool `json:"delete"`
+	Replace   bool `json:"replace"`
+}
+
+func configuredManagementShareCapabilities(link *share.Link) ManagementShareCapabilities {
+	if link == nil {
+		return ManagementShareCapabilities{}
+	}
+	readable := link.ShareType != "upload"
+	thumbnail := readable && !link.DisableThumbnails
+	viewer := readable && !link.DisableFileViewer
+	return ManagementShareCapabilities{
+		Browse:    readable,
+		Preview:   thumbnail || viewer,
+		Download:  readable && !link.DisableDownload,
+		Thumbnail: thumbnail,
+		Viewer:    viewer,
+		Create:    link.AllowCreate,
+		Modify:    link.AllowModify,
+		Delete:    link.AllowDelete,
+		Replace:   link.AllowReplacements,
+	}
+}
+
+func calculateManagementShareCapabilities(link *share.Link, owner *users.User, root publicShareTarget, rootErr error) ManagementShareCapabilities {
+	if link == nil || owner == nil || rootErr != nil ||
+		(link.Expire != 0 && link.Expire <= time.Now().Unix()) {
+		return ManagementShareCapabilities{}
+	}
+	access := calculatePublicShareAccess(link, owner)
+	browse := access.allows(publicShareReadBrowse)
+	thumbnail := access.allows(publicShareReadBrowse | publicShareReadThumbnail)
+	viewer := access.allows(publicShareReadBrowse | publicShareReadViewer)
+	capabilities := ManagementShareCapabilities{
+		Browse:    browse,
+		Preview:   thumbnail || viewer,
+		Download:  access.allows(publicShareReadBrowse | publicShareReadDownload),
+		Thumbnail: thumbnail,
+		Viewer:    viewer,
+	}
+	if root.IsDir {
+		capabilities.Create = access.create
+		capabilities.Modify = access.modify
+		capabilities.Delete = access.delete
+		capabilities.Replace = access.replace
+	}
+	return capabilities
+}
+
+func managementShareStatus(link *share.Link, rootErr error) string {
+	if link != nil && link.Expire != 0 && link.Expire <= time.Now().Unix() {
+		return "expired"
+	}
+	if rootErr != nil {
+		return "unavailable"
+	}
+	return "active"
+}
+
+// ShareResponse is the explicit, secret-free DTO used by every Share management response.
 type ShareResponse struct {
-	*share.Link
-	Source     string `json:"source"` // Override embedded field to show source name
-	Username   string `json:"username,omitempty"`
-	PathExists bool   `json:"pathExists"`
+	DownloadsLimit           int                         `json:"downloadsLimit,omitempty"`
+	ShareTheme               string                      `json:"shareTheme,omitempty"`
+	DisableAnonymous         bool                        `json:"disableAnonymous"`
+	MaxBandwidth             int                         `json:"maxBandwidth,omitempty"`
+	DisableThumbnails        bool                        `json:"disableThumbnails"`
+	KeepAfterExpiration      bool                        `json:"keepAfterExpiration"`
+	AllowedUsernames         []string                    `json:"allowedUsernames,omitempty"`
+	ThemeColor               string                      `json:"themeColor,omitempty"`
+	Banner                   string                      `json:"banner,omitempty"`
+	Title                    string                      `json:"title,omitempty"`
+	Description              string                      `json:"description,omitempty"`
+	Favicon                  string                      `json:"favicon,omitempty"`
+	QuickDownload            bool                        `json:"quickDownload"`
+	HideNavButtons           bool                        `json:"hideNavButtons"`
+	DisableSidebar           bool                        `json:"disableSidebar"`
+	Source                   string                      `json:"source"`
+	Path                     string                      `json:"path"`
+	DownloadURL              string                      `json:"downloadURL,omitempty"`
+	ShareURL                 string                      `json:"shareURL"`
+	FaviconURL               string                      `json:"faviconUrl,omitempty"`
+	BannerURL                string                      `json:"bannerUrl,omitempty"`
+	DisableShareCard         bool                        `json:"disableShareCard"`
+	EnforceDarkLightMode     string                      `json:"enforceDarkLightMode,omitempty"`
+	ViewMode                 string                      `json:"viewMode,omitempty"`
+	EnableOnlyOffice         bool                        `json:"enableOnlyOffice"`
+	ShareType                string                      `json:"shareType"`
+	PerUserDownloadLimit     bool                        `json:"perUserDownloadLimit"`
+	ExtractEmbeddedSubtitles bool                        `json:"extractEmbeddedSubtitles"`
+	AllowDelete              bool                        `json:"allowDelete"`
+	AllowCreate              bool                        `json:"allowCreate"`
+	AllowModify              bool                        `json:"allowModify"`
+	DisableFileViewer        bool                        `json:"disableFileViewer"`
+	DisableDownload          bool                        `json:"disableDownload"`
+	AllowReplacements        bool                        `json:"allowReplacements"`
+	SidebarLinks             []users.SidebarLink         `json:"sidebarLinks"`
+	HasPassword              bool                        `json:"hasPassword"`
+	ShowHidden               bool                        `json:"showHidden"`
+	HideFileExt              string                      `json:"hideFileExt,omitempty"`
+	DisableLoginOption       bool                        `json:"disableLoginOption"`
+	SourceURL                string                      `json:"sourceURL,omitempty"`
+	CanEditShare             bool                        `json:"canEditShare"`
+	Downloads                int                         `json:"downloads"`
+	Hash                     string                      `json:"hash"`
+	Expire                   int64                       `json:"expire"`
+	Username                 string                      `json:"username,omitempty"`
+	PathExists               bool                        `json:"pathExists"`
+	Status                   string                      `json:"status"`
+	ConfiguredCapabilities   ManagementShareCapabilities `json:"configuredCapabilities"`
+	EffectiveCapabilities    ManagementShareCapabilities `json:"effectiveCapabilities"`
 }
 
 // convertToFrontendShareResponse converts shares to response format with usernames
@@ -109,10 +223,9 @@ func convertToFrontendShareResponse(r *http.Request, shares []*share.Link, user 
 			continue
 		}
 		s := stored.Clone()
-		// Look for the username of the user who created the share
-		creator, err := store.Users.Get(s.UserID)
+		creator, creatorErr := store.Users.Get(s.UserID)
 		username := ""
-		if err == nil {
+		if creatorErr == nil {
 			username = creator.Username
 		}
 
@@ -128,21 +241,67 @@ func convertToFrontendShareResponse(r *http.Request, shares []*share.Link, user 
 			s.Source = sourceInfo.Path
 		}
 
-		// Check if the path exists on the filesystem
 		pathExists := utils.CheckPathExists(filepath.Join(sourceInfo.Path, s.Path))
-
-		s.CommonShare.HasPassword = s.HasPassword()
-		s.DownloadURL = getShareURL(r, s.Hash, true, s.Token)
-		s.ShareURL = getShareURL(r, s.Hash, false, s.Token)
-		if s.UserCanEdit(user) {
-			s.CommonShare.SourceURL = s.SourceURL(user)
+		var root publicShareTarget
+		rootErr := errors.ErrAccessDenied
+		if creatorErr == nil {
+			root, rootErr = resolveShareRoot(s, creator)
 		}
-		// Create response with source name (overrides the embedded Link's source field)
+		canEditShare := user != nil && s.UserCanEdit(user)
+		sourceURL := ""
+		if canEditShare {
+			sourceURL = s.SourceURL(user)
+		}
 		responses = append(responses, &ShareResponse{
-			Link:       s,
-			Source:     sourceInfo.Name, // Override to show source name instead of backend path
-			Username:   username,
-			PathExists: pathExists,
+			DownloadsLimit:           s.DownloadsLimit,
+			ShareTheme:               s.ShareTheme,
+			DisableAnonymous:         s.DisableAnonymous,
+			MaxBandwidth:             s.MaxBandwidth,
+			DisableThumbnails:        s.DisableThumbnails,
+			KeepAfterExpiration:      s.KeepAfterExpiration,
+			AllowedUsernames:         append([]string(nil), s.AllowedUsernames...),
+			ThemeColor:               s.ThemeColor,
+			Banner:                   s.Banner,
+			Title:                    s.Title,
+			Description:              s.Description,
+			Favicon:                  s.Favicon,
+			QuickDownload:            s.QuickDownload,
+			HideNavButtons:           s.HideNavButtons,
+			DisableSidebar:           s.DisableSidebar,
+			Source:                   sourceInfo.Name,
+			Path:                     s.Path,
+			DownloadURL:              getShareURL(r, s.Hash, true),
+			ShareURL:                 getShareURL(r, s.Hash, false),
+			FaviconURL:               s.FaviconURL(),
+			BannerURL:                s.BannerURL(),
+			DisableShareCard:         s.DisableShareCard,
+			EnforceDarkLightMode:     s.EnforceDarkLightMode,
+			ViewMode:                 s.ViewMode,
+			EnableOnlyOffice:         s.EnableOnlyOffice,
+			ShareType:                s.ShareType,
+			PerUserDownloadLimit:     s.PerUserDownloadLimit,
+			ExtractEmbeddedSubtitles: s.ExtractEmbeddedSubtitles,
+			AllowDelete:              s.AllowDelete,
+			AllowCreate:              s.AllowCreate,
+			AllowModify:              s.AllowModify,
+			DisableFileViewer:        s.DisableFileViewer,
+			DisableDownload:          s.DisableDownload,
+			AllowReplacements:        s.AllowReplacements,
+			SidebarLinks:             append([]users.SidebarLink(nil), s.SidebarLinks...),
+			HasPassword:              s.HasPassword(),
+			ShowHidden:               s.ShowHidden,
+			HideFileExt:              s.HideFileExt,
+			DisableLoginOption:       s.DisableLoginOption,
+			SourceURL:                sourceURL,
+			CanEditShare:             canEditShare,
+			Downloads:                s.Downloads,
+			Hash:                     s.Hash,
+			Expire:                   s.Expire,
+			Username:                 username,
+			PathExists:               pathExists,
+			Status:                   managementShareStatus(s, rootErr),
+			ConfiguredCapabilities:   configuredManagementShareCapabilities(s),
+			EffectiveCapabilities:    calculateManagementShareCapabilities(s, creator, root, rootErr),
 		})
 	}
 	return responses, nil
@@ -168,7 +327,7 @@ func filterSharesForCaller(shares []*share.Link, d *requestContext) []*share.Lin
 // @Tags Shares
 // @Accept json
 // @Produce json
-// @Success 200 {array} share.Link "List of share links"
+// @Success 200 {array} ShareResponse "List of share links"
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /api/share/list [get]
 func shareListHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
@@ -199,7 +358,7 @@ func shareListHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 // @Produce json
 // @Param path query string true "Resource path for which to retrieve share links"
 // @Param source query string true "Source name for share links"
-// @Success 200 {array} share.Link "List of share links for the specified path"
+// @Success 200 {array} ShareResponse "List of share links for the specified path"
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /api/share [get]
 func shareGetHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
@@ -368,7 +527,7 @@ func sharePatchHandler(w http.ResponseWriter, r *http.Request, d *requestContext
 // @Accept json
 // @Produce json
 // @Param body body share.CreateBody true "Share creation parameters"
-// @Success 200 {object} share.Link "Created share link"
+// @Success 200 {object} ShareResponse "Created or updated share link"
 // @Failure 400 {object} map[string]string "Bad request - failed to decode body"
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /api/share [post]
@@ -424,23 +583,7 @@ func sharePostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 		return status, err
 	}
 	stringHash := ""
-	var token string
 	if len(hash) > 0 {
-		// Generate a cryptographically secure token similar to JWT
-		// Create a random payload
-		payloadBuffer := make([]byte, 24)
-		if _, err = rand.Read(payloadBuffer); err != nil {
-			return http.StatusInternalServerError, err
-		}
-		payload := base64.URLEncoding.EncodeToString(payloadBuffer)
-
-		// Sign the payload with HMAC-SHA256 using the same secret key as JWT tokens
-		mac := hmac.New(sha256.New, []byte(config.Auth.Key))
-		mac.Write([]byte(payload))
-		signature := base64.URLEncoding.EncodeToString(mac.Sum(nil))
-
-		// Combine payload and signature: payload.signature (similar to JWT format)
-		token = payload + "." + signature
 		stringHash = string(hash)
 	}
 	if s != nil {
@@ -473,7 +616,7 @@ func sharePostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 		candidate := s.Clone()
 		candidate.Expire = expire
 		candidate.PasswordHash = stringHash
-		candidate.Token = token
+		candidate.Token = ""
 		// Preserve immutable fields for updates. Path and Source should not change on edits.
 		// If the request attempts to provide empty values (or any values) for these,
 		// keep the existing ones from the stored share.
@@ -498,19 +641,11 @@ func sharePostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 			}
 			return http.StatusInternalServerError, err
 		}
-		s = candidate
-		// Convert to ShareResponse format with username
-		var user *users.User
-		user, err = store.Users.Get(s.UserID)
-		username := ""
-		if err == nil {
-			username = user.Username
+		sharesWithUsernames, convertErr := convertToFrontendShareResponse(r, []*share.Link{candidate}, d.user)
+		if convertErr != nil {
+			return http.StatusInternalServerError, convertErr
 		}
-		response := &ShareResponse{
-			Link:     s,
-			Username: username,
-		}
-		return renderJSON(w, r, response)
+		return renderJSON(w, r, sharesWithUsernames[0])
 	}
 
 	source, ok := config.Server.NameToSource[body.Source]
@@ -558,7 +693,6 @@ func sharePostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 		UserID:              d.user.ID,
 		Hash:                secure_hash,
 		PasswordHash:        stringHash,
-		Token:               token,
 		CommonShare:         body.CommonShare,
 		Version:             1, // Set version for new shares
 		CapabilityVersion:   share.CurrentCapabilityVersion,
@@ -717,23 +851,19 @@ func shareDirectDownloadHandler(w http.ResponseWriter, r *http.Request, d *reque
 	response := DirectDownloadResponse{
 		Status:      "200",
 		Hash:        secureHash,
-		DownloadURL: getShareURL(r, secureHash, true, shareLink.Token),
-		ShareURL:    getShareURL(r, secureHash, false, shareLink.Token),
+		DownloadURL: getShareURL(r, secureHash, true),
+		ShareURL:    getShareURL(r, secureHash, false),
 	}
 
 	return renderJSON(w, r, response)
 }
 
-func getShareURL(r *http.Request, hash string, isDirectDownload bool, token string) string {
+func getShareURL(r *http.Request, hash string, isDirectDownload bool) string {
 	var shareURL string
-	tokenParam := ""
-	if token != "" && isDirectDownload {
-		tokenParam = fmt.Sprintf("&token=%s", url.QueryEscape(token))
-	}
 
 	if config.Server.ExternalUrl != "" {
 		if isDirectDownload {
-			shareURL = fmt.Sprintf("%s%spublic/api/resources/download?hash=%s%s", config.Server.ExternalUrl, config.Server.BaseURL, hash, tokenParam)
+			shareURL = fmt.Sprintf("%s%spublic/api/resources/download?hash=%s", config.Server.ExternalUrl, config.Server.BaseURL, hash)
 		} else {
 			shareURL = fmt.Sprintf("%s%spublic/share/%s", config.Server.ExternalUrl, config.Server.BaseURL, hash)
 		}
@@ -756,7 +886,7 @@ func getShareURL(r *http.Request, hash string, isDirectDownload bool, token stri
 			scheme = getScheme(r)
 		}
 		if isDirectDownload {
-			shareURL = fmt.Sprintf("%s://%s%spublic/api/resources/download?hash=%s%s", scheme, host, config.Server.BaseURL, hash, tokenParam)
+			shareURL = fmt.Sprintf("%s://%s%spublic/api/resources/download?hash=%s", scheme, host, config.Server.BaseURL, hash)
 		} else {
 			shareURL = fmt.Sprintf("%s://%s%spublic/share/%s", scheme, host, config.Server.BaseURL, hash)
 		}
@@ -776,7 +906,7 @@ func getShareURL(r *http.Request, hash string, isDirectDownload bool, token stri
 // @Router /public/api/share/info [get]
 func shareInfoHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
 	hash := r.URL.Query().Get("hash")
-	// Get the file link by hash (need full Link to get Token)
+	// Get the file link by hash.
 	shareLink, err := store.Share.GetByHash(hash)
 	if err != nil {
 		return http.StatusNotFound, fmt.Errorf("share hash not found")
@@ -801,7 +931,7 @@ func shareInfoHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	}
 	commonShare := shareLink.CommonShare
 	commonShare.Capabilities = access.frontendCapabilities()
-	commonShare.ShareURL = getShareURL(r, hash, false, "")
+	commonShare.ShareURL = getShareURL(r, hash, false)
 	commonShare.BannerUrl = shareLink.BannerURL()
 	commonShare.FaviconUrl = shareLink.FaviconURL()
 	commonShare.Source = ""

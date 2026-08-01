@@ -971,7 +971,6 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 				filterPublicShareFileInfo(data, readTarget, file, idx)
 			}
 		}
-		file.Token = link.Token
 		file.Source = link.Hash
 		file.Hash = link.Hash
 		if !link.EnableOnlyOffice || !data.shareAccess.allows(publicShareReadOriginalViewer) || reachedDownloadsLimit {
@@ -2032,6 +2031,7 @@ func redactPublicSharePath(path string) string {
 
 func redactedRequestURL(r *http.Request) string {
 	publicRoute := strings.Contains(r.URL.Path, "/public/")
+	managementShareRoute := strings.Contains(r.URL.Path, "/api/share")
 	auditQueryPath := "/api/audit"
 	if config != nil {
 		auditQueryPath = strings.TrimSuffix(config.Server.BaseURL, "/") + "/api/audit"
@@ -2048,7 +2048,8 @@ func redactedRequestURL(r *http.Request) string {
 	for key := range query {
 		lowerKey := strings.ToLower(key)
 		_, sensitive := sensitiveQueryKeys[lowerKey]
-		if auditQueryRoute || sensitive || (publicRoute && lowerKey == "hash") {
+		managementShareSecret := managementShareRoute && (lowerKey == "hash" || lowerKey == "cursor")
+		if auditQueryRoute || sensitive || (publicRoute && lowerKey == "hash") || managementShareSecret {
 			query[key] = []string{"[REDACTED]"}
 		}
 	}

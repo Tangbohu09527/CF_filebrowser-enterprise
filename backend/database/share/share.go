@@ -120,9 +120,8 @@ type Link struct {
 	UserID       uint   `json:"userID"`
 	Expire       int64  `json:"expire"`
 	PasswordHash string `json:"password_hash,omitempty"`
-	// Token is a random value that will only be set when PasswordHash is set. It is
-	// URL-Safe and is used to download links in password-protected shares via a
-	// query arg.
+	// Token is retained for compatibility with legacy stored password shares.
+	// It is not accepted for authentication or exposed by HTTP responses.
 	Token string `json:"token,omitempty"`
 
 	Mu            sync.Mutex     `json:"-"`

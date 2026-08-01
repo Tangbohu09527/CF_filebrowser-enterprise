@@ -310,6 +310,54 @@ func TestPublicShareInternalLogsRedactHash(t *testing.T) {
 	})
 }
 
+func TestManagementShareAccessLogsRedactQuerySecrets(t *testing.T) {
+	previousConfig := config
+	config = &settings.Settings{}
+	t.Cleanup(func() { config = previousConfig })
+	capture := &securityCaptureLogger{}
+	logpkg.SetGlobalLogger(capture)
+	t.Cleanup(func() { logpkg.SetGlobalLogger(nil) })
+
+	query := url.Values{
+		"hash":     {"MANAGEMENT-SHARE-HASH-SECRET"},
+		"token":    {"MANAGEMENT-SHARE-TOKEN-SECRET"},
+		"password": {"MANAGEMENT-SHARE-PASSWORD-SECRET"},
+		"cursor":   {"MANAGEMENT-SHARE-CURSOR-SECRET"},
+		"safe":     {"visible"},
+	}.Encode()
+	secrets := []string{
+		"MANAGEMENT-SHARE-HASH-SECRET",
+		"MANAGEMENT-SHARE-TOKEN-SECRET",
+		"MANAGEMENT-SHARE-PASSWORD-SECRET",
+		"MANAGEMENT-SHARE-CURSOR-SECRET",
+	}
+
+	for _, test := range []struct {
+		name   string
+		status int
+	}{
+		{name: "authorized request", status: http.StatusNoContent},
+		{name: "request rejected before handler", status: http.StatusForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			capture.reset()
+			handler := LoggingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(test.status)
+			}))
+			request := httptest.NewRequest(http.MethodDelete, "/api/share?"+query, nil)
+			handler.ServeHTTP(httptest.NewRecorder(), request)
+
+			output := capture.String()
+			assertSensitiveLogValuesAbsent(t, output, secrets)
+			for _, visible := range []string{http.MethodDelete, "/api/share", fmt.Sprintf("%d", test.status)} {
+				if !strings.Contains(output, visible) {
+					t.Errorf("management share access log omitted safe value %q: %s", visible, output)
+				}
+			}
+		})
+	}
+}
+
 func assertSensitiveLogValuesAbsent(t *testing.T, output string, secrets []string) {
 	t.Helper()
 	for _, secret := range secrets {
