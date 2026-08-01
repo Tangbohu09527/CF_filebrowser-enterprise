@@ -536,6 +536,11 @@
     "lockPassword": "Voorkom dat de gebruiker het wachtwoord wijzigt",
     "newUser": "Nieuwe gebruiker",
     "permissions": {
+      "browse": "Bladeren",
+      "browseDescription": "Mappen en bestandslijsten bekijken",
+      "preview": "Voorbeeld",
+      "previewDescription": "Bestandsinhoud in de browser bekijken",
+      "downloadDescription": "Originele bestanden downloaden",
       "admin": "Beheerder",
       "modify": "Bestanden bewerken",
       "share": "Bestanden delen",

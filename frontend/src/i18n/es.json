@@ -254,6 +254,11 @@
     "lockPassword": "Impedir que el usuario cambie su contraseña",
     "newUser": "Nuevo usuario",
     "permissions": {
+      "browse": "Explorar",
+      "browseDescription": "Ver directorios y listas de archivos",
+      "preview": "Vista previa",
+      "previewDescription": "Previsualizar el contenido de los archivos en el navegador",
+      "downloadDescription": "Descargar archivos originales",
       "modify": "Editar archivos",
       "share": "Compartir archivos",
       "admin": "Administrador",

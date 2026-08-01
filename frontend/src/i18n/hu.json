@@ -253,6 +253,11 @@
     "lockPassword": "Felhasználói jelszó megváltoztatásának megakadályozása",
     "newUser": "Új felhasználó",
     "permissions": {
+      "browse": "Tallózás",
+      "browseDescription": "Könyvtárak és fájllisták megtekintése",
+      "preview": "Előnézet",
+      "previewDescription": "Fájltartalom előnézete a böngészőben",
+      "downloadDescription": "Eredeti fájlok letöltése",
       "modify": "Fájlok szerkesztése",
       "share": "Fájlok megosztása",
       "admin": "Adminisztrátor",

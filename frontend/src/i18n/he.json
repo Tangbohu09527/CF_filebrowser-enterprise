@@ -253,6 +253,11 @@
     "lockPassword": "מנע ממשתמש להחליף סיסמא",
     "newUser": "משתמש חדש",
     "permissions": {
+      "browse": "עיון",
+      "browseDescription": "הצגת תיקיות ורשימות קבצים",
+      "preview": "תצוגה מקדימה",
+      "previewDescription": "הצגת תוכן קבצים בדפדפן",
+      "downloadDescription": "הורדת קבצים מקוריים",
       "modify": "עריכת קבצים קבצים",
       "share": "שיתוף קבצים",
       "admin": "מנהל",

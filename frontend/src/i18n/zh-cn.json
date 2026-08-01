@@ -254,6 +254,11 @@
     "lockPassword": "禁止用户修改密码",
     "newUser": "新建用户",
     "permissions": {
+      "browse": "浏览",
+      "browseDescription": "查看目录和文件列表",
+      "preview": "预览",
+      "previewDescription": "在网页内预览文件内容",
+      "downloadDescription": "下载原始文件",
       "modify": "编辑",
       "share": "分享文件",
       "admin": "管理员",

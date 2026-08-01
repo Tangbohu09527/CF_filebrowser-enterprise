@@ -253,6 +253,11 @@
     "lockPassword": "パスワード変更を禁止",
     "newUser": "新しいユーザー",
     "permissions": {
+      "browse": "参照",
+      "browseDescription": "ディレクトリとファイル一覧を表示",
+      "preview": "プレビュー",
+      "previewDescription": "ブラウザー内でファイルの内容をプレビュー",
+      "downloadDescription": "元のファイルをダウンロード",
       "modify": "ファイルを編集",
       "share": "ファイルを共有",
       "admin": "管理者",

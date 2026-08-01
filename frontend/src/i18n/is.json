@@ -582,6 +582,11 @@
     "passwordUpdated": "Lykilorð uppfært!",
     "path": "Slóð",
     "permissions": {
+      "browse": "Fletta",
+      "browseDescription": "Skoða möppur og skráalista",
+      "preview": "Forskoða",
+      "previewDescription": "Forskoða innihald skráa í vafranum",
+      "downloadDescription": "Sækja upprunalegar skrár",
       "admin": "Kerfisstjórnandi",
       "modify": "Breyta skrám",
       "share": "Deila skrám",

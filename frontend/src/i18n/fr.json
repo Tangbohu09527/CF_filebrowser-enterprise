@@ -254,6 +254,11 @@
     "lockPassword": "Empêcher l'utilisateur de changer son mot de passe",
     "newUser": "Nouvel utilisateur",
     "permissions": {
+      "browse": "Parcourir",
+      "browseDescription": "Afficher les dossiers et les listes de fichiers",
+      "preview": "Aperçu",
+      "previewDescription": "Prévisualiser le contenu des fichiers dans le navigateur",
+      "downloadDescription": "Télécharger les fichiers originaux",
       "modify": "Modifier des fichiers",
       "share": "Partager des fichiers",
       "admin": "Administrateur",

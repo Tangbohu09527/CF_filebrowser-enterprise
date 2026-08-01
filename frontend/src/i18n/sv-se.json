@@ -253,6 +253,11 @@
     "lockPassword": "Förhindra att användare kan byta lösenord",
     "newUser": "Ny användare",
     "permissions": {
+      "browse": "Bläddra",
+      "browseDescription": "Visa mappar och fillistor",
+      "preview": "Förhandsgranska",
+      "previewDescription": "Förhandsgranska filinnehåll i webbläsaren",
+      "downloadDescription": "Ladda ner originalfiler",
       "modify": "Ändra fil",
       "share": "Dela filer",
       "admin": "Administratör",

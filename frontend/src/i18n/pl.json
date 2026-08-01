@@ -253,6 +253,11 @@
     "lockPassword": "Zablokuj użytkownikowi możliwość zmiany hasła",
     "newUser": "Nowy Użytkownik",
     "permissions": {
+      "browse": "Przeglądanie",
+      "browseDescription": "Wyświetlanie katalogów i list plików",
+      "preview": "Podgląd",
+      "previewDescription": "Podgląd zawartości plików w przeglądarce",
+      "downloadDescription": "Pobieranie oryginalnych plików",
       "modify": "Edycja plików",
       "share": "Udostępnianie plików",
       "admin": "Administrator",

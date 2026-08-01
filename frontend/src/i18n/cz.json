@@ -409,6 +409,11 @@
     "lockPassword": "Zabránit uživateli ve změně hesla",
     "newUser": "Nový uživatel",
     "permissions": {
+      "browse": "Procházet",
+      "browseDescription": "Zobrazit adresáře a seznamy souborů",
+      "preview": "Náhled",
+      "previewDescription": "Zobrazit náhled obsahu souborů v prohlížeči",
+      "downloadDescription": "Stáhnout původní soubory",
       "admin": "Administrátor",
       "modify": "Upravit soubory",
       "share": "Sdílet soubory",

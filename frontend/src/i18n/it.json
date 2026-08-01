@@ -536,6 +536,11 @@
     "lockPassword": "Impedisci all'utente di cambiare la password",
     "newUser": "Nuovo Utente",
     "permissions": {
+      "browse": "Esplora",
+      "browseDescription": "Visualizza cartelle ed elenchi di file",
+      "preview": "Anteprima",
+      "previewDescription": "Visualizza l'anteprima dei file nel browser",
+      "downloadDescription": "Scarica i file originali",
       "admin": "Amministratore",
       "modify": "Modifica file",
       "share": "Condividi file",

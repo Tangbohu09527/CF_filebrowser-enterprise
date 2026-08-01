@@ -253,6 +253,11 @@
     "lockPassword": "منع المستخدم من تغيير كلمة المرور",
     "newUser": "مستخدم جديد",
     "permissions": {
+      "browse": "تصفح",
+      "browseDescription": "عرض المجلدات وقوائم الملفات",
+      "preview": "معاينة",
+      "previewDescription": "معاينة محتوى الملفات في المتصفح",
+      "downloadDescription": "تنزيل الملفات الأصلية",
       "modify": "Edit files",
       "share": "Share files",
       "admin": "المدير",

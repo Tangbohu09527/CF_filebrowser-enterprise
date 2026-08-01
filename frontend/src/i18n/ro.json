@@ -253,6 +253,11 @@
     "lockPassword": "Împiedică utilizatorul să-și schimbe parola",
     "newUser": "Utilizator nou",
     "permissions": {
+      "browse": "Navigare",
+      "browseDescription": "Vizualizează directoarele și listele de fișiere",
+      "preview": "Previzualizare",
+      "previewDescription": "Previzualizează conținutul fișierelor în browser",
+      "downloadDescription": "Descarcă fișierele originale",
       "modify": "Modifică fișiere",
       "share": "Distribuie fișiere",
       "admin": "Administrator",

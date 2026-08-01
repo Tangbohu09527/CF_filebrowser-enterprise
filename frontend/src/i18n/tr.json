@@ -253,6 +253,11 @@
     "lockPassword": "Kullanıcının parolayı değiştirmesini engelle",
     "newUser": "Yeni Kullanıcı",
     "permissions": {
+      "browse": "Göz at",
+      "browseDescription": "Dizinleri ve dosya listelerini görüntüle",
+      "preview": "Önizleme",
+      "previewDescription": "Dosya içeriklerini tarayıcıda önizle",
+      "downloadDescription": "Orijinal dosyaları indir",
       "modify": "Dosyaları değiştir",
       "share": "Dosyaları paylaş",
       "admin": "Yönetici",

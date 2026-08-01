@@ -543,7 +543,12 @@
       "realtime": "Enable real-time connections and updates",
       "create": "Create files",
       "delete": "Delete files",
-      "download": "Download files"
+      "browse": "Browse",
+      "browseDescription": "View directories and file lists",
+      "preview": "Preview",
+      "previewDescription": "Preview file contents in the browser",
+      "download": "Download files",
+      "downloadDescription": "Download original files"
     },
     "permissions-name": "Permissions",
     "permissionsHelp": "User permissions control access to what type of actions the user can perform. Administrar access gives full control to update and change any user's settings as well as many system settings.",

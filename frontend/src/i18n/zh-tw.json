@@ -253,6 +253,11 @@
     "lockPassword": "禁止使用者變更密碼",
     "newUser": "新增使用者",
     "permissions": {
+      "browse": "瀏覽",
+      "browseDescription": "查看目錄和檔案清單",
+      "preview": "預覽",
+      "previewDescription": "在網頁內預覽檔案內容",
+      "downloadDescription": "下載原始檔案",
       "modify": "編輯檔案",
       "share": "分享檔案",
       "admin": "管理員",

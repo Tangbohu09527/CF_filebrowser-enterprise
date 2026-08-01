@@ -253,6 +253,11 @@
     "lockPassword": "Zabrániť používateľovi meniť heslo",
     "newUser": "Nový používateľ",
     "permissions": {
+      "browse": "Prehľadávať",
+      "browseDescription": "Zobraziť priečinky a zoznamy súborov",
+      "preview": "Náhľad",
+      "previewDescription": "Zobraziť náhľad obsahu súborov v prehliadači",
+      "downloadDescription": "Stiahnuť pôvodné súbory",
       "modify": "Upravovať súbory",
       "share": "Zdieľať súbory",
       "admin": "Správca",
