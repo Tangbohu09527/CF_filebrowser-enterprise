@@ -1,12 +1,16 @@
 package bolt
 
 import (
+	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	storm "github.com/asdine/storm/v3"
@@ -18,19 +22,22 @@ const (
 	auditEventKeyBytes     = 16
 	auditRecoveryBatchSize = 100
 	maxAuditListLimit      = 1000
+	maxAuditQueryScan      = 10000
 )
 
 var errAuditSchemaUnavailable = errors.New("audit storage schema is unavailable")
 
 type auditBoltStore struct {
-	db  *storm.DB
-	now func() time.Time
+	db             *storm.DB
+	now            func() time.Time
+	queryScanLimit int
 }
 
 func newAuditStore(db *storm.DB) *auditBoltStore {
 	return &auditBoltStore{
-		db:  db,
-		now: time.Now,
+		db:             db,
+		now:            time.Now,
+		queryScanLimit: maxAuditQueryScan,
 	}
 }
 
@@ -217,6 +224,285 @@ func (store *auditBoltStore) ListTerminal(limit int) ([]auditdb.Event, error) {
 	return events, nil
 }
 
+func (store *auditBoltStore) Query(ctx context.Context, options auditdb.QueryOptions) (auditdb.QueryResult, error) {
+	normalized, err := auditdb.NormalizeQueryOptions(options)
+	if err != nil {
+		return auditdb.QueryResult{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return auditdb.QueryResult{}, err
+	}
+
+	afterKey, err := decodeAuditQueryEventID(normalized.AfterID)
+	if err != nil {
+		return auditdb.QueryResult{}, err
+	}
+	if normalized.RequestID != "" {
+		return store.queryAuditRequestID(ctx, normalized, afterKey)
+	}
+
+	result := auditdb.QueryResult{Events: make([]auditdb.Event, 0, normalized.Limit)}
+	err = store.db.Bolt.View(func(tx *bbolt.Tx) error {
+		bucketName, indexValue := selectAuditQueryIndex(normalized)
+		var bucket *bbolt.Bucket
+		var prefix []byte
+		if bucketName == nil {
+			var bucketErr error
+			bucket, bucketErr = requiredAuditBucket(tx, auditEventsBucket)
+			if bucketErr != nil {
+				return bucketErr
+			}
+		} else {
+			var bucketErr error
+			bucket, bucketErr = requiredAuditBucket(tx, bucketName)
+			if bucketErr != nil {
+				return bucketErr
+			}
+			prefix = auditSecondaryIndexPrefix(indexValue)
+		}
+
+		upperExclusive, empty := auditQueryUpperExclusive(normalized, afterKey)
+		if empty || auditQueryStartsAfterLatestEvent(normalized) {
+			return nil
+		}
+		cursor := bucket.Cursor()
+		key, value := startAuditQueryCursor(cursor, prefix, upperExclusive)
+		scanLimit := store.queryScanLimit
+		if scanLimit < 1 {
+			scanLimit = maxAuditQueryScan
+		}
+
+		scanned := 0
+		lastScannedID := ""
+		exhausted := false
+		for key != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+
+			eventKey := key
+			if prefix != nil {
+				if !bytes.HasPrefix(key, prefix) {
+					exhausted = true
+					break
+				}
+				if len(key) != len(prefix)+auditEventKeyBytes || len(value) != auditEventKeyBytes ||
+					!bytes.Equal(key[len(prefix):], value) {
+					return errors.New("invalid audit secondary index entry")
+				}
+				eventKey = value
+			}
+			if len(eventKey) != auditEventKeyBytes {
+				return errors.New("invalid persisted audit event key")
+			}
+
+			timestamp := auditTimestampFromEventKey(eventKey)
+			if normalized.From != nil && timestamp.Before(*normalized.From) {
+				exhausted = true
+				break
+			}
+
+			scanned++
+			lastScannedID = hex.EncodeToString(eventKey)
+			var event *auditdb.Event
+			var loadErr error
+			if prefix == nil {
+				event, loadErr = decodeTerminalEvent(eventKey, value)
+			} else {
+				event, loadErr = loadTerminalEvent(tx, eventKey)
+			}
+			if loadErr != nil {
+				return loadErr
+			}
+			if auditEventMatchesQuery(*event, normalized) {
+				result.Events = append(result.Events, *event)
+				if len(result.Events) > normalized.Limit {
+					break
+				}
+			}
+			if scanned >= scanLimit {
+				break
+			}
+			key, value = cursor.Prev()
+		}
+		if key == nil {
+			exhausted = true
+		}
+
+		switch {
+		case len(result.Events) > normalized.Limit:
+			result.Events = result.Events[:normalized.Limit]
+			result.HasMore = true
+			result.NextID = result.Events[len(result.Events)-1].ID
+		case !exhausted && lastScannedID != "":
+			result.HasMore = true
+			result.NextID = lastScannedID
+		}
+		return nil
+	})
+	if err != nil {
+		return auditdb.QueryResult{}, fmt.Errorf("query terminal audit events: %w", err)
+	}
+	return result, nil
+}
+
+func (store *auditBoltStore) queryAuditRequestID(
+	ctx context.Context,
+	options auditdb.QueryOptions,
+	afterKey []byte,
+) (auditdb.QueryResult, error) {
+	result := auditdb.QueryResult{Events: make([]auditdb.Event, 0, 1)}
+	err := store.db.Bolt.View(func(tx *bbolt.Tx) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		requestIDs, bucketErr := requiredAuditBucket(tx, auditRequestIDsBucket)
+		if bucketErr != nil {
+			return bucketErr
+		}
+		eventKey := requestIDs.Get([]byte(options.RequestID))
+		if eventKey == nil {
+			return nil
+		}
+		if afterKey != nil && bytes.Compare(eventKey, afterKey) >= 0 {
+			return nil
+		}
+		event, loadErr := loadTerminalEventForRequest(tx, options.RequestID, eventKey)
+		if loadErr != nil {
+			return loadErr
+		}
+		if auditEventMatchesQuery(*event, options) {
+			result.Events = append(result.Events, *event)
+		}
+		return nil
+	})
+	if err != nil {
+		return auditdb.QueryResult{}, fmt.Errorf("query terminal audit event by request ID: %w", err)
+	}
+	return result, nil
+}
+
+func decodeAuditQueryEventID(id string) ([]byte, error) {
+	if id == "" {
+		return nil, nil
+	}
+	key, err := hex.DecodeString(id)
+	if err != nil || len(key) != auditEventKeyBytes {
+		return nil, fmt.Errorf("%w: invalid cursor event", auditdb.ErrInvalidQuery)
+	}
+	return key, nil
+}
+
+func selectAuditQueryIndex(options auditdb.QueryOptions) ([]byte, string) {
+	switch {
+	case options.Actor != "":
+		// Existing databases can contain only user:<id> actor entries.
+		return nil, ""
+	case options.TokenRef != "":
+		return auditIndexTokenRefBucket, options.TokenRef
+	case options.ShareRef != "":
+		return auditIndexShareRefBucket, options.ShareRef
+	case options.Action != "":
+		return auditIndexActionBucket, string(options.Action)
+	case options.Source != "":
+		return auditIndexSourceBucket, options.Source
+	case options.Result != "":
+		return auditIndexResultBucket, string(options.Result)
+	default:
+		return nil, ""
+	}
+}
+
+func auditQueryUpperExclusive(options auditdb.QueryOptions, afterKey []byte) ([]byte, bool) {
+	upperExclusive := append([]byte(nil), afterKey...)
+	epoch := time.Unix(0, 0).UTC()
+	latest := time.Unix(0, math.MaxInt64).UTC()
+	if options.To != nil {
+		if !options.To.After(epoch) {
+			return nil, true
+		}
+		if !options.To.After(latest) {
+			toKey := makeAuditEventKey(*options.To, 0)
+			if upperExclusive == nil || bytes.Compare(toKey, upperExclusive) < 0 {
+				upperExclusive = toKey
+			}
+		}
+	}
+	return upperExclusive, false
+}
+
+func auditQueryStartsAfterLatestEvent(options auditdb.QueryOptions) bool {
+	return options.From != nil && options.From.After(time.Unix(0, math.MaxInt64).UTC())
+}
+
+func startAuditQueryCursor(cursor *bbolt.Cursor, prefix, upperExclusive []byte) ([]byte, []byte) {
+	if upperExclusive != nil {
+		seek := make([]byte, 0, len(prefix)+len(upperExclusive))
+		seek = append(seek, prefix...)
+		seek = append(seek, upperExclusive...)
+		key, _ := cursor.Seek(seek)
+		if key == nil {
+			return cursor.Last()
+		}
+		return cursor.Prev()
+	}
+	if prefix == nil {
+		return cursor.Last()
+	}
+	prefixEnd := append([]byte(nil), prefix...)
+	prefixEnd[len(prefixEnd)-1]++
+	key, _ := cursor.Seek(prefixEnd)
+	if key == nil {
+		return cursor.Last()
+	}
+	return cursor.Prev()
+}
+
+func auditTimestampFromEventKey(eventKey []byte) time.Time {
+	return time.Unix(0, int64(binary.BigEndian.Uint64(eventKey[:8]))).UTC()
+}
+
+func auditEventMatchesQuery(event auditdb.Event, options auditdb.QueryOptions) bool {
+	if options.Actor != "" && event.Username != options.Actor {
+		return false
+	}
+	if options.TokenRef != "" && event.TokenRef != options.TokenRef {
+		return false
+	}
+	if options.ShareRef != "" && event.ShareRef != options.ShareRef {
+		return false
+	}
+	if options.Action != "" && event.Action != options.Action {
+		return false
+	}
+	if options.Source != "" && event.Source != options.Source {
+		return false
+	}
+	if options.Path != "" && !auditCanonicalPathHasPrefix(event.CanonicalPath, options.Path) {
+		return false
+	}
+	if options.RequestID != "" && event.RequestID != options.RequestID {
+		return false
+	}
+	if options.Result != "" && event.Result != options.Result {
+		return false
+	}
+	if options.From != nil && event.TimestampUTC.Before(*options.From) {
+		return false
+	}
+	if options.To != nil && !event.TimestampUTC.Before(*options.To) {
+		return false
+	}
+	return true
+}
+
+func auditCanonicalPathHasPrefix(canonicalPath, prefix string) bool {
+	if prefix == "/" {
+		return strings.HasPrefix(canonicalPath, "/")
+	}
+	return canonicalPath == prefix || strings.HasPrefix(canonicalPath, prefix+"/")
+}
+
 func (store *auditBoltStore) RecoverPending() (int, error) {
 	total := 0
 	for {
@@ -322,7 +608,6 @@ func putTerminalEvent(tx *bbolt.Tx, event *auditdb.Event, allowPending bool) err
 		bucket []byte
 		value  string
 	}{
-		{bucket: auditIndexActorBucket, value: auditActorIndexValue(*event)},
 		{bucket: auditIndexActionBucket, value: string(event.Action)},
 		{bucket: auditIndexTokenRefBucket, value: event.TokenRef},
 		{bucket: auditIndexShareRefBucket, value: event.ShareRef},
@@ -339,6 +624,15 @@ func putTerminalEvent(tx *bbolt.Tx, event *auditdb.Event, allowPending bool) err
 		}
 		if putErr := bucket.Put(auditSecondaryIndexKey(index.value, eventKey), eventKey); putErr != nil {
 			return fmt.Errorf("persist audit secondary index: %w", putErr)
+		}
+	}
+	actorBucket, err := requiredAuditBucket(tx, auditIndexActorBucket)
+	if err != nil {
+		return err
+	}
+	for _, value := range auditActorIndexValues(*event) {
+		if putErr := actorBucket.Put(auditSecondaryIndexKey(value, eventKey), eventKey); putErr != nil {
+			return fmt.Errorf("persist audit actor index: %w", putErr)
 		}
 	}
 	return nil
@@ -424,12 +718,26 @@ func auditSecondaryIndexKey(value string, eventKey []byte) []byte {
 	return key
 }
 
+func auditSecondaryIndexPrefix(value string) []byte {
+	prefix := make([]byte, len(value)+1)
+	copy(prefix, value)
+	return prefix
+}
+
 func auditActorIndexValue(event auditdb.Event) string {
+	return auditActorIndexValues(event)[0]
+}
+
+func auditActorIndexValues(event auditdb.Event) []string {
+	values := make([]string, 0, 2)
 	if event.UserID != nil {
-		return "user:" + strconv.FormatUint(uint64(*event.UserID), 10)
+		values = append(values, "user:"+strconv.FormatUint(uint64(*event.UserID), 10))
 	}
 	if event.Username != "" {
-		return "username:" + event.Username
+		values = append(values, "username:"+event.Username)
 	}
-	return "anonymous"
+	if len(values) == 0 {
+		values = append(values, "anonymous")
+	}
+	return values
 }

@@ -1064,6 +1064,10 @@ func (store *auditStoreStub) ListTerminal(limit int) ([]auditdb.Event, error) {
 	return result, nil
 }
 
+func (store *auditStoreStub) Query(context.Context, auditdb.QueryOptions) (auditdb.QueryResult, error) {
+	return auditdb.QueryResult{Events: []auditdb.Event{}}, nil
+}
+
 func (store *auditStoreStub) RecoverPending() (int, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()

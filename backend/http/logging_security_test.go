@@ -78,6 +78,109 @@ func TestLoggingMiddlewareRedactsSensitiveQueryValues(t *testing.T) {
 	})
 }
 
+func TestAuditQueryRejectedRequestLogsRedactAllQueryValues(t *testing.T) {
+	tests := []struct {
+		name       string
+		baseURL    string
+		routePath  string
+		requestURL string
+		credential func(*testing.T, *auditQueryHTTPFixture) string
+		wantStatus int
+	}{
+		{
+			name:       "anonymous",
+			baseURL:    "/",
+			routePath:  "/api/audit",
+			requestURL: "/api/audit",
+			credential: func(*testing.T, *auditQueryHTTPFixture) string { return "" },
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "ordinary user with base URL",
+			baseURL:    "/company/files/",
+			routePath:  "/company/files/api/audit",
+			requestURL: "/company/files/api/audit",
+			credential: func(t *testing.T, fixture *auditQueryHTTPFixture) string {
+				return fixture.sessionToken(t, fixture.user)
+			},
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:       "dot segment redirect",
+			baseURL:    "/",
+			routePath:  "/api/audit",
+			requestURL: "/api/ignored/../audit",
+			credential: func(*testing.T, *auditQueryHTTPFixture) string { return "" },
+			wantStatus: http.StatusTemporaryRedirect,
+		},
+		{
+			name:       "repeated slash redirect with base URL",
+			baseURL:    "/company/files/",
+			routePath:  "/company/files/api/audit",
+			requestURL: "/company/files/api//audit",
+			credential: func(*testing.T, *auditQueryHTTPFixture) string { return "" },
+			wantStatus: http.StatusTemporaryRedirect,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newAuditQueryHTTPFixture(t)
+			config.Server.BaseURL = test.baseURL
+			capture := &securityCaptureLogger{}
+			logpkg.SetGlobalLogger(capture)
+			t.Cleanup(func() { logpkg.SetGlobalLogger(nil) })
+
+			secrets := map[string]string{
+				"actor":   "AUDIT-ACTOR-LOG-SECRET",
+				"path":    "/AUDIT-PATH-LOG-SECRET",
+				"cursor":  "AUDIT-CURSOR-LOG-SECRET",
+				"unknown": "AUDIT-UNKNOWN-LOG-SECRET",
+			}
+			query := make(url.Values, len(secrets))
+			for key, secret := range secrets {
+				query.Set(key, secret)
+			}
+			request := httptest.NewRequest(http.MethodGet, test.requestURL+"?"+query.Encode(), nil)
+			if credential := test.credential(t, fixture); credential != "" {
+				request.Header.Set("Authorization", "Bearer "+credential)
+			}
+			response := httptest.NewRecorder()
+			mux := http.NewServeMux()
+			mux.Handle(test.routePath, withAdmin(auditQueryHandler))
+			handler := AuditMiddleware(LoggingMiddleware(mux), NewAuditService(store.Audit))
+			handler.ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Fatalf("status: got %d, want %d; body=%s", response.Code, test.wantStatus, response.Body.String())
+			}
+			requestID := response.Header().Get(auditRequestIDHeader)
+			if requestID == "" {
+				t.Fatal("audit request ID header is empty")
+			}
+			output := capture.String()
+			for key, secret := range secrets {
+				if strings.Contains(output, secret) {
+					t.Errorf("audit query log exposed %s value %q: %s", key, secret, output)
+				}
+				if !strings.Contains(output, key+"=%5BREDACTED%5D") {
+					t.Errorf("audit query log did not retain redacted %s parameter: %s", key, output)
+				}
+			}
+			for _, expected := range []string{
+				test.requestURL,
+				http.MethodGet,
+				fmt.Sprintf("| %3d |", test.wantStatus),
+				"request_id=" + requestID,
+			} {
+				if !strings.Contains(output, expected) {
+					t.Errorf("audit query log missing %q: %s", expected, output)
+				}
+			}
+		})
+	}
+}
+
 func TestOnlyOfficeCallbackTransportErrorRedactsSensitiveURL(t *testing.T) {
 	fixture := setupPreviewSecurityFixture(t)
 	officeFile := fixture.files["Office"]

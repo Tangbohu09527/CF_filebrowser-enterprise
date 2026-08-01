@@ -2032,6 +2032,11 @@ func redactPublicSharePath(path string) string {
 
 func redactedRequestURL(r *http.Request) string {
 	publicRoute := strings.Contains(r.URL.Path, "/public/")
+	auditQueryPath := "/api/audit"
+	if config != nil {
+		auditQueryPath = strings.TrimSuffix(config.Server.BaseURL, "/") + "/api/audit"
+	}
+	auditQueryRoute := pathpkg.Clean(r.URL.Path) == pathpkg.Clean(auditQueryPath)
 	path := redactPublicSharePath(r.URL.Path)
 	if r.URL.RawQuery == "" {
 		return path
@@ -2043,7 +2048,7 @@ func redactedRequestURL(r *http.Request) string {
 	for key := range query {
 		lowerKey := strings.ToLower(key)
 		_, sensitive := sensitiveQueryKeys[lowerKey]
-		if sensitive || (publicRoute && lowerKey == "hash") {
+		if auditQueryRoute || sensitive || (publicRoute && lowerKey == "hash") {
 			query[key] = []string{"[REDACTED]"}
 		}
 	}

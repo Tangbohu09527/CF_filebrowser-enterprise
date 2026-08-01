@@ -155,6 +155,7 @@ func StartHttp(ctx context.Context, storage *bolt.BoltStore, shutdownComplete ch
 	api.HandleFunc("GET /access/groups", withAdmin(groupGetHandler))
 	api.HandleFunc("POST /access/group", withAdmin(groupPostHandler))
 	api.HandleFunc("DELETE /access/group", withAdmin(groupDeleteHandler))
+	api.HandleFunc("GET /audit", withAdmin(auditQueryHandler))
 
 	// ========================================
 	// Share Routes - /api/share/
