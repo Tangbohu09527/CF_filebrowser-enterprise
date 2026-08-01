@@ -35,13 +35,15 @@ func GetEmbeddedAssets() embed.FS {
 }
 
 var (
-	store   *bolt.BoltStore
-	config  *settings.Settings
-	assetFs fs.FS
+	store        *bolt.BoltStore
+	auditRuntime *AuditService
+	config       *settings.Settings
+	assetFs      fs.FS
 )
 
 func StartHttp(ctx context.Context, storage *bolt.BoltStore, shutdownComplete chan struct{}) {
 	store = storage
+	auditRuntime = NewAuditService(storage.Audit)
 	config = &settings.Config
 	var err error
 	// Start pprof server in a separate goroutine

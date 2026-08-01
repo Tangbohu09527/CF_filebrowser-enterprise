@@ -1603,46 +1603,376 @@ func withTimeout(timeout time.Duration, fn handleFunc) http.HandlerFunc {
 
 func muxWithMiddleware(mux *http.ServeMux) *http.ServeMux {
 	wrappedMux := http.NewServeMux()
-	wrappedMux.Handle("/", LoggingMiddleware(mux))
+	wrappedMux.Handle("/", AuditMiddleware(LoggingMiddleware(mux), auditRuntime))
 	return wrappedMux
 }
 
-// ResponseWriterWrapper wraps the standard http.ResponseWriter to capture the status code
+// ResponseWriterWrapper wraps the standard http.ResponseWriter to capture response facts.
 type ResponseWriterWrapper struct {
 	http.ResponseWriter
 	StatusCode  int
-	wroteHeader bool
-	PayloadSize int
+	PayloadSize int64
 	User        string
+	wroteHeader bool
+	writeFailed bool
 }
 
-// WriteHeader captures the status code and ensures it's only written once
 func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
-	if !w.wroteHeader { // Prevent WriteHeader from being called multiple times
-		if statusCode == 0 {
-			statusCode = http.StatusInternalServerError
-		}
-		w.StatusCode = statusCode
-		w.ResponseWriter.WriteHeader(statusCode)
-		w.wroteHeader = true
+	if w.wroteHeader {
+		return
 	}
+	if statusCode == 0 {
+		statusCode = http.StatusInternalServerError
+	}
+	w.StatusCode = statusCode
+	w.wroteHeader = true
+	w.ResponseWriter.WriteHeader(statusCode)
 }
 
-// Write is the method to write the response body and ensure WriteHeader is called
 func (w *ResponseWriterWrapper) Write(b []byte) (int, error) {
-	if !w.wroteHeader { // Default to 200 if WriteHeader wasn't called explicitly
+	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
-	return w.ResponseWriter.Write(b)
+	written, err := w.ResponseWriter.Write(b)
+	w.recordWrite(int64(written), err)
+	return written, err
+}
+
+func (w *ResponseWriterWrapper) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (w *ResponseWriterWrapper) responseWriterWrapper() *ResponseWriterWrapper {
+	return w
+}
+
+func (w *ResponseWriterWrapper) recordWrite(written int64, err error) {
+	if written > 0 {
+		w.PayloadSize += written
+	}
+	if err != nil {
+		w.writeFailed = true
+	}
+}
+
+func (w *ResponseWriterWrapper) WriteFailed() bool {
+	return w.writeFailed
+}
+
+type trackedResponseWriter interface {
+	http.ResponseWriter
+	Unwrap() http.ResponseWriter
+	responseWriterWrapper() *ResponseWriterWrapper
+}
+
+type trackedFlusher struct {
+	state   *ResponseWriterWrapper
+	flusher http.Flusher
+}
+
+func (flusher trackedFlusher) Flush() {
+	_ = flusher.FlushError()
+}
+
+func (flusher trackedFlusher) FlushError() error {
+	if !flusher.state.wroteHeader {
+		flusher.state.WriteHeader(http.StatusOK)
+	}
+	if errorFlusher, ok := flusher.flusher.(interface{ FlushError() error }); ok {
+		return errorFlusher.FlushError()
+	}
+	flusher.flusher.Flush()
+	return nil
+}
+
+type responseFlusher interface {
+	http.Flusher
+	FlushError() error
+}
+
+type trackedReaderFrom struct {
+	state      *ResponseWriterWrapper
+	readerFrom io.ReaderFrom
+}
+
+func (readerFrom trackedReaderFrom) ReadFrom(reader io.Reader) (int64, error) {
+	if !readerFrom.state.wroteHeader {
+		readerFrom.state.WriteHeader(http.StatusOK)
+	}
+	written, err := readerFrom.readerFrom.ReadFrom(reader)
+	readerFrom.state.recordWrite(written, err)
+	return written, err
+}
+
+const (
+	responseWriterFlusher uint8 = 1 << iota
+	responseWriterHijacker
+	responseWriterPusher
+	responseWriterReaderFrom
+	responseWriterCloseNotifier
+)
+
+func wrapResponseWriter(writer http.ResponseWriter) (http.ResponseWriter, *ResponseWriterWrapper) {
+	if state := responseWriterStateFrom(writer); state != nil {
+		return writer, state
+	}
+	state := &ResponseWriterWrapper{ResponseWriter: writer, StatusCode: http.StatusOK}
+	return preserveResponseWriterInterfaces(state, writer), state
+}
+
+func responseWriterStateFrom(writer http.ResponseWriter) *ResponseWriterWrapper {
+	tracked, ok := writer.(interface {
+		responseWriterWrapper() *ResponseWriterWrapper
+	})
+	if !ok {
+		return nil
+	}
+	return tracked.responseWriterWrapper()
+}
+
+func preserveResponseWriterInterfaces(base trackedResponseWriter, underlying http.ResponseWriter) http.ResponseWriter {
+	var capabilities uint8
+	var flusher responseFlusher
+	var hijacker http.Hijacker
+	var pusher http.Pusher
+	var readerFrom io.ReaderFrom
+	var closeNotifier http.CloseNotifier
+	if supported, ok := underlying.(http.Flusher); ok {
+		capabilities |= responseWriterFlusher
+		flusher = trackedFlusher{state: base.responseWriterWrapper(), flusher: supported}
+	}
+	if supported, ok := underlying.(http.Hijacker); ok {
+		capabilities |= responseWriterHijacker
+		hijacker = supported
+	}
+	if supported, ok := underlying.(http.Pusher); ok {
+		capabilities |= responseWriterPusher
+		pusher = supported
+	}
+	if supported, ok := underlying.(io.ReaderFrom); ok {
+		capabilities |= responseWriterReaderFrom
+		readerFrom = trackedReaderFrom{state: base.responseWriterWrapper(), readerFrom: supported}
+	}
+	if supported, ok := underlying.(http.CloseNotifier); ok {
+		capabilities |= responseWriterCloseNotifier
+		closeNotifier = supported
+	}
+
+	switch capabilities {
+	case 0:
+		return base
+	case responseWriterFlusher:
+		return struct {
+			trackedResponseWriter
+			responseFlusher
+		}{base, flusher}
+	case responseWriterHijacker:
+		return struct {
+			trackedResponseWriter
+			http.Hijacker
+		}{base, hijacker}
+	case responseWriterFlusher | responseWriterHijacker:
+		return struct {
+			trackedResponseWriter
+			responseFlusher
+			http.Hijacker
+		}{base, flusher, hijacker}
+	case responseWriterPusher:
+		return struct {
+			trackedResponseWriter
+			http.Pusher
+		}{base, pusher}
+	case responseWriterFlusher | responseWriterPusher:
+		return struct {
+			trackedResponseWriter
+			responseFlusher
+			http.Pusher
+		}{base, flusher, pusher}
+	case responseWriterHijacker | responseWriterPusher:
+		return struct {
+			trackedResponseWriter
+			http.Hijacker
+			http.Pusher
+		}{base, hijacker, pusher}
+	case responseWriterFlusher | responseWriterHijacker | responseWriterPusher:
+		return struct {
+			trackedResponseWriter
+			responseFlusher
+			http.Hijacker
+			http.Pusher
+		}{base, flusher, hijacker, pusher}
+	case responseWriterReaderFrom:
+		return struct {
+			trackedResponseWriter
+			io.ReaderFrom
+		}{base, readerFrom}
+	case responseWriterFlusher | responseWriterReaderFrom:
+		return struct {
+			trackedResponseWriter
+			responseFlusher
+			io.ReaderFrom
+		}{base, flusher, readerFrom}
+	case responseWriterHijacker | responseWriterReaderFrom:
+		return struct {
+			trackedResponseWriter
+			http.Hijacker
+			io.ReaderFrom
+		}{base, hijacker, readerFrom}
+	case responseWriterFlusher | responseWriterHijacker | responseWriterReaderFrom:
+		return struct {
+			trackedResponseWriter
+			responseFlusher
+			http.Hijacker
+			io.ReaderFrom
+		}{base, flusher, hijacker, readerFrom}
+	case responseWriterPusher | responseWriterReaderFrom:
+		return struct {
+			trackedResponseWriter
+			http.Pusher
+			io.ReaderFrom
+		}{base, pusher, readerFrom}
+	case responseWriterFlusher | responseWriterPusher | responseWriterReaderFrom:
+		return struct {
+			trackedResponseWriter
+			responseFlusher
+			http.Pusher
+			io.ReaderFrom
+		}{base, flusher, pusher, readerFrom}
+	case responseWriterHijacker | responseWriterPusher | responseWriterReaderFrom:
+		return struct {
+			trackedResponseWriter
+			http.Hijacker
+			http.Pusher
+			io.ReaderFrom
+		}{base, hijacker, pusher, readerFrom}
+	case responseWriterFlusher | responseWriterHijacker | responseWriterPusher | responseWriterReaderFrom:
+		return struct {
+			trackedResponseWriter
+			responseFlusher
+			http.Hijacker
+			http.Pusher
+			io.ReaderFrom
+		}{base, flusher, hijacker, pusher, readerFrom}
+	case responseWriterCloseNotifier:
+		return struct {
+			trackedResponseWriter
+			http.CloseNotifier
+		}{base, closeNotifier}
+	case responseWriterFlusher | responseWriterCloseNotifier:
+		return struct {
+			trackedResponseWriter
+			responseFlusher
+			http.CloseNotifier
+		}{base, flusher, closeNotifier}
+	case responseWriterHijacker | responseWriterCloseNotifier:
+		return struct {
+			trackedResponseWriter
+			http.Hijacker
+			http.CloseNotifier
+		}{base, hijacker, closeNotifier}
+	case responseWriterFlusher | responseWriterHijacker | responseWriterCloseNotifier:
+		return struct {
+			trackedResponseWriter
+			responseFlusher
+			http.Hijacker
+			http.CloseNotifier
+		}{base, flusher, hijacker, closeNotifier}
+	case responseWriterPusher | responseWriterCloseNotifier:
+		return struct {
+			trackedResponseWriter
+			http.Pusher
+			http.CloseNotifier
+		}{base, pusher, closeNotifier}
+	case responseWriterFlusher | responseWriterPusher | responseWriterCloseNotifier:
+		return struct {
+			trackedResponseWriter
+			responseFlusher
+			http.Pusher
+			http.CloseNotifier
+		}{base, flusher, pusher, closeNotifier}
+	case responseWriterHijacker | responseWriterPusher | responseWriterCloseNotifier:
+		return struct {
+			trackedResponseWriter
+			http.Hijacker
+			http.Pusher
+			http.CloseNotifier
+		}{base, hijacker, pusher, closeNotifier}
+	case responseWriterFlusher | responseWriterHijacker | responseWriterPusher | responseWriterCloseNotifier:
+		return struct {
+			trackedResponseWriter
+			responseFlusher
+			http.Hijacker
+			http.Pusher
+			http.CloseNotifier
+		}{base, flusher, hijacker, pusher, closeNotifier}
+	case responseWriterReaderFrom | responseWriterCloseNotifier:
+		return struct {
+			trackedResponseWriter
+			io.ReaderFrom
+			http.CloseNotifier
+		}{base, readerFrom, closeNotifier}
+	case responseWriterFlusher | responseWriterReaderFrom | responseWriterCloseNotifier:
+		return struct {
+			trackedResponseWriter
+			responseFlusher
+			io.ReaderFrom
+			http.CloseNotifier
+		}{base, flusher, readerFrom, closeNotifier}
+	case responseWriterHijacker | responseWriterReaderFrom | responseWriterCloseNotifier:
+		return struct {
+			trackedResponseWriter
+			http.Hijacker
+			io.ReaderFrom
+			http.CloseNotifier
+		}{base, hijacker, readerFrom, closeNotifier}
+	case responseWriterFlusher | responseWriterHijacker | responseWriterReaderFrom | responseWriterCloseNotifier:
+		return struct {
+			trackedResponseWriter
+			responseFlusher
+			http.Hijacker
+			io.ReaderFrom
+			http.CloseNotifier
+		}{base, flusher, hijacker, readerFrom, closeNotifier}
+	case responseWriterPusher | responseWriterReaderFrom | responseWriterCloseNotifier:
+		return struct {
+			trackedResponseWriter
+			http.Pusher
+			io.ReaderFrom
+			http.CloseNotifier
+		}{base, pusher, readerFrom, closeNotifier}
+	case responseWriterFlusher | responseWriterPusher | responseWriterReaderFrom | responseWriterCloseNotifier:
+		return struct {
+			trackedResponseWriter
+			responseFlusher
+			http.Pusher
+			io.ReaderFrom
+			http.CloseNotifier
+		}{base, flusher, pusher, readerFrom, closeNotifier}
+	case responseWriterHijacker | responseWriterPusher | responseWriterReaderFrom | responseWriterCloseNotifier:
+		return struct {
+			trackedResponseWriter
+			http.Hijacker
+			http.Pusher
+			io.ReaderFrom
+			http.CloseNotifier
+		}{base, hijacker, pusher, readerFrom, closeNotifier}
+	default:
+		return struct {
+			trackedResponseWriter
+			responseFlusher
+			http.Hijacker
+			http.Pusher
+			io.ReaderFrom
+			http.CloseNotifier
+		}{base, flusher, hijacker, pusher, readerFrom, closeNotifier}
+	}
 }
 
 // Helper function to set the user in the ResponseWriterWrapper
 func setUserInResponseWriter(w http.ResponseWriter, user *users.User) {
-	// Wrap the response writer to set the user field
-	if wrappedWriter, ok := w.(*ResponseWriterWrapper); ok {
-		if user != nil {
-			wrappedWriter.User = user.Username
-		}
+	wrappedWriter := responseWriterStateFrom(w)
+	if wrappedWriter != nil && user != nil {
+		wrappedWriter.User = user.Username
 	}
 }
 
@@ -1667,13 +1997,20 @@ func getRemoteIP(r *http.Request) string {
 }
 
 var sensitiveQueryKeys = map[string]struct{}{
-	"auth":         {},
-	"jwt":          {},
-	"token":        {},
-	"password":     {},
-	"code":         {},
-	"archivetoken": {},
-	"capability":   {},
+	"auth":             {},
+	"authorization":    {},
+	"jwt":              {},
+	"token":            {},
+	"tokenhash":        {},
+	"password":         {},
+	"cookie":           {},
+	"code":             {},
+	"key":              {},
+	"secret":           {},
+	"sharehash":        {},
+	"archivetoken":     {},
+	"capability":       {},
+	"onlyofficesecret": {},
 }
 
 func redactPublicSharePath(path string) string {
@@ -1716,67 +2053,58 @@ func redactedRequestURL(r *http.Request) string {
 // LoggingMiddleware logs each request and its status code.
 func LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// DEFER RECOVERY FUNCTION
+		start := time.Now()
+		wrappedWriter, responseState := wrapResponseWriter(w)
 		defer func() {
 			if rcv := recover(); rcv != nil {
 				method := r.Method
 				requestURL := redactedRequestURL(r)
-				username := "unknown" // Default username
-
-				// Attempt to get username from ResponseWriterWrapper if it's set
-				if ww, ok := w.(*ResponseWriterWrapper); ok && ww.User != "" {
-					username = ww.User
+				username := "unknown"
+				if responseState.User != "" {
+					username = responseState.User
 				}
-				// Get Go-level stack trace
-				buf := make([]byte, 16384)     // Increased buffer size for potentially long CGo traces
-				n := runtime.Stack(buf, false) // false for current goroutine only
+				buf := make([]byte, 16384)
+				n := runtime.Stack(buf, false)
 				stackTrace := string(buf[:n])
+				requestID := ""
+				if recorder := AuditRecorderFromRequest(r); recorder != nil {
+					requestID = recorder.RequestID()
+				}
+				logger.Errorf("PANIC RECOVERED (%T)\nRequestID: %s\nUser: %s\nMethod: %s\nURL: %s\nRemoteAddr: %s\nGo Stack Trace:\n%s",
+					rcv, requestID, username, method, requestURL, getRemoteIP(r), stackTrace)
 
-				logger.Errorf("PANIC RECOVERED (%T)\nUser: %s\nMethod: %s\nURL: %s\nRemoteAddr: %s\nGo Stack Trace:\n%s",
-					rcv, username, method, requestURL, getRemoteIP(r), stackTrace)
-
-				// Attempt to send a 500 error response to the client
-				// This is a best-effort; the connection might be broken or process too unstable.
-				if ww, ok := w.(*ResponseWriterWrapper); ok { // Check if it's our wrapper
-					if !ww.wroteHeader { // Only write if headers haven't been sent
-						ww.Header().Set("Content-Type", "application/json; charset=utf-8")
-						ww.WriteHeader(http.StatusInternalServerError)
-					}
-				} else {
-					_, _ = renderJSON(w, r, &HttpResponse{
+				if !responseState.wroteHeader {
+					_, _ = renderJSON(wrappedWriter, r, &HttpResponse{
 						Status:  500,
 						Message: "A critical internal error occurred. Please try again later.",
 					}, http.StatusInternalServerError)
 				}
-
 			}
+
+			fullURL := redactedRequestURL(r)
+			truncUser := responseState.User
+			if truncUser == "" {
+				truncUser = "N/A"
+			} else if len(truncUser) > 12 {
+				truncUser = truncUser[:10] + ".."
+			}
+			requestID := ""
+			if recorder := AuditRecorderFromRequest(r); recorder != nil {
+				requestID = recorder.RequestID()
+			}
+			duration := time.Since(start)
+			logger.ApiPath(responseState.StatusCode, fullURL,
+				fmt.Sprintf("%-7s | %3d | %-15s | %-12s | %-12s | request_id=%s | \"%s\"",
+					r.Method,
+					responseState.StatusCode,
+					getRemoteIP(r),
+					truncUser,
+					fmt.Sprintf("%vms", duration.Milliseconds()),
+					requestID,
+					fullURL))
 		}()
 
-		start := time.Now()
-		wrappedWriter := &ResponseWriterWrapper{ResponseWriter: w, StatusCode: http.StatusOK}
-
-		// Call the next handler in the chain
 		next.ServeHTTP(wrappedWriter, r)
-
-		// Existing logging logic for normal requests
-		fullURL := redactedRequestURL(r)
-		truncUser := wrappedWriter.User
-		if truncUser == "" {
-			truncUser = "N/A" // Handle case where user might not be set (e.g., if panic occurred before user auth)
-		} else if len(truncUser) > 12 {
-			truncUser = truncUser[:10] + ".."
-		}
-		duration := time.Since(start)
-
-		// ApiPathExclude is applied per logging sink inside go-logger (logger.ApiPath).
-		logger.ApiPath(wrappedWriter.StatusCode, fullURL,
-			fmt.Sprintf("%-7s | %3d | %-15s | %-12s | %-12s | \"%s\"",
-				r.Method,
-				wrappedWriter.StatusCode,
-				getRemoteIP(r),
-				truncUser,
-				fmt.Sprintf("%vms", duration.Milliseconds()),
-				fullURL))
 	})
 }
 
@@ -1820,12 +2148,6 @@ func renderJSON(w http.ResponseWriter, r *http.Request, data interface{}, status
 func acceptsGzip(r *http.Request) bool {
 	ae := r.Header.Get("Accept-Encoding")
 	return ae != "" && strings.Contains(ae, "gzip")
-}
-
-func (w *ResponseWriterWrapper) Flush() {
-	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
-		flusher.Flush()
-	}
 }
 
 func getScheme(r *http.Request) string {
