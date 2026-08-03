@@ -106,10 +106,10 @@ type CommonShare struct {
 }
 type CreateBody struct {
 	CommonShare
-	Hash     string `json:"hash,omitempty"`
-	Password string `json:"password"`
-	Expires  string `json:"expires"`
-	Unit     string `json:"unit"`
+	Hash     string  `json:"hash,omitempty"`
+	Password *string `json:"password,omitempty"`
+	Expires  string  `json:"expires"`
+	Unit     string  `json:"unit"`
 }
 
 // Link is the information needed to build a shareable link.
