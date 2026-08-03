@@ -8,6 +8,7 @@ import (
 	"net/http"
 	pathpkg "path"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/gtsteffaniak/filebrowser/backend/common/errors"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	auditdb "github.com/gtsteffaniak/filebrowser/backend/database/audit"
 	"github.com/gtsteffaniak/filebrowser/backend/database/share"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing"
@@ -417,6 +419,12 @@ func shareDeleteHandler(w http.ResponseWriter, r *http.Request, d *requestContex
 	if thisShare.UserID != d.user.ID && !d.user.Permissions.Admin {
 		return http.StatusForbidden, fmt.Errorf("you are not allowed to delete this share")
 	}
+	if err := configureShareMutationAudit(r, auditdb.ActionShareDelete, thisShare, nil); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
+	if err := reserveShareMutationAudit(r); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
 
 	err = store.Share.Delete(hash)
 	if err != nil {
@@ -499,6 +507,13 @@ func sharePatchHandler(w http.ResponseWriter, r *http.Request, d *requestContext
 	if err := validateShareRoot(updatedCandidate, owner); err != nil {
 		return http.StatusForbidden, fmt.Errorf("new share path is not authorized")
 	}
+	if err := configureShareMutationAudit(r, auditdb.ActionShareUpdate, updatedCandidate,
+		[]auditdb.ChangedField{auditdb.ChangedFieldPath}); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
+	if err := reserveShareMutationAudit(r); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
 	// Update the share path
 	err = store.Share.UpdateSharePath(body.Hash, updatedCandidate.Path)
 	if err != nil {
@@ -542,6 +557,13 @@ func sharePostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 		defer r.Body.Close()
 	}
 	body.Capabilities = nil
+	if body.Hash != "" {
+		if recorder := AuditRecorderFromRequest(r); recorder != nil {
+			if err := recorder.SetAction(auditdb.ActionShareUpdate); err != nil {
+				return http.StatusServiceUnavailable, ErrAuditUnavailable
+			}
+		}
+	}
 
 	// check if body.Hash is a valid hash
 	if body.Hash != "" {
@@ -635,6 +657,13 @@ func sharePostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 			candidate.ResetDownloadCounts()
 		}
 
+		if err = configureShareMutationAudit(r, auditdb.ActionShareUpdate, candidate,
+			auditShareChangedFields(existing, candidate)); err != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		if err = reserveShareMutationAudit(r); err != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
 		if err = store.Share.UpdateIfUnchanged(existing, candidate); err != nil {
 			if err == share.ErrConcurrentUpdate || err == errors.ErrNotExist {
 				return http.StatusConflict, fmt.Errorf("share changed while it was being updated")
@@ -700,6 +729,17 @@ func sharePostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	}
 	if err = validateShareRoot(s, d.user); err != nil {
 		return http.StatusForbidden, fmt.Errorf("share root is not authorized")
+	}
+	if err = configureShareMutationAudit(r, auditdb.ActionShareCreate, s, []auditdb.ChangedField{
+		auditdb.ChangedFieldSource,
+		auditdb.ChangedFieldPath,
+		auditdb.ChangedFieldExpiration,
+		auditdb.ChangedFieldCapabilities,
+	}); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
+	if err = reserveShareMutationAudit(r); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
 	}
 	if err = store.Share.Save(s); err != nil {
 		return http.StatusInternalServerError, err
@@ -842,6 +882,19 @@ func shareDirectDownloadHandler(w http.ResponseWriter, r *http.Request, d *reque
 		return http.StatusForbidden, fmt.Errorf("the target source is private")
 	}
 
+	if err := configureShareMutationAudit(r, auditdb.ActionShareCreate, shareLink, []auditdb.ChangedField{
+		auditdb.ChangedFieldSource,
+		auditdb.ChangedFieldPath,
+		auditdb.ChangedFieldExpiration,
+		auditdb.ChangedFieldDownloadLimit,
+		auditdb.ChangedFieldBandwidthLimit,
+		auditdb.ChangedFieldCapabilities,
+	}); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
+	if err := reserveShareMutationAudit(r); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
 	// Save the share
 	if err := store.Share.Save(shareLink); err != nil {
 		return http.StatusInternalServerError, err
@@ -856,6 +909,100 @@ func shareDirectDownloadHandler(w http.ResponseWriter, r *http.Request, d *reque
 	}
 
 	return renderJSON(w, r, response)
+}
+
+func configureShareMutationAudit(r *http.Request, action auditdb.Action, link *share.Link, changedFields []auditdb.ChangedField) error {
+	recorder := AuditRecorderFromRequest(r)
+	if recorder == nil {
+		return nil
+	}
+	if link == nil || link.UserID == 0 {
+		return ErrAuditInvalidState
+	}
+	if err := recorder.SetAction(action); err != nil {
+		return err
+	}
+	shareRef := auditdb.DeriveShareRef(link.Hash)
+	if shareRef == "" {
+		return ErrAuditInvalidState
+	}
+	if err := recorder.SetShareRef(shareRef); err != nil {
+		return err
+	}
+	if err := recorder.SetResource(auditShareSourceName(link), link.Path, link.Path); err != nil {
+		return err
+	}
+	ownerPath := "/" + strconv.FormatUint(uint64(link.UserID), 10)
+	if err := recorder.SetTarget("users", ownerPath, ownerPath); err != nil {
+		return err
+	}
+	if len(changedFields) == 0 {
+		return nil
+	}
+	return recorder.MergeMetadata(&auditdb.MetadataV1{
+		SchemaVersion: auditdb.CurrentMetadataSchemaVersion,
+		ChangedFields: changedFields,
+	})
+}
+
+func reserveShareMutationAudit(r *http.Request) error {
+	recorder := AuditRecorderFromRequest(r)
+	if recorder == nil {
+		return nil
+	}
+	if err := recorder.ReservePending(); err != nil {
+		_ = recorder.SetErrorCode(auditErrorCodeAuditUnavailable)
+		return ErrAuditUnavailable
+	}
+	return nil
+}
+
+func auditShareSourceName(link *share.Link) string {
+	if link == nil || config == nil {
+		return ""
+	}
+	if sourceInfo, ok := config.Server.SourceMap[link.Source]; ok && sourceInfo != nil {
+		return sourceInfo.Name
+	}
+	if sourceInfo, ok := config.Server.NameToSource[link.Source]; ok && sourceInfo != nil {
+		return sourceInfo.Name
+	}
+	return ""
+}
+
+func auditShareChangedFields(before, after *share.Link) []auditdb.ChangedField {
+	if before == nil || after == nil {
+		return nil
+	}
+	changed := make([]auditdb.ChangedField, 0, 8)
+	if before.Expire != after.Expire {
+		changed = append(changed, auditdb.ChangedFieldExpiration)
+	}
+	if before.DownloadsLimit != after.DownloadsLimit || before.PerUserDownloadLimit != after.PerUserDownloadLimit {
+		changed = append(changed, auditdb.ChangedFieldDownloadLimit)
+	}
+	if before.MaxBandwidth != after.MaxBandwidth {
+		changed = append(changed, auditdb.ChangedFieldBandwidthLimit)
+	}
+	if !reflect.DeepEqual(before.AllowedUsernames, after.AllowedUsernames) {
+		changed = append(changed, auditdb.ChangedFieldAllowedUsers)
+	}
+	if before.PasswordHash != after.PasswordHash {
+		changed = append(changed, auditdb.ChangedFieldAuthentication)
+	}
+	if before.Title != after.Title {
+		changed = append(changed, auditdb.ChangedFieldName)
+	}
+	if before.Description != after.Description {
+		changed = append(changed, auditdb.ChangedFieldDescription)
+	}
+	if before.CreatorCapabilities != after.CreatorCapabilities || before.CapabilityVersion != after.CapabilityVersion ||
+		before.AllowCreate != after.AllowCreate || before.AllowModify != after.AllowModify ||
+		before.AllowDelete != after.AllowDelete || before.AllowReplacements != after.AllowReplacements ||
+		before.DisableDownload != after.DisableDownload || before.DisableFileViewer != after.DisableFileViewer {
+		changed = append(changed, auditdb.ChangedFieldCapabilities)
+	}
+	return changed
 }
 
 func getShareURL(r *http.Request, hash string, isDirectDownload bool) string {

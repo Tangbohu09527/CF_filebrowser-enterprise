@@ -15,6 +15,7 @@ import (
 	"github.com/gtsteffaniak/filebrowser/backend/common/errors"
 	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	auditdb "github.com/gtsteffaniak/filebrowser/backend/database/audit"
 	"github.com/gtsteffaniak/filebrowser/backend/database/storage"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 )
@@ -315,6 +316,16 @@ func userDeleteHandler(w http.ResponseWriter, r *http.Request, d *requestContext
 	if err != nil {
 		return status, err
 	}
+	target, err := store.Users.Get(givenUserId)
+	if err != nil {
+		return errToStatus(err), err
+	}
+	if err := configureUserMutationAudit(r, auditdb.ActionUserDelete, target.Username, nil); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
+	if err := reserveUserMutationAudit(r); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
 
 	// Delete the user
 	err = store.Users.Delete(givenUserId)
@@ -373,6 +384,12 @@ func usersPostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	status, err := verifyActorPasswordForUserActions(r, d)
 	if err != nil {
 		return status, err
+	}
+	if err := configureUserMutationAudit(r, auditdb.ActionUserCreate, req.User.Username, nil); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
+	if err := reserveUserMutationAudit(r); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
 	}
 
 	err = storage.CreateUser(req.User, req.User.Permissions)
@@ -506,6 +523,29 @@ func userPutHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (
 		return http.StatusBadRequest, fmt.Errorf("failed to get user: %w", err)
 	}
 	req.User.Permissions = applyPermissionPresence(req.User.Permissions, oldUser.Permissions, req.permissionPresence)
+	permissionsUpdated := len(req.Which) == 0
+	explicitPermissionUpdate := false
+	for _, field := range req.Which {
+		if strings.EqualFold(field, "permissions") {
+			explicitPermissionUpdate = true
+			permissionsUpdated = true
+			break
+		}
+		if strings.EqualFold(field, "all") {
+			permissionsUpdated = true
+		}
+	}
+	action := auditdb.ActionUserUpdate
+	if explicitPermissionUpdate || (permissionsUpdated && d.user.Permissions.Admin) {
+		action = auditdb.ActionPermissionUpdate
+	}
+	changedFields := auditUserChangedFields(req.Which)
+	if err := configureUserMutationAudit(r, action, oldUser.Username, changedFields); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
+	if explicitPermissionUpdate && !d.user.Permissions.Admin {
+		return http.StatusForbidden, fmt.Errorf("cannot update permissions without admin permissions")
+	}
 
 	if d.user.LoginMethod == users.LoginMethodPassword && !userPutOnlyNonAdminEditableFields(req.Which) {
 		var status int
@@ -515,12 +555,8 @@ func userPutHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (
 		}
 	}
 
-	permissionsUpdated := len(req.Which) == 0
-	for _, field := range req.Which {
-		if strings.EqualFold(field, "permissions") || strings.EqualFold(field, "all") {
-			permissionsUpdated = true
-			break
-		}
+	if err := reserveUserMutationAudit(r); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
 	}
 	if permissionsUpdated && oldUser.Permissions.Api && !req.User.Permissions.Api {
 		tokens := make(map[string]struct{}, len(oldUser.Tokens)+len(oldUser.ApiKeys))
@@ -545,4 +581,78 @@ func userPutHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (
 	}
 
 	return http.StatusNoContent, nil
+}
+
+func configureUserMutationAudit(r *http.Request, action auditdb.Action, targetUsername string, changedFields []auditdb.ChangedField) error {
+	recorder := AuditRecorderFromRequest(r)
+	if recorder == nil {
+		return nil
+	}
+	if err := recorder.SetAction(action); err != nil {
+		return err
+	}
+	targetPath := "/" + url.PathEscape(targetUsername)
+	if err := recorder.SetResource("users", targetPath, targetPath); err != nil {
+		return err
+	}
+	if len(changedFields) == 0 {
+		return nil
+	}
+	return recorder.MergeMetadata(&auditdb.MetadataV1{
+		SchemaVersion: auditdb.CurrentMetadataSchemaVersion,
+		ChangedFields: changedFields,
+	})
+}
+
+func reserveUserMutationAudit(r *http.Request) error {
+	recorder := AuditRecorderFromRequest(r)
+	if recorder == nil {
+		return nil
+	}
+	if err := recorder.ReservePending(); err != nil {
+		_ = recorder.SetErrorCode(auditErrorCodeAuditUnavailable)
+		return ErrAuditUnavailable
+	}
+	return nil
+}
+
+func auditUserChangedFields(fields []string) []auditdb.ChangedField {
+	fieldMap := map[string]auditdb.ChangedField{
+		"username":           auditdb.ChangedFieldUsername,
+		"password":           auditdb.ChangedFieldPassword,
+		"permissions":        auditdb.ChangedFieldPermissions,
+		"scopes":             auditdb.ChangedFieldScopes,
+		"tokens":             auditdb.ChangedFieldTokens,
+		"apikeys":            auditdb.ChangedFieldTokens,
+		"loginmethod":        auditdb.ChangedFieldLoginMethod,
+		"locale":             auditdb.ChangedFieldLocale,
+		"viewmode":           auditdb.ChangedFieldViewMode,
+		"preview":            auditdb.ChangedFieldPreview,
+		"sidebarlinks":       auditdb.ChangedFieldSidebar,
+		"passkeycredentials": auditdb.ChangedFieldAuthentication,
+		"otpenabled":         auditdb.ChangedFieldAuthentication,
+		"disablesettings":    auditdb.ChangedFieldSettings,
+		"themecolor":         auditdb.ChangedFieldTheme,
+		"darkmode":           auditdb.ChangedFieldTheme,
+	}
+	if len(fields) == 0 || strings.EqualFold(strings.TrimSpace(fields[0]), "all") {
+		fields = []string{
+			"permissions", "scopes", "loginMethod", "locale", "viewMode", "preview",
+			"sidebarLinks", "otpEnabled", "disableSettings", "themeColor",
+		}
+	}
+	changed := make([]auditdb.ChangedField, 0, len(fields))
+	seen := make(map[auditdb.ChangedField]struct{}, len(fields))
+	for _, field := range fields {
+		mapped, ok := fieldMap[strings.ToLower(strings.TrimSpace(field))]
+		if !ok {
+			continue
+		}
+		if _, exists := seen[mapped]; exists {
+			continue
+		}
+		seen[mapped] = struct{}{}
+		changed = append(changed, mapped)
+	}
+	return changed
 }

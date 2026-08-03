@@ -15,6 +15,7 @@ import (
 	"github.com/gtsteffaniak/filebrowser/backend/common/errors"
 	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	auditdb "github.com/gtsteffaniak/filebrowser/backend/database/audit"
 	"github.com/gtsteffaniak/filebrowser/backend/database/share"
 	"github.com/gtsteffaniak/filebrowser/backend/database/storage"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
@@ -221,7 +222,38 @@ func loginHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (in
 	if d.user.HasPasskeyMFA() && d.user.TOTPSecret == "" {
 		return http.StatusForbidden, errors.ErrPasskeyMFARequired
 	}
-	return printToken(w, r, d.user)
+	status, err := printToken(w, r, d.user)
+	if err != nil {
+		return status, err
+	}
+	if err := recordSuccessfulLoginAudit(r, d); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
+	return status, nil
+}
+
+func recordSuccessfulLoginAudit(r *http.Request, d *requestContext) error {
+	recorder := AuditRecorderFromRequest(r)
+	if recorder == nil {
+		return nil
+	}
+	if d.apiToken {
+		return recorder.SetAction("")
+	}
+	if d.user == nil || d.user.ID == 0 || d.user.Username == "" {
+		return ErrAuditInvalidState
+	}
+	if err := recorder.SetAction(auditdb.ActionAuthLogin); err != nil {
+		return err
+	}
+	if err := recorder.SetActor(&d.user.ID, d.user.Username); err != nil {
+		return err
+	}
+	if err := recorder.SetAuthMethod(auditdb.AuthMethodSession); err != nil {
+		return err
+	}
+	permissions := auditPermissions(d.user.Permissions)
+	return recorder.SetEffectivePermissions(&permissions)
 }
 
 // logoutHandler handles user logout

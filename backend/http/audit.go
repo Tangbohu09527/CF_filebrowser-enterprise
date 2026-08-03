@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	auditdb "github.com/gtsteffaniak/filebrowser/backend/database/audit"
@@ -497,6 +498,11 @@ func withAuditDefaultAction(action auditdb.Action, fn handleFunc) stdhttp.Handle
 		if err := recorder.SetAuthMethod(auditdb.AuthMethodAnonymous); err != nil {
 			return stdhttp.StatusServiceUnavailable, ErrAuditUnavailable
 		}
+		if action == auditdb.ActionAuthLoginFailed {
+			if err := recorder.SetActor(nil, boundedAuditUsername(request.URL.Query().Get("username"))); err != nil {
+				return stdhttp.StatusServiceUnavailable, ErrAuditUnavailable
+			}
+		}
 		status, err := fn(writer, request, data)
 		if status == stdhttp.StatusUnauthorized || status == stdhttp.StatusForbidden {
 			if codeErr := recorder.setErrorCodeIfEmpty(auditErrorCodeAuthenticationRequired); codeErr != nil {
@@ -505,6 +511,23 @@ func withAuditDefaultAction(action auditdb.Action, fn handleFunc) stdhttp.Handle
 		}
 		return status, err
 	})
+}
+
+func boundedAuditUsername(username string) string {
+	username = strings.Map(func(character rune) rune {
+		if character < 0x20 || character == 0x7f {
+			return -1
+		}
+		return character
+	}, username)
+	for len(username) > auditdb.MaxUsernameBytes {
+		_, size := utf8.DecodeLastRuneInString(username)
+		if size == 0 {
+			return ""
+		}
+		username = username[:len(username)-size]
+	}
+	return username
 }
 
 func withAuditAuthenticatedUser(fn handleFunc) handleFunc {
@@ -537,6 +560,16 @@ func withAuditAuthenticatedUser(fn handleFunc) handleFunc {
 		}
 		return fn(writer, request, data)
 	}
+}
+
+func withAuditShareMutation(action auditdb.Action, fn handleFunc) stdhttp.HandlerFunc {
+	permissionChecked := func(writer stdhttp.ResponseWriter, request *stdhttp.Request, data *requestContext) (int, error) {
+		if !data.user.Permissions.Share {
+			return stdhttp.StatusForbidden, nil
+		}
+		return fn(writer, request, data)
+	}
+	return withAuditDefaultAction(action, withUserHelper(withAuditAuthenticatedUser(permissionChecked)))
 }
 
 func auditPermissions(permissions users.Permissions) auditdb.Permissions {
