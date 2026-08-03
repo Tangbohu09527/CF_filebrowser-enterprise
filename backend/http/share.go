@@ -504,6 +504,7 @@ func sharePatchHandler(w http.ResponseWriter, r *http.Request, d *requestContext
 	}
 	updatedCandidate := thisShare.Clone()
 	updatedCandidate.Path = utils.AddTrailingSlashIfNotExists(newPath)
+	updatedCandidate.Token = ""
 	if err := validateShareRoot(updatedCandidate, owner); err != nil {
 		return http.StatusForbidden, fmt.Errorf("new share path is not authorized")
 	}
@@ -514,20 +515,15 @@ func sharePatchHandler(w http.ResponseWriter, r *http.Request, d *requestContext
 	if err := reserveShareMutationAudit(r); err != nil {
 		return http.StatusServiceUnavailable, ErrAuditUnavailable
 	}
-	// Update the share path
-	err = store.Share.UpdateSharePath(body.Hash, updatedCandidate.Path)
-	if err != nil {
-		return http.StatusInternalServerError, err
-	}
-
-	// Get the updated share
-	updatedShare, err := store.Share.GetByHash(body.Hash)
-	if err != nil {
+	if err = store.Share.UpdateIfUnchanged(thisShare, updatedCandidate); err != nil {
+		if err == share.ErrConcurrentUpdate || err == errors.ErrNotExist {
+			return http.StatusConflict, fmt.Errorf("share changed while it was being updated")
+		}
 		return http.StatusInternalServerError, err
 	}
 
 	// Convert to response format
-	sharesWithUsernames, err := convertToFrontendShareResponse(r, []*share.Link{updatedShare}, d.user)
+	sharesWithUsernames, err := convertToFrontendShareResponse(r, []*share.Link{updatedCandidate}, d.user)
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}

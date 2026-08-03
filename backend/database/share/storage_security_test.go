@@ -101,6 +101,7 @@ func TestUpdateIfUnchangedPersistenceFailureDoesNotMutateShare(t *testing.T) {
 		t.Fatal(err)
 	}
 	candidate := existing.Clone()
+	candidate.Path = "/moved"
 	candidate.PasswordHash = "replacement-password-hash"
 	candidate.Token = ""
 	candidate.Title = "replacement title"
@@ -114,7 +115,7 @@ func TestUpdateIfUnchangedPersistenceFailureDoesNotMutateShare(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.PasswordHash != original.PasswordHash || stored.Token != original.Token ||
+	if stored.Path != original.Path || stored.PasswordHash != original.PasswordHash || stored.Token != original.Token ||
 		stored.Title != original.Title || stored.Description != original.Description {
 		t.Fatalf("failed persistence partially updated cached share: %+v", stored)
 	}
@@ -122,7 +123,7 @@ func TestUpdateIfUnchangedPersistenceFailureDoesNotMutateShare(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if persisted.PasswordHash != original.PasswordHash || persisted.Token != original.Token ||
+	if persisted.Path != original.Path || persisted.PasswordHash != original.PasswordHash || persisted.Token != original.Token ||
 		persisted.Title != original.Title || persisted.Description != original.Description {
 		t.Fatalf("failed persistence partially updated backend share: %+v", persisted)
 	}
