@@ -600,7 +600,7 @@ func sharePostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 		expire = time.Now().Add(add).Unix()
 	}
 
-	hash, status, err := getSharePasswordHash(body)
+	hash, status, err := getSharePasswordHash(body.Password)
 	if err != nil {
 		return status, err
 	}
@@ -637,7 +637,9 @@ func sharePostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 
 		candidate := s.Clone()
 		candidate.Expire = expire
-		candidate.PasswordHash = stringHash
+		if body.Password != nil {
+			candidate.PasswordHash = stringHash
+		}
 		candidate.Token = ""
 		// Preserve immutable fields for updates. Path and Source should not change on edits.
 		// If the request attempts to provide empty values (or any values) for these,
@@ -1116,12 +1118,12 @@ func shareInfoHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	return renderJSON(w, r, commonShare)
 }
 
-func getSharePasswordHash(body share.CreateBody) (data []byte, statuscode int, err error) {
-	if body.Password == "" {
+func getSharePasswordHash(password *string) (data []byte, statuscode int, err error) {
+	if password == nil || *password == "" {
 		return nil, 0, nil
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(body.Password), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(*password), bcrypt.DefaultCost)
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("failed to hash password")
 	}

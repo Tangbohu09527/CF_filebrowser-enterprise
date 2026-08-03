@@ -82,6 +82,52 @@ func TestStaleShareUpdateCannotRecreateDeletedHash(t *testing.T) {
 	}
 }
 
+func TestUpdateIfUnchangedPersistenceFailureDoesNotMutateShare(t *testing.T) {
+	original := &Link{
+		Hash:         "update-persistence-failure",
+		PasswordHash: "original-password-hash",
+		Token:        "original-legacy-token",
+		CommonShare: CommonShare{
+			Source:      "source",
+			Path:        "/public",
+			Title:       "original title",
+			Description: "original description",
+		},
+	}
+	backend := newSecurityShareBackend(original)
+	storage := NewStorage(backend, nil)
+	existing, err := storage.GetByHash(original.Hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := existing.Clone()
+	candidate.PasswordHash = "replacement-password-hash"
+	candidate.Token = ""
+	candidate.Title = "replacement title"
+	candidate.Description = "replacement description"
+	backend.saveErr = errors.New("forced update persistence failure")
+
+	if err := storage.UpdateIfUnchanged(existing, candidate); err == nil {
+		t.Fatal("UpdateIfUnchanged unexpectedly succeeded")
+	}
+	stored, err := storage.GetByHash(original.Hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.PasswordHash != original.PasswordHash || stored.Token != original.Token ||
+		stored.Title != original.Title || stored.Description != original.Description {
+		t.Fatalf("failed persistence partially updated cached share: %+v", stored)
+	}
+	persisted, err := backend.GetByHash(original.Hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.PasswordHash != original.PasswordHash || persisted.Token != original.Token ||
+		persisted.Title != original.Title || persisted.Description != original.Description {
+		t.Fatalf("failed persistence partially updated backend share: %+v", persisted)
+	}
+}
+
 type securityShareBackend struct {
 	links   map[string]*Link
 	saveErr error

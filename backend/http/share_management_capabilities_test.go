@@ -42,7 +42,7 @@ func TestManagementShareCapabilityContract(t *testing.T) {
 		password := "management-share-password-secret"
 		body := dbshare.CreateBody{
 			CommonShare: managementShareAllCapabilities("source1", "/public"),
-			Password:    password,
+			Password:    &password,
 		}
 		createPayload, err := json.Marshal(body)
 		if err != nil {

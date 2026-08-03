@@ -32,7 +32,8 @@ func TestAuditShareActionsSuccessAndSecretBoundary(t *testing.T) {
 		owner := fixture.newUser(t, "audit-share-create-owner", auditShareFullPermissions())
 		session := auditTokenSession(t, owner)
 		body := auditShareCreateBody("source1", "/public")
-		body.Password = auditSharePasswordSecret
+		password := auditSharePasswordSecret
+		body.Password = &password
 		body.DownloadURL = "https://download.invalid/" + auditShareURLSecret
 		body.ShareURL = "https://share.invalid/" + auditShareURLSecret
 
@@ -81,7 +82,8 @@ func TestAuditShareActionsSuccessAndSecretBoundary(t *testing.T) {
 		body := auditShareCreateBody("ignored-source", "/ignored-path")
 		body.Hash = shareHash
 		body.Title = "after-update"
-		body.Password = auditSharePasswordSecret
+		password := auditSharePasswordSecret
+		body.Password = &password
 		body.DownloadURL = "https://download.invalid/" + auditShareURLSecret
 		body.ShareURL = "https://share.invalid/" + auditShareURLSecret
 		pendingBeforeMutation := false
@@ -213,7 +215,8 @@ func TestAuditSharePermissionDenied(t *testing.T) {
 	deniedUser := fixture.newUser(t, "audit-share-permission-denied", users.Permissions{Browse: true, Preview: true, Download: true})
 	session := auditTokenSession(t, deniedUser)
 	body := auditShareCreateBody("source1", "/public")
-	body.Password = auditSharePasswordSecret
+	password := auditSharePasswordSecret
+	body.Password = &password
 
 	response := fixture.request(t, stdhttp.MethodPost, "/api/share", mustJSON(t, body), session)
 	if response.Code != stdhttp.StatusForbidden {
