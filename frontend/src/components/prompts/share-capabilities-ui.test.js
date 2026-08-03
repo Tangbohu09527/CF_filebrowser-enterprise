@@ -112,6 +112,10 @@ const CONFIGURED = {
   delete: false,
   replace: true,
 };
+const DERIVED_CONFIGURED = {
+  ...CONFIGURED,
+  preview: true,
+};
 const EFFECTIVE = {
   browse: true,
   preview: false,
@@ -223,7 +227,7 @@ afterEach(() => {
 });
 
 describe("Share configured capability form state", () => {
-  it("renders nine directly mapped configured capability controls for a new Share", async () => {
+  it("renders Browse and Preview as derived controls while other normal Share controls remain editable", async () => {
     const { root, vm } = mountComponent(Share, {
       item: { isDir: true, name: "docs", path: "/docs/", source: "default" },
     });
@@ -241,12 +245,34 @@ describe("Share configured capability form state", () => {
       replace: false,
     };
     const invertedControls = new Set(["download", "thumbnail", "viewer"]);
+    const derivedControls = new Set(["browse", "preview"]);
     for (const key of CAPABILITY_KEYS) {
       const input = root.querySelector(`input[aria-label="${key}"]`);
       expect(input, `missing configured capability control: ${key}`).not.toBeNull();
       const configuredValue = invertedControls.has(key) ? !input.checked : input.checked;
       expect(configuredValue, `configured capability state: ${key}`).toBe(expected[key]);
+      expect(input.disabled, `configured capability editability: ${key}`).toBe(derivedControls.has(key));
     }
+
+    const browseHelp = root.querySelector('input[aria-label="browse"]')
+      .closest(".toggle-container")
+      .querySelector(".tooltip-info-icon");
+    browseHelp.dispatchEvent(new MouseEvent("mouseenter", { clientX: 10, clientY: 20 }));
+    expect(mocks.showTooltip).toHaveBeenLastCalledWith({
+      content: "settings.permissions.browse = share.shareType",
+      x: 10,
+      y: 20,
+    });
+
+    const previewHelp = root.querySelector('input[aria-label="preview"]')
+      .closest(".toggle-container")
+      .querySelector(".tooltip-info-icon");
+    previewHelp.dispatchEvent(new MouseEvent("mouseenter", { clientX: 30, clientY: 40 }));
+    expect(mocks.showTooltip).toHaveBeenLastCalledWith({
+      content: "settings.permissions.preview = profileSettings.showThumbnails / profileSettings.fileViewerOptions",
+      x: 30,
+      y: 40,
+    });
 
     const createInput = root.querySelector('input[aria-label="create"]');
     createInput.checked = true;
@@ -255,13 +281,112 @@ describe("Share configured capability form state", () => {
     expect(vm.configuredCapabilities.create).toBe(true);
   });
 
+  it("does not accept direct Browse/Preview edits and derives Preview from Thumbnail/Viewer", () => {
+    const context = shareContext({
+      configuredCapabilities: { ...ALL_FALSE },
+      shareType: "normal",
+    });
+
+    context.setConfiguredCapability("browse", false);
+    context.setConfiguredCapability("preview", true);
+    expect(context.configuredCapabilities).toMatchObject({ browse: true, preview: false });
+
+    context.setConfiguredCapability("thumbnail", true);
+    expect(context.configuredCapabilities).toMatchObject({ thumbnail: true, preview: true });
+
+    context.setConfiguredCapability("thumbnail", false);
+    context.setConfiguredCapability("viewer", true);
+    expect(context.configuredCapabilities).toMatchObject({ viewer: true, preview: true });
+
+    context.setConfiguredCapability("viewer", false);
+    expect(context.configuredCapabilities.preview).toBe(false);
+  });
+
+  it("keeps all seven non-derived normal Share capabilities configurable", () => {
+    const context = shareContext({
+      configuredCapabilities: { ...ALL_FALSE },
+      shareType: "normal",
+    });
+    const configurable = ["download", "thumbnail", "viewer", "create", "modify", "delete", "replace"];
+
+    for (const capability of configurable) {
+      context.setConfiguredCapability(capability, true);
+      expect(context.configuredCapabilities[capability], capability).toBe(true);
+    }
+    expect(context.configuredCapabilities).toMatchObject({ browse: true, preview: true });
+
+    for (const capability of configurable) {
+      context.setConfiguredCapability(capability, false);
+      expect(context.configuredCapabilities[capability], capability).toBe(false);
+    }
+    expect(context.configuredCapabilities).toMatchObject({ browse: true, preview: false });
+  });
+
+  it("locks Upload Create on and disables capabilities the backend derives", async () => {
+    const { root, vm } = mountComponent(Share, {
+      item: { isDir: true, name: "docs", path: "/docs/", source: "default" },
+    });
+    await flushComponentUpdates();
+
+    const shareType = root.querySelector('option[value="upload"]').closest("select");
+    shareType.value = "upload";
+    shareType.dispatchEvent(new Event("change", { bubbles: true }));
+    await nextTick();
+
+    const previewHelp = root.querySelector('input[aria-label="preview"]')
+      .closest(".toggle-container")
+      .querySelector(".tooltip-info-icon");
+    previewHelp.dispatchEvent(new MouseEvent("mouseenter", { clientX: 50, clientY: 60 }));
+    expect(mocks.showTooltip).toHaveBeenLastCalledWith({
+      content: "settings.permissions.preview = share.shareType",
+      x: 50,
+      y: 60,
+    });
+
+    expectNineExplicitBooleans(vm.configuredCapabilities, {
+      browse: false,
+      preview: false,
+      download: true,
+      thumbnail: true,
+      viewer: true,
+      create: true,
+      modify: false,
+      delete: false,
+      replace: false,
+    });
+    for (const key of ["browse", "preview", "create"]) {
+      expect(root.querySelector(`input[aria-label="${key}"]`).disabled, key).toBe(true);
+    }
+    for (const key of ["download", "thumbnail", "viewer", "modify", "delete", "replace"]) {
+      expect(root.querySelector(`input[aria-label="${key}"]`).disabled, key).toBe(false);
+    }
+
+    vm.setConfiguredCapability("create", false);
+    expect(vm.configuredCapabilities.create).toBe(true);
+
+    shareType.value = "normal";
+    shareType.dispatchEvent(new Event("change", { bubbles: true }));
+    await nextTick();
+    expectNineExplicitBooleans(vm.configuredCapabilities, {
+      browse: true,
+      preview: true,
+      download: true,
+      thumbnail: true,
+      viewer: true,
+      create: false,
+      modify: false,
+      delete: false,
+      replace: false,
+    });
+  });
+
   it("hydrates all nine configured capabilities in the management edit watcher", () => {
     const link = makeShare();
     const context = shareContext({ isEditMode: true, link });
 
     Share.watch.isEditMode.handler.call(context, true);
 
-    expectNineExplicitBooleans(context.configuredCapabilities, CONFIGURED);
+    expectNineExplicitBooleans(context.configuredCapabilities, DERIVED_CONFIGURED);
     expect(context.configuredCapabilities).not.toBe(link.configuredCapabilities);
   });
 
@@ -271,20 +396,39 @@ describe("Share configured capability form state", () => {
 
     Share.methods.editLink.call(context, link);
 
-    expectNineExplicitBooleans(context.configuredCapabilities, CONFIGURED);
+    expectNineExplicitBooleans(context.configuredCapabilities, DERIVED_CONFIGURED);
     expect(context.configuredCapabilities).not.toBe(link.configuredCapabilities);
   });
 
-  it("submits all nine explicit false values for a new share", async () => {
+  it("submits all nine explicit booleans with normal Share derived values", async () => {
     const context = shareContext({
       configuredCapabilities: { ...ALL_FALSE },
       listing: false,
+      shareType: "normal",
     });
 
     await Share.methods.submit.call(context);
 
     const payload = mocks.createShare.mock.calls[0][0];
-    expectNineExplicitBooleans(payload.configuredCapabilities, ALL_FALSE);
+    expectNineExplicitBooleans(payload.configuredCapabilities, { ...ALL_FALSE, browse: true });
+  });
+
+  it("submits Upload Browse/Preview false and Create true even from contradictory form state", async () => {
+    const context = shareContext({
+      configuredCapabilities: { ...ALL_TRUE, create: false },
+      listing: false,
+      shareType: "upload",
+    });
+
+    await Share.methods.submit.call(context);
+
+    const payload = mocks.createShare.mock.calls[0][0];
+    expectNineExplicitBooleans(payload.configuredCapabilities, {
+      ...ALL_TRUE,
+      browse: false,
+      preview: false,
+      create: true,
+    });
   });
 });
 

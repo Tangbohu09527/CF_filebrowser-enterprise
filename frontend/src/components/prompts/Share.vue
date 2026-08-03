@@ -228,17 +228,17 @@
               class="item"
               :model-value="configuredCapabilities.browse"
               :name="$t('settings.permissions.browse')"
-              :description="$t('settings.permissions.browseDescription')"
+              :description="`${$t('settings.permissions.browse')} = ${$t('share.shareType')}`"
               aria-label="browse"
-              @update:modelValue="setConfiguredCapability('browse', $event)"
+              disabled
             />
             <ToggleSwitch
               class="item"
               :model-value="configuredCapabilities.preview"
               :name="$t('settings.permissions.preview')"
-              :description="$t('settings.permissions.previewDescription')"
+              :description="shareType === 'upload' ? `${$t('settings.permissions.preview')} = ${$t('share.shareType')}` : `${$t('settings.permissions.preview')} = ${$t('profileSettings.showThumbnails')} / ${$t('profileSettings.fileViewerOptions')}`"
               aria-label="preview"
-              @update:modelValue="setConfiguredCapability('preview', $event)"
+              disabled
             />
             <ToggleSwitch
               class="item"
@@ -267,9 +267,9 @@
               class="item"
               :model-value="configuredCapabilities.create"
               :name="$t('share.allowCreate')"
-              :description="$t('share.allowCreateDescription')"
+              :description="shareType === 'upload' ? `${$t('share.allowCreate')} = ${$t('share.uploadShare')}` : $t('share.allowCreateDescription')"
               aria-label="create"
-              :disabled="sourceReadOnly"
+              :disabled="sourceReadOnly || shareType === 'upload'"
               @update:modelValue="setConfiguredCapability('create', $event)"
             />
             <ToggleSwitch
@@ -516,11 +516,11 @@ import { eventBus } from "@/store/eventBus";
 import {
   SHARE_CAPABILITY_KEYS,
   defaultShareCapabilities,
+  deriveConfiguredShareCapabilities,
   effectiveCapabilityItems,
   hasAnyEffectiveCapability,
   hasCapabilityReduction,
   hasEffectiveCapability,
-  normalizeShareCapabilities,
 } from "@/utils/shareCapabilities";
 //import ViewMode from "@/components/settings/ViewMode.vue";
 
@@ -562,6 +562,8 @@ export default {
       password: "",
       listing: true,
       configuredCapabilities: defaultShareCapabilities(),
+      configuredShareType: "normal",
+      normalShareCreateCapability: false,
       downloadsLimit: "",
       perUserDownloadLimit: false,
       shareTheme: "default",
@@ -768,15 +770,42 @@ export default {
       if (!SHARE_CAPABILITY_KEYS.includes(capability)) {
         return;
       }
-      this.configuredCapabilities = {
-        ...this.configuredCapabilities,
-        [capability]: enabled === true,
-      };
+      if (capability === "browse" || capability === "preview") {
+        this.configuredCapabilities = deriveConfiguredShareCapabilities(
+          this.configuredCapabilities,
+          this.shareType,
+        );
+        return;
+      }
+      this.configuredCapabilities = deriveConfiguredShareCapabilities(
+        {
+          ...this.configuredCapabilities,
+          [capability]: enabled === true,
+        },
+        this.shareType,
+      );
+      if (this.shareType !== "upload" && capability === "create") {
+        this.normalShareCreateCapability = this.configuredCapabilities.create;
+      }
     },
     setShareTypeDescription() {
       this.description = this.shareType === "upload"
         ? this.$t("share.descriptionUploadDefault")
         : this.$t("share.descriptionDefault");
+      let configuredCapabilities = this.configuredCapabilities;
+      if (this.shareType === "upload" && this.configuredShareType !== "upload") {
+        this.normalShareCreateCapability = configuredCapabilities.create;
+      } else if (this.shareType !== "upload" && this.configuredShareType === "upload") {
+        configuredCapabilities = {
+          ...configuredCapabilities,
+          create: this.normalShareCreateCapability,
+        };
+      }
+      this.configuredCapabilities = deriveConfiguredShareCapabilities(
+        configuredCapabilities,
+        this.shareType,
+      );
+      this.configuredShareType = this.shareType;
     },
     effectiveCapabilityItems(share) {
       return effectiveCapabilityItems(share);
@@ -824,7 +853,15 @@ export default {
         : "0";
       this.unit = "hours";
       this.resetPasswordChange();
-      this.configuredCapabilities = normalizeShareCapabilities(link.configuredCapabilities);
+      this.shareType = link.shareType || "normal";
+      this.configuredCapabilities = deriveConfiguredShareCapabilities(
+        link.configuredCapabilities,
+        this.shareType,
+      );
+      this.configuredShareType = this.shareType;
+      this.normalShareCreateCapability = this.shareType === "upload"
+        ? false
+        : this.configuredCapabilities.create;
       this.downloadsLimit = link.downloadsLimit ? String(link.downloadsLimit) : "";
       this.perUserDownloadLimit = link.perUserDownloadLimit === true;
       this.maxBandwidth = link.maxBandwidth ? String(link.maxBandwidth) : "";
@@ -847,7 +884,6 @@ export default {
       this.enforceDarkLightMode = link.enforceDarkLightMode || "default";
       this.viewMode = link.viewMode || "normal";
       this.enableOnlyOffice = link.enableOnlyOffice === true;
-      this.shareType = link.shareType || "normal";
       this.extractEmbeddedSubtitles = link.extractEmbeddedSubtitles === true;
       this.disableLoginOption = link.disableLoginOption === true;
       this.sidebarLinks = Array.isArray(link.sidebarLinks) ? [...link.sidebarLinks] : [];
@@ -872,6 +908,11 @@ export default {
         return;
       }
       try {
+        const configuredCapabilities = deriveConfiguredShareCapabilities(
+          this.configuredCapabilities,
+          this.shareType,
+        );
+        this.configuredCapabilities = configuredCapabilities;
         if (!this.description) {
           if (this.shareType === 'upload') {
             this.description = this.$t("share.descriptionUploadDefault");
@@ -889,7 +930,7 @@ export default {
           expires: isPermanent ? "" : this.time.toString(),
           unit: this.unit,
           disableAnonymous: this.disableAnonymous,
-          configuredCapabilities: normalizeShareCapabilities(this.configuredCapabilities),
+          configuredCapabilities,
           maxBandwidth: this.maxBandwidth ? parseInt(this.maxBandwidth, 10) : 0,
           downloadsLimit: this.downloadsLimit ? parseInt(this.downloadsLimit, 10) : 0,
           perUserDownloadLimit: this.perUserDownloadLimit,
@@ -1020,7 +1061,12 @@ export default {
         // Clear editing link when switching to create new share
         this.editingLink = null;
         this.resetPasswordChange();
-        this.configuredCapabilities = defaultShareCapabilities();
+        this.normalShareCreateCapability = false;
+        this.configuredShareType = this.shareType;
+        this.configuredCapabilities = deriveConfiguredShareCapabilities(
+          defaultShareCapabilities(),
+          this.shareType,
+        );
         // Set default sidebar links for new shares
         this.setDefaultSidebarLinks();
         this.populateDefaults();

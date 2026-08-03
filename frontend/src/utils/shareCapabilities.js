@@ -76,6 +76,33 @@ export function normalizeShareCapabilities(value) {
 }
 
 /**
+ * Apply the server-owned Share type rules while retaining all nine explicit
+ * booleans. Upload Browse/Preview are unavailable, and Create is required.
+ *
+ * @param {unknown} value
+ * @param {string} shareType
+ * @returns {ShareCapabilities}
+ */
+export function deriveConfiguredShareCapabilities(value, shareType) {
+  const capabilities = normalizeShareCapabilities(value);
+
+  if (shareType === "upload") {
+    return {
+      ...capabilities,
+      browse: false,
+      preview: false,
+      create: true,
+    };
+  }
+
+  return {
+    ...capabilities,
+    browse: true,
+    preview: capabilities.thumbnail || capabilities.viewer,
+  };
+}
+
+/**
  * @param {{ configuredCapabilities?: unknown, effectiveCapabilities?: unknown } | null | undefined} share
  * @returns {{ key: string, enabled: boolean, configured: boolean, reduced: boolean }[]}
  */

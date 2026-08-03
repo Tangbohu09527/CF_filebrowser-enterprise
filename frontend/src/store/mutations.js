@@ -476,6 +476,7 @@ export const mutations = {
     emitStateChanged();
   },
   clearShareData: () => {
+    state.sharePassword = "";
     state.shareInfo = {
       isShare: false,
       disableThumbnails: false,
