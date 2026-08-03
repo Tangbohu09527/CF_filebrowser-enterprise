@@ -22,8 +22,9 @@ export async function copyToClipboard(text) {
     }
   }
 
+  let textArea;
   try {
-    const textArea = document.createElement('textarea');
+    textArea = document.createElement('textarea');
     textArea.value = text;
     textArea.style.position = 'fixed';
     textArea.style.opacity = '0';
@@ -32,17 +33,17 @@ export async function copyToClipboard(text) {
     textArea.select();
 
     const success = document.execCommand('copy');
-    document.body.removeChild(textArea);
-
     if (success) {
       notify.showSuccessToast(successMessage);
       return true;
     }
-    throw new Error('execCommand returned false');
-  } catch (err) {
-    // If all fails, show the text to copy in a notification
-    notify.showSuccess(`${errorMessage}:\n\n${text}`); // notify.showSucess to avoid clutter the console.
-    console.error('Copy failed:', err);
+
+    notify.showError(errorMessage);
     return false;
+  } catch (_err) {
+    notify.showError(errorMessage);
+    return false;
+  } finally {
+    textArea?.remove();
   }
 }

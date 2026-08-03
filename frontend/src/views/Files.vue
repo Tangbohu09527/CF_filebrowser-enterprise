@@ -278,6 +278,14 @@ export default {
       const hash = getters.shareHash();
       const isShare = hash !== "";
 
+      if (isShare && state.shareInfo?.hash === hash) {
+        this.sharePassword = state.sharePassword;
+      } else {
+        this.sharePassword = "";
+        this.attemptedPasswordLogin = false;
+        mutations.setSharePassword("");
+      }
+
       // Fetch and store share info if this is a share
       if (isShare) {
         const shareInfo = await shareApi.getShareInfoPublic(hash);
@@ -308,14 +316,12 @@ export default {
         // Check for password requirement (applies to both regular and upload shares)
         if (shareInfo.hasPassword) {
           if (this.sharePassword === "") {
-            this.sharePassword = localStorage.getItem(`sharepass:${shareInfo.hash}`);
-            if (this.sharePassword === null || this.sharePassword === "") {
-              this.showPasswordPrompt();
-              return;
-            }
+            this.showPasswordPrompt();
+            return;
           }
-          // Store password in localStorage
-          localStorage.setItem(`sharepass:${shareInfo.hash}`, this.sharePassword);
+        } else {
+          this.sharePassword = "";
+          mutations.setSharePassword("");
         }
 
         if (shareInfo.themeColor) {
@@ -526,6 +532,7 @@ export default {
         props: {
           submitCallback: (password) => {
             this.sharePassword = password;
+            mutations.setSharePassword(password);
             this.fetchData();
           },
           showWrongCredentials: this.attemptedPasswordLogin,

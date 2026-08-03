@@ -14,7 +14,13 @@
       :loading="loading"
     >
       <template #cell-path="{ row }">
-        <a :href="buildLink(row)" target="_blank" rel="noopener noreferrer">{{ row.path }}</a>
+        <a
+          v-if="hasAnyEffectiveCapability(row)"
+          :href="row.shareURL"
+          target="_blank"
+          rel="noopener noreferrer"
+        >{{ row.path }}</a>
+        <span v-else>{{ row.path }}</span>
       </template>
       <template #cell-expire="{ row }">
         <template v-if="row.expire !== 0">{{ humanTime(row.expire) }}</template>
@@ -26,10 +32,30 @@
       </template>
       <template #cell-warning="{ row }">
         <i
-          v-if="!row.pathExists"
+          v-if="row.pathExists === false"
           class="material-symbols warning-icon"
           :title="$t('messages.pathNotFound')"
         >warning</i>
+      </template>
+      <template #cell-effectiveCapabilities="{ row }">
+        <ShareCapabilities
+          :capabilities="row.effectiveCapabilities"
+          :configured-capabilities="row.configuredCapabilities"
+        />
+      </template>
+      <template #cell-passwordStatus="{ row }">
+        <i
+          v-if="isPasswordProtected(row)"
+          class="material-symbols"
+          :aria-label="$t('general.yes')"
+          :title="$t('general.yes')"
+        >lock</i>
+        <i
+          v-else
+          class="material-symbols"
+          :aria-label="$t('general.no')"
+          :title="$t('general.no')"
+        >lock_open</i>
       </template>
       <template #cell-edit="{ row }">
         <button
@@ -57,7 +83,8 @@
         <button
           type="button"
           class="action"
-          @click.stop="copyToClipboard(buildLink(row))"
+          :disabled="!hasAnyEffectiveCapability(row)"
+          @click.stop="copyShareURL(row)"
           :aria-label="$t('buttons.copyToClipboard')"
           :title="$t('buttons.copyToClipboard')"
         >
@@ -67,10 +94,10 @@
       <template #cell-copyDownload="{ row }">
         <button
           type="button"
-          :disabled="row.shareType === 'upload'"
+          :disabled="!hasEffectiveCapability(row, 'download')"
           class="action"
           v-if="row.downloadURL"
-          @click.stop="copyToClipboard(row.downloadURL)"
+          @click.stop="copyDownloadURL(row)"
           :aria-label="$t('buttons.copyDownloadLinkToClipboard')"
           :title="$t('buttons.copyDownloadLinkToClipboard')"
         >
@@ -87,15 +114,23 @@ import { shareApi } from "@/api";
 import { state, mutations } from "@/store";
 import Errors from "@/views/Errors.vue";
 import SettingsTable from "@/components/settings/Table.vue";
+import ShareCapabilities from "@/components/share/Capabilities.vue";
 import { fromNow } from '@/utils/moment';
 import { eventBus } from "@/store/eventBus";
 import { copyToClipboard } from "@/utils/clipboard";
+import {
+  effectiveCapabilityItems,
+  hasAnyEffectiveCapability,
+  hasCapabilityReduction,
+  hasEffectiveCapability,
+} from "@/utils/shareCapabilities";
 
 export default {
   name: "shares",
   components: {
     Errors,
     SettingsTable,
+    ShareCapabilities,
   },
   data: () => ({
     /** @type {any} */
@@ -160,6 +195,23 @@ export default {
           sortable: true,
           align: "center",
         },
+        {
+          key: "status",
+          label: this.$t("general.status"),
+          sortable: true,
+          align: "center",
+        },
+        {
+          key: "effectiveCapabilities",
+          label: this.$t("settings.permissions-name"),
+          align: "center",
+        },
+        {
+          key: "passwordStatus",
+          label: this.$t("general.password"),
+          narrow: true,
+          align: "center",
+        },
         { key: "warning", label: "", narrow: true, align: "center" },
         { key: "edit", label: "", narrow: true, align: "center" },
         { key: "delete", label: "", narrow: true, align: "center" },
@@ -169,8 +221,26 @@ export default {
     },
   },
   methods: {
-    async copyToClipboard(text) {
-      await copyToClipboard(text);
+    effectiveCapabilityItems(share) {
+      return effectiveCapabilityItems(share);
+    },
+    hasCapabilityReduction(share) {
+      return hasCapabilityReduction(share);
+    },
+    hasAnyEffectiveCapability(share) {
+      return hasAnyEffectiveCapability(share);
+    },
+    hasEffectiveCapability(share, capability) {
+      return hasEffectiveCapability(share, capability);
+    },
+    isPasswordProtected(share) {
+      return share?.hasPassword === true;
+    },
+    async copyShareURL(share) {
+      await copyToClipboard(share.shareURL);
+    },
+    async copyDownloadURL(share) {
+      await copyToClipboard(share.downloadURL);
     },
     async reloadShares() {
       this.loading = true;
@@ -184,7 +254,6 @@ export default {
         this.error = null; // Clear any previous errors
       } catch (e) {
         this.error = e;
-        console.error(e);
       } finally {
         this.loading = false;
       }
@@ -211,14 +280,13 @@ export default {
           buttons: [
             {
               label: this.$t("general.delete"),
-              action: () => {
+              action: async () => {
                 try {
-                  shareApi.remove(item.hash);
+                  await shareApi.remove(item.hash);
                   this.links = this.links.filter((link) => link.hash !== item.hash);
                   notify.showSuccessToast(this.$t("settings.shareDeleted"));
                   mutations.closeTopPrompt();
-                } catch (e) {
-                  console.error(e);
+                } catch (_e) {
                   notify.showErrorToast(this.$t("share.deleteFailed"));
                 }
               },

@@ -239,7 +239,7 @@ export default {
     async fetchItems(path) {
       let items;
       if (this.isShare) {
-        const res = await resourcesApi.fetchFilesPublic(path, this.shareHash, state.shareInfo?.password, false, false, true);
+        const res = await resourcesApi.fetchFilesPublic(path, this.shareHash, state.sharePassword, false, false, true);
         items = res.items || [];
       } else {
         const res = await resourcesApi.fetchFiles(this.currentSource, path, false, false, true);

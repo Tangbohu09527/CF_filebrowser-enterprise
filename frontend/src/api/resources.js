@@ -7,6 +7,12 @@ import { adjustedData, fetchURL } from './utils'
 
 export { fetchPreviewImage } from '@/utils/previewRequests'
 
+function addSharePasswordHeader(headers, hash) {
+  if (state.shareInfo?.hash === hash && state.sharePassword) {
+    headers['X-SHARE-PASSWORD'] = state.sharePassword
+  }
+}
+
 // Notify if errors occur
 export async function fetchFiles(source, path, content = false, metadata = false, skipExtendedAttrs = false) {
   if (!source || source === undefined || source === null) {
@@ -60,10 +66,7 @@ export async function signalUploadPause(source, path, shareHash = null) {
       path: path,
     })
     const headers = {}
-    const sharePassword = localStorage.getItem(`sharepass:${shareHash}`)
-    if (sharePassword) {
-      headers['X-SHARE-PASSWORD'] = sharePassword
-    }
+    addSharePasswordHeader(headers, shareHash)
     await fetchURL(apiPath, { method: 'POST', headers })
     return
   }
@@ -1036,10 +1039,7 @@ export function postPublic(
   if (!hash || hash === undefined || hash === null) {
     throw new Error('no hash provided')
   }
-  const sharePassword = localStorage.getItem(`sharepass:${hash}`);
-  if (sharePassword) {
-    headers["X-SHARE-PASSWORD"] = sharePassword;
-  }
+  addSharePasswordHeader(headers, hash);
   try {
     const apiPath = getPublicApiPath("resources", {
       path: path,
@@ -1124,10 +1124,7 @@ export function postPublic(
 async function resourceActionPublic(hash, path, method, content, token = "") {
   try {
     const headers = {};
-    const sharePassword = localStorage.getItem(`sharepass:${hash}`);
-    if (sharePassword) {
-      headers["X-SHARE-PASSWORD"] = sharePassword;
-    }
+    addSharePasswordHeader(headers, hash);
     const apiPath = getPublicApiPath('resources', { path, hash: hash, token: token })
     const response = await fetch(apiPath, {
       method,

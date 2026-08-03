@@ -146,7 +146,7 @@
           <p>{{ $t('sidebar.selectShare') }}</p>
           <select v-model="newLink.target" @change="handleShareChange" class="input">
             <option value="">{{ $t('sidebar.chooseShare') }}</option>
-            <option v-for="share in availableShares" :key="share.hash" :value="`/public/share/${share.hash}`">
+            <option v-for="share in availableShares" :key="share.hash" :value="share.shareURL">
               {{ share.hash }} {{ $t('general.of') }} {{ share.path }}
             </option>
           </select>
@@ -451,25 +451,62 @@ export default {
       this.syncMainToolsHubLinkRow(value);
     },
     getIconClass,
-    getShareHash(target) {
-      // Extract hash from /public/share/<hash> or /public/share/<hash>/path
-      if (!target) return '';
-      const parts = target.split('/');
-      // parts: ['', 'public', 'share', '<hash>', ...subpath]
-      if (parts.length >= 4 && parts[1] === 'public' && parts[2] === 'share') {
-        return parts[3];
+    shareForTarget(target) {
+      if (!target) return null;
+      try {
+        const selected = new URL(target, window.location.origin);
+        return this.availableShares.find((share) => {
+          if (!share?.shareURL) return false;
+          const base = new URL(share.shareURL, window.location.origin);
+          const basePath = base.pathname.replace(/\/+$/, '');
+          return base.origin === selected.origin &&
+            base.search === selected.search &&
+            (selected.pathname === basePath || selected.pathname.startsWith(`${basePath}/`));
+        }) || null;
+      } catch (_error) {
+        return null;
       }
-      return '';
+    },
+    getShareHash(target) {
+      if (!target) return '';
+      const managedShare = this.shareForTarget(target);
+      if (managedShare) {
+        return managedShare.hash;
+      }
+      try {
+        const parts = new URL(target, window.location.origin).pathname.split('/').filter(Boolean);
+        const publicIndex = parts.findIndex((part, index) => part === 'public' && parts[index + 1] === 'share');
+        return publicIndex >= 0 ? decodeURIComponent(parts[publicIndex + 2] || '') : '';
+      } catch (_error) {
+        return '';
+      }
     },
     getShareSubpath(target) {
-      // Extract subpath from /public/share/<hash>/subpath
       if (!target) return '/';
-      const parts = target.split('/');
-      // parts: ['', 'public', 'share', '<hash>', ...subpath]
-      if (parts.length >= 4 && parts[1] === 'public' && parts[2] === 'share') {
-        return parts.length > 4 ? `/${parts.slice(4).join('/')}` : '/';
+      const managedShare = this.shareForTarget(target);
+      if (!managedShare) return '/';
+      try {
+        const base = new URL(managedShare.shareURL, window.location.origin);
+        const selected = new URL(target, window.location.origin);
+        const basePath = base.pathname.replace(/\/+$/, '');
+        if (base.origin !== selected.origin || (selected.pathname !== basePath && !selected.pathname.startsWith(`${basePath}/`))) {
+          return '/';
+        }
+        return selected.pathname.slice(basePath.length) || '/';
+      } catch (_error) {
+        return '/';
       }
-      return '/';
+    },
+    appendShareSubpath(shareURL, subpath) {
+      if (!shareURL || !subpath || subpath === '/') return shareURL;
+      try {
+        const absolute = /^[a-z][a-z\d+.-]*:\/\//i.test(shareURL);
+        const target = new URL(shareURL, window.location.origin);
+        target.pathname = `${target.pathname.replace(/\/+$/, '')}/${subpath.replace(/^\/+/, '')}`;
+        return absolute ? target.toString() : `${target.pathname}${target.search}${target.hash}`;
+      } catch (_error) {
+        return shareURL;
+      }
     },
     openIconPicker() {
       mutations.showPrompt({
@@ -489,8 +526,7 @@ export default {
       }
       try {
         this.availableShares = await shareApi.list();
-      } catch (error) {
-        console.error("Failed to load shares:", error);
+      } catch (_error) {
         this.availableShares = [];
       }
     },
@@ -687,10 +723,11 @@ export default {
       if (this.isSourceCategory(this.newLink.category)) {
         this.newLink.sourcePath = this.tempSelectedPath;
       } else if (this.newLink.category === 'share') {
-        // Update target with new subpath
         const hash = this.getShareHash(this.newLink.target);
-        const subpath = this.tempSelectedPath === '/' ? '' : this.tempSelectedPath;
-        this.newLink.target = `/public/share/${hash}${subpath}`;
+        const share = this.availableShares.find((item) => item.hash === hash);
+        if (share?.shareURL) {
+          this.newLink.target = this.appendShareSubpath(share.shareURL, this.tempSelectedPath);
+        }
       }
       this.isSelectingPath = false;
     },
@@ -751,7 +788,7 @@ export default {
         linkData.target = this.newLink.sourcePath || '/';
         linkData.sourceName = this.newLink.sourceName;
       } else if (this.newLink.category === "share") {
-        // For shares: target is already the full path /public/share/<hash>/<subpath>
+        // Share targets originate from the management DTO's shareURL.
         linkData.target = this.newLink.target;
       } else if (this.newLink.category === "tool") {
         linkData.target = this.newLink.target;
@@ -874,15 +911,7 @@ export default {
     async saveLinks() {
       try {
         if (this.context === 'share') {
-          // Save to share
-          const payload = {
-            hash: this.shareData.hash,
-            sidebarLinks: this.links,
-          };
-
-          await shareApi.create(payload);
-
-          // Notify Share component of the updated links via eventBus
+          // The parent Share form submits the complete management payload.
           eventBus.emit('shareSidebarLinksUpdated', {
             hash: this.shareData.hash,
             sidebarLinks: this.links,
