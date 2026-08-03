@@ -854,23 +854,43 @@ func CopyResource(isSrcDir bool, sourceIndex, destIndex, realsrc, realdst string
 }
 
 func WriteDirectory(opts utils.FileOptions) error {
+	return writeDirectoryWithPreCommit(opts, "", nil)
+}
+
+func WriteDirectoryWithPreCommit(opts utils.FileOptions, verifiedRealPath string, preCommit func() error) error {
+	if verifiedRealPath == "" || preCommit == nil {
+		return fmt.Errorf("verified directory path and pre-commit check are required")
+	}
+	return writeDirectoryWithPreCommit(opts, verifiedRealPath, preCommit)
+}
+
+func writeDirectoryWithPreCommit(opts utils.FileOptions, verifiedRealPath string, preCommit func() error) error {
 	idx := indexing.GetIndex(opts.Source)
 	if idx == nil {
 		return fmt.Errorf("could not get index: %v ", opts.Source)
 	}
-	realPath, _, _ := idx.GetRealPath(opts.Path)
+	realPath := verifiedRealPath
+	if realPath == "" {
+		realPath, _, _ = idx.GetRealPath(opts.Path)
+	}
 
 	var stat os.FileInfo
 	var err error
 	// Check if the destination exists and is a file
-	if stat, err = os.Stat(realPath); err == nil && !stat.IsDir() {
+	stat, err = os.Stat(realPath)
+	replaceFile := err == nil && !stat.IsDir()
+	if preCommit != nil {
+		if err = preCommit(); err != nil {
+			return fmt.Errorf("directory pre-commit check: %w", err)
+		}
+	}
+	if replaceFile {
 		// If it's a file and we're trying to create a directory, remove the file first
 		err = os.Remove(realPath)
 		if err != nil {
 			return fmt.Errorf("could not remove existing file to create directory: %v", err)
 		}
 	}
-
 	// Ensure the parent directories exist
 	// Permissions are set by MkdirAll (subject to umask, which is usually acceptable)
 	err = os.MkdirAll(realPath, fileutils.PermDir)
@@ -902,12 +922,26 @@ func WriteDirectory(opts utils.FileOptions) error {
 	return nil
 }
 
-func WriteFile(source, path string, in io.Reader) (returnErr error) {
+func WriteFile(source, path string, in io.Reader) error {
+	return writeFileWithPreCommit(source, path, "", in, nil)
+}
+
+func WriteFileWithPreCommit(source, path, verifiedRealPath string, in io.Reader, preCommit func() error) error {
+	if verifiedRealPath == "" || preCommit == nil {
+		return fmt.Errorf("verified file path and pre-commit check are required")
+	}
+	return writeFileWithPreCommit(source, path, verifiedRealPath, in, preCommit)
+}
+
+func writeFileWithPreCommit(source, path, verifiedRealPath string, in io.Reader, preCommit func() error) (returnErr error) {
 	idx := indexing.GetIndex(source)
 	if idx == nil {
 		return fmt.Errorf("could not get index: %v ", source)
 	}
-	realPath, _, _ := idx.GetRealPath(path)
+	realPath := verifiedRealPath
+	if realPath == "" {
+		realPath, _, _ = idx.GetRealPath(path)
+	}
 	// Strip trailing slash from realPath if it's meant to be a file
 	realPath = strings.TrimRight(realPath, "/")
 	// Ensure the parent directories exist
@@ -976,6 +1010,11 @@ func WriteFile(source, path string, in io.Reader) (returnErr error) {
 	tempFile = nil
 	if closeErr != nil {
 		return fmt.Errorf("close temporary file: %w", closeErr)
+	}
+	if preCommit != nil {
+		if err := preCommit(); err != nil {
+			return fmt.Errorf("file pre-commit check: %w", err)
+		}
 	}
 
 	if err := os.Rename(tempPath, realPath); err != nil {

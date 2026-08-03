@@ -118,32 +118,7 @@ func StartHttp(ctx context.Context, storage *bolt.BoltStore, shutdownComplete ch
 	// ========================================
 	// Resources Routes - /api/resources/ (with public routes)
 	// ========================================
-	api.HandleFunc("GET /resources", withUser(resourceGetHandler))
-	api.HandleFunc("GET /resources/items", withUser(itemsGetHandler))
-	api.HandleFunc("DELETE /resources", withUser(resourceDeleteHandler))
-	api.HandleFunc("POST /resources", withUser(resourcePostHandler))
-	api.HandleFunc("PUT /resources", withUser(resourcePutHandler))
-	api.HandleFunc("PATCH /resources", withUser(resourcePatchHandler))
-	api.HandleFunc("DELETE /resources/bulk", withUser(resourceBulkDeleteHandler))
-	api.HandleFunc("POST /resources/archive", withUser(archiveCreateHandler))
-	api.HandleFunc("POST /resources/unarchive", withUser(unarchiveHandler))
-	api.HandleFunc("GET /resources/download", withUser(downloadHandler))
-	api.HandleFunc("GET /resources/preview", withTimeout(30*time.Second, withUserHelper(previewHandler)))
-	api.HandleFunc("GET /resources/preview-source/{ticket}", authenticatedPreviewSnapshotHandler)
-	api.HandleFunc("POST /resources/pause", withUser(resourcePauseHandler))
-	publicApi.HandleFunc("GET /resources", withHashFile(publicGetResourceHandler))
-	publicApi.HandleFunc("GET /resources/items", withHashFile(publicItemsGetHandler))
-	publicApi.HandleFunc("POST /resources", withHashFile(publicUploadHandler))
-	publicApi.HandleFunc("PUT /resources", withHashFile(publicPutHandler))
-	publicApi.HandleFunc("DELETE /resources", withHashFile(publicDeleteHandler))
-	publicApi.HandleFunc("DELETE /resources/bulk", withHashFile(publicBulkDeleteHandler))
-	publicApi.HandleFunc("PATCH /resources", withHashFile(publicPatchHandler))
-	publicApi.HandleFunc("GET /resources/download", withHashFile(publicDownloadHandler))
-	publicApi.HandleFunc("GET /resources/preview", withTimeout(30*time.Second, withHashFileHelper(publicPreviewHandler)))
-	publicApi.HandleFunc("POST /resources/pause", withHashFile(publicPauseHandler))
-	// Legacy routes (backwards compatibility)
-	api.HandleFunc("GET /raw", withUser(downloadHandler))
-	publicApi.HandleFunc("GET /raw", withHashFile(publicDownloadHandler))
+	registerCoreFileActionRoutes(api, publicApi)
 
 	// ========================================
 	// Access Routes - /api/access/
@@ -166,8 +141,6 @@ func StartHttp(ctx context.Context, storage *bolt.BoltStore, shutdownComplete ch
 	api.HandleFunc("POST /share", withPermShare(sharePostHandler))
 	api.HandleFunc("PATCH /share", withPermShare(sharePatchHandler))
 	api.HandleFunc("DELETE /share", withPermShare(shareDeleteHandler))
-	publicApi.HandleFunc("GET /share/info", withOrWithoutUser(shareInfoHandler))
-	publicApi.HandleFunc("GET /share/image", withHashFile(getShareImage))
 
 	// ========================================
 	// Settings Routes - /api/settings/
@@ -190,9 +163,6 @@ func StartHttp(ctx context.Context, storage *bolt.BoltStore, shutdownComplete ch
 	api.HandleFunc("GET /media/subtitles", withUser(subtitlesHandler))
 	api.HandleFunc("GET /media/metadata", withUser(metadataHandler))
 	api.HandleFunc("GET /media/lyrics", withUser(lyricsHandler))
-	publicApi.HandleFunc("GET /media/subtitles", withHashFile(publicSubtitlesHandler))
-	publicApi.HandleFunc("GET /media/metadata", withHashFile(publicMetadataHandler))
-	publicApi.HandleFunc("GET /media/lyrics", withHashFile(publicLyricsHandler))
 
 	// ========================================
 	// OnlyOffice Routes - /api/office/ (with public routes)

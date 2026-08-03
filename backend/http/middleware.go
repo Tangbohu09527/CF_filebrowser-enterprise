@@ -23,6 +23,7 @@ import (
 	"github.com/gtsteffaniak/filebrowser/backend/common/errors"
 	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	auditdb "github.com/gtsteffaniak/filebrowser/backend/database/audit"
 	"github.com/gtsteffaniak/filebrowser/backend/database/share"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing"
@@ -39,6 +40,7 @@ type requestContext struct {
 	shareScope   string
 	shareTargets []publicShareTarget
 	shareArchive []publicShareArchiveEntry
+	auditShare   bool
 	fileInfo     iteminfo.ExtendedFileInfo
 	token        string
 	apiToken     bool
@@ -757,6 +759,119 @@ func authorizePublicShareSingleWriteRequest(r *http.Request, d *requestContext, 
 	return true, nil
 }
 
+func publicShareAuditHash(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return ""
+	}
+	values := query["hash"]
+	if len(values) != 1 || values[0] == "" || len(values[0]) > 4096 {
+		return ""
+	}
+	return values[0]
+}
+
+func withAuditPublicShareAccess(fn handleFunc) handleFunc {
+	return func(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+		d.auditShare = true
+		recorder := AuditRecorderFromRequest(r)
+		if recorder != nil {
+			if err := recorder.SetAction(auditdb.ActionShareAccess); err != nil {
+				return http.StatusServiceUnavailable, ErrAuditUnavailable
+			}
+			if err := recorder.SetAuthMethod(auditdb.AuthMethodShare); err != nil {
+				return http.StatusServiceUnavailable, ErrAuditUnavailable
+			}
+			if err := recorder.SetShareRef(auditdb.DeriveShareRef(publicShareAuditHash(r))); err != nil {
+				return http.StatusServiceUnavailable, ErrAuditUnavailable
+			}
+		}
+
+		status, err := fn(w, r, d)
+		if recorder != nil && (status == http.StatusUnauthorized || status == http.StatusForbidden) {
+			if auditErr := recorder.setErrorCodeIfEmpty(auditErrorCodeAuthenticationRequired); auditErr != nil {
+				return http.StatusServiceUnavailable, ErrAuditUnavailable
+			}
+		}
+		return status, err
+	}
+}
+
+func setPublicShareAuditContext(r *http.Request, d *requestContext, link *share.Link, target *publicShareTarget) error {
+	if d == nil || !d.auditShare {
+		return nil
+	}
+	recorder := AuditRecorderFromRequest(r)
+	if recorder == nil {
+		return nil
+	}
+	if link != nil && link.Hash != "" {
+		if err := recorder.SetShareRef(auditdb.DeriveShareRef(link.Hash)); err != nil {
+			return ErrAuditUnavailable
+		}
+	}
+	if d.user != nil && d.user.Username != "" {
+		var userID *uint
+		if d.user.ID != 0 {
+			userID = &d.user.ID
+		}
+		if err := recorder.SetActor(userID, d.user.Username); err != nil {
+			return ErrAuditUnavailable
+		}
+	}
+	if d.shareUser != nil && link != nil {
+		access := d.shareAccess
+		shareEnabled := link.CapabilityVersion == share.CurrentCapabilityVersion &&
+			d.shareUser.Permissions.Share && link.CreatorCapabilities.Share
+		permissions := auditdb.Permissions{
+			Share:    shareEnabled,
+			Modify:   access.modify || access.replace,
+			Delete:   access.delete,
+			Create:   access.create,
+			Browse:   access.browse,
+			Preview:  access.thumbnail || access.viewer,
+			Download: access.download,
+		}
+		if err := recorder.SetEffectivePermissions(&permissions); err != nil {
+			return ErrAuditUnavailable
+		}
+	}
+	if link == nil || config == nil {
+		return nil
+	}
+	source, ok := config.Server.SourceMap[link.Source]
+	if !ok || source == nil || source.Name == "" {
+		return nil
+	}
+	logicalPath := ""
+	canonicalPath := ""
+	if target != nil {
+		logicalPath = target.LogicalPath
+		canonicalPath = target.CanonicalPath
+	}
+	if err := recorder.SetResource(source.Name, logicalPath, canonicalPath); err != nil {
+		return ErrAuditUnavailable
+	}
+	return nil
+}
+
+func publicShareAuditTarget(d *requestContext, sourcePath string) *publicShareTarget {
+	if d == nil || d.share == nil || len(d.shareTargets) == 0 {
+		return nil
+	}
+	if len(d.shareTargets) == 1 {
+		return &d.shareTargets[0]
+	}
+	root, err := resolvePublicShareLogicalTarget(d, sourcePath, d.share.Path)
+	if err != nil {
+		return nil
+	}
+	return &root
+}
+
 // Middleware to handle file requests by hash and pass it to the handler
 func withHashFileHelper(fn handleFunc) handleFunc {
 	authenticated := withOrWithoutUserHelper(func(w http.ResponseWriter, r *http.Request, data *requestContext) (int, error) {
@@ -778,6 +893,9 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 		if err != nil {
 			data.share = &share.Link{}
 			return http.StatusNotFound, fmt.Errorf("share hash not found")
+		}
+		if auditErr := setPublicShareAuditContext(r, data, link, nil); auditErr != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
 		}
 		archiveToken := query.Get("archiveToken")
 		keepArchiveToken := archiveToken == ""
@@ -833,6 +951,9 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 			return http.StatusNotFound, fmt.Errorf("user for share no longer exists")
 		}
 		data.shareAccess = calculatePublicShareAccess(link, data.shareUser)
+		if auditErr := setPublicShareAuditContext(r, data, link, nil); auditErr != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
 		uploadInitializationProbe := link.ShareType == "upload" && route.uploadInitializationProbe && r.Header.Get("Range") == ""
 		if route.read && !uploadInitializationProbe && !data.shareAccess.allows(route.requirement) {
 			invalidatePublicShareArchiveToken(query.Get("archiveToken"), link.Hash)
@@ -866,8 +987,12 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 			if !publicShareWriteAllowed(http.MethodPost, "/resources", data.shareAccess) {
 				return http.StatusForbidden, fmt.Errorf("public share access denied")
 			}
-			if _, _, targetErr := authorizePublicShareWriteTarget(data, source.Path, inputPath); targetErr != nil {
+			target, _, targetErr := authorizePublicShareWriteTarget(data, source.Path, inputPath)
+			if targetErr != nil {
 				return http.StatusForbidden, fmt.Errorf("public share access denied")
+			}
+			if auditErr := setPublicShareAuditContext(r, data, link, &target); auditErr != nil {
+				return http.StatusServiceUnavailable, ErrAuditUnavailable
 			}
 			return http.StatusNotImplemented, fmt.Errorf("browsing is disabled for upload shares")
 		}
@@ -880,6 +1005,9 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 				return http.StatusForbidden, fmt.Errorf("public share access denied")
 			}
 			if handled {
+				if auditErr := setPublicShareAuditContext(r, data, link, publicShareAuditTarget(data, source.Path)); auditErr != nil {
+					return http.StatusServiceUnavailable, ErrAuditUnavailable
+				}
 				return callHandler()
 			}
 		}
@@ -908,6 +1036,9 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 				}
 				data.shareTargets = append(data.shareTargets, target)
 			}
+			if auditErr := setPublicShareAuditContext(r, data, link, publicShareAuditTarget(data, source.Path)); auditErr != nil {
+				return http.StatusServiceUnavailable, ErrAuditUnavailable
+			}
 			return callHandler()
 		}
 
@@ -920,6 +1051,9 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 			}
 			data.shareTargets = []publicShareTarget{readTarget}
 			data.IndexPath = utils.AddTrailingSlashIfNotExists(readTarget.ScopedPath)
+			if auditErr := setPublicShareAuditContext(r, data, link, &readTarget); auditErr != nil {
+				return http.StatusServiceUnavailable, ErrAuditUnavailable
+			}
 		} else {
 			var scopedPath string
 			scopedPath, err = resolvePublicShareWriteScopedPath(link.Path, data.shareScope, requestedPath)
@@ -1007,6 +1141,18 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 		r.URL.RawQuery = query.Encode()
 		return authenticated(w, r, data)
 	}
+}
+
+func withAuditHashFileHelper(fn handleFunc) handleFunc {
+	return withAuditPublicShareAccess(withHashFileHelper(fn))
+}
+
+func withAuditHashFile(fn handleFunc) http.HandlerFunc {
+	return wrapHandler(withAuditHashFileHelper(fn))
+}
+
+func withAuditShareAccess(fn handleFunc) http.HandlerFunc {
+	return wrapHandler(withAuditPublicShareAccess(withOrWithoutUserHelper(fn)))
 }
 
 // Middleware to ensure the user is an admin

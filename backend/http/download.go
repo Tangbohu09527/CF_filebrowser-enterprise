@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	commonerrors "github.com/gtsteffaniak/filebrowser/backend/common/errors"
+	auditdb "github.com/gtsteffaniak/filebrowser/backend/database/audit"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing/iteminfo"
 	"github.com/gtsteffaniak/go-logger/logger"
@@ -292,6 +293,13 @@ func rawFilesHandler(w http.ResponseWriter, r *http.Request, d *requestContext, 
 			currentTarget, currentErr := resolveAuthenticatedReadTarget(currentUser, source, authenticatedTargets[0].RequestedPath)
 			if currentErr != nil || !sameAuthenticatedReadTarget(authenticatedTargets[0], currentTarget) {
 				return http.StatusForbidden, commonerrors.ErrAccessDenied
+			}
+			itemCount := int64(len(fileList))
+			if auditErr := setCoreFileAuditReadTarget(r, currentTarget, &auditdb.MetadataV1{
+				SchemaVersion: auditdb.CurrentMetadataSchemaVersion,
+				ItemCount:     &itemCount,
+			}); auditErr != nil {
+				return http.StatusServiceUnavailable, ErrAuditUnavailable
 			}
 			fd, fileInfo, err2 = openAuthenticatedReadTarget(currentTarget)
 		} else {

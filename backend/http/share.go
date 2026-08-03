@@ -911,6 +911,9 @@ func shareInfoHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	if err != nil {
 		return http.StatusNotFound, fmt.Errorf("share hash not found")
 	}
+	if auditErr := setPublicShareAuditContext(r, d, shareLink, nil); auditErr != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
 	if !publicShareAudienceAllowed(shareLink, d.user) {
 		return http.StatusForbidden, fmt.Errorf("share is not available to this user")
 	}
@@ -919,8 +922,15 @@ func shareInfoHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 		return http.StatusNotFound, fmt.Errorf("user for share no longer exists")
 	}
 	access := calculatePublicShareAccess(shareLink, owner)
-	if err := validateShareRoot(shareLink, owner); err != nil {
+	d.share = shareLink
+	d.shareUser = owner
+	d.shareAccess = access
+	root, err := resolveShareRoot(shareLink, owner)
+	if err != nil {
 		return http.StatusForbidden, fmt.Errorf("public share access denied")
+	}
+	if auditErr := setPublicShareAuditContext(r, d, shareLink, &root); auditErr != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
 	}
 	if shareLink.ShareType == "upload" {
 		if !access.create && !access.modify && !access.delete {

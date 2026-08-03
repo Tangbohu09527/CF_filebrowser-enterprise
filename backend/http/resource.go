@@ -3,7 +3,9 @@ package http
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path"
@@ -15,6 +17,7 @@ import (
 	"github.com/gtsteffaniak/filebrowser/backend/adapters/fs/files"
 	"github.com/gtsteffaniak/filebrowser/backend/common/errors"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	auditdb "github.com/gtsteffaniak/filebrowser/backend/database/audit"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing/iteminfo"
@@ -25,6 +28,284 @@ import (
 
 var pauseCache = cache.NewCache[string](1 * time.Minute)
 var publicPauseCache = cache.NewCache[string](1 * time.Minute)
+
+var errResourceAuditTargetChanged = stderrors.New("audited resource target changed")
+
+type resourceAuditCountingReader struct {
+	reader    io.Reader
+	bytesRead int64
+}
+
+func (reader *resourceAuditCountingReader) Read(buffer []byte) (int, error) {
+	read, err := reader.reader.Read(buffer)
+	reader.bytesRead += int64(read)
+	return read, err
+}
+
+func prepareResourceWriteAudit(
+	request *http.Request,
+	action auditdb.Action,
+	source, logicalPath, canonicalPath string,
+	targetSource, targetLogicalPath, targetCanonicalPath string,
+	metadata *auditdb.MetadataV1,
+) error {
+	recorder := AuditRecorderFromRequest(request)
+	if recorder == nil {
+		return nil
+	}
+	if err := recorder.SetAction(action); err != nil {
+		return err
+	}
+	if err := recorder.SetResource(source, logicalPath, canonicalPath); err != nil {
+		return err
+	}
+	if targetCanonicalPath != "" {
+		if err := recorder.SetTarget(targetSource, targetLogicalPath, targetCanonicalPath); err != nil {
+			return err
+		}
+	}
+	return recorder.MergeMetadata(metadata)
+}
+
+func prepareResourceWriteAuditAction(request *http.Request, action auditdb.Action, metadata *auditdb.MetadataV1) error {
+	recorder := AuditRecorderFromRequest(request)
+	if recorder == nil {
+		return nil
+	}
+	if err := recorder.SetAction(action); err != nil {
+		return err
+	}
+	return recorder.MergeMetadata(metadata)
+}
+
+func setResourceWriteAuditPaths(
+	request *http.Request,
+	source, logicalPath, canonicalPath string,
+	targetSource, targetLogicalPath, targetCanonicalPath string,
+) error {
+	recorder := AuditRecorderFromRequest(request)
+	if recorder == nil {
+		return nil
+	}
+	if err := recorder.SetResource(source, logicalPath, canonicalPath); err != nil {
+		return err
+	}
+	if targetCanonicalPath == "" {
+		return nil
+	}
+	return recorder.SetTarget(targetSource, targetLogicalPath, targetCanonicalPath)
+}
+
+func mergeResourceWriteAuditMetadata(request *http.Request, metadata *auditdb.MetadataV1) error {
+	recorder := AuditRecorderFromRequest(request)
+	if recorder == nil {
+		return nil
+	}
+	return recorder.MergeMetadata(metadata)
+}
+
+func reserveResourceWriteAudit(request *http.Request) error {
+	recorder := AuditRecorderFromRequest(request)
+	if recorder == nil {
+		return nil
+	}
+	return recorder.ReservePending()
+}
+
+func resourceWriteAuditMetadata(method auditdb.Method, itemCount int64) *auditdb.MetadataV1 {
+	zero := int64(0)
+	return &auditdb.MetadataV1{
+		SchemaVersion: auditdb.CurrentMetadataSchemaVersion,
+		Method:        method,
+		ItemCount:     &itemCount,
+		SuccessCount:  &zero,
+		FailedCount:   &zero,
+		DeniedCount:   &zero,
+	}
+}
+
+func resourceWriteAuditOutcomeMetadata(itemCount, successCount, failedCount, deniedCount int64) *auditdb.MetadataV1 {
+	return &auditdb.MetadataV1{
+		SchemaVersion: auditdb.CurrentMetadataSchemaVersion,
+		ItemCount:     &itemCount,
+		SuccessCount:  &successCount,
+		FailedCount:   &failedCount,
+		DeniedCount:   &deniedCount,
+	}
+}
+
+func resourceAuditAccessDenied(err error) bool {
+	return stderrors.Is(err, errors.ErrAccessDenied) ||
+		stderrors.Is(err, errors.ErrPermissionDenied) || os.IsPermission(err)
+}
+
+func resolveResourceAuditWriteTarget(user *users.User, source, requestedPath string) (authenticatedReadTarget, error) {
+	target, err := resolveAuthenticatedWriteTarget(user, source, requestedPath)
+	if err == nil || (!stderrors.Is(err, errors.ErrNotExist) && !os.IsNotExist(err)) {
+		return target, err
+	}
+
+	safePath, err := sanitizeAuthenticatedReadPath(requestedPath)
+	if err != nil {
+		return target, err
+	}
+	idx, userScope, err := authenticatedReadScope(user, source)
+	if err != nil {
+		return target, err
+	}
+	logicalPath := normalizePublicShareIndexPath(utils.JoinPathAsUnix(userScope, safePath))
+	if store.Access == nil || !publicSharePathWithin(userScope, logicalPath) ||
+		!store.Access.PermittedFresh(idx.Path, logicalPath, user.Username) {
+		return target, errors.ErrAccessDenied
+	}
+
+	remaining := []string{path.Base(safePath)}
+	parentPath := path.Dir(safePath)
+	for {
+		parent, parentErr := resolveAuthenticatedBrowseTarget(user, source, parentPath)
+		if parentErr == nil {
+			if parent.Info == nil || !parent.Info.IsDir() {
+				return target, errors.ErrAccessDenied
+			}
+			relativeSuffix := path.Join(remaining...)
+			canonicalPath := normalizePublicShareIndexPath(path.Join(parent.CanonicalPath, relativeSuffix))
+			realPath := filepath.Join(parent.RealPath, filepath.FromSlash(relativeSuffix))
+			if !publicSharePathWithin(userScope, canonicalPath) ||
+				!store.Access.PermittedFresh(idx.Path, canonicalPath, user.Username) ||
+				!publicShareRealPathWithin(parent.SourceReal, realPath) ||
+				!publicShareRealPathWithin(parent.ScopeReal, realPath) {
+				return target, errors.ErrAccessDenied
+			}
+			scopedPath, scopedErr := publicShareScopedPath(userScope, canonicalPath)
+			if scopedErr != nil {
+				return target, scopedErr
+			}
+			return authenticatedReadTarget{
+				Index:         idx,
+				SourcePath:    idx.Path,
+				SourceReal:    parent.SourceReal,
+				UserScope:     userScope,
+				ScopeReal:     parent.ScopeReal,
+				ScopeInfo:     parent.ScopeInfo,
+				RequestedPath: safePath,
+				LogicalPath:   logicalPath,
+				LogicalAccess: true,
+				CanonicalPath: canonicalPath,
+				EntryPath:     canonicalPath,
+				ScopedPath:    scopedPath,
+				RealPath:      realPath,
+			}, nil
+		}
+		if !stderrors.Is(parentErr, errors.ErrNotExist) && !os.IsNotExist(parentErr) {
+			return target, parentErr
+		}
+		if parentPath == "/" || parentPath == "." {
+			return target, parentErr
+		}
+		remaining = append([]string{path.Base(parentPath)}, remaining...)
+		parentPath = path.Dir(parentPath)
+	}
+}
+
+func resourceAuditWriteTarget(d *requestContext, source, requestedPath string) (authenticatedReadTarget, error) {
+	if d.share != nil && len(d.shareTargets) != 0 {
+		shareTarget := d.shareTargets[0]
+		return authenticatedReadTarget{
+			RequestedPath: shareTarget.RequestedPath,
+			LogicalPath:   shareTarget.LogicalPath,
+			CanonicalPath: shareTarget.CanonicalPath,
+			RealPath:      shareTarget.RealPath,
+			Info:          shareTarget.info,
+		}, nil
+	}
+	return resolveResourceAuditWriteTarget(d.user, source, requestedPath)
+}
+
+func resourceAuditCanonicalPath(idx *indexing.Index, realPath string) (string, error) {
+	if idx == nil {
+		return "", errors.ErrAccessDenied
+	}
+	sourceReal, err := filepath.EvalSymlinks(idx.Path)
+	if err != nil {
+		return "", err
+	}
+	targetAbsolute, err := filepath.Abs(realPath)
+	if err != nil || !publicShareRealPathWithin(sourceReal, targetAbsolute) {
+		return "", errors.ErrAccessDenied
+	}
+	relative, err := filepath.Rel(sourceReal, targetAbsolute)
+	if err != nil || filepath.IsAbs(relative) {
+		return "", errors.ErrAccessDenied
+	}
+	relative = publicShareCanonicalCaseRelative(sourceReal, relative)
+	canonicalPath := normalizePublicShareIndexPath(filepath.ToSlash(relative))
+	if canonicalPath == "/" {
+		return "", errors.ErrAccessDenied
+	}
+	return canonicalPath, nil
+}
+
+func sameResourceAuditWriteTarget(original, current authenticatedReadTarget) bool {
+	if original.Index == nil || current.Index == nil || original.ScopeInfo == nil || current.ScopeInfo == nil {
+		return false
+	}
+	if original.Index.Name != current.Index.Name || original.SourcePath != current.SourcePath ||
+		original.UserScope != current.UserScope || original.LogicalPath != current.LogicalPath ||
+		original.CanonicalPath != current.CanonicalPath ||
+		!publicShareSameRealPath(original.SourceReal, current.SourceReal) ||
+		!publicShareSameRealPath(original.ScopeReal, current.ScopeReal) ||
+		!publicShareSameRealPath(original.RealPath, current.RealPath) ||
+		!os.SameFile(original.ScopeInfo, current.ScopeInfo) {
+		return false
+	}
+	if original.Info == nil || current.Info == nil {
+		return original.Info == nil && current.Info == nil
+	}
+	return original.Info.Mode().Type() == current.Info.Mode().Type() && os.SameFile(original.Info, current.Info)
+}
+
+func samePublicShareAuditWriteTarget(original, current publicShareTarget, currentExists bool) bool {
+	originalExists := original.info != nil
+	if originalExists != currentExists || original.RequestedPath != current.RequestedPath ||
+		original.LogicalPath != current.LogicalPath || original.CanonicalPath != current.CanonicalPath ||
+		original.ScopedPath != current.ScopedPath ||
+		!publicShareSameRealPath(original.RealPath, current.RealPath) {
+		return false
+	}
+	if !originalExists {
+		return true
+	}
+	return current.info != nil && original.IsDir == current.IsDir &&
+		original.info.Mode().Type() == current.info.Mode().Type() && os.SameFile(original.info, current.info)
+}
+
+func resourceAuditWritePreCommit(
+	d *requestContext,
+	source, requestedPath string,
+	original authenticatedReadTarget,
+) func() error {
+	if d.share != nil && len(d.shareTargets) != 0 {
+		shareTarget := d.shareTargets[0]
+		idx := indexing.GetIndex(source)
+		return func() error {
+			if idx == nil {
+				return errResourceAuditTargetChanged
+			}
+			current, exists, err := authorizePublicShareWriteTarget(d, idx.Path, shareTarget.RequestedPath)
+			if err != nil || !samePublicShareAuditWriteTarget(shareTarget, current, exists) {
+				return errResourceAuditTargetChanged
+			}
+			return nil
+		}
+	}
+	return func() error {
+		current, err := resolveResourceAuditWriteTarget(d.user, source, requestedPath)
+		if err != nil || !sameResourceAuditWriteTarget(original, current) {
+			return errResourceAuditTargetChanged
+		}
+		return nil
+	}
+}
 
 // validateMoveOperation checks if a move/rename operation is valid at the HTTP level
 // It prevents moving a directory into itself or its subdirectories
@@ -192,6 +473,9 @@ func resourceGetHandler(w http.ResponseWriter, r *http.Request, d *requestContex
 	}
 	if err = filterAuthenticatedDirectoryFileInfo(responseUser, source, currentTarget, fileInfo); err != nil {
 		return http.StatusForbidden, errors.ErrAccessDenied
+	}
+	if err = setCoreFileAuditReadTarget(r, currentTarget, nil); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
 	}
 	if !responseUser.Permissions.Preview {
 		fileInfo.Metadata = nil
@@ -388,14 +672,30 @@ func resourceDeleteHandler(w http.ResponseWriter, r *http.Request, d *requestCon
 	if err != nil {
 		return errToStatus(err), err
 	}
+	if AuditRecorderFromRequest(r) != nil {
+		auditTarget, auditErr := resolveAuthenticatedReadTarget(d.user, source, path)
+		if auditErr != nil {
+			return errToStatus(auditErr), auditErr
+		}
+		metadata := resourceWriteAuditMetadata(auditdb.MethodDELETE, 1)
+		if auditErr = prepareResourceWriteAudit(r, auditdb.ActionFileDelete,
+			source, auditTarget.LogicalPath, auditTarget.CanonicalPath, "", "", "", metadata); auditErr != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		if auditErr = reserveResourceWriteAudit(r); auditErr != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+	}
 
 	// delete thumbnails
 	preview.DelThumbs(r.Context(), *fileInfo)
 
 	err = files.DeleteFiles(source, fileInfo.RealPath, fileInfo.Type == "directory")
 	if err != nil {
+		_ = mergeResourceWriteAuditMetadata(r, resourceWriteAuditOutcomeMetadata(1, 0, 1, 0))
 		return errToStatus(err), err
 	}
+	_ = mergeResourceWriteAuditMetadata(r, resourceWriteAuditOutcomeMetadata(1, 1, 0, 0))
 	return http.StatusOK, nil
 
 }
@@ -475,6 +775,23 @@ func resourceBulkDeleteHandler(w http.ResponseWriter, r *http.Request, d *reques
 		Succeeded: make([]BulkDeleteItem, 0),
 		Failed:    make([]BulkDeleteItem, 0),
 	}
+	itemCount := int64(len(items))
+	auditEnabled := AuditRecorderFromRequest(r) != nil
+	if err := prepareResourceWriteAuditAction(r, auditdb.ActionFileDelete,
+		resourceWriteAuditMetadata(auditdb.MethodDELETE, itemCount)); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
+	auditReserved := false
+	auditDeniedCount := int64(0)
+	defer func() {
+		successCount := int64(len(response.Succeeded))
+		failedCount := int64(len(response.Failed)) - auditDeniedCount
+		if failedCount < 0 {
+			failedCount = 0
+		}
+		_ = mergeResourceWriteAuditMetadata(r,
+			resourceWriteAuditOutcomeMetadata(itemCount, successCount, failedCount, auditDeniedCount))
+	}()
 
 	// Process each item one at a time
 	for _, item := range items {
@@ -530,6 +847,7 @@ func resourceBulkDeleteHandler(w http.ResponseWriter, r *http.Request, d *reques
 			}
 
 			if idx.Config.ReadOnly {
+				auditDeniedCount++
 				response.Failed = append(response.Failed, BulkDeleteItem{
 					Source:  item.Source,
 					Path:    sanitizedPath,
@@ -541,6 +859,7 @@ func resourceBulkDeleteHandler(w http.ResponseWriter, r *http.Request, d *reques
 			// get user scope path from share
 			userScope, err := d.shareUser.GetScopeForSourceName(sourceName)
 			if err != nil {
+				auditDeniedCount++
 				response.Failed = append(response.Failed, BulkDeleteItem{
 					Source:  item.Source,
 					Path:    sanitizedPath,
@@ -588,6 +907,7 @@ func resourceBulkDeleteHandler(w http.ResponseWriter, r *http.Request, d *reques
 			// Check user scope for this source
 			_, err := filePermUser.GetScopeForSourceName(item.Source)
 			if err != nil {
+				auditDeniedCount++
 				response.Failed = append(response.Failed, BulkDeleteItem{
 					Source:  item.Source,
 					Path:    sanitizedPath,
@@ -607,6 +927,7 @@ func resourceBulkDeleteHandler(w http.ResponseWriter, r *http.Request, d *reques
 			}
 
 			if idx.Config.ReadOnly {
+				auditDeniedCount++
 				response.Failed = append(response.Failed, BulkDeleteItem{
 					Source:  item.Source,
 					Path:    sanitizedPath,
@@ -623,12 +944,35 @@ func resourceBulkDeleteHandler(w http.ResponseWriter, r *http.Request, d *reques
 				ShowHidden:     true,
 			}, store.Access, filePermUser, store.Share)
 			if err != nil {
+				if resourceAuditAccessDenied(err) {
+					auditDeniedCount++
+				}
 				response.Failed = append(response.Failed, BulkDeleteItem{
 					Source:  item.Source,
 					Path:    sanitizedPath,
 					Message: err.Error(),
 				})
 				continue
+			}
+			if auditEnabled && !auditReserved {
+				auditTarget, auditErr := resolveAuthenticatedReadTarget(filePermUser, item.Source, sanitizedPath)
+				if auditErr != nil {
+					if resourceAuditAccessDenied(auditErr) {
+						auditDeniedCount++
+					}
+					response.Failed = append(response.Failed, BulkDeleteItem{
+						Source: item.Source, Path: sanitizedPath, Message: "resource path is unavailable",
+					})
+					continue
+				}
+				if auditErr = setResourceWriteAuditPaths(r, item.Source,
+					auditTarget.LogicalPath, auditTarget.CanonicalPath, "", "", ""); auditErr != nil {
+					return http.StatusServiceUnavailable, ErrAuditUnavailable
+				}
+				if auditErr = reserveResourceWriteAudit(r); auditErr != nil {
+					return http.StatusServiceUnavailable, ErrAuditUnavailable
+				}
+				auditReserved = true
 			}
 			err = files.DeleteFiles(item.Source, fileInfo.RealPath, fileInfo.Type == "directory")
 			if err != nil {
@@ -738,7 +1082,7 @@ func publicPauseHandler(w http.ResponseWriter, r *http.Request, d *requestContex
 // @Failure 409 {object} map[string]string "Conflict - Resource already exists"
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /api/resources [post]
-func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (status int, returnErr error) {
 	path := r.URL.Query().Get("path")
 	source := r.URL.Query().Get("source")
 
@@ -782,6 +1126,16 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 
 	// get scoped path
 	realPath, _, _ := idx.GetRealPath(fullIndexPath)
+	auditEnabled := AuditRecorderFromRequest(r) != nil
+	var auditTarget authenticatedReadTarget
+	if auditEnabled {
+		var auditErr error
+		auditTarget, auditErr = resourceAuditWriteTarget(d, source, path)
+		if auditErr != nil {
+			return errToStatus(auditErr), auditErr
+		}
+		realPath = auditTarget.RealPath
+	}
 
 	// Check access control for the target path
 	if !store.Access.Permitted(idx.Path, path, filePermUser.Username) {
@@ -796,7 +1150,9 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 	defer unlockTarget()
 
 	// Check permissions and file/folder conflicts before any write.
+	targetExists := false
 	if stat, statErr := os.Stat(realPath); statErr == nil {
+		targetExists = true
 		if d.share == nil && !d.user.Permissions.Modify {
 			return http.StatusForbidden, fmt.Errorf("user is not allowed to modify")
 		}
@@ -821,6 +1177,44 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 	} else {
 		return errToStatus(statErr), statErr
 	}
+
+	itemCount := int64(1)
+	auditBytes := int64(0)
+	var auditPreCommit func() error
+	if auditEnabled {
+		action := auditdb.ActionFileUpload
+		if targetExists {
+			action = auditdb.ActionFileModify
+		}
+		overwrite := targetExists
+		metadata := resourceWriteAuditMetadata(auditdb.MethodPOST, itemCount)
+		metadata.Bytes = &auditBytes
+		metadata.Overwrite = &overwrite
+		if auditErr := prepareResourceWriteAudit(r, action, source,
+			auditTarget.LogicalPath, auditTarget.CanonicalPath, "", "", "", metadata); auditErr != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		if auditErr := reserveResourceWriteAudit(r); auditErr != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		auditPreCommit = resourceAuditWritePreCommit(d, source, path, auditTarget)
+		defer func() {
+			successCount := int64(0)
+			failedCount := int64(0)
+			deniedCount := int64(0)
+			switch {
+			case status >= http.StatusOK && status < http.StatusBadRequest:
+				successCount = 1
+			case status == http.StatusUnauthorized || status == http.StatusForbidden:
+				deniedCount = 1
+			default:
+				failedCount = 1
+			}
+			outcome := resourceWriteAuditOutcomeMetadata(itemCount, successCount, failedCount, deniedCount)
+			outcome.Bytes = &auditBytes
+			_ = mergeResourceWriteAuditMetadata(r, outcome)
+		}()
+	}
 	if chunkOffsetStr != "" {
 		cleanupStaleChunkUploadTemps(filepath.Dir(realPath), realPath)
 	}
@@ -831,8 +1225,15 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 		dirOpts := fileOpts
 		dirOpts.Path = fullIndexPath
 
-		err = files.WriteDirectory(dirOpts)
+		if auditEnabled {
+			err = files.WriteDirectoryWithPreCommit(dirOpts, realPath, auditPreCommit)
+		} else {
+			err = files.WriteDirectory(dirOpts)
+		}
 		if err != nil {
+			if stderrors.Is(err, errResourceAuditTargetChanged) {
+				return http.StatusConflict, errResourceAuditTargetChanged
+			}
 			logger.Debugf("error writing directory: %v", err)
 			return errToStatus(err), err
 		}
@@ -905,6 +1306,7 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 		}()
 
 		chunkSize, tooLarge, copyErr := copyChunkUploadBody(outFile, r.Body, remaining)
+		auditBytes = chunkSize
 		if copyErr != nil {
 			logger.Debugf("could not write chunk to temp file: %v", copyErr)
 			resetErr := resetChunkUploadFile(outFile, offset)
@@ -1002,6 +1404,12 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 			removeChunkUploadTemp(tempFilePath)
 			return http.StatusInternalServerError, fmt.Errorf("could not close completed chunk upload: %v", closeErr)
 		}
+		if auditPreCommit != nil {
+			if preCommitErr := auditPreCommit(); preCommitErr != nil {
+				removeChunkUploadTemp(tempFilePath)
+				return http.StatusConflict, errResourceAuditTargetChanged
+			}
+		}
 
 		// The target can change while the final request body is being read.
 		if _, statErr := os.Stat(realPath); statErr == nil {
@@ -1043,8 +1451,24 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 		preview.DelThumbs(r.Context(), *fileInfo)
 	}
 
-	err = files.WriteFile(fileOpts.Source, fullIndexPath, r.Body)
+	input := io.Reader(r.Body)
+	var countingBody *resourceAuditCountingReader
+	if auditEnabled {
+		countingBody = &resourceAuditCountingReader{reader: r.Body}
+		input = countingBody
+	}
+	if auditEnabled {
+		err = files.WriteFileWithPreCommit(fileOpts.Source, fullIndexPath, realPath, input, auditPreCommit)
+	} else {
+		err = files.WriteFile(fileOpts.Source, fullIndexPath, input)
+	}
+	if countingBody != nil {
+		auditBytes = countingBody.bytesRead
+	}
 	if err != nil {
+		if stderrors.Is(err, errResourceAuditTargetChanged) {
+			return http.StatusConflict, errResourceAuditTargetChanged
+		}
 		logger.Debugf("error writing file: %v", err)
 		return errToStatus(err), err
 	}
@@ -1065,7 +1489,7 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 // @Failure 405 {object} map[string]string "Method not allowed"
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /api/resources [put]
-func resourcePutHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+func resourcePutHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (status int, returnErr error) {
 	source := r.URL.Query().Get("source")
 	path := r.URL.Query().Get("path")
 
@@ -1093,10 +1517,23 @@ func resourcePutHandler(w http.ResponseWriter, r *http.Request, d *requestContex
 		logger.Debugf("user %s denied access to path %s", d.user.Username, fullIndexPath)
 		return http.StatusForbidden, fmt.Errorf("access denied to path %s", path)
 	}
+	auditEnabled := AuditRecorderFromRequest(r) != nil
+	var auditTarget authenticatedReadTarget
+	realPath := filepath.Join(idx.Path + fullIndexPath)
+	if auditEnabled {
+		var auditErr error
+		auditTarget, auditErr = resourceAuditWriteTarget(d, source, path)
+		if auditErr != nil {
+			return errToStatus(auditErr), auditErr
+		}
+		realPath = auditTarget.RealPath
+	}
 
 	// Check target permissions before WriteFile can create or truncate it.
-	stat, statErr := os.Stat(filepath.Join(idx.Path + fullIndexPath))
+	targetExists := false
+	stat, statErr := os.Stat(realPath)
 	if statErr == nil {
+		targetExists = true
 		if !d.user.Permissions.Modify {
 			return http.StatusForbidden, fmt.Errorf("user is not allowed to modify")
 		}
@@ -1111,7 +1548,61 @@ func resourcePutHandler(w http.ResponseWriter, r *http.Request, d *requestContex
 		return errToStatus(statErr), statErr
 	}
 
-	err = files.WriteFile(source, fullIndexPath, r.Body)
+	itemCount := int64(1)
+	auditBytes := int64(0)
+	var auditPreCommit func() error
+	if auditEnabled {
+		action := auditdb.ActionFileUpload
+		if targetExists {
+			action = auditdb.ActionFileModify
+		}
+		overwrite := targetExists
+		metadata := resourceWriteAuditMetadata(auditdb.MethodPUT, itemCount)
+		metadata.Bytes = &auditBytes
+		metadata.Overwrite = &overwrite
+		if auditErr := prepareResourceWriteAudit(r, action, source,
+			auditTarget.LogicalPath, auditTarget.CanonicalPath, "", "", "", metadata); auditErr != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		if auditErr := reserveResourceWriteAudit(r); auditErr != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		auditPreCommit = resourceAuditWritePreCommit(d, source, path, auditTarget)
+		defer func() {
+			successCount := int64(0)
+			failedCount := int64(0)
+			deniedCount := int64(0)
+			switch {
+			case status >= http.StatusOK && status < http.StatusBadRequest:
+				successCount = 1
+			case status == http.StatusUnauthorized || status == http.StatusForbidden:
+				deniedCount = 1
+			default:
+				failedCount = 1
+			}
+			outcome := resourceWriteAuditOutcomeMetadata(itemCount, successCount, failedCount, deniedCount)
+			outcome.Bytes = &auditBytes
+			_ = mergeResourceWriteAuditMetadata(r, outcome)
+		}()
+	}
+
+	input := io.Reader(r.Body)
+	var countingBody *resourceAuditCountingReader
+	if auditEnabled {
+		countingBody = &resourceAuditCountingReader{reader: r.Body}
+		input = countingBody
+	}
+	if auditEnabled {
+		err = files.WriteFileWithPreCommit(source, fullIndexPath, realPath, input, auditPreCommit)
+	} else {
+		err = files.WriteFile(source, fullIndexPath, input)
+	}
+	if countingBody != nil {
+		auditBytes = countingBody.bytesRead
+	}
+	if stderrors.Is(err, errResourceAuditTargetChanged) {
+		return http.StatusConflict, errResourceAuditTargetChanged
+	}
 	return errToStatus(err), err
 }
 
@@ -1129,11 +1620,7 @@ func resourcePutHandler(w http.ResponseWriter, r *http.Request, d *requestContex
 // @Failure 404 {object} map[string]string "Resource not found"
 // @Failure 500 {object} MoveCopyResponse "All operations failed"
 // @Router /api/resources [patch]
-func resourcePatchHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
-	if !d.user.Permissions.Modify && d.share == nil {
-		return http.StatusForbidden, fmt.Errorf("user is not allowed to create or modify")
-	}
-
+func resourcePatchHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (status int, returnErr error) {
 	req, ok := d.Data.(MoveCopyRequest)
 	if req.Action == "" || !ok {
 		// Parse request body
@@ -1149,10 +1636,45 @@ func resourcePatchHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 	if req.Action == "" {
 		return http.StatusBadRequest, fmt.Errorf("action is required (copy, move, or rename)")
 	}
+	auditAction := auditdb.Action("")
+	switch req.Action {
+	case "rename":
+		auditAction = auditdb.ActionFileRename
+	case "move":
+		auditAction = auditdb.ActionFileMove
+	}
+	auditEnabled := AuditRecorderFromRequest(r) != nil && auditAction != ""
+	itemCount := int64(len(req.Items))
+	if auditEnabled {
+		metadata := resourceWriteAuditMetadata(auditdb.MethodPATCH, itemCount)
+		metadata.Overwrite = &req.Overwrite
+		if err := prepareResourceWriteAuditAction(r, auditAction, metadata); err != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+	}
+	if !d.user.Permissions.Modify && d.share == nil {
+		if auditEnabled {
+			_ = mergeResourceWriteAuditMetadata(r, resourceWriteAuditOutcomeMetadata(itemCount, 0, 0, itemCount))
+		}
+		return http.StatusForbidden, fmt.Errorf("user is not allowed to create or modify")
+	}
 
 	response := MoveCopyResponse{
 		Succeeded: make([]MoveCopyItem, 0),
 		Failed:    make([]MoveCopyItem, 0),
+	}
+	auditReserved := false
+	auditDeniedCount := int64(0)
+	if auditEnabled {
+		defer func() {
+			successCount := int64(len(response.Succeeded))
+			failedCount := int64(len(response.Failed)) - auditDeniedCount
+			if failedCount < 0 {
+				failedCount = 0
+			}
+			_ = mergeResourceWriteAuditMetadata(r,
+				resourceWriteAuditOutcomeMetadata(itemCount, successCount, failedCount, auditDeniedCount))
+		}()
 	}
 
 	// Process each item
@@ -1192,12 +1714,14 @@ func resourcePatchHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 		if d.share == nil {
 			userscopeSrc, err = d.user.GetScopeForSourceName(item.FromSource)
 			if err != nil {
+				auditDeniedCount++
 				item.Message = "source not available"
 				response.Failed = append(response.Failed, item)
 				continue
 			}
 			userscopeDst, err = d.user.GetScopeForSourceName(item.ToSource)
 			if err != nil {
+				auditDeniedCount++
 				item.Message = "destination source not available"
 				response.Failed = append(response.Failed, item)
 				continue
@@ -1243,6 +1767,7 @@ func resourcePatchHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 		}
 
 		if dstIdx.Config.ReadOnly {
+			auditDeniedCount++
 			item.Message = "destination source is read-only"
 			if d.share != nil {
 				response.Failed = append(response.Failed, MoveCopyItem{
@@ -1258,6 +1783,7 @@ func resourcePatchHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 		fullSrcIndexPath := utils.JoinPathAsUnix(userscopeSrc, item.FromPath)
 		fullDstIndexPath := utils.JoinPathAsUnix(userscopeDst, item.ToPath)
 		if fullDstIndexPath == "/" || fullSrcIndexPath == "/" {
+			auditDeniedCount++
 			item.Message = "source or destination is the root or unautharized directory"
 			response.Failed = append(response.Failed, item)
 			continue
@@ -1265,6 +1791,7 @@ func resourcePatchHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 
 		// Check access control for both source and destination paths
 		if !store.Access.Permitted(srcIdx.Path, fullSrcIndexPath, d.user.Username) {
+			auditDeniedCount++
 			item.Message = "access denied to source path"
 			if d.share != nil {
 				response.Failed = append(response.Failed, MoveCopyItem{
@@ -1276,6 +1803,7 @@ func resourcePatchHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 			continue
 		}
 		if !store.Access.Permitted(dstIdx.Path, fullDstIndexPath, d.user.Username) {
+			auditDeniedCount++
 			item.Message = "access denied to destination path"
 			if d.share != nil {
 				response.Failed = append(response.Failed, MoveCopyItem{
@@ -1339,6 +1867,49 @@ func resourcePatchHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 				response.Failed = append(response.Failed, item)
 				continue
 			}
+		}
+		if auditEnabled && !auditReserved {
+			var sourceLogicalPath, sourceCanonicalPath, targetLogicalPath, targetCanonicalPath string
+			if d.share != nil && len(d.shareTargets) >= 2 {
+				sourceLogicalPath = d.shareTargets[0].LogicalPath
+				sourceCanonicalPath = d.shareTargets[0].CanonicalPath
+				targetLogicalPath = d.shareTargets[1].LogicalPath
+				targetCanonicalPath = d.shareTargets[1].CanonicalPath
+			} else {
+				sourceLogicalPath = normalizePublicShareIndexPath(fullSrcIndexPath)
+				targetLogicalPath = normalizePublicShareIndexPath(fullDstIndexPath)
+				sourceCanonicalPath, err = resourceAuditCanonicalPath(srcIdx, realSrc)
+				if err == nil {
+					targetCanonicalPath, err = resourceAuditCanonicalPath(dstIdx, realDest)
+				}
+				cleanSourceScope := normalizePublicShareIndexPath(userscopeSrc)
+				cleanTargetScope := normalizePublicShareIndexPath(userscopeDst)
+				if err == nil && (!publicSharePathWithin(cleanSourceScope, sourceCanonicalPath) ||
+					!publicSharePathWithin(cleanTargetScope, targetCanonicalPath) ||
+					!store.Access.PermittedFresh(srcIdx.Path, sourceCanonicalPath, d.user.Username) ||
+					!store.Access.PermittedFresh(dstIdx.Path, targetCanonicalPath, d.user.Username)) {
+					err = errors.ErrAccessDenied
+				}
+				if req.Rename && err == nil && targetCanonicalPath != normalizePublicShareIndexPath(fullDstIndexPath) {
+					targetLogicalPath = targetCanonicalPath
+				}
+			}
+			if err != nil {
+				if resourceAuditAccessDenied(err) {
+					auditDeniedCount++
+				}
+				item.Message = "audit path is unavailable"
+				response.Failed = append(response.Failed, item)
+				continue
+			}
+			if err = setResourceWriteAuditPaths(r, item.FromSource, sourceLogicalPath, sourceCanonicalPath,
+				item.ToSource, targetLogicalPath, targetCanonicalPath); err != nil {
+				return http.StatusServiceUnavailable, ErrAuditUnavailable
+			}
+			if err = reserveResourceWriteAudit(r); err != nil {
+				return http.StatusServiceUnavailable, ErrAuditUnavailable
+			}
+			auditReserved = true
 		}
 
 		// Perform the action
@@ -1544,6 +2115,9 @@ func itemsGetHandler(w http.ResponseWriter, r *http.Request, d *requestContext) 
 	items, err = filterAuthenticatedDirectoryItems(currentUser, source, currentTarget, items)
 	if err != nil {
 		return http.StatusForbidden, errors.ErrAccessDenied
+	}
+	if err = setCoreFileAuditReadTarget(r, currentTarget, nil); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
 	}
 	return renderJSON(w, r, items)
 }

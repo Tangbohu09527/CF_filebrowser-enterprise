@@ -265,6 +265,7 @@ func (recorder *AuditRecorder) SetOrigin(origin auditdb.Origin) error {
 }
 
 func (recorder *AuditRecorder) SetResource(source, path, canonicalPath string) error {
+	source = normalizeAuditSourceIdentifier(source)
 	return recorder.mutateReservationField(func(event *auditdb.Event) {
 		event.Source = source
 		event.Path = path
@@ -273,11 +274,43 @@ func (recorder *AuditRecorder) SetResource(source, path, canonicalPath string) e
 }
 
 func (recorder *AuditRecorder) SetTarget(source, path, canonicalPath string) error {
+	source = normalizeAuditSourceIdentifier(source)
 	return recorder.mutateReservationField(func(event *auditdb.Event) {
 		event.TargetSource = source
 		event.TargetPath = path
 		event.TargetCanonicalPath = canonicalPath
 	})
+}
+
+func normalizeAuditSourceIdentifier(source string) string {
+	if source == "" {
+		return ""
+	}
+	if validLiteralAuditSource(source) && !strings.HasPrefix(strings.ToLower(source), "source.") {
+		return source
+	}
+	return auditdb.DeriveSourceRef(source)
+}
+
+func validLiteralAuditSource(source string) bool {
+	if len(source) == 0 || len(source) > auditdb.MaxSourceBytes || strings.TrimSpace(source) != source {
+		return false
+	}
+	for index := 0; index < len(source); index++ {
+		character := source[index]
+		alphaNumeric := character >= 'A' && character <= 'Z' ||
+			character >= 'a' && character <= 'z' || character >= '0' && character <= '9'
+		if index == 0 {
+			if !alphaNumeric {
+				return false
+			}
+			continue
+		}
+		if !alphaNumeric && character != '.' && character != '_' && character != '-' && character != ' ' {
+			return false
+		}
+	}
+	return true
 }
 
 func (recorder *AuditRecorder) SetEffectivePermissions(permissions *auditdb.Permissions) error {
@@ -428,8 +461,10 @@ func (recorder *AuditRecorder) finalize(finalization AuditFinalization) error {
 	terminalMetadata := &auditdb.MetadataV1{
 		SchemaVersion:   auditdb.CurrentMetadataSchemaVersion,
 		DurationMs:      &durationMilliseconds,
-		Bytes:           &bytesWritten,
 		ClientCancelled: &clientCancelled,
+	}
+	if recorder.event.Metadata == nil || recorder.event.Metadata.Bytes == nil {
+		terminalMetadata.Bytes = &bytesWritten
 	}
 	event := cloneRecorderEvent(recorder.event)
 	event.TimestampUTC = now
@@ -486,7 +521,11 @@ func validAuditFinalizationErrorCode(errorCode string) bool {
 }
 
 func withAuditDefaultAction(action auditdb.Action, fn handleFunc) stdhttp.HandlerFunc {
-	return wrapHandler(func(writer stdhttp.ResponseWriter, request *stdhttp.Request, data *requestContext) (int, error) {
+	return wrapHandler(withAuditDefaultActionHelper(action, fn))
+}
+
+func withAuditDefaultActionHelper(action auditdb.Action, fn handleFunc) handleFunc {
+	return func(writer stdhttp.ResponseWriter, request *stdhttp.Request, data *requestContext) (int, error) {
 		recorder := AuditRecorderFromRequest(request)
 		if recorder == nil {
 			return stdhttp.StatusServiceUnavailable, ErrAuditUnavailable
@@ -504,7 +543,7 @@ func withAuditDefaultAction(action auditdb.Action, fn handleFunc) stdhttp.Handle
 			}
 		}
 		return status, err
-	})
+	}
 }
 
 func withAuditAuthenticatedUser(fn handleFunc) handleFunc {
@@ -623,6 +662,7 @@ func auditMiddlewareWithRandom(next stdhttp.Handler, service *AuditService, rand
 		recorder := newAuditRecorder(service, requestID, normalizedAuditClientIP(request), time.Now())
 		request = request.WithContext(context.WithValue(request.Context(), auditRecorderContextKey{}, recorder))
 		defer func() {
+			mergeAuditResponseRangeMetadata(recorder, responseState.Header().Get("Content-Range"))
 			clientCancelled := errors.Is(request.Context().Err(), context.Canceled)
 			_ = recorder.Finalize(AuditFinalization{
 				HTTPStatus:      responseState.StatusCode,
