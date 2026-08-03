@@ -18,6 +18,7 @@ import (
 	"github.com/coreos/go-systemd/v22/activation"
 	"github.com/gtsteffaniak/filebrowser/backend/adapters/fs/fileutils"
 	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
+	auditdb "github.com/gtsteffaniak/filebrowser/backend/database/audit"
 	"github.com/gtsteffaniak/filebrowser/backend/database/storage/bolt"
 	"github.com/gtsteffaniak/filebrowser/backend/events"
 	"github.com/gtsteffaniak/go-logger/logger"
@@ -91,16 +92,28 @@ func StartHttp(ctx context.Context, storage *bolt.BoltStore, shutdownComplete ch
 	// User Routes - /api/users/ (with public routes)
 	// ========================================
 	api.HandleFunc("GET /users", withUser(userGetHandler))
-	api.HandleFunc("POST /users", withSelfOrAdmin(usersPostHandler))
-	api.HandleFunc("PUT /users", withUser(userPutHandler))
+	api.HandleFunc("POST /users", withAuditDefaultAction(
+		auditdb.ActionUserCreate,
+		withUserHelper(withAuditAuthenticatedUser(usersPostHandler)),
+	))
+	api.HandleFunc("PUT /users", withAuditDefaultAction(
+		auditdb.ActionUserUpdate,
+		withUserHelper(withAuditAuthenticatedUser(userPutHandler)),
+	))
 	api.HandleFunc("PATCH /users/pinnedItems", withUser(userPatchPinnedItemsHandler))
-	api.HandleFunc("DELETE /users", withSelfOrAdmin(userDeleteHandler))
+	api.HandleFunc("DELETE /users", withAuditDefaultAction(
+		auditdb.ActionUserDelete,
+		withUserHelper(withAuditAuthenticatedUser(userDeleteHandler)),
+	))
 	publicApi.HandleFunc("GET /users", withUser(userGetHandler))
 
 	// ========================================
 	// Auth Routes - /api/auth/
 	// ========================================
-	api.HandleFunc("POST /auth/login", withRateLimit(AuthRateLimitCredentialLockout, loginHelper(loginHandler)))
+	api.HandleFunc("POST /auth/login", withAuditDefaultAction(
+		auditdb.ActionAuthLoginFailed,
+		withRateLimitChain(AuthRateLimitCredentialLockout, loginHelper(loginHandler)),
+	))
 	api.HandleFunc("POST /auth/logout", withOrWithoutUser(withRateLimitChain(AuthRateLimitModerate, logoutHandler)))
 	api.HandleFunc("POST /auth/signup", withoutUser(withRateLimitChain(AuthRateLimitModerate, signupHandler)))
 	api.HandleFunc("POST /auth/otp/generate", withOrWithoutUser(withRateLimitChain(AuthRateLimitModerate, generateOTPHandler)))
@@ -161,11 +174,11 @@ func StartHttp(ctx context.Context, storage *bolt.BoltStore, shutdownComplete ch
 	// Share Routes - /api/share/
 	// ========================================
 	api.HandleFunc("GET /share/list", withPermShare(shareListHandler))
-	api.HandleFunc("GET /share/direct", withPermShare(shareDirectDownloadHandler))
+	api.HandleFunc("GET /share/direct", withAuditShareMutation(auditdb.ActionShareCreate, shareDirectDownloadHandler))
 	api.HandleFunc("GET /share", withPermShare(shareGetHandler))
-	api.HandleFunc("POST /share", withPermShare(sharePostHandler))
-	api.HandleFunc("PATCH /share", withPermShare(sharePatchHandler))
-	api.HandleFunc("DELETE /share", withPermShare(shareDeleteHandler))
+	api.HandleFunc("POST /share", withAuditShareMutation(auditdb.ActionShareCreate, sharePostHandler))
+	api.HandleFunc("PATCH /share", withAuditShareMutation(auditdb.ActionShareUpdate, sharePatchHandler))
+	api.HandleFunc("DELETE /share", withAuditShareMutation(auditdb.ActionShareDelete, shareDeleteHandler))
 	publicApi.HandleFunc("GET /share/info", withOrWithoutUser(shareInfoHandler))
 	publicApi.HandleFunc("GET /share/image", withHashFile(getShareImage))
 
