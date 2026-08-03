@@ -24,6 +24,7 @@ import (
 	"github.com/gtsteffaniak/filebrowser/backend/adapters/fs/fileutils"
 	commonerrors "github.com/gtsteffaniak/filebrowser/backend/common/errors"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	auditdb "github.com/gtsteffaniak/filebrowser/backend/database/audit"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing/iteminfo"
@@ -783,8 +784,136 @@ func webDAVDestinationPath(r *http.Request, prefix string) (string, int, error) 
 	return destinationPath, 0, nil
 }
 
+type webDAVAuditOperation struct {
+	action auditdb.Action
+	method auditdb.Method
+	write  bool
+}
+
+func webDAVAuditOperationForMethod(method string) (webDAVAuditOperation, bool) {
+	switch method {
+	case http.MethodGet:
+		return webDAVAuditOperation{action: auditdb.ActionWebDAVRead, method: auditdb.MethodGET}, true
+	case http.MethodHead:
+		return webDAVAuditOperation{action: auditdb.ActionWebDAVRead, method: auditdb.MethodHEAD}, true
+	case "PROPFIND":
+		return webDAVAuditOperation{action: auditdb.ActionWebDAVRead, method: auditdb.MethodPROPFIND}, true
+	case http.MethodPut:
+		return webDAVAuditOperation{action: auditdb.ActionWebDAVWrite, method: auditdb.MethodPUT, write: true}, true
+	case "MKCOL":
+		return webDAVAuditOperation{action: auditdb.ActionWebDAVWrite, method: auditdb.MethodMKCOL, write: true}, true
+	case "COPY":
+		return webDAVAuditOperation{action: auditdb.ActionWebDAVWrite, method: auditdb.MethodCOPY, write: true}, true
+	case "MOVE":
+		return webDAVAuditOperation{action: auditdb.ActionWebDAVWrite, method: auditdb.MethodMOVE, write: true}, true
+	case http.MethodDelete:
+		return webDAVAuditOperation{action: auditdb.ActionWebDAVWrite, method: auditdb.MethodDELETE, write: true}, true
+	case "LOCK":
+		return webDAVAuditOperation{action: auditdb.ActionWebDAVWrite, method: auditdb.MethodLOCK, write: true}, true
+	case "UNLOCK":
+		return webDAVAuditOperation{action: auditdb.ActionWebDAVWrite, method: auditdb.MethodUNLOCK, write: true}, true
+	default:
+		return webDAVAuditOperation{}, false
+	}
+}
+
+func prepareWebDAVProtocolAudit(request *http.Request, operation webDAVAuditOperation) error {
+	recorder := AuditRecorderFromRequest(request)
+	if recorder == nil {
+		return nil
+	}
+	if err := recorder.SetAction(operation.action); err != nil {
+		return err
+	}
+	if err := recorder.SetOrigin(auditdb.OriginWebDAV); err != nil {
+		return err
+	}
+	if err := recorder.SetAuthMethod(auditdb.AuthMethodWebDAV); err != nil {
+		return err
+	}
+	return recorder.MergeMetadata(&auditdb.MetadataV1{
+		SchemaVersion: auditdb.CurrentMetadataSchemaVersion,
+		Method:        operation.method,
+	})
+}
+
+func prepareAuthenticatedWebDAVAudit(request *http.Request, data *requestContext) error {
+	recorder := AuditRecorderFromRequest(request)
+	if recorder == nil {
+		return nil
+	}
+	if data == nil || data.user == nil || data.user.ID == 0 || data.user.Username == "" {
+		return ErrAuditUnavailable
+	}
+	if err := recorder.SetActor(&data.user.ID, data.user.Username); err != nil {
+		return err
+	}
+	authMethod := auditdb.AuthMethodWebDAV
+	tokenRef := ""
+	if data.apiToken {
+		authMethod = auditdb.AuthMethodToken
+		tokenRef = auditdb.DeriveTokenRef(utils.HashSHA256(data.token))
+		if tokenRef == "" {
+			return ErrAuditUnavailable
+		}
+	}
+	if err := recorder.SetAuthMethod(authMethod); err != nil {
+		return err
+	}
+	if err := recorder.SetTokenRef(tokenRef); err != nil {
+		return err
+	}
+	permissions := auditPermissions(data.user.Permissions)
+	return recorder.SetEffectivePermissions(&permissions)
+}
+
+func prepareWebDAVResourceAudit(request *http.Request, source string, sourceTarget authenticatedReadTarget, target *authenticatedReadTarget) error {
+	recorder := AuditRecorderFromRequest(request)
+	if recorder == nil {
+		return nil
+	}
+	if err := recorder.SetResource(source, sourceTarget.LogicalPath, sourceTarget.CanonicalPath); err != nil {
+		return err
+	}
+	if target == nil {
+		return nil
+	}
+	return recorder.SetTarget(source, target.LogicalPath, target.CanonicalPath)
+}
+
+func reserveWebDAVWriteAudit(request *http.Request) error {
+	recorder := AuditRecorderFromRequest(request)
+	if recorder == nil {
+		return nil
+	}
+	return recorder.ReservePending()
+}
+
+func withAuditWebDAV(fn handleFunc) http.HandlerFunc {
+	authenticated := withBasicAuthHelper(fn)
+	audited := func(w http.ResponseWriter, r *http.Request, data *requestContext) (int, error) {
+		operation, ok := webDAVAuditOperationForMethod(r.Method)
+		if ok {
+			if err := prepareWebDAVProtocolAudit(r, operation); err != nil {
+				return http.StatusServiceUnavailable, ErrAuditUnavailable
+			}
+		}
+		return authenticated(w, r, data)
+	}
+	return wrapHandlerBasicAuth(audited)
+}
+
 // webDAVHandler serves WebDAV requests.
 func webDAVHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+	auditOperation, auditRequest := webDAVAuditOperationForMethod(r.Method)
+	if auditRequest {
+		if err := prepareWebDAVProtocolAudit(r, auditOperation); err != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		if err := prepareAuthenticatedWebDAVAudit(r, d); err != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+	}
 	requestPath := r.PathValue("path")
 	if requestPath == "" {
 		requestPath = "/"
@@ -800,6 +929,9 @@ func webDAVHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 	writeTargets := make(map[string]struct{})
 	writePermissions := make(map[string]webDAVWritePermission)
 	removedOverwriteTargets := make(map[string]struct{})
+	var auditSourceTarget authenticatedReadTarget
+	var auditTarget *authenticatedReadTarget
+	auditSourceTargetSet := false
 	if r.Method == http.MethodPut || r.Method == "MKCOL" || r.Method == "LOCK" || r.Method == "UNLOCK" || r.Method == "PROPPATCH" {
 		writeTargets[webDAVPathKey(requestPath)] = struct{}{}
 	}
@@ -840,8 +972,13 @@ func webDAVHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 
 	switch r.Method {
 	case http.MethodGet, http.MethodHead, http.MethodPost, "PROPFIND", "PROPPATCH":
-		if _, status, err := preflightWebDAVReadTarget(d.user, source, requestPath, false, false); status != 0 {
+		target, status, err := preflightWebDAVReadTarget(d.user, source, requestPath, false, false)
+		if status != 0 {
 			return status, err
+		}
+		if auditRequest {
+			auditSourceTarget = target
+			auditSourceTargetSet = true
 		}
 	case http.MethodOptions:
 		if _, status, err := preflightWebDAVReadTarget(d.user, source, requestPath, false, true); status != 0 {
@@ -876,11 +1013,15 @@ func webDAVHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 			entryPaths[webDAVPathKey(destinationPath)] = struct{}{}
 			writePermissions[webDAVPathKey(destinationPath)] = required
 		}
+		auditSourceTarget = sourceTarget
+		auditSourceTargetSet = true
+		auditTarget = &destinationTarget
 	case "MOVE":
 		if webDAVVirtualRoot(requestPath) {
 			return http.StatusForbidden, nil
 		}
-		if _, status, err := preflightWebDAVReadTarget(d.user, source, requestPath, true, false); status != 0 {
+		sourceTarget, status, err := preflightWebDAVReadTarget(d.user, source, requestPath, true, false)
+		if status != 0 {
 			return status, err
 		}
 		entryPaths[webDAVPathKey(requestPath)] = struct{}{}
@@ -905,6 +1046,9 @@ func webDAVHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 			entryPaths[webDAVPathKey(destinationPath)] = struct{}{}
 			writePermissions[webDAVPathKey(destinationPath)] = required
 		}
+		auditSourceTarget = sourceTarget
+		auditSourceTargetSet = true
+		auditTarget = &destinationTarget
 	case http.MethodPut, "MKCOL":
 		target, status, err := preflightWebDAVWriteTarget(d.user, source, requestPath)
 		if status != 0 {
@@ -920,14 +1064,19 @@ func webDAVHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 		if r.Method == http.MethodPut && target.Info != nil && !d.user.Permissions.Delete {
 			return http.StatusForbidden, fmt.Errorf("delete permission required to overwrite destination")
 		}
+		auditSourceTarget = target
+		auditSourceTargetSet = true
 	case http.MethodDelete:
 		if webDAVVirtualRoot(requestPath) {
 			return http.StatusForbidden, nil
 		}
-		if _, status, err := preflightWebDAVReadTarget(d.user, source, requestPath, true, false); status != 0 {
+		target, status, err := preflightWebDAVReadTarget(d.user, source, requestPath, true, false)
+		if status != 0 {
 			return status, err
 		}
 		entryPaths[webDAVPathKey(requestPath)] = struct{}{}
+		auditSourceTarget = target
+		auditSourceTargetSet = true
 	case "LOCK", "UNLOCK":
 		target, status, err := preflightWebDAVWriteTarget(d.user, source, requestPath)
 		if status != 0 {
@@ -937,6 +1086,8 @@ func webDAVHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 		if err := requireWebDAVWritePermission(d.user.Permissions, required); err != nil {
 			return http.StatusForbidden, err
 		}
+		auditSourceTarget = target
+		auditSourceTargetSet = true
 	}
 
 	logger.Debugf("webdav: method=%s, request=%s, source=%s, requestPath=%s", r.Method, r.URL.Path, source, permissionPath)
@@ -960,6 +1111,14 @@ func webDAVHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 	sourceRoot, _, err := authenticatedReadRoots(idx, userScope)
 	if err != nil {
 		return errToStatus(err), err
+	}
+	if auditRequest {
+		if !auditSourceTargetSet {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		if err := prepareWebDAVResourceAudit(r, source, auditSourceTarget, auditTarget); err != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
 	}
 
 	// Wrap the filesystem to filter directory listings using FileInfoFaster
@@ -998,6 +1157,11 @@ func webDAVHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 		},
 	}
 
+	if auditRequest && auditOperation.write {
+		if err := reserveWebDAVWriteAudit(r); err != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+	}
 	wd.ServeHTTP(w, r)
 	return 200, nil // errors and responses (XML-formatted) are handled by webdav handler
 }

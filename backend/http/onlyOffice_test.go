@@ -3,9 +3,17 @@ package http
 import (
 	"net/url"
 	"testing"
+
+	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
 )
 
 func TestResolveOnlyOfficeDownloadURL(t *testing.T) {
+	previousConfig := config
+	if config == nil {
+		config = &settings.Settings{}
+	}
+	t.Cleanup(func() { config = previousConfig })
+
 	orig := config.Integrations.OnlyOffice
 	t.Cleanup(func() {
 		config.Integrations.OnlyOffice = orig

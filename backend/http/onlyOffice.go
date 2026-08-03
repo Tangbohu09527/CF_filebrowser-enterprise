@@ -19,6 +19,7 @@ import (
 	"github.com/gtsteffaniak/filebrowser/backend/adapters/fs/files"
 	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	auditdb "github.com/gtsteffaniak/filebrowser/backend/database/audit"
 	"github.com/gtsteffaniak/filebrowser/backend/database/share"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing"
@@ -90,6 +91,7 @@ var onlyOfficeCallbackInFlight = make(map[string]struct{})
 var onlyOfficeDownloadClient = &http.Client{
 	Timeout: onlyOfficeDownloadTimeout,
 }
+var onlyOfficeWriteFileWithPreCommit = files.WriteFileWithPreCommit
 
 func onlyOfficeCapabilityExpiry(d *requestContext) time.Time {
 	expires := time.Now().Add(onlyOfficeCapabilityTTL)
@@ -828,6 +830,120 @@ func finishOnlyOfficeCallbackUse(claims *onlyOfficeCapabilityClaims, consume boo
 	onlyOfficeCapabilityUseMu.Unlock()
 }
 
+func isOnlyOfficeSaveAuditStatus(status int) bool {
+	return status == onlyOfficeStatusDocumentClosedWithChanges ||
+		status == onlyOfficeStatusForceSaveWhileDocumentStillOpen
+}
+
+func prepareOnlyOfficeSaveAudit(r *http.Request, claims *onlyOfficeCapabilityClaims, status int) error {
+	recorder := AuditRecorderFromRequest(r)
+	if recorder == nil {
+		return nil
+	}
+	if claims == nil || !isOnlyOfficeSaveAuditStatus(status) {
+		return ErrAuditInvalidState
+	}
+	if err := recorder.SetAction(auditdb.ActionOnlyOfficeSave); err != nil {
+		return err
+	}
+	if err := recorder.SetOrigin(auditdb.OriginOnlyOffice); err != nil {
+		return err
+	}
+	if err := recorder.SetAuthMethod(auditdb.AuthMethodOnlyOffice); err != nil {
+		return err
+	}
+	var userID *uint
+	if claims.RequesterID != 0 {
+		userID = &claims.RequesterID
+	}
+	if err := recorder.SetActor(userID, boundedAuditUsername(claims.RequesterUsername)); err != nil {
+		return err
+	}
+	if err := recorder.SetShareRef(auditdb.DeriveShareRef(claims.ShareHash)); err != nil {
+		return err
+	}
+	zeroBytes := int64(0)
+	callbackStatus := status
+	return recorder.MergeMetadata(&auditdb.MetadataV1{
+		SchemaVersion:    auditdb.CurrentMetadataSchemaVersion,
+		Bytes:            &zeroBytes,
+		Method:           auditdb.MethodPOST,
+		OnlyOfficeStatus: &callbackStatus,
+	})
+}
+
+func onlyOfficeSaveAuditPermissions(d *requestContext, claims *onlyOfficeCapabilityClaims) auditdb.Permissions {
+	if d == nil || claims == nil {
+		return auditdb.Permissions{}
+	}
+	permissions := auditdb.Permissions{}
+	if d.share != nil {
+		permissions.Browse = claims.Browse && d.shareAccess.browse
+		permissions.Download = claims.Download && d.shareAccess.download
+		permissions.Modify = claims.CanEdit && !config.Integrations.OnlyOffice.ViewOnly && onlyOfficePublicEditAllowed(d)
+		return permissions
+	}
+	if d.user != nil {
+		permissions.Browse = claims.Browse && d.user.Permissions.Browse
+		permissions.Download = claims.Download && d.user.Permissions.Download
+		permissions.Modify = claims.CanEdit && !config.Integrations.OnlyOffice.ViewOnly && d.user.Permissions.Modify
+	}
+	return permissions
+}
+
+func enrichOnlyOfficeSaveAudit(
+	r *http.Request,
+	d *requestContext,
+	claims *onlyOfficeCapabilityClaims,
+	state onlyOfficeCapabilityState,
+) (auditdb.Permissions, error) {
+	permissions := onlyOfficeSaveAuditPermissions(d, claims)
+	recorder := AuditRecorderFromRequest(r)
+	if recorder == nil {
+		return permissions, nil
+	}
+	tokenRef := ""
+	if state.ParentAPITokenHash != "" {
+		tokenRef = auditdb.DeriveTokenRef(state.ParentAPITokenHash)
+		if tokenRef == "" {
+			return permissions, ErrAuditInvalidState
+		}
+	}
+	if err := recorder.SetTokenRef(tokenRef); err != nil {
+		return permissions, err
+	}
+	target, err := resourceAuditWriteTarget(d, claims.Source, claims.Path)
+	if err != nil || target.LogicalPath == "" || target.CanonicalPath == "" {
+		return permissions, ErrAuditInvalidState
+	}
+	if err := recorder.SetResource(claims.Source, target.LogicalPath, target.CanonicalPath); err != nil {
+		return permissions, err
+	}
+	if err := recorder.SetEffectivePermissions(&permissions); err != nil {
+		return permissions, err
+	}
+	return permissions, nil
+}
+
+func reserveOnlyOfficeSaveAudit(r *http.Request) error {
+	recorder := AuditRecorderFromRequest(r)
+	if recorder == nil {
+		return nil
+	}
+	return recorder.ReservePending()
+}
+
+func mergeOnlyOfficeSaveAuditBytes(r *http.Request, written int64) {
+	recorder := AuditRecorderFromRequest(r)
+	if recorder == nil {
+		return
+	}
+	_ = recorder.MergeMetadata(&auditdb.MetadataV1{
+		SchemaVersion: auditdb.CurrentMetadataSchemaVersion,
+		Bytes:         &written,
+	})
+}
+
 // resolveOnlyOfficeDownloadURL validates a callback document URL against
 // integrations.office.url and optionally rewrites the origin to integrations.office.internalUrl.
 // Returns an empty string when the URL is missing, malformed, or not hosted on the configured
@@ -1088,7 +1204,11 @@ func processOnlyOfficeCallback(w http.ResponseWriter, r *http.Request, d *reques
 		}
 		client := *onlyOfficeDownloadClient
 		client.CheckRedirect = onlyOfficeCheckRedirect
-		doc, err := client.Get(downloadURL)
+		downloadRequest, err := http.NewRequestWithContext(r.Context(), http.MethodGet, downloadURL, nil)
+		if err != nil {
+			return returnOnlyOfficeError(w, r, 500, "failed to prepare updated document download")
+		}
+		doc, err := client.Do(downloadRequest)
 		if err != nil {
 			logOnlyOfficeDownloadError(err)
 			return returnOnlyOfficeError(w, r, 500, "failed to download updated document")
@@ -1136,10 +1256,20 @@ func processOnlyOfficeCallback(w http.ResponseWriter, r *http.Request, d *reques
 		fullIndexPath := utils.JoinPathAsUnix(userScope, path)
 
 		reader := io.Reader(doc.Body)
-		if authorizeWrite != nil {
-			reader = &onlyOfficeAuthorizedReader{reader: reader, authorize: authorizeWrite}
+		var countedReader *resourceAuditCountingReader
+		if AuditRecorderFromRequest(r) != nil {
+			countedReader = &resourceAuditCountingReader{reader: reader}
+			reader = countedReader
 		}
-		writeErr := files.WriteFile(source, fullIndexPath, reader)
+		var writeErr error
+		if authorizeWrite != nil && d.fileInfo.RealPath != "" {
+			writeErr = onlyOfficeWriteFileWithPreCommit(source, fullIndexPath, d.fileInfo.RealPath, reader, authorizeWrite)
+		} else {
+			writeErr = files.WriteFile(source, fullIndexPath, reader)
+		}
+		if countedReader != nil && (writeErr == nil || errors.Is(writeErr, files.ErrWriteCommitted)) {
+			mergeOnlyOfficeSaveAuditBytes(r, countedReader.bytesRead)
+		}
 		if writeErr != nil {
 			if errors.Is(writeErr, errOnlyOfficeWriteAuthorizationChanged) {
 				return returnOnlyOfficeError(w, r, http.StatusForbidden, "OnlyOffice write authorization changed")
@@ -1179,23 +1309,6 @@ func processOnlyOfficeCallback(w http.ResponseWriter, r *http.Request, d *reques
 	return returnOnlyOfficeSuccess(w, r)
 }
 
-type onlyOfficeAuthorizedReader struct {
-	reader     io.Reader
-	authorize  func() error
-	authorized bool
-}
-
-func (reader *onlyOfficeAuthorizedReader) Read(buffer []byte) (int, error) {
-	n, err := reader.reader.Read(buffer)
-	if err == io.EOF && !reader.authorized {
-		reader.authorized = true
-		if authErr := reader.authorize(); authErr != nil {
-			return n, errOnlyOfficeWriteAuthorizationChanged
-		}
-	}
-	return n, err
-}
-
 // onlyofficeCallbackHandler handles OnlyOffice document server callbacks
 //
 // @Summary Handle OnlyOffice document server callback
@@ -1230,20 +1343,58 @@ func onlyofficeCallbackHandler(w http.ResponseWriter, r *http.Request, _ *reques
 	if callbackData.Key != claims.DocumentKey {
 		return http.StatusForbidden, errors.New("OnlyOffice callback document key mismatch")
 	}
+	auditSave := isOnlyOfficeSaveAuditStatus(callbackData.Status)
+	auditRecorder := AuditRecorderFromRequest(r)
 	if err := beginOnlyOfficeCallbackUse(claims); err != nil {
 		return http.StatusForbidden, errors.New("OnlyOffice callback capability is already in use or unavailable")
 	}
 	consumeCapability := false
 	defer func() { finishOnlyOfficeCallbackUse(claims, consumeCapability) }()
-	requireEdit := callbackData.Status == onlyOfficeStatusDocumentClosedWithChanges ||
-		callbackData.Status == onlyOfficeStatusForceSaveWhileDocumentStillOpen
-	d, state, err := resolveOnlyOfficeCapability(claims, requireEdit)
+	requireEdit := auditSave
+	var d *requestContext
+	var state onlyOfficeCapabilityState
+	if auditSave && auditRecorder != nil {
+		var resolveErr error
+		d, state, resolveErr = resolveOnlyOfficeCapability(claims, false)
+		if resolveErr != nil {
+			return http.StatusForbidden, errors.New("OnlyOffice callback capability is no longer authorized")
+		}
+		if auditErr := prepareOnlyOfficeSaveAudit(r, claims, callbackData.Status); auditErr != nil {
+			return returnOnlyOfficeError(w, r, http.StatusServiceUnavailable, "audit service unavailable")
+		}
+		permissions, auditErr := enrichOnlyOfficeSaveAudit(r, d, claims, state)
+		if auditErr != nil {
+			return returnOnlyOfficeError(w, r, http.StatusServiceUnavailable, "audit service unavailable")
+		}
+		if !permissions.Modify {
+			return http.StatusForbidden, errors.New("OnlyOffice callback capability is no longer authorized")
+		}
+		d, state, resolveErr = resolveOnlyOfficeCapability(claims, true)
+		if resolveErr != nil {
+			return http.StatusForbidden, errors.New("OnlyOffice callback capability is no longer authorized")
+		}
+		permissions, auditErr = enrichOnlyOfficeSaveAudit(r, d, claims, state)
+		if auditErr != nil {
+			return returnOnlyOfficeError(w, r, http.StatusServiceUnavailable, "audit service unavailable")
+		}
+		if !permissions.Modify {
+			return http.StatusForbidden, errors.New("OnlyOffice callback capability is no longer authorized")
+		}
+		if auditErr = reserveOnlyOfficeSaveAudit(r); auditErr != nil {
+			return returnOnlyOfficeError(w, r, http.StatusServiceUnavailable, "audit service unavailable")
+		}
+	} else {
+		d, state, err = resolveOnlyOfficeCapability(claims, requireEdit)
+	}
 	if err != nil {
 		return http.StatusForbidden, errors.New("OnlyOffice callback capability is no longer authorized")
 	}
 	query := url.Values{"source": {claims.Source}, "path": {claims.Path}}
 	r.URL.RawQuery = query.Encode()
 	authorizeWrite := func() error {
+		if err := r.Context().Err(); err != nil {
+			return err
+		}
 		if _, _, authErr := resolveOnlyOfficeCapability(claims, true); authErr != nil {
 			return errOnlyOfficeWriteAuthorizationChanged
 		}
