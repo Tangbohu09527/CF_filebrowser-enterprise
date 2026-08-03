@@ -312,7 +312,7 @@ export default {
           try {
             if (getters.isShare()) {
               const hash = state.shareInfo.hash;
-              const password = localStorage.getItem(`sharepass:${hash}`) || "";
+              const password = state.sharePassword;
               this.lyrics = await mediaApi.getLyricsPublic(state.req.path, hash, password);
             } else {
               this.lyrics = await mediaApi.getLyrics(state.req.source, state.req.path);
@@ -346,8 +346,7 @@ export default {
       try {
         let enriched;
         if (getters.isShare()) {
-          const pwd =
-            localStorage.getItem(`sharepass:${state.shareInfo.hash}`) || "";
+          const pwd = state.sharePassword;
           enriched = await mediaApi.fetchDirectoryMediaMetadataPublic(
             req.path,
             state.shareInfo.hash,

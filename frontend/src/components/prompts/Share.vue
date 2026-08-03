@@ -60,6 +60,26 @@
             <template v-if="row.expire !== 0">{{ humanTime(row.expire) }}</template>
             <template v-else>{{ $t("general.permanent") }}</template>
           </template>
+          <template #cell-effectiveCapabilities="{ row }">
+            <ShareCapabilities
+              :capabilities="row.effectiveCapabilities"
+              :configured-capabilities="row.configuredCapabilities"
+            />
+          </template>
+          <template #cell-passwordStatus="{ row }">
+            <i
+              v-if="isPasswordProtected(row)"
+              class="material-symbols"
+              :aria-label="$t('general.yes')"
+              :title="$t('general.yes')"
+            >lock</i>
+            <i
+              v-else
+              class="material-symbols"
+              :aria-label="$t('general.no')"
+              :title="$t('general.no')"
+            >lock_open</i>
+          </template>
           <template #cell-editShare="{ row }">
             <button
               type="button"
@@ -75,7 +95,8 @@
             <button
               type="button"
               class="action"
-              @click.stop="copyToClipboard(row.shareURL)"
+              :disabled="!hasAnyEffectiveCapability(row)"
+              @click.stop="copyShareURL(row)"
               :aria-label="$t('buttons.copyToClipboard')"
               :title="$t('buttons.copyToClipboard')"
             >
@@ -85,10 +106,10 @@
           <template #cell-downloadShare="{ row }">
             <button
               type="button"
-              :disabled="row.shareType === 'upload'"
+              :disabled="!hasEffectiveCapability(row, 'download')"
               class="action"
               v-if="row.downloadURL"
-              @click.stop="copyToClipboard(row.downloadURL)"
+              @click.stop="copyDownloadURL(row)"
               :aria-label="$t('buttons.copyDownloadLinkToClipboard')"
               :title="$t('buttons.copyDownloadLinkToClipboard')"
             >
@@ -109,6 +130,14 @@
         </settings-table>
       </div>
       <div v-else>
+        <div v-if="currentShare" class="effective-capabilities-panel">
+          <p>{{ $t("general.status", { suffix: ":" }) }} {{ currentShare.status }}</p>
+          <p>{{ $t("settings.permissions-name") }}</p>
+          <ShareCapabilities
+            :capabilities="currentShare.effectiveCapabilities"
+            :configured-capabilities="currentShare.configuredCapabilities"
+          />
+        </div>
         <div v-if="!showMoreExpanded">
           <p>
             {{ $t("files.duration") }}
@@ -133,17 +162,48 @@
               help
             </i>
           </p>
-          <div v-if="hasExistingPassword && !isChangingPassword" class="password-change-section">
+          <div class="password-status" :data-has-password="hasExistingPassword">
+            <i v-if="hasExistingPassword && !removePassword" class="material-symbols">lock</i>
+            <i v-else class="material-symbols">lock_open</i>
+            <span>{{ hasExistingPassword && !removePassword ? $t("general.yes") : $t("general.no") }}</span>
+          </div>
+          <div v-if="hasExistingPassword && !isChangingPassword && !removePassword" class="password-change-section">
             <button
               type="button"
               class="button button--flat button--blue"
-              @click="isChangingPassword = true" style="width: 100%;"
+              @click="startPasswordReplacement"
             >
               <i class="material-symbols">lock_reset</i>
               {{ $t("general.change") }}
             </button>
+            <button
+              type="button"
+              class="button button--flat"
+              @click="markPasswordForRemoval"
+            >
+              <i class="material-symbols">lock_open</i>
+              {{ $t("general.delete") }}
+            </button>
           </div>
-          <input v-else class="input" type="password" autocomplete="new-password" v-model.trim="password" />
+          <div v-else-if="removePassword" class="password-change-section">
+            <button type="button" class="button button--flat" @click="resetPasswordChange">
+              <i class="material-symbols">undo</i>
+              {{ $t("general.cancel") }}
+            </button>
+          </div>
+          <div v-else class="password-replacement-input">
+            <input class="input" type="password" autocomplete="new-password" v-model.trim="password" />
+            <button
+              v-if="hasExistingPassword && isChangingPassword"
+              type="button"
+              class="button button--flat"
+              @click="resetPasswordChange"
+              :aria-label="$t('general.cancel')"
+              :title="$t('general.cancel')"
+            >
+              <i class="material-symbols">undo</i>
+            </button>
+          </div>
           <p>
             {{ $t("share.shareType") }}
             <i class="material-symbols-outlined tooltip-info-icon"
@@ -151,7 +211,7 @@
               help
             </i>
           </p>
-          <select class="input" v-model="shareType">
+          <select class="input" v-model="shareType" @change="setShareTypeDescription">
             <option value="normal">{{ $t("share.normalShare") }}</option>
             <option value="upload" :disabled="sourceReadOnly">{{ $t("share.uploadShare") }}</option>
           </select>
@@ -163,16 +223,82 @@
             <i class="material-symbols">link</i>
             {{ $t('share.customizeSidebarLinksButton') }}
           </button>
-          <div class="settings-items" style="margin-top: 0.5em;">
-            <ToggleSwitch v-if="shareType === 'normal'" class="item" v-model="allowModify"
-              :name="$t('share.allowModify')" :description="$t('share.allowModifyDescription')"
-              aria-label="allow editing files toggle" :disabled="sourceReadOnly" />
-            <ToggleSwitch v-if="shareType === 'normal'" class="item" v-model="allowCreate"
-              :name="$t('share.allowCreate')" :description="$t('share.allowCreateDescription')"
-              aria-label="allow creating and uploading files and folders toggle" :disabled="sourceReadOnly" />
-            <ToggleSwitch v-if="shareType === 'normal'" class="item" v-model="allowDelete"
-              :name="$t('share.allowDelete')" :description="$t('share.allowDeleteDescription')"
-              aria-label="allow deleting files toggle" :disabled="sourceReadOnly" />
+          <div class="settings-items share-capability-editor" data-testid="configured-capabilities">
+            <ToggleSwitch
+              class="item"
+              :model-value="configuredCapabilities.browse"
+              :name="$t('settings.permissions.browse')"
+              :description="$t('settings.permissions.browseDescription')"
+              aria-label="browse"
+              @update:modelValue="setConfiguredCapability('browse', $event)"
+            />
+            <ToggleSwitch
+              class="item"
+              :model-value="configuredCapabilities.preview"
+              :name="$t('settings.permissions.preview')"
+              :description="$t('settings.permissions.previewDescription')"
+              aria-label="preview"
+              @update:modelValue="setConfiguredCapability('preview', $event)"
+            />
+            <ToggleSwitch
+              class="item"
+              :model-value="!configuredCapabilities.download"
+              :name="$t('share.disableDownload')"
+              :description="$t('share.disableDownloadDescription')"
+              aria-label="download"
+              @update:modelValue="setConfiguredCapability('download', !$event)"
+            />
+            <ToggleSwitch
+              class="item"
+              :model-value="!configuredCapabilities.thumbnail"
+              :name="$t('share.disableThumbnails')"
+              :description="$t('share.disableThumbnailsDescription')"
+              aria-label="thumbnail"
+              @update:modelValue="setConfiguredCapability('thumbnail', !$event)"
+            />
+            <ToggleSwitch
+              class="item"
+              :model-value="!configuredCapabilities.viewer"
+              :name="$t('share.disableFileViewer')"
+              aria-label="viewer"
+              @update:modelValue="setConfiguredCapability('viewer', !$event)"
+            />
+            <ToggleSwitch
+              class="item"
+              :model-value="configuredCapabilities.create"
+              :name="$t('share.allowCreate')"
+              :description="$t('share.allowCreateDescription')"
+              aria-label="create"
+              :disabled="sourceReadOnly"
+              @update:modelValue="setConfiguredCapability('create', $event)"
+            />
+            <ToggleSwitch
+              class="item"
+              :model-value="configuredCapabilities.modify"
+              :name="$t('share.allowModify')"
+              :description="$t('share.allowModifyDescription')"
+              aria-label="modify"
+              :disabled="sourceReadOnly"
+              @update:modelValue="setConfiguredCapability('modify', $event)"
+            />
+            <ToggleSwitch
+              class="item"
+              :model-value="configuredCapabilities.delete"
+              :name="$t('share.allowDelete')"
+              :description="$t('share.allowDeleteDescription')"
+              aria-label="delete"
+              :disabled="sourceReadOnly"
+              @update:modelValue="setConfiguredCapability('delete', $event)"
+            />
+            <ToggleSwitch
+              class="item"
+              :model-value="configuredCapabilities.replace"
+              :name="$t('share.allowReplacements')"
+              :description="$t('share.allowReplacementsDescription')"
+              aria-label="replace"
+              :disabled="sourceReadOnly"
+              @update:modelValue="setConfiguredCapability('replace', $event)"
+            />
           </div>
         </div>
         <SettingsItem :title="showMoreExpanded ? $t('buttons.showLess') : $t('buttons.showMore')" :collapsable="true"
@@ -208,14 +334,6 @@
                 <option value="gallery">{{ $t("buttons.galleryView") }}</option>
               </select>
             </div>
-            <ToggleSwitch v-if="createAllowed" class="item" v-model="allowReplacements"
-              :name="$t('share.allowReplacements')" :description="$t('share.allowReplacementsDescription')"
-              :disabled="sourceReadOnly" />
-            <ToggleSwitch v-if="shareType === 'normal'" class="item" v-model="disableDownload"
-              :name="$t('share.disableDownload')" :description="$t('share.disableDownloadDescription')"
-              aria-label="disable downloading files toggle" />
-            <ToggleSwitch v-if="shareType === 'normal'" class="item" v-model="disableFileViewer"
-              :name="$t('share.disableFileViewer')" />
             <ToggleSwitch v-if="shareType === 'normal'" class="item" v-model="quickDownload"
               :name="$t('profileSettings.showQuickDownload')"
               :description="$t('profileSettings.showQuickDownloadDescription')" />
@@ -246,8 +364,6 @@
             </select>
             <ToggleSwitch class="item" v-model="keepAfterExpiration" :name="$t('share.keepAfterExpiration')"
               :description="$t('share.keepAfterExpirationDescription')" />
-            <ToggleSwitch v-if="shareType === 'normal'" class="item" v-model="disableThumbnails"
-              :name="$t('share.disableThumbnails')" :description="$t('share.disableThumbnailsDescription')" />
             <ToggleSwitch v-if="shareType === 'normal'" class="item" v-model="showHidden"
               :name="$t('profileSettings.showHiddenFiles')"
               :description="$t('profileSettings.showHiddenFilesDescription')" />
@@ -393,9 +509,19 @@ import { buildItemUrl } from "@/utils/url";
 import ToggleSwitch from "@/components/settings/ToggleSwitch.vue";
 import SettingsItem from "@/components/settings/SettingsItem.vue";
 import SettingsTable from "@/components/settings/Table.vue";
+import ShareCapabilities from "@/components/share/Capabilities.vue";
 import FileList from "../files/FileList.vue";
 import { globalVars } from "@/utils/constants";
 import { eventBus } from "@/store/eventBus";
+import {
+  SHARE_CAPABILITY_KEYS,
+  defaultShareCapabilities,
+  effectiveCapabilityItems,
+  hasAnyEffectiveCapability,
+  hasCapabilityReduction,
+  hasEffectiveCapability,
+  normalizeShareCapabilities,
+} from "@/utils/shareCapabilities";
 //import ViewMode from "@/components/settings/ViewMode.vue";
 
 export default {
@@ -404,6 +530,7 @@ export default {
     ToggleSwitch,
     SettingsItem,
     SettingsTable,
+    ShareCapabilities,
     FileList,
     //ViewMode,
   },
@@ -434,18 +561,12 @@ export default {
       links: [],
       password: "",
       listing: true,
-      allowModify: false,
-      disableDownload: false,
-      allowDelete: false,
-      allowCreate: false,
-      allowReplacements: false,
+      configuredCapabilities: defaultShareCapabilities(),
       downloadsLimit: "",
       perUserDownloadLimit: false,
       shareTheme: "default",
       disableAnonymous: false,
       maxBandwidth: "",
-      disableFileViewer: false,
-      disableThumbnails: false,
       showHidden: false,
       hideFileExt: "",
       enableAllowedUsernames: false,
@@ -475,6 +596,7 @@ export default {
       tempSource: "",
       pathExists: true,
       isChangingPassword: false,
+      removePassword: false,
       /** Set while a pathPicker for banner/favicon is open; cleared on select/cancel. */
       pendingBannerFaviconContextId: null,
       filePickerField: null, // 'banner' or 'favicon'
@@ -490,8 +612,8 @@ export default {
     }
   },
   computed: {
-    createAllowed() {
-      return this.allowCreate;
+    currentShare() {
+      return this.isEditMode ? this.link : this.editingLink;
     },
     displayPath() {
       // When editing, use the link's path; otherwise use the item's path
@@ -541,6 +663,23 @@ export default {
           sortFn: (a, b) => (a.expire ?? 0) - (b.expire ?? 0),
           align: "center",
         },
+        {
+          key: "effectiveCapabilities",
+          label: this.$t("settings.permissions-name"),
+          align: "center",
+        },
+        {
+          key: "status",
+          label: this.$t("general.status"),
+          sortable: true,
+          align: "center",
+        },
+        {
+          key: "passwordStatus",
+          label: this.$t("general.password"),
+          narrow: true,
+          align: "center",
+        },
         { key: "editShare", label: "", narrow: true, align: "center" },
         { key: "copyShare", label: "", narrow: true, align: "center" },
         { key: "downloadShare", label: "", narrow: true, align: "center" },
@@ -566,9 +705,8 @@ export default {
       return this.editing && this.link && Object.keys(this.link).length > 0;
     },
     hasExistingPassword() {
-      // Check if we're editing a link and it has a password
       const currentLink = this.isEditMode ? this.link : this.editingLink;
-      return currentLink?.hasPassword;
+      return currentLink?.hasPassword === true;
     },
   },
   watch: {
@@ -576,77 +714,15 @@ export default {
       if (!isListing) {
         this.password = "";
         this.isChangingPassword = false;
+        this.removePassword = false;
       }
-    },
-    shareType(newType) {
-      if (this.sourceReadOnly && newType === 'upload') {
-        this.shareType = 'normal';
-        return;
-      }
-      if (newType === 'upload') {
-        this.description = this.$t("share.descriptionUploadDefault");
-      } else {
-        this.description = this.$t("share.descriptionDefault");
-      }
-    },
-    sourceReadOnly: {
-      immediate: true,
-      handler(readOnly) {
-        if (readOnly) {
-          this.applyReadOnlyConstraints();
-        }
-      },
     },
     isEditMode: {
       immediate: true,
       handler(isEditMode) {
         if (isEditMode) {
           this.listing = false;
-          // Check if path exists
-          this.pathExists = this.link.pathExists !== false;
-          this.time = this.link.expire
-            ? String(Math.round((new Date(this.link.expire * 1000).getTime() - Date.now()) / 3600000))
-            : "0";
-          this.unit = "hours";
-          this.password = "";
-          this.isChangingPassword = false;
-          this.disableDownload = this.link.disableDownload || false;
-          this.allowModify = this.link.allowModify || false;
-          this.allowDelete = this.link.allowDelete || false;
-          this.allowCreate = this.link.allowCreate || false;
-          this.allowReplacements = this.link.allowReplacements || false;
-          this.downloadsLimit = this.link.downloadsLimit ? String(this.link.downloadsLimit) : "";
-          this.perUserDownloadLimit = this.link.perUserDownloadLimit || false;
-          this.maxBandwidth = this.link.maxBandwidth ? String(this.link.maxBandwidth) : "";
-          this.shareTheme = this.link.shareTheme || "default";
-          this.disableAnonymous = this.link.disableAnonymous || false;
-          this.disableThumbnails = this.link.disableThumbnails || false;
-          this.disableFileViewer = this.link.disableFileViewer || false;
-          this.showHidden = this.link.showHidden || false;
-          this.hideFileExt = this.link.hideFileExt || "";
-          this.enableAllowedUsernames = Array.isArray(this.link.allowedUsernames) && this.link.allowedUsernames.length > 0;
-          this.allowedUsernames = this.enableAllowedUsernames ? this.link.allowedUsernames.join(", ") : "";
-          this.keepAfterExpiration = this.link.keepAfterExpiration || false;
-          this.themeColor = this.link.themeColor || "";
-          this.banner = this.link.banner || "";
-          this.title = this.link.title || "";
-          this.description = this.link.description || "";
-          this.favicon = this.link.favicon || "";
-          this.quickDownload = this.link.quickDownload || false;
-          this.disableNavButtons = this.link.hideNavButtons || false;
-          this.disableShareCard = this.link.disableShareCard || false;
-          this.disableSidebar = this.link.disableSidebar || false;
-          this.enforceDarkLightMode = this.link.enforceDarkLightMode || "default";
-          this.viewMode = this.link.viewMode || "normal";
-          this.enableOnlyOffice = this.link.enableOnlyOffice || false;
-          this.shareType = this.link.shareType || "normal";
-          this.extractEmbeddedSubtitles = this.link.extractEmbeddedSubtitles || false;
-          this.disableLoginOption = this.link.disableLoginOption || false;
-          this.sidebarLinks = Array.isArray(this.link.sidebarLinks) ? [...this.link.sidebarLinks] : [];
-          //this.viewMode = this.link.viewMode || "normal";
-          if (this.sourceReadOnly) {
-            this.applyReadOnlyConstraints();
-          }
+          this.hydrateShare(this.link);
         }
       },
     },
@@ -660,8 +736,7 @@ export default {
     try {
       const links = await shareApi.get(this.item.path, this.item.source);
       this.links = links;
-    } catch (err) {
-      console.error(err);
+    } catch (_err) {
       return;
     } finally {
       this.linksLoading = false;
@@ -689,18 +764,93 @@ export default {
     eventBus.off('pathPickerCancelled', this.onBannerFaviconPathPickerCancelled);
   },
   methods: {
-    applyReadOnlyConstraints() {
-      if (this.shareType === 'upload') {
-        this.shareType = 'normal';
+    setConfiguredCapability(capability, enabled) {
+      if (!SHARE_CAPABILITY_KEYS.includes(capability)) {
+        return;
       }
-      this.allowModify = false;
-      this.allowDelete = false;
-      this.allowCreate = false;
-      this.allowReplacements = false;
-      this.enableOnlyOffice = false;
+      this.configuredCapabilities = {
+        ...this.configuredCapabilities,
+        [capability]: enabled === true,
+      };
+    },
+    setShareTypeDescription() {
+      this.description = this.shareType === "upload"
+        ? this.$t("share.descriptionUploadDefault")
+        : this.$t("share.descriptionDefault");
+    },
+    effectiveCapabilityItems(share) {
+      return effectiveCapabilityItems(share);
+    },
+    hasCapabilityReduction(share) {
+      return hasCapabilityReduction(share);
+    },
+    hasAnyEffectiveCapability(share) {
+      return hasAnyEffectiveCapability(share);
+    },
+    hasEffectiveCapability(share, capability) {
+      return hasEffectiveCapability(share, capability);
+    },
+    isPasswordProtected(share) {
+      return share?.hasPassword === true;
     },
     async copyToClipboard(text) {
       await copyToClipboard(text);
+    },
+    async copyShareURL(share) {
+      await copyToClipboard(share.shareURL);
+    },
+    async copyDownloadURL(share) {
+      await copyToClipboard(share.downloadURL);
+    },
+    startPasswordReplacement() {
+      this.password = "";
+      this.removePassword = false;
+      this.isChangingPassword = true;
+    },
+    markPasswordForRemoval() {
+      this.password = "";
+      this.isChangingPassword = false;
+      this.removePassword = true;
+    },
+    resetPasswordChange() {
+      this.password = "";
+      this.isChangingPassword = false;
+      this.removePassword = false;
+    },
+    hydrateShare(link) {
+      this.pathExists = link.pathExists !== false;
+      this.time = link.expire
+        ? String(Math.round((new Date(link.expire * 1000).getTime() - Date.now()) / 3600000))
+        : "0";
+      this.unit = "hours";
+      this.resetPasswordChange();
+      this.configuredCapabilities = normalizeShareCapabilities(link.configuredCapabilities);
+      this.downloadsLimit = link.downloadsLimit ? String(link.downloadsLimit) : "";
+      this.perUserDownloadLimit = link.perUserDownloadLimit === true;
+      this.maxBandwidth = link.maxBandwidth ? String(link.maxBandwidth) : "";
+      this.shareTheme = link.shareTheme || "default";
+      this.disableAnonymous = link.disableAnonymous === true;
+      this.showHidden = link.showHidden === true;
+      this.hideFileExt = link.hideFileExt || "";
+      this.enableAllowedUsernames = Array.isArray(link.allowedUsernames) && link.allowedUsernames.length > 0;
+      this.allowedUsernames = this.enableAllowedUsernames ? link.allowedUsernames.join(", ") : "";
+      this.keepAfterExpiration = link.keepAfterExpiration === true;
+      this.themeColor = link.themeColor || "";
+      this.banner = link.banner || "";
+      this.title = link.title || "";
+      this.description = link.description || "";
+      this.favicon = link.favicon || "";
+      this.quickDownload = link.quickDownload === true;
+      this.disableNavButtons = link.hideNavButtons === true;
+      this.disableShareCard = link.disableShareCard === true;
+      this.disableSidebar = link.disableSidebar === true;
+      this.enforceDarkLightMode = link.enforceDarkLightMode || "default";
+      this.viewMode = link.viewMode || "normal";
+      this.enableOnlyOffice = link.enableOnlyOffice === true;
+      this.shareType = link.shareType || "normal";
+      this.extractEmbeddedSubtitles = link.extractEmbeddedSubtitles === true;
+      this.disableLoginOption = link.disableLoginOption === true;
+      this.sidebarLinks = Array.isArray(link.sidebarLinks) ? [...link.sidebarLinks] : [];
     },
     /**
      * @param {MouseEvent} event
@@ -739,17 +889,11 @@ export default {
           expires: isPermanent ? "" : this.time.toString(),
           unit: this.unit,
           disableAnonymous: this.disableAnonymous,
-          disableDownload: this.disableDownload,
-          allowModify: this.allowModify,
-          allowDelete: this.allowDelete,
-          allowCreate: this.allowCreate,
-          allowReplacements: this.allowReplacements,
+          configuredCapabilities: normalizeShareCapabilities(this.configuredCapabilities),
           maxBandwidth: this.maxBandwidth ? parseInt(this.maxBandwidth, 10) : 0,
           downloadsLimit: this.downloadsLimit ? parseInt(this.downloadsLimit, 10) : 0,
           perUserDownloadLimit: this.perUserDownloadLimit,
           shareTheme: this.shareTheme,
-          disableFileViewer: this.disableFileViewer,
-          disableThumbnails: this.disableThumbnails,
           showHidden: this.showHidden,
           hideFileExt: this.hideFileExt,
           allowedUsernames: this.enableAllowedUsernames ? this.allowedUsernames.split(',').map(u => u.trim()) : [],
@@ -773,11 +917,12 @@ export default {
           sidebarLinks: this.sidebarLinks,
         };
 
-        // Handle password inclusion logic:
-        // - Always include for new shares
-        // - For editing: only include if no existing password OR explicitly changing it
         const isEditing = this.isEditMode || this.editingLink;
-        if (!isEditing || !this.hasExistingPassword || this.isChangingPassword) {
+        if (!isEditing) {
+          payload.password = this.password;
+        } else if (this.removePassword) {
+          payload.password = "";
+        } else if (this.password !== "") {
           payload.password = this.password;
         }
 
@@ -785,15 +930,6 @@ export default {
           payload.hash = this.link.hash;
         } else if (this.editingLink) {
           payload.hash = this.editingLink.hash;
-        }
-
-        if (this.sourceReadOnly) {
-          payload.shareType = 'normal';
-          payload.allowModify = false;
-          payload.allowDelete = false;
-          payload.allowCreate = false;
-          payload.allowReplacements = false;
-          payload.enableOnlyOffice = false;
         }
 
         const res = await shareApi.create(payload);
@@ -820,6 +956,7 @@ export default {
         this.unit = "hours";
         this.password = "";
         this.isChangingPassword = false;
+        this.removePassword = false;
 
         this.listing = true;
       } catch (err) {
@@ -834,50 +971,8 @@ export default {
      */
     editLink(link) {
       this.listing = false;
-      this.time = link.expire
-        ? String(Math.round((new Date(link.expire * 1000).getTime() - Date.now()) / 3600000))
-        : "0";
-      this.unit = "hours";
-      this.password = "";
-      this.isChangingPassword = false;
-      this.disableDownload = link.disableDownload || false;
-      this.allowModify = link.allowModify || false;
-      this.allowDelete = link.allowDelete || false;
-      this.allowCreate = link.allowCreate || false;
-      this.allowReplacements = link.allowReplacements || false;
-      this.downloadsLimit = link.downloadsLimit ? String(link.downloadsLimit) : "";
-      this.perUserDownloadLimit = link.perUserDownloadLimit || false;
-      this.maxBandwidth = link.maxBandwidth ? String(link.maxBandwidth) : "";
-      this.shareTheme = link.shareTheme || "default";
-      this.disableAnonymous = link.disableAnonymous || false;
-      this.disableThumbnails = link.disableThumbnails || false;
-      this.disableFileViewer = link.disableFileViewer || false;
-      this.showHidden = link.showHidden || false;
-      this.hideFileExt = link.hideFileExt || "";
-      this.enableAllowedUsernames = Array.isArray(link.allowedUsernames) && link.allowedUsernames.length > 0;
-      this.allowedUsernames = this.enableAllowedUsernames ? link.allowedUsernames.join(", ") : "";
-      this.keepAfterExpiration = link.keepAfterExpiration || false;
-      this.themeColor = link.themeColor || "";
-      this.banner = link.banner || "";
-      this.title = link.title || "";
-      this.description = link.description || "";
-      this.favicon = link.favicon || "";
-      this.quickDownload = link.quickDownload || false;
-      this.disableNavButtons = link.hideNavButtons || false;
-      this.disableShareCard = link.disableShareCard || false;
-      this.disableSidebar = link.disableSidebar || false;
-      this.enforceDarkLightMode = link.enforceDarkLightMode || "default";
-      this.viewMode = link.viewMode || "normal";
-      this.enableOnlyOffice = link.enableOnlyOffice || false;
-      this.shareType = link.shareType || "normal";
-      this.extractEmbeddedSubtitles = link.extractEmbeddedSubtitles || false;
-      this.disableLoginOption = link.disableLoginOption || false;
-      this.sidebarLinks = Array.isArray(link.sidebarLinks) ? [...link.sidebarLinks] : [];
-      // Store the link being edited
       this.editingLink = link;
-      if (this.sourceReadOnly) {
-        this.applyReadOnlyConstraints();
-      }
+      this.hydrateShare(link);
     },
     /**
      * @param {Event} event
@@ -893,8 +988,8 @@ export default {
         if (this.links.length === 0) {
           this.listing = false;
         }
-      } catch (err) {
-        console.error(err);
+      } catch (_err) {
+        return;
       }
     },
     /**
@@ -924,7 +1019,8 @@ export default {
       } else {
         // Clear editing link when switching to create new share
         this.editingLink = null;
-        this.isChangingPassword = false;
+        this.resetPasswordChange();
+        this.configuredCapabilities = defaultShareCapabilities();
         // Set default sidebar links for new shares
         this.setDefaultSidebarLinks();
         this.populateDefaults();
@@ -978,9 +1074,8 @@ export default {
           this.isReassigningPath = false;
           // Emit event to reload shares in settings view
           eventBus.emit('sharesChanged');
-        } catch (e) {
+        } catch (_e) {
           notify.showError(this.$t("messages.pathReassignFailed"));
-          console.error(e);
         }
       }
     },
@@ -1122,6 +1217,8 @@ export default {
 
 .password-change-section {
   margin-bottom: 1em;
+  display: flex;
+  gap: 0.5em;
 }
 
 .password-change-section button {
@@ -1129,6 +1226,35 @@ export default {
   align-items: center;
   justify-content: center;
   gap: 0.5em;
+  flex: 1;
+}
+
+.password-status,
+.password-replacement-input {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  margin-bottom: 0.5em;
+}
+
+.password-replacement-input .input {
+  flex: 1;
+}
+
+.effective-capabilities-panel {
+  margin-bottom: 1em;
+  padding-block: 0.75em;
+  border-block: 1px solid var(--divider);
+}
+
+.effective-capabilities-panel > p {
+  margin-top: 0;
+}
+
+.share-capability-editor {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: 0.5em 1em;
 }
 
 .file-picker-input-group {

@@ -1,4 +1,5 @@
 import { notify } from "@/notify";
+import { normalizeShareCapabilities } from "@/utils/shareCapabilities.js";
 import { getApiPath, getPublicApiPath } from "@/utils/url.js";
 import { adjustedData, fetchJSON, fetchURL } from "./utils";
 
@@ -10,10 +11,10 @@ import { adjustedData, fetchJSON, fetchURL } from "./utils";
 // List all shares
 export async function list() {
   try {
-  const apiPath = getApiPath("share/list");
+    const apiPath = getApiPath("share/list");
     return await fetchJSON(apiPath);
-  } catch (/** @type {any} */ err) {
-    notify.showError(err.message || "Error listing shares");
+  } catch (err) {
+    notify.showError("Error listing shares");
     throw err;
   }
 }
@@ -30,8 +31,8 @@ export async function get(path, source) {
     const apiPath = getApiPath("share", params);
     const data = await fetchJSON(apiPath);
     return adjustedData(data);
-  } catch (/** @type {any} */ err) {
-    notify.showError(err.message || "Error fetching data");
+  } catch (err) {
+    notify.showError("Error fetching share");
     throw err;
   }
 }
@@ -48,8 +49,8 @@ export async function remove(hash) {
     await fetchURL(apiPath, {
       method: "DELETE",
     });
-  } catch (/** @type {any} */ err) {
-    notify.showError(err.message || "Error deleting share");
+  } catch (err) {
+    notify.showError("Error deleting share");
     throw err;
   }
 }
@@ -61,13 +62,26 @@ export async function remove(hash) {
  */
 export async function create(bodyObj = {}) {
   try {
+    const payload = { ...(bodyObj || {}) };
+    if (Object.hasOwn(payload, "configuredCapabilities")) {
+      const capabilities = normalizeShareCapabilities(payload.configuredCapabilities);
+      payload.configuredCapabilities = capabilities;
+      payload.disableDownload = !capabilities.download;
+      payload.disableThumbnails = !capabilities.thumbnail;
+      payload.disableFileViewer = !capabilities.viewer;
+      payload.allowCreate = capabilities.create;
+      payload.allowModify = capabilities.modify;
+      payload.allowDelete = capabilities.delete;
+      payload.allowReplacements = capabilities.replace;
+    }
+
     const apiPath = getApiPath("share");
     return await fetchJSON(apiPath, {
-    method: "POST",
-    body: JSON.stringify(bodyObj || {}),
-  });
-  } catch (/** @type {any} */ err) {
-    notify.showError(err.message || "Error creating share");
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    notify.showError("Error creating share");
     throw err;
   }
 }
@@ -86,28 +100,29 @@ export async function updatePath(hash, newPath) {
       body: JSON.stringify({ hash, path: newPath }),
       headers: { 'Content-Type': 'application/json' }
     });
-  } catch (/** @type {any} */ err) {
-    notify.showError(err.message || "Error updating share path");
+  } catch (err) {
+    notify.showError("Error updating share path");
     throw err;
   }
 }
 
 /**
+ * @typedef {import("@/utils/shareCapabilities.js").ShareCapabilities} ShareCapabilities
+ */
+
+/**
  * @typedef {object} Share
  * @property {string} hash
- * @property {string} path
+ * @property {string} shareURL
+ * @property {string} downloadURL
  * @property {string} source
+ * @property {string} path
+ * @property {string} shareType
  * @property {number} expire
- * @property {number} downloadsLimit
- * @property {number} maxBandwidth
- * @property {string} shareTheme
- * @property {boolean} disableAnonymous
- * @property {boolean} disableThumbnails
- * @property {boolean} keepAfterExpiration
- * @property {string[]} allowedUsernames
- * @property {string} viewMode
- * @property {string} token
- * @property {boolean} inline
+ * @property {string} status
+ * @property {boolean} hasPassword
+ * @property {ShareCapabilities} configuredCapabilities
+ * @property {ShareCapabilities} effectiveCapabilities
  */
 
 // ============================================================================
@@ -120,7 +135,7 @@ export async function getShareInfoPublic(hash) {
     const response = await fetch(apiPath)
     return response.json()
   } catch (err) {
-    notify.showError(err.message || 'Error getting share info')
+    notify.showError('Error getting share info')
     throw err
   }
 }

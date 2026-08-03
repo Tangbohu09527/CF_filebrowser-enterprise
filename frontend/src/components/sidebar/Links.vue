@@ -195,7 +195,7 @@ import { goToItem } from "@/utils/url";
 import { getIconClass } from "@/utils/material-symbols";
 import IndexInfo from "@/components/files/IndexInfo.vue";
 import { globalVars } from "@/utils/constants";
-import { resourcesApi } from "@/api";
+import { resourcesApi, shareApi } from "@/api";
 import ShareInfo from "@/components/files/ShareInfo.vue";
 import FileTree from '@/components/files/FileTree.vue';
 
@@ -648,17 +648,15 @@ export default {
       // Get the current share hash and fetch full share details
       const shareHash = state.shareInfo?.hash;
       if (!shareHash) {
-        console.error("No share hash found");
         return;
       }
 
       try {
-        // Fetch the full share details to pass to the edit dialog
-        // The shareInfo object should already have most details we need
-        const shareData = {
-          ...state.shareInfo,
-          hash: shareHash,
-        };
+        const managedShares = await shareApi.list();
+        const shareData = managedShares.find((share) => share.hash === shareHash);
+        if (!shareData) {
+          return;
+        }
 
         mutations.showPrompt({
           name: "share",
@@ -667,8 +665,8 @@ export default {
             link: shareData,
           },
         });
-      } catch (err) {
-        console.error("Failed to open edit share dialog:", err);
+      } catch (_err) {
+        return;
       }
     },
     cycleMode() {
