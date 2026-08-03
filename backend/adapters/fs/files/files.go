@@ -30,6 +30,9 @@ import (
 
 var reDuration = regexp.MustCompile(`^\[(?:(\d{1,2}):)?(\d{1,2}):(\d{1,2})\.(\d+)\](.*)`)
 
+// ErrWriteCommitted marks an error returned after the formal file replacement succeeded.
+var ErrWriteCommitted = stderrors.New("file write committed")
+
 // CheckPermissionsFunc allows tests to override CheckPermissions behavior
 var CheckPermissionsFunc = checkPermissionsImpl
 
@@ -1025,7 +1028,7 @@ func writeFileWithPreCommit(source, path, verifiedRealPath string, in io.Reader,
 	// Refresh the file itself
 	err = RefreshIndex(source, path, false, false)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: refresh file index: %w", ErrWriteCommitted, err)
 	}
 
 	// Refresh parent directory to update its size

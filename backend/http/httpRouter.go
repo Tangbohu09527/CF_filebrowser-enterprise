@@ -213,7 +213,7 @@ func StartHttp(ctx context.Context, storage *bolt.BoltStore, shutdownComplete ch
 	if !config.Server.DisableWebDAV {
 		// Uses Basic Auth where password is JWT token
 		// Note: do not trim /dav prefix here - webdav library requires it
-		router.Handle(webDavPath+"/{source}/{path...}", withBasicAuth(webDAVHandler))
+		router.Handle(webDavPath+"/{source}/{path...}", withAuditWebDAV(webDAVHandler))
 	}
 
 	// Frontend share route redirect (DEPRECATED - maintain for backwards compatibility)
