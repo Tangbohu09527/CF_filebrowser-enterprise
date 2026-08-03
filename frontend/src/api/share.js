@@ -1,5 +1,5 @@
 import { notify } from "@/notify";
-import { normalizeShareCapabilities } from "@/utils/shareCapabilities.js";
+import { deriveConfiguredShareCapabilities } from "@/utils/shareCapabilities.js";
 import { getApiPath, getPublicApiPath } from "@/utils/url.js";
 import { adjustedData, fetchJSON, fetchURL } from "./utils";
 
@@ -64,7 +64,10 @@ export async function create(bodyObj = {}) {
   try {
     const payload = { ...(bodyObj || {}) };
     if (Object.hasOwn(payload, "configuredCapabilities")) {
-      const capabilities = normalizeShareCapabilities(payload.configuredCapabilities);
+      const capabilities = deriveConfiguredShareCapabilities(
+        payload.configuredCapabilities,
+        payload.shareType,
+      );
       payload.configuredCapabilities = capabilities;
       payload.disableDownload = !capabilities.download;
       payload.disableThumbnails = !capabilities.thumbnail;
