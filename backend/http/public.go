@@ -2,6 +2,7 @@ package http
 
 import (
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"github.com/gtsteffaniak/filebrowser/backend/adapters/fs/files"
 	"github.com/gtsteffaniak/filebrowser/backend/common/errors"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	auditdb "github.com/gtsteffaniak/filebrowser/backend/database/audit"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing/iteminfo"
 	"github.com/gtsteffaniak/filebrowser/backend/preview"
@@ -616,9 +618,27 @@ func publicPutHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	if sourceName == "" {
 		return http.StatusNotFound, fmt.Errorf("source not available")
 	}
-	err := files.WriteFile(sourceName, target.CanonicalPath, r.Body)
+	overwrite := true
+	itemCount := int64(1)
+	if err := reservePublicShareWriteAudit(r, auditdb.ActionFileModify, sourceName, target, &auditdb.MetadataV1{
+		SchemaVersion: auditdb.CurrentMetadataSchemaVersion,
+		Overwrite:     &overwrite,
+		Method:        auditdb.MethodPUT,
+		ItemCount:     &itemCount,
+	}); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
+	countedBody := &publicShareAuditCountingReader{reader: r.Body}
+	err := files.WriteFileWithPreCommit(sourceName, target.CanonicalPath, target.RealPath, countedBody,
+		resourceAuditWritePreCommit(d, sourceName, target.RequestedPath, authenticatedReadTarget{}))
+	if auditErr := mergePublicShareWriteAuditResult(r, countedBody.bytesRead, 1, err == nil); auditErr != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
 	// hide the error
 	if err != nil {
+		if stderrors.Is(err, errResourceAuditTargetChanged) {
+			return http.StatusConflict, errResourceAuditTargetChanged
+		}
 		logger.Errorf("public put handler: error updating resource with error %v", err)
 		return http.StatusInternalServerError, fmt.Errorf("an error occurred while updating the resource")
 	}
@@ -651,7 +671,21 @@ func publicDeleteHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 		return http.StatusNotFound, fmt.Errorf("resource not available")
 	}
 	fileInfo.RealPath = target.RealPath
+	if !publicShareWriteTargetUnchanged(target) {
+		return http.StatusForbidden, fmt.Errorf("public share access denied")
+	}
+	itemCount := int64(1)
+	if err = reservePublicShareWriteAudit(r, auditdb.ActionFileDelete, sourceInfo.Name, target, &auditdb.MetadataV1{
+		SchemaVersion: auditdb.CurrentMetadataSchemaVersion,
+		Method:        auditdb.MethodDELETE,
+		ItemCount:     &itemCount,
+	}); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
 	err = files.DeleteFiles(d.share.Source, target.RealPath, target.IsDir)
+	if auditErr := mergePublicShareWriteAuditCounts(r, 1, boolToAuditCount(err == nil), boolToAuditCount(err != nil), 0); auditErr != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
 	if err != nil {
 		logger.Errorf("public delete handler: error deleting resource with error %v", err)
 		return http.StatusInternalServerError, fmt.Errorf("an error occured while deleting the resource")
@@ -781,6 +815,27 @@ func publicBulkDeleteHandler(w http.ResponseWriter, r *http.Request, d *requestC
 		fileInfo.RealPath = target.RealPath
 		fileInfos[i] = fileInfo
 	}
+	for _, manifest := range manifests {
+		if !publicShareWriteManifestUnchanged(manifest) {
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
+	}
+	auditTarget := targets[0]
+	if len(targets) > 1 {
+		root, resolveErr := resolvePublicShareLogicalTarget(d, sourceInfo.Path, d.share.Path)
+		if resolveErr != nil {
+			return http.StatusForbidden, fmt.Errorf("public share access denied")
+		}
+		auditTarget = root
+	}
+	itemCount := int64(len(targets))
+	if err := reservePublicShareWriteAudit(r, auditdb.ActionFileDelete, sourceInfo.Name, auditTarget, &auditdb.MetadataV1{
+		SchemaVersion: auditdb.CurrentMetadataSchemaVersion,
+		Method:        auditdb.MethodDELETE,
+		ItemCount:     &itemCount,
+	}); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
 
 	response := BulkDeleteResponse{Succeeded: make([]BulkDeleteItem, 0, len(items)), Failed: []BulkDeleteItem{}}
 	for i, target := range targets {
@@ -795,6 +850,9 @@ func publicBulkDeleteHandler(w http.ResponseWriter, r *http.Request, d *requestC
 	status := http.StatusOK
 	if len(response.Failed) != 0 {
 		status = http.StatusMultiStatus
+	}
+	if err := mergePublicShareWriteAuditCounts(r, int64(len(targets)), int64(len(response.Succeeded)), int64(len(response.Failed)), 0); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
 	}
 	return renderJSON(w, r, response, status)
 }
@@ -1016,6 +1074,7 @@ func publicPatchHandler(w http.ResponseWriter, r *http.Request, d *requestContex
 	// handler select a different path if filesystem state changes before mutation.
 	req.Rename = false
 	d.Data = req
+	d.shareTargets = []publicShareTarget{plans[0].from, plans[0].to}
 
 	// Call the regular handler (will treat this like a normal user request now)
 	status, err := resourcePatchHandler(w, r, d)
@@ -1023,12 +1082,92 @@ func publicPatchHandler(w http.ResponseWriter, r *http.Request, d *requestContex
 	// For shares, we need to sanitize the response to hide internal details
 	// The response has already been written by resourcePatchHandler, but we can still return error
 	if err != nil {
+		if status == http.StatusServiceUnavailable {
+			return status, err
+		}
 		logger.Errorf("public patch handler: error processing patch with error %v", err)
 		// Obfuscate errors for security
 		return http.StatusInternalServerError, fmt.Errorf("an error occurred while processing the request")
 	}
 
 	return status, err
+}
+
+type publicShareAuditCountingReader struct {
+	reader    io.Reader
+	bytesRead int64
+}
+
+func (reader *publicShareAuditCountingReader) Read(buffer []byte) (int, error) {
+	read, err := reader.reader.Read(buffer)
+	reader.bytesRead += int64(read)
+	return read, err
+}
+
+func reservePublicShareWriteAudit(
+	r *http.Request,
+	action auditdb.Action,
+	source string,
+	target publicShareTarget,
+	metadata *auditdb.MetadataV1,
+) error {
+	recorder := AuditRecorderFromRequest(r)
+	if recorder == nil {
+		return nil
+	}
+	if err := recorder.SetAction(action); err != nil {
+		return ErrAuditUnavailable
+	}
+	if err := recorder.SetResource(source, target.LogicalPath, target.CanonicalPath); err != nil {
+		return ErrAuditUnavailable
+	}
+	if err := recorder.MergeMetadata(metadata); err != nil {
+		return ErrAuditUnavailable
+	}
+	if err := recorder.ReservePending(); err != nil {
+		return ErrAuditUnavailable
+	}
+	return nil
+}
+
+func mergePublicShareWriteAuditResult(r *http.Request, bytesRead, itemCount int64, success bool) error {
+	succeeded := boolToAuditCount(success)
+	failed := boolToAuditCount(!success)
+	denied := int64(0)
+	metadata := &auditdb.MetadataV1{
+		SchemaVersion: auditdb.CurrentMetadataSchemaVersion,
+		Bytes:         &bytesRead,
+		ItemCount:     &itemCount,
+		SuccessCount:  &succeeded,
+		FailedCount:   &failed,
+		DeniedCount:   &denied,
+	}
+	recorder := AuditRecorderFromRequest(r)
+	if recorder == nil {
+		return nil
+	}
+	return recorder.MergeMetadata(metadata)
+}
+
+func mergePublicShareWriteAuditCounts(r *http.Request, items, succeeded, failed, denied int64) error {
+	recorder := AuditRecorderFromRequest(r)
+	if recorder == nil {
+		return nil
+	}
+	return recorder.MergeMetadata(&auditdb.MetadataV1{
+		SchemaVersion: auditdb.CurrentMetadataSchemaVersion,
+		ItemCount:     &items,
+		SuccessCount:  &succeeded,
+		FailedCount:   &failed,
+		DeniedCount:   &denied,
+	})
+}
+
+func boolToAuditCount(value bool) int64 {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 // getShareImage serves banner or favicon files for shares as resizable previews
@@ -1085,6 +1224,13 @@ func getShareImage(w http.ResponseWriter, r *http.Request, d *requestContext) (i
 	// Ensure it's an image file
 	if !strings.HasPrefix(fileInfo.Type, "image/") {
 		return http.StatusBadRequest, fmt.Errorf("invalid file type, must be image")
+	}
+	target, err = reauthorizePublicShareTarget(d, sourceInfo.Path, target)
+	if err != nil {
+		return http.StatusForbidden, fmt.Errorf("public share access denied")
+	}
+	if auditErr := setPublicShareAuditContext(r, d, d.share, &target); auditErr != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
 	}
 
 	// Set file info in request context for preview generation

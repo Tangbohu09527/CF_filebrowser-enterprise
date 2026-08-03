@@ -191,6 +191,9 @@ func previewHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (
 	if err != nil {
 		return errToStatus(err), err
 	}
+	if err = setCoreFileAuditReadTarget(r, target, nil); err != nil {
+		return http.StatusServiceUnavailable, ErrAuditUnavailable
+	}
 	fileInfo, err := files.FileInfoFaster(utils.FileOptions{
 		Path:           target.ScopedPath,
 		Source:         source,

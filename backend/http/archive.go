@@ -26,6 +26,7 @@ import (
 	commonerrors "github.com/gtsteffaniak/filebrowser/backend/common/errors"
 	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+	auditdb "github.com/gtsteffaniak/filebrowser/backend/database/audit"
 	"github.com/gtsteffaniak/filebrowser/backend/database/share"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
 	"github.com/gtsteffaniak/filebrowser/backend/indexing"
@@ -610,7 +611,7 @@ func serveArchiveWithServeContent(w http.ResponseWriter, r *http.Request, d *req
 // @Failure 413 {object} map[string]string "Request Entity Too Large (archive size exceeds maxArchiveSizeGB limit)"
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /api/resources/archive [post]
-func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (status int, returnErr error) {
 	if d.share != nil {
 		return http.StatusForbidden, fmt.Errorf("archive create not allowed for shares")
 	}
@@ -735,6 +736,41 @@ func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 		}
 	}
 
+	auditEnabled := AuditRecorderFromRequest(r) != nil
+	auditItemCount := int64(len(req.Paths))
+	auditAccessibleCount := int64(len(itemPaths))
+	auditDeniedCount := auditItemCount - auditAccessibleCount
+	auditBytes := int64(0)
+	if auditEnabled {
+		overwrite := destinationTarget.Info != nil
+		metadata := resourceWriteAuditMetadata(auditdb.MethodPOST, auditItemCount)
+		metadata.Bytes = &auditBytes
+		metadata.Overwrite = &overwrite
+		if auditErr := prepareResourceWriteAudit(r, auditdb.ActionArchiveCreate, destSource,
+			destinationTarget.LogicalPath, destinationTarget.CanonicalPath, "", "", "", metadata); auditErr != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		if auditErr := reserveResourceWriteAudit(r); auditErr != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		defer func() {
+			successCount := int64(0)
+			failedCount := int64(0)
+			deniedCount := auditDeniedCount
+			switch {
+			case status >= http.StatusOK && status < http.StatusBadRequest:
+				successCount = auditAccessibleCount
+			case status == http.StatusUnauthorized || status == http.StatusForbidden:
+				deniedCount += auditAccessibleCount
+			default:
+				failedCount = auditAccessibleCount
+			}
+			outcome := resourceWriteAuditOutcomeMetadata(auditItemCount, successCount, failedCount, deniedCount)
+			outcome.Bytes = &auditBytes
+			_ = mergeResourceWriteAuditMetadata(r, outcome)
+		}()
+	}
+
 	tempFile, err := os.CreateTemp("", "filebrowser-server-archive-*")
 	if err != nil {
 		return http.StatusInternalServerError, err
@@ -765,6 +801,11 @@ func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 	}
 	if err = tempFile.Sync(); err != nil {
 		return http.StatusInternalServerError, err
+	}
+	if auditEnabled {
+		if archiveInfo, statErr := tempFile.Stat(); statErr == nil {
+			auditBytes = archiveInfo.Size()
+		}
 	}
 	if err = tempFile.Close(); err != nil {
 		return http.StatusInternalServerError, err
@@ -797,20 +838,44 @@ func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 			itemTargets[i] = currentTarget
 		}
 	}
-	destinationTarget, err = resolveAuthenticatedWriteTarget(currentUser, destSource, req.Destination)
+	currentDestinationTarget, err := resolveAuthenticatedWriteTarget(currentUser, destSource, req.Destination)
 	if err != nil {
 		return errToStatus(err), fmt.Errorf("destination path is unavailable: %w", err)
 	}
-	if permissionErr := requireArchiveDestinationPermission(currentUser.Permissions, destinationTarget); permissionErr != nil {
+	if permissionErr := requireArchiveDestinationPermission(currentUser.Permissions, currentDestinationTarget); permissionErr != nil {
 		return archiveWritePreflightStatus(permissionErr), permissionErr
 	}
+	if !sameResourceAuditWriteTarget(destinationTarget, currentDestinationTarget) {
+		return http.StatusConflict, fmt.Errorf("archive destination changed during creation")
+	}
+	destinationTarget = currentDestinationTarget
 	completedArchive, err := os.Open(tempPath)
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
-	writeErr := files.WriteFile(destSource, destinationTarget.CanonicalPath, completedArchive)
+	writeErr := files.WriteFileWithPreCommit(destSource, destinationTarget.CanonicalPath,
+		destinationTarget.RealPath, completedArchive, func() error {
+			latestUser, latestAuthErr := currentAuthenticatedArchiveUser(d)
+			if latestAuthErr != nil {
+				return latestAuthErr
+			}
+			latestTarget, latestTargetErr := resolveAuthenticatedWriteTarget(latestUser, destSource, req.Destination)
+			if latestTargetErr != nil {
+				return latestTargetErr
+			}
+			if permissionErr := requireArchiveDestinationPermission(latestUser.Permissions, latestTarget); permissionErr != nil {
+				return permissionErr
+			}
+			if !sameResourceAuditWriteTarget(destinationTarget, latestTarget) {
+				return errResourceAuditTargetChanged
+			}
+			return nil
+		})
 	closeErr := completedArchive.Close()
 	if writeErr != nil {
+		if errors.Is(writeErr, errResourceAuditTargetChanged) {
+			return http.StatusConflict, errResourceAuditTargetChanged
+		}
 		return errToStatus(writeErr), writeErr
 	}
 	if closeErr != nil {
@@ -879,7 +944,7 @@ func archiveCreateHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 // @Failure 413 {object} map[string]string "Request Entity Too Large (archive size exceeds maxArchiveSizeGB limit)"
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /api/resources/unarchive [post]
-func unarchiveHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+func unarchiveHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (status int, returnErr error) {
 	if d.share != nil {
 		return http.StatusForbidden, fmt.Errorf("unarchive not allowed for shares")
 	}
@@ -959,6 +1024,35 @@ func unarchiveHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	if !isZip && !isTarGz {
 		return http.StatusBadRequest, fmt.Errorf("unsupported archive format (use .zip or .tar.gz)")
 	}
+	auditEnabled := AuditRecorderFromRequest(r) != nil
+	auditItemCount := int64(1)
+	if auditEnabled {
+		overwrite := false
+		metadata := resourceWriteAuditMetadata(auditdb.MethodPOST, auditItemCount)
+		metadata.Overwrite = &overwrite
+		if auditErr := prepareResourceWriteAudit(r, auditdb.ActionArchiveExtract, req.ToSource,
+			destinationTarget.LogicalPath, destinationTarget.CanonicalPath, "", "", "", metadata); auditErr != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		if auditErr := reserveResourceWriteAudit(r); auditErr != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
+		defer func() {
+			successCount := int64(0)
+			failedCount := int64(0)
+			deniedCount := int64(0)
+			switch {
+			case status >= http.StatusOK && status < http.StatusBadRequest:
+				successCount = 1
+			case status == http.StatusUnauthorized || status == http.StatusForbidden:
+				deniedCount = 1
+			default:
+				failedCount = 1
+			}
+			_ = mergeResourceWriteAuditMetadata(r,
+				resourceWriteAuditOutcomeMetadata(auditItemCount, successCount, failedCount, deniedCount))
+		}()
+	}
 	archiveSnapshot, _, cleanupArchiveSnapshot, snapshotErr := snapshotAuthenticatedReadTarget(archiveTarget)
 	if snapshotErr != nil {
 		return errToStatus(snapshotErr), fmt.Errorf("archive snapshot is unavailable: %w", snapshotErr)
@@ -1003,6 +1097,19 @@ func unarchiveHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	destReal = destinationTarget.RealPath
 	if preflightErr = authorizeArchiveExtractionPlan(currentUser, destinationTarget, extractionPlan); preflightErr != nil {
 		return archiveExtractionPreflightStatus(preflightErr), preflightErr
+	}
+	if auditEnabled {
+		overwrite := false
+		for _, entry := range extractionPlan.entries {
+			if entry.existingInfo != nil {
+				overwrite = true
+				break
+			}
+		}
+		_ = mergeResourceWriteAuditMetadata(r, &auditdb.MetadataV1{
+			SchemaVersion: auditdb.CurrentMetadataSchemaVersion,
+			Overwrite:     &overwrite,
+		})
 	}
 
 	var extractErr error
@@ -1450,6 +1557,7 @@ func archiveExtensionForAlgorithm(algo string) (string, error) {
 //
 // server.maxArchiveSizeGB is enforced only for the HEAD/Range spool path.
 func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestContext, source string, fileList []string) (int, error) {
+	requestedItemCount := int64(len(fileList))
 	var shareRealPath string
 	if d.share != nil {
 		idx := indexing.GetIndex(source)
@@ -1532,6 +1640,16 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 				denied := fmt.Errorf("archive member access has changed: %w", commonerrors.ErrAccessDenied)
 				return errToStatus(denied), denied
 			}
+			if len(session.memberTargets) == 0 {
+				return http.StatusForbidden, fmt.Errorf("archive contains no accessible members")
+			}
+			itemCount := int64(len(session.requestFileList))
+			if auditErr := setCoreFileAuditReadTarget(r, session.memberTargets[0], &auditdb.MetadataV1{
+				SchemaVersion: auditdb.CurrentMetadataSchemaVersion,
+				ItemCount:     &itemCount,
+			}); auditErr != nil {
+				return http.StatusServiceUnavailable, ErrAuditUnavailable
+			}
 		}
 
 		session, ok = acquireArchiveSpool(token, session)
@@ -1597,6 +1715,12 @@ func BuildAndStreamArchive(w http.ResponseWriter, r *http.Request, d *requestCon
 			return errToStatus(err), fmt.Errorf("failed to resolve archive path %s: %w", fileList[0], err)
 		}
 		realPath = firstTarget.RealPath
+		if auditErr := setCoreFileAuditReadTarget(r, firstTarget, &auditdb.MetadataV1{
+			SchemaVersion: auditdb.CurrentMetadataSchemaVersion,
+			ItemCount:     &requestedItemCount,
+		}); auditErr != nil {
+			return http.StatusServiceUnavailable, ErrAuditUnavailable
+		}
 	}
 	originalFileName := archiveAttachmentStem(fileList, realPath) + extension
 
