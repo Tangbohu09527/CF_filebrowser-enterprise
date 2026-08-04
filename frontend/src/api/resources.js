@@ -7,9 +7,20 @@ import { adjustedData, fetchURL } from './utils'
 
 export { fetchPreviewImage } from '@/utils/previewRequests'
 
-function addSharePasswordHeader(headers, hash) {
-  if (state.shareInfo?.hash === hash && state.sharePassword) {
-    headers['X-SHARE-PASSWORD'] = state.sharePassword
+function getCredentialsForShareHash(hash) {
+  const matchesActiveShare =
+    typeof hash === 'string' &&
+    hash !== '' &&
+    hash === state.shareInfo?.hash
+
+  return {
+    matchesActiveShare,
+    password: matchesActiveShare && typeof state.sharePassword === 'string'
+      ? state.sharePassword
+      : '',
+    token: matchesActiveShare && typeof state.shareInfo?.token === 'string'
+      ? state.shareInfo.token
+      : '',
   }
 }
 
@@ -61,12 +72,18 @@ export async function getItems(source, path, only = "") {
  */
 export async function signalUploadPause(source, path, shareHash = null) {
   if (shareHash) {
+    const credentials = getCredentialsForShareHash(shareHash)
+    if (!credentials.matchesActiveShare) {
+      throw new Error('share is not active')
+    }
     const apiPath = getPublicApiPath('resources/pause', {
       hash: shareHash,
       path: path,
     })
     const headers = {}
-    addSharePasswordHeader(headers, shareHash)
+    if (credentials.password) {
+      headers['X-SHARE-PASSWORD'] = credentials.password
+    }
     await fetchURL(apiPath, { method: 'POST', headers })
     return
   }
@@ -152,6 +169,10 @@ export async function put(source, path, content = '') {
 }
 
 export async function download(format, files, shareHash = "") {
+  const shareCredentials = getCredentialsForShareHash(shareHash)
+  if (shareHash && !shareCredentials.matchesActiveShare) {
+    throw new Error('share is not active')
+  }
   const downloadChunkSizeMb = state.user?.fileLoading?.downloadChunkSizeMb || 0
   const sizeThreshold = downloadChunkSizeMb * 1024 * 1024
 
@@ -200,7 +221,7 @@ export async function download(format, files, shareHash = "") {
     algo: format,
     ...(shareHash && { hash: shareHash }),
     ...(!shareHash && source && { source: source }),
-    ...(state.shareInfo.token && { token: state.shareInfo.token }),
+    ...(shareCredentials.token && { token: shareCredentials.token }),
     sessionId: state.sessionId,
   }
 
@@ -552,6 +573,10 @@ async function downloadChunkedArchive(url, format, files, filePaths, source, sha
 }
 
 async function downloadChunked(file, shareHash = "") {
+  const shareCredentials = getCredentialsForShareHash(shareHash)
+  if (shareHash && !shareCredentials.matchesActiveShare) {
+    throw new Error('share is not active')
+  }
   const chunkSizeMb = state.user?.fileLoading?.downloadChunkSizeMb || 0
 
   if (chunkSizeMb === 0) {
@@ -566,7 +591,7 @@ async function downloadChunked(file, shareHash = "") {
     file: file.path,
     ...(shareHash && { hash: shareHash }),
     ...(!shareHash && file.source && { source: file.source }),
-    ...(state.shareInfo.token && { token: state.shareInfo.token }),
+    ...(shareCredentials.token && { token: shareCredentials.token }),
     sessionId: state.sessionId
   }
 
@@ -931,20 +956,24 @@ export async function unarchive(opts) {
  * @param {boolean} metadata
  * @returns {Promise<any>}
  */
-export async function fetchFilesPublic(path, hash, password = "", content = false, metadata = false, skipExtendedAttrs = false) {
+export async function fetchFilesPublic(path, hash, _password = "", content = false, metadata = false, skipExtendedAttrs = false) {
+  const credentials = getCredentialsForShareHash(hash)
   const params = {
     path: path,
     hash,
     ...(skipExtendedAttrs && { skipExtendedAttrs: 'true' }),
     ...(content && { content: 'true' }),
     ...(metadata && { metadata: 'true' }),
-    ...(state.shareInfo.token && { token: state.shareInfo.token })
+    ...(credentials.token && { token: credentials.token })
   }
   const apiPath = getPublicApiPath("resources", params);
+  const headers = {}
+  if (credentials.password) {
+    headers["X-SHARE-PASSWORD"] = credentials.password
+  }
   const response = await fetch(apiPath, {
-    headers: {
-      "X-SHARE-PASSWORD": password || "",
-    },
+    credentials: credentials.matchesActiveShare ? 'same-origin' : 'omit',
+    headers,
   });
 
   if (!response.ok) {
@@ -971,13 +1000,16 @@ export async function getItemsPublic(hash, path, only = "") {
     throw new Error('no hash provided')
   }
   try {
+    const credentials = getCredentialsForShareHash(hash)
     const apiPath = getPublicApiPath('resources/items', {
       path: path,
       hash: hash,
       ...(only && { only: only }),
-      ...(state.shareInfo.token && { token: state.shareInfo.token })
+      ...(credentials.token && { token: credentials.token })
     })
-    const response = await fetch(apiPath)
+    const response = await fetch(apiPath, {
+      credentials: credentials.matchesActiveShare ? 'same-origin' : 'omit',
+    })
     const data = await response.json()
     return data
   } catch (err) {
@@ -1039,7 +1071,19 @@ export function postPublic(
   if (!hash || hash === undefined || hash === null) {
     throw new Error('no hash provided')
   }
-  addSharePasswordHeader(headers, hash);
+  const credentials = getCredentialsForShareHash(hash)
+  if (!credentials.matchesActiveShare) {
+    throw new Error('share is not active')
+  }
+  const requestHeaders = { ...headers }
+  for (const name of Object.keys(requestHeaders)) {
+    if (name.toLowerCase() === 'x-share-password') {
+      delete requestHeaders[name]
+    }
+  }
+  if (credentials.password) {
+    requestHeaders['X-SHARE-PASSWORD'] = credentials.password
+  }
   try {
     const apiPath = getPublicApiPath("resources", {
       path: path,
@@ -1051,8 +1095,8 @@ export function postPublic(
     const request = new XMLHttpRequest();
     request.open("POST", apiPath, true);
 
-    for (const header in headers) {
-      request.setRequestHeader(header, headers[header]);
+    for (const header in requestHeaders) {
+      request.setRequestHeader(header, requestHeaders[header]);
     }
     if (typeof onupload === "function") {
       request.upload.onprogress = (event) => {
@@ -1121,14 +1165,22 @@ export function postPublic(
   }
 }
 
-async function resourceActionPublic(hash, path, method, content, token = "") {
+async function resourceActionPublic(hash, path, method, content) {
   try {
-    const headers = {};
-    addSharePasswordHeader(headers, hash);
-    const apiPath = getPublicApiPath('resources', { path, hash: hash, token: token })
+    const credentials = getCredentialsForShareHash(hash)
+    const headers = {}
+    if (credentials.password) {
+      headers['X-SHARE-PASSWORD'] = credentials.password
+    }
+    const apiPath = getPublicApiPath('resources', {
+      path,
+      hash,
+      ...(credentials.token && { token: credentials.token }),
+    })
     const response = await fetch(apiPath, {
       method,
       body: content,
+      credentials: credentials.matchesActiveShare ? 'same-origin' : 'omit',
       headers,
     });
     if (!response.ok) {
@@ -1220,6 +1272,7 @@ export async function moveCopyPublic(
   }
 
   try {
+    const credentials = getCredentialsForShareHash(hash)
     const requestBody = {
       items: items.map(item => ({
         fromPath: item.from,
@@ -1233,9 +1286,10 @@ export async function moveCopyPublic(
     const apiPath = getPublicApiPath('resources', { hash: hash })
     const response = await fetch(apiPath, {
       method: 'PATCH',
+      credentials: credentials.matchesActiveShare ? 'same-origin' : 'omit',
       headers: {
         'Content-Type': 'application/json',
-        ...(state.shareInfo.token && { 'X-Auth-Token': state.shareInfo.token })
+        ...(credentials.token && { 'X-Auth-Token': credentials.token })
       },
       body: JSON.stringify(requestBody),
     })
