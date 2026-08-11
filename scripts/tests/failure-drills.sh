@@ -71,6 +71,31 @@ fi
 printf '[PASS] simulated full cache failed closed\n'
 PASSED=$((PASSED + 1))
 
+for byte_count in 0 1 999999999999999999 1000000000000000000; do
+  validate_byte_count "$byte_count" boundary_byte_count
+done
+printf '[PASS] canonical byte counts through the one-exabyte boundary were accepted\n'
+PASSED=$((PASSED + 1))
+
+expect_failure "byte count above the one-exabyte boundary" "$BASH_BIN" -c \
+  'source "$1"; validate_byte_count "$2" boundary_byte_count' \
+  _ "$REPO_ROOT/scripts/lib/deployment-common.sh" 1000000000000000001
+expect_failure "signed 64-bit maximum byte count" "$BASH_BIN" -c \
+  'source "$1"; validate_byte_count "$2" boundary_byte_count' \
+  _ "$REPO_ROOT/scripts/lib/deployment-common.sh" 9223372036854775807
+expect_failure "maximum 19-digit byte count" "$BASH_BIN" -c \
+  'source "$1"; validate_byte_count "$2" boundary_byte_count' \
+  _ "$REPO_ROOT/scripts/lib/deployment-common.sh" 9999999999999999999
+expect_failure "byte count with a leading zero" "$BASH_BIN" -c \
+  'source "$1"; validate_byte_count "$2" boundary_byte_count' \
+  _ "$REPO_ROOT/scripts/lib/deployment-common.sh" 01
+expect_failure "negative byte count" "$BASH_BIN" -c \
+  'source "$1"; validate_byte_count "$2" boundary_byte_count' \
+  _ "$REPO_ROOT/scripts/lib/deployment-common.sh" -1
+expect_failure "non-numeric byte count" "$BASH_BIN" -c \
+  'source "$1"; validate_byte_count "$2" boundary_byte_count' \
+  _ "$REPO_ROOT/scripts/lib/deployment-common.sh" non-numeric
+
 restore_root="$TMP_ROOT/restore fixture"
 mkdir -p "$restore_root/deploy" "$restore_root/config" "$restore_root/data" \
   "$restore_root/cache" "$restore_root/files" "$restore_root/backups/corrupt/payload"
@@ -92,6 +117,77 @@ expect_failure "restore checksum mismatch" env \
   ENV_FILE="$restore_root/deploy/.env" \
   COMPOSE_FILE="$restore_root/deploy/compose.yaml" \
   "$BASH_BIN" "$REPO_ROOT/scripts/restore.sh" --backup "$restore_root/backups/corrupt"
+
+metric_totals=$("$BASH_BIN" -c '
+  set -Eeuo pipefail
+  restore_script=$1
+  set -- --help
+  source "$restore_script" >/dev/null
+
+  declare -A metric_values=(
+    [database_logical_bytes]=1 [database_archive_bytes]=7
+    [config_logical_bytes]=2 [config_archive_bytes]=11
+    [secrets_logical_bytes]=3 [secrets_archive_bytes]=13
+    [files_logical_bytes]=5 [files_archive_bytes]=17
+    [deployment_logical_bytes]=8 [deployment_archive_bytes]=19
+    [systemd_logical_bytes]=13 [systemd_archive_bytes]=23
+  )
+  manifest_required() {
+    local key=$2
+    [[ -n ${metric_values[$key]+present} ]] || die "manifest metric is missing"
+    printf "%s" "${metric_values[$key]}"
+  }
+  archive_logical_bytes() {
+    local label=${1%.tar}
+    printf "%s" "${metric_values[${label}_logical_bytes]}"
+  }
+  archive_file_bytes() {
+    local label=${1%.tar}
+    printf "%s" "${metric_values[${label}_archive_bytes]}"
+  }
+  validate_all_payload_metrics() {
+    local database_logical_bytes=0 config_logical_bytes=0 secrets_logical_bytes=0
+    local files_logical_bytes=0 deployment_logical_bytes=0 systemd_logical_bytes=0
+    local database_archive_bytes=0 config_archive_bytes=0 secrets_archive_bytes=0
+    local files_archive_bytes=0 deployment_archive_bytes=0 systemd_archive_bytes=0
+    local label total_logical_bytes total_archive_bytes
+
+    for label in database config secrets files deployment systemd; do
+      validate_payload_metric manifest "$label" "$label.tar"
+    done
+    [[ "$database_logical_bytes:$database_archive_bytes" == 1:7 ]]
+    [[ "$config_logical_bytes:$config_archive_bytes" == 2:11 ]]
+    [[ "$secrets_logical_bytes:$secrets_archive_bytes" == 3:13 ]]
+    [[ "$files_logical_bytes:$files_archive_bytes" == 5:17 ]]
+    [[ "$deployment_logical_bytes:$deployment_archive_bytes" == 8:19 ]]
+    [[ "$systemd_logical_bytes:$systemd_archive_bytes" == 13:23 ]]
+    total_logical_bytes=$(( database_logical_bytes + config_logical_bytes + secrets_logical_bytes + files_logical_bytes + deployment_logical_bytes + systemd_logical_bytes ))
+    total_archive_bytes=$(( database_archive_bytes + config_archive_bytes + secrets_archive_bytes + files_archive_bytes + deployment_archive_bytes + systemd_archive_bytes ))
+    printf "%s:%s" "$total_logical_bytes" "$total_archive_bytes"
+  }
+  validate_all_payload_metrics
+' _ "$REPO_ROOT/scripts/restore.sh")
+[[ "$metric_totals" == 32:90 ]] || die "payload metric totals were not assigned correctly"
+printf '[PASS] all payload byte metrics remained caller-local and summed correctly\n'
+PASSED=$((PASSED + 1))
+
+expect_failure "missing payload archive metric" "$BASH_BIN" -c '
+  set -Eeuo pipefail
+  restore_script=$1
+  set -- --help
+  source "$restore_script" >/dev/null
+  manifest_required() {
+    [[ $2 != config_archive_bytes ]] || die "manifest metric is missing"
+    printf "1"
+  }
+  archive_logical_bytes() { printf "1"; }
+  archive_file_bytes() { printf "1"; }
+  validate_config_metric() {
+    local config_logical_bytes=0 config_archive_bytes=0
+    validate_payload_metric manifest config config.tar
+  }
+  validate_config_metric
+' _ "$REPO_ROOT/scripts/restore.sh"
 
 digest=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 expect_failure "implicit public-registry image reference" "$BASH_BIN" -c \

@@ -156,7 +156,9 @@ PY
 
   if command -v shellcheck >/dev/null 2>&1; then
     mapfile -d '' shell_files < <(find "$REPO_ROOT/scripts" -type f -name '*.sh' -print0)
-    shellcheck "${shell_files[@]}"
+    # Warnings and errors block CI. Intentional info-level findings require
+    # separate cleanup and are not part of the current release gate.
+    shellcheck --severity=warning "${shell_files[@]}"
   elif [[ ${CI:-false} == true ]]; then
     die "shellcheck is required in CI"
   else

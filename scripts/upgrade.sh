@@ -72,7 +72,8 @@ upgrade_id="upgrade-$(date -u +'%Y%m%dT%H%M%SZ')-$$"
 ensure_lifecycle_state_root
 state_history="$FILEBROWSER_LIFECYCLE_STATE_ROOT/upgrade-history"
 [[ ! -L "$state_history" ]] || die "upgrade history must not be a symlink"
-mkdir -m 0700 -p -- "$state_history"
+mkdir -p -- "$state_history"
+chmod 0700 -- "$state_history"
 [[ $(stat -c '%u:%g:%a' "$state_history") == 0:0:700 ]] ||
   die "upgrade history must be owned by root:root with mode 0700"
 state_dir="$state_history/$upgrade_id"

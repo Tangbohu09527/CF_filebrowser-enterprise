@@ -188,9 +188,17 @@ validate_payload_metric() {
 }
 
 validate_backup_bundle() {
+  (( $# == 7 )) || die "validate_backup_bundle requires a backup path and six archive-byte outputs"
   local backup=$1 manifest checksum_file payload archive checksum member extra member_path owner mode links
+  local database_archive_bytes_out=$2 config_archive_bytes_out=$3 secrets_archive_bytes_out=$4
+  local files_archive_bytes_out=$5 deployment_archive_bytes_out=$6 systemd_archive_bytes_out=$7
   local format_version deployment_schema database_engine database_schema compatibility_image
   local files_prefix deployment_prefix
+  local database_logical_bytes=0 config_logical_bytes=0 secrets_logical_bytes=0
+  local files_logical_bytes=0 deployment_logical_bytes=0 systemd_logical_bytes=0
+  local database_archive_bytes=0 config_archive_bytes=0 secrets_archive_bytes=0
+  local files_archive_bytes=0 deployment_archive_bytes=0 systemd_archive_bytes=0
+  local total_logical_bytes=0 total_archive_bytes=0
 
   manifest="$backup/manifest.tsv"
   checksum_file="$backup/checksums.sha256"
@@ -349,6 +357,13 @@ validate_backup_bundle() {
     --config "$PREFLIGHT_DIR/config/config.yaml" \
     --env "$PREFLIGHT_DIR/deployment/.env"
   cleanup_preflight
+
+  printf -v "$database_archive_bytes_out" '%s' "$database_archive_bytes"
+  printf -v "$config_archive_bytes_out" '%s' "$config_archive_bytes"
+  printf -v "$secrets_archive_bytes_out" '%s' "$secrets_archive_bytes"
+  printf -v "$files_archive_bytes_out" '%s' "$files_archive_bytes"
+  printf -v "$deployment_archive_bytes_out" '%s' "$deployment_archive_bytes"
+  printf -v "$systemd_archive_bytes_out" '%s' "$systemd_archive_bytes"
 }
 
 journal_required() {
@@ -761,6 +776,9 @@ validate_restore_atomic_targets() {
 }
 
 create_and_validate_staging() {
+  (( $# == 6 )) || die "create_and_validate_staging requires six validated archive-byte values"
+  local database_archive_bytes=$1 config_archive_bytes=$2 secrets_archive_bytes=$3
+  local files_archive_bytes=$4 deployment_archive_bytes=$5 systemd_archive_bytes=$6
   local config_required files_required deploy_required database_required systemd_required cache_required
   local unit_path unit_name
   RESTORE_ID=$(date -u +'%Y%m%dT%H%M%SZ')-$$
@@ -911,6 +929,10 @@ recovery_exit() {
 }
 
 main() {
+  local validated_database_archive_bytes=0 validated_config_archive_bytes=0
+  local validated_secrets_archive_bytes=0 validated_files_archive_bytes=0
+  local validated_deployment_archive_bytes=0 validated_systemd_archive_bytes=0
+
   while (( $# > 0 )); do
     case "$1" in
       --backup)
@@ -1008,7 +1030,13 @@ main() {
   trap 'exit 143' TERM
   trap 'exit 130' INT
   trap 'exit 129' HUP
-  validate_backup_bundle "$BACKUP_REAL"
+  validate_backup_bundle "$BACKUP_REAL" \
+    validated_database_archive_bytes \
+    validated_config_archive_bytes \
+    validated_secrets_archive_bytes \
+    validated_files_archive_bytes \
+    validated_deployment_archive_bytes \
+    validated_systemd_archive_bytes
   log "backup hashes, schema-2 paths, image pins, payload sizes, and archived production configuration validated"
   validate_restore_atomic_targets
 
@@ -1069,7 +1097,13 @@ main() {
     die "rollback Nginx image is unavailable locally: $ROLLBACK_NGINX_IMAGE"
   log "current state is protected by a fully validated rollback point at $ROLLBACK_POINT"
 
-  create_and_validate_staging
+  create_and_validate_staging \
+    "$validated_database_archive_bytes" \
+    "$validated_config_archive_bytes" \
+    "$validated_secrets_archive_bytes" \
+    "$validated_files_archive_bytes" \
+    "$validated_deployment_archive_bytes" \
+    "$validated_systemd_archive_bytes"
   create_restore_journal
   register_and_swap "$DATA_ROOT/database.db" "$DATABASE_NEW" true
   register_and_swap "$CONFIG_ROOT" "$CONFIG_NEW" true

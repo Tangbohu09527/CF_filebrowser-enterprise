@@ -471,10 +471,23 @@ archive_file_bytes() {
 }
 
 validate_byte_count() {
-  local value=$1 label=${2:-byte_count}
+  local value=$1 label=${2:-byte_count} index value_digit maximum_digit
+  local maximum_byte_count=1000000000000000000
+  local LC_ALL=C
   [[ "$value" == 0 || "$value" =~ ^[1-9][0-9]*$ ]] || die "$label must be a canonical non-negative integer"
-  (( ${#value} < 19 )) || [[ ${#value} -eq 19 && "$value" < 1000000000000000001 ]] ||
+  if (( ${#value} > ${#maximum_byte_count} )); then
     die "$label exceeds the supported one-exabyte safety bound"
+  fi
+  if (( ${#value} == ${#maximum_byte_count} )); then
+    # Compare one digit at a time so 19-digit values never enter Bash arithmetic.
+    for (( index=0; index<${#maximum_byte_count}; index++ )); do
+      value_digit=${value:index:1}
+      maximum_digit=${maximum_byte_count:index:1}
+      (( value_digit <= maximum_digit )) ||
+        die "$label exceeds the supported one-exabyte safety bound"
+      (( value_digit == maximum_digit )) || break
+    done
+  fi
 }
 
 space_with_margin() {

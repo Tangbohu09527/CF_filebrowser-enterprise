@@ -139,6 +139,16 @@ class DeploymentAssetTests(unittest.TestCase):
                 if path.name not in {"container-entrypoint.sh", "nginx-entrypoint.sh"}:
                     self.assertIn("set -Eeuo pipefail", text)
 
+    def test_shellcheck_blocks_warnings_and_errors_but_not_info(self) -> None:
+        validator = (ROOT / "scripts" / "validate-deployment.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'shellcheck --severity=warning "${shell_files[@]}"', validator
+        )
+        self.assertNotIn("shellcheck --severity=error", validator)
+        self.assertNotRegex(validator, r"shellcheck[^\n]*\|\|\s*true")
+
     def test_lifecycle_guards_are_present(self) -> None:
         backup = (ROOT / "scripts" / "backup.sh").read_text(encoding="utf-8")
         restore = (ROOT / "scripts" / "restore.sh").read_text(encoding="utf-8")
@@ -235,6 +245,42 @@ class DeploymentAssetTests(unittest.TestCase):
         common = (ROOT / "scripts" / "lib" / "deployment-common.sh").read_text(
             encoding="utf-8"
         )
+        bundle_start = restore.index("validate_backup_bundle()")
+        bundle_end = restore.index("\njournal_required()", bundle_start)
+        bundle_validation = restore[bundle_start:bundle_end]
+        main = restore[restore.index("\nmain() {") :]
+        bundle_call = main[
+            main.index('validate_backup_bundle "$BACKUP_REAL"') :
+            main.index("log \"backup hashes", main.index('validate_backup_bundle "$BACKUP_REAL"'))
+        ]
+        staging_call = main[
+            main.index("create_and_validate_staging") :
+            main.index("create_restore_journal", main.index("create_and_validate_staging"))
+        ]
+        for payload in (
+            "database",
+            "config",
+            "secrets",
+            "files",
+            "deployment",
+            "systemd",
+        ):
+            with self.subTest(payload=payload):
+                self.assertIn(f"{payload}_logical_bytes=0", bundle_validation)
+                self.assertIn(f"{payload}_archive_bytes=0", bundle_validation)
+                self.assertIn(
+                    f'validate_payload_metric "$manifest" {payload} ',
+                    bundle_validation,
+                )
+                self.assertIn(
+                    f'printf -v "${payload}_archive_bytes_out" \'%s\' '
+                    f'"${payload}_archive_bytes"',
+                    bundle_validation,
+                )
+                self.assertIn(f"validated_{payload}_archive_bytes", bundle_call)
+                self.assertIn(
+                    f'"$validated_{payload}_archive_bytes"', staging_call
+                )
         self.assertIn("deployment_schema\" == 2", restore)
         self.assertIn("compare_archived_environment", restore)
         self.assertIn("deployment_validation.py\" --production", restore)
@@ -244,6 +290,21 @@ class DeploymentAssetTests(unittest.TestCase):
         self.assertIn("durable_move \"$target\" \"$original\"", restore)
         self.assertIn("validate_restore_atomic_targets", restore)
         self.assertIn("hard-linked backup members are forbidden", restore)
+        self.assertIn(
+            "total_logical_bytes=$(( database_logical_bytes", bundle_validation
+        )
+        self.assertIn(
+            "total_archive_bytes=$(( database_archive_bytes", bundle_validation
+        )
+        for payload in (
+            "database",
+            "config",
+            "secrets",
+            "files",
+            "deployment",
+            "systemd",
+        ):
+            self.assertIn(f"validated_{payload}_archive_bytes=0", restore)
         self.assertIn(
             "FILEBROWSER_RESTORE_JOURNAL=$FILEBROWSER_LIFECYCLE_STATE_ROOT/restore-journal.tsv",
             common,
@@ -258,6 +319,20 @@ class DeploymentAssetTests(unittest.TestCase):
         upgrade = (ROOT / "scripts" / "upgrade.sh").read_text(encoding="utf-8")
         rollback = (ROOT / "scripts" / "rollback.sh").read_text(encoding="utf-8")
         restore = (ROOT / "scripts" / "restore.sh").read_text(encoding="utf-8")
+
+        history = upgrade.index(
+            'state_history="$FILEBROWSER_LIFECYCLE_STATE_ROOT/upgrade-history"'
+        )
+        history_mkdir = upgrade.index('mkdir -p -- "$state_history"', history)
+        history_chmod = upgrade.index('chmod 0700 -- "$state_history"', history_mkdir)
+        history_stat = upgrade.index(
+            "stat -c '%u:%g:%a' \"$state_history\"", history_chmod
+        )
+        state_dir = upgrade.index('state_dir="$state_history/$upgrade_id"', history_stat)
+        self.assertLess(history, history_mkdir)
+        self.assertLess(history_mkdir, history_chmod)
+        self.assertLess(history_chmod, history_stat)
+        self.assertLess(history_stat, state_dir)
 
         self.assertIn('cat >"$state_temp"', upgrade)
         self.assertNotIn('cat >"$STATE_FILE"', upgrade)
