@@ -1,0 +1,11 @@
+# Local Staging build override only. Runtime uses FILEBROWSER_IMAGE from the approved env file.
+services:
+  filebrowser-enterprise:
+    image: ${FILEBROWSER_BUILD_IMAGE:?FILEBROWSER_BUILD_IMAGE is required}
+    pull_policy: build
+    build:
+      context: ../..
+      dockerfile: _docker/Dockerfile
+      args:
+        VERSION: ${BUILD_VERSION:?BUILD_VERSION is required}
+        REVISION: ${BUILD_REVISION:?BUILD_REVISION is required}

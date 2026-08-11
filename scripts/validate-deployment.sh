@@ -68,6 +68,8 @@ if [[ "$MODE" == repository ]]; then
   validate_shell_syntax "$REPO_ROOT"
   "$PYTHON_BIN" "$REPO_ROOT/scripts/lib/deployment_validation.py" --repository "$REPO_ROOT"
   "$PYTHON_BIN" "$REPO_ROOT/deploy/tests/test_deployment_assets.py"
+  bash -n "$REPO_ROOT/deploy/shared-host/validate.sh"
+  "$PYTHON_BIN" "$REPO_ROOT/deploy/tests/test_shared_host_assets.py"
   bash "$REPO_ROOT/scripts/tests/failure-drills.sh"
 
   repository_docker_config=$(mktemp -d)

@@ -1,0 +1,70 @@
+name: cf-filebrowser
+
+services:
+  filebrowser-enterprise:
+    image: ${FILEBROWSER_IMAGE:?FILEBROWSER_IMAGE must be set explicitly}
+    profiles:
+      - approved
+    user: "${FILEBROWSER_UID:?FILEBROWSER_UID is required}:${FILEBROWSER_GID:?FILEBROWSER_GID is required}"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: ${STOP_GRACE_PERIOD:?STOP_GRACE_PERIOD is required}
+    read_only: true
+    entrypoint:
+      - /opt/filebrowser-enterprise/scripts/container-entrypoint.sh
+    environment:
+      FILEBROWSER_CONFIG: /etc/filebrowser-enterprise/config.yaml
+      FILEBROWSER_DATABASE: /var/lib/filebrowser-enterprise/database.db
+      FILEBROWSER_JWT_TOKEN_SECRET_FILE: /run/filebrowser-secrets/jwt_token_secret
+      FILEBROWSER_TOTP_SECRET_FILE: /run/filebrowser-secrets/totp_secret
+      FILEBROWSER_BOOTSTRAP_PASSWORD_FILE: /run/filebrowser-secrets/bootstrap_admin_password
+    volumes:
+      - type: bind
+        source: "${CONFIG_ROOT:?CONFIG_ROOT is required}/config.yaml"
+        target: /etc/filebrowser-enterprise/config.yaml
+        read_only: true
+      - type: bind
+        source: "${CONFIG_ROOT:?CONFIG_ROOT is required}/secrets"
+        target: /run/filebrowser-secrets
+        read_only: true
+      - type: bind
+        source: "${DATA_ROOT:?DATA_ROOT is required}"
+        target: /var/lib/filebrowser-enterprise
+      - type: bind
+        source: "${CACHE_ROOT:?CACHE_ROOT is required}"
+        target: /var/cache/filebrowser-enterprise
+      - type: bind
+        source: "${FILES_ROOT:?FILES_ROOT is required}"
+        target: /srv/filebrowser/files
+      - type: bind
+        source: "${SOURCE_ROOT:?SOURCE_ROOT is required}/scripts/container-entrypoint.sh"
+        target: /opt/filebrowser-enterprise/scripts/container-entrypoint.sh
+        read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    expose:
+      - "8080"
+    networks:
+      - private
+    healthcheck:
+      test: ["CMD-SHELL", "app_health=$$(curl --fail --silent --show-error http://127.0.0.1:8080/health) && [ \"$$app_health\" = '{\"message\":\"ok\"}' ]"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: ${FILEBROWSER_PIDS:?FILEBROWSER_PIDS is required}
+    mem_limit: ${FILEBROWSER_MEMORY:?FILEBROWSER_MEMORY is required}
+    cpus: ${FILEBROWSER_CPUS:?FILEBROWSER_CPUS is required}
+    logging:
+      driver: local
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+networks:
+  private:
+    driver: bridge
