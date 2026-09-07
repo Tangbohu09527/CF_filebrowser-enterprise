@@ -24,6 +24,7 @@ import stat
 import struct
 import subprocess
 import sys
+import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
@@ -230,6 +231,87 @@ def fixtures():
             "picture.png": png_fixture(), "photo.jpg": jpeg}
 
 
+
+PENDING_PREFIX_BYTES = 64 * 1024
+PENDING_CONTENT_BYTES = 1024 * 1024
+PENDING_HOLD_SECONDS = 120
+
+
+def pending_control(value):
+    if (not isinstance(value, dict) or value.get("version") != 1
+            or not re.fullmatch(r"/cf-audit-pending-[0-9a-f]{12}", str(value.get("root", "")))
+            or value.get("original_size") != 4096 or value.get("prefix_size") != PENDING_PREFIX_BYTES
+            or any(not re.fullmatch(r"[0-9a-f]{64}", str(value.get(key, "")))
+                   for key in ("original_sha256", "prefix_sha256"))):
+        raise AcceptanceError("invalid private pending probe control")
+    return value
+
+
+def pending_file_state(path, expected_size, expected_hash, service_id, *, partial=False):
+    before = path.lstat()
+    if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+            or before.st_uid != service_id or before.st_gid != service_id
+            or not 0 <= before.st_size <= expected_size or (not partial and before.st_size != expected_size)):
+        raise AcceptanceError("pending probe file identity or size mismatch")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        content = stream.read(expected_size + 1)
+        finished = os.fstat(stream.fileno())
+    after = path.lstat()
+    identity = lambda item: (item.st_dev, item.st_ino, item.st_mode, item.st_nlink,
+                             item.st_uid, item.st_gid, item.st_size, item.st_mtime_ns)
+    versions = (before, opened, finished, after)
+    if any(identity(info)[:-2] != identity(before)[:-2] for info in versions):
+        raise AcceptanceError("pending probe file identity changed during observation")
+    changing = any(identity(info) != identity(before) for info in versions)
+    if changing:
+        if not partial or any(not 0 <= info.st_size <= expected_size for info in versions):
+            raise AcceptanceError("pending probe file changed during observation")
+        # A growing temporary file is not ready. Only a subsequent stable full
+        # prefix observation authorizes interruption; never relax target checks.
+        return {"device": after.st_dev, "inode": after.st_ino, "mode": after.st_mode,
+                "size": after.st_size, "mtime_ns": after.st_mtime_ns, "complete": False}
+    complete = len(content) == expected_size
+    if len(content) != before.st_size or (complete and hashlib.sha256(content).hexdigest() != expected_hash):
+        raise AcceptanceError("pending probe file bytes mismatch")
+    return {"device": before.st_dev, "inode": before.st_ino, "mode": before.st_mode,
+            "size": before.st_size, "mtime_ns": before.st_mtime_ns, "complete": complete}
+
+
+def audit_pending_filesystem(control, *, files_root=None, service_id=10001):
+    """Private bounded observation; never emit this record as public evidence."""
+    control = pending_control(control)
+    files_root = Path(files_root or "/srv/storage/cf-filebrowser-enterprise/files")
+    directory = files_root / control["root"].lstrip("/")
+    directory_before = directory.lstat()
+    for entry in (files_root, directory):
+        info = entry.lstat()
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != service_id or info.st_gid != service_id:
+            raise AcceptanceError("pending probe directory identity mismatch")
+    entries = []
+    with os.scandir(directory) as listing:
+        for entry in listing:
+            entries.append(entry.name)
+            if len(entries) > 2:
+                raise AcceptanceError("pending probe has unexpected directory entries")
+    temporary = [name for name in entries if re.fullmatch(r"\.filebrowser-write-[A-Za-z0-9]+", name)]
+    if "target.bin" not in entries or len(temporary) > 1 or len(entries) != 1 + len(temporary):
+        raise AcceptanceError("pending probe has unexpected directory entries")
+    target = pending_file_state(directory / "target.bin", control["original_size"], control["original_sha256"], service_id)
+    temp = None
+    if temporary:
+        temp = pending_file_state(directory / temporary[0], control["prefix_size"], control["prefix_sha256"], service_id, partial=True)
+        temp["name"] = temporary[0]
+    directory_after = directory.lstat()
+    def directory_identity(info):
+        return {"device": info.st_dev, "inode": info.st_ino, "mode": info.st_mode,
+                "uid": info.st_uid, "gid": info.st_gid}
+    if directory_identity(directory_after) != directory_identity(directory_before):
+        raise AcceptanceError("pending probe directory changed during observation")
+    return {"target": target, "temporary": temp, "directory": directory_identity(directory_before)}
+
+
 class Acceptance:
     def __init__(self, client, args, state):
         self.client, self.args, self.state = client, args, state
@@ -370,6 +452,107 @@ class Acceptance:
             self.state["audit_ids"] = sorted(ids)
             self.checkpoint()
         self.check("audit_records_present", len(ids) > 0, record_count=len(ids))
+    def pending_audit_items(self, *, request_id=None):
+        account = self.state["users"]["pending"]
+        query = {"actor": account["username"], "source": SOURCE, "path": self.state["root"] + "/target.bin",
+                 "action": "file.modify", "limit": "100"}
+        if request_id is not None:
+            query["requestID"] = request_id
+        page = self.request("audit_pending_query", "GET", "/api/audit", token=self.admin, query=query).json()
+        self.check("audit_pending_query_bounded", isinstance(page, dict) and isinstance(page.get("items"), list) and page.get("hasMore") is False)
+        return page["items"]
+
+    def audit_pending_prepare(self):
+        self.login_admin()
+        self.resource("audit_pending_directory_create", "POST", self.state["root"], self.admin, isDir="true", body=b"")
+        granted = {name: name in ("api", "browse", "download", "create", "modify") for name in PERMISSIONS}
+        session = self.create_user("pending", granted)
+        original, prefix = secrets.token_bytes(4096), secrets.token_bytes(PENDING_PREFIX_BYTES)
+        self.state["pending"] = {"original": base64.b64encode(original).decode("ascii"),
+                                 "prefix": base64.b64encode(prefix).decode("ascii")}
+        self.checkpoint()
+        self.resource("audit_pending_original_create", "POST", "/target.bin", session, body=original)
+        self.check("audit_pending_original_download", self.download("audit_pending_original_read", "/target.bin", session).body == original)
+        self.check("audit_pending_no_prior_modify", self.pending_audit_items() == [])
+        control = {"version": 1, "root": self.state["root"], "original_size": len(original),
+                   "original_sha256": hashlib.sha256(original).hexdigest(), "prefix_size": len(prefix),
+                   "prefix_sha256": hashlib.sha256(prefix).hexdigest()}
+        write_json(Path(self.args.state_file).with_suffix(".control.json"), control)
+        self.state["pending"]["prepared"] = True
+        self.checkpoint()
+
+    def audit_pending_hold(self):
+        pending = self.state["pending"]
+        self.check("audit_pending_prepared", pending.get("prepared") is True and not pending.get("attempted"))
+        account = self.state["users"]["pending"]
+        session = self.login(account["username"], account["password"], "audit_pending_writer_login")
+        prefix = base64.b64decode(pending["prefix"], validate=True)
+        self.check("audit_pending_prefix_shape", len(prefix) == PENDING_PREFIX_BYTES)
+        pending["attempted"] = True
+        self.checkpoint()
+        connection = http.client.HTTPSConnection(self.client.host, self.client.port, context=self.client.context, timeout=30)
+        deadline = time.monotonic() + PENDING_HOLD_SECONDS
+        try:
+            connection.connect()
+            connection.sock.settimeout(max(0.001, deadline - time.monotonic()))
+            path = "/api/resources?" + urllib.parse.urlencode({"source": SOURCE, "path": "/target.bin"})
+            self.client.requests += 1
+            connection.putrequest("PUT", path)
+            connection.putheader("Authorization", "Bearer " + session)
+            connection.putheader("Content-Type", "application/octet-stream")
+            connection.putheader("Content-Length", str(PENDING_CONTENT_BYTES))
+            connection.putheader("Connection", "close")
+            connection.endheaders()
+            connection.send(prefix)
+            pending["prefix_sent"] = True
+            self.checkpoint()
+            connection.sock.settimeout(max(0.001, deadline - time.monotonic()))
+            try:
+                connection.getresponse()
+            except (http.client.RemoteDisconnected, ssl.SSLEOFError, ConnectionResetError):
+                pending["disconnected"] = True
+                self.checkpoint()
+                self.check("audit_pending_connection_interrupted", True)
+            else:
+                raise AcceptanceError("audit_pending_request_completed_before_interruption")
+        except (OSError, http.client.HTTPException) as error:
+            raise AcceptanceError(transport_failure(error)) from None
+        finally:
+            connection.close()
+
+    def audit_pending_verify(self):
+        pending = self.state["pending"]
+        self.check("audit_pending_hold_completed", pending.get("prefix_sent") is True and pending.get("disconnected") is True)
+        self.login_admin()
+        events = self.pending_audit_items()
+        self.check("audit_pending_one_recovered_event", len(events) == 1, record_count=len(events))
+        event = events[0]
+        self.check("audit_pending_event_shape", isinstance(event, dict) and isinstance(event.get("metadata"), dict))
+        account = self.state["users"]["pending"]
+        expected_path = self.state["root"] + "/target.bin"
+        self.check("audit_pending_recovered_identity", event.get("username") == account["username"]
+                   and event.get("userId") == account["id"] and event.get("source") == SOURCE
+                   and event.get("path") == expected_path and event.get("canonicalPath") == expected_path
+                   and event.get("origin") == "http" and event.get("action") == "file.modify")
+        self.check("audit_pending_recovered_terminal", event.get("result") == "unknown"
+                   and event.get("errorCode") == "process_interrupted" and event.get("httpStatus") is None
+                   and event.get("metadata", {}).get("schemaVersion") == 1
+                   and event.get("metadata", {}).get("method") == "PUT"
+                   and event.get("metadata", {}).get("overwrite") is True)
+        request_id = event.get("requestId")
+        self.check("audit_pending_real_request_id", isinstance(request_id, str) and re.fullmatch(r"[0-9a-f]{32}", request_id) is not None)
+        pending["request_id"] = request_id  # Protected state only; never public evidence.
+        self.checkpoint()
+        self.check("audit_pending_exact_request_lookup", self.pending_audit_items(request_id=request_id) == [event])
+        session = self.login(account["username"], account["password"], "audit_pending_restarted_writer_login")
+        original = base64.b64decode(pending["original"], validate=True)
+        self.check("audit_pending_original_not_overwritten", self.download("audit_pending_restarted_download", "/target.bin", session).body == original)
+        following = secrets.token_bytes(4096)
+        self.resource("audit_pending_following_write", "PUT", "/target.bin", session, body=following)
+        self.check("audit_pending_following_read", self.download("audit_pending_following_download", "/target.bin", session).body == following)
+        pending["verified"] = True
+        self.checkpoint()
+
     def exercise(self):
         self.login_admin()
         self.resource("fixture_directory_create", "POST", self.state["root"], self.admin, isDir="true", body=b"")
@@ -969,7 +1152,7 @@ class Acceptance:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("exercise", "protocols", "verify-restored"))
+    parser.add_argument("phase", choices=("exercise", "protocols", "verify-restored", "audit-pending-prepare", "audit-pending-hold", "audit-pending-verify"))
     parser.add_argument("--url", "--base-url", dest="url", required=True)
     parser.add_argument("--ca-file", required=True)
     parser.add_argument("--admin-password-file", required=True)
@@ -985,10 +1168,11 @@ def main(argv=None):
     ca = protected_path(args.ca_file)
     evidence_path = protected_path(args.evidence, existing=False)
     state_path = Path(args.state_file)
-    if args.phase == "exercise":
+    if args.phase in ("exercise", "audit-pending-prepare"):
         protected_path(state_path, existing=False)
         identifier = secrets.token_hex(6)
-        state = {"version": 1, "id": identifier, "source": SOURCE, "root": "/cf-acceptance-" + identifier,
+        prefix = "/cf-audit-pending-" if args.phase == "audit-pending-prepare" else "/cf-acceptance-"
+        state = {"version": 1, "id": identifier, "source": SOURCE, "root": prefix + identifier,
                  "users": {}, "files": {}, "tokens": {}, "shares": {}, "seed_completed": False}
         write_json(state_path, state)
     else:
@@ -1004,6 +1188,8 @@ def main(argv=None):
             test.exercise()
         elif args.phase == "protocols":
             test.protocols()
+        elif args.phase.startswith("audit-pending-"):
+            getattr(test, args.phase.replace("-", "_"))()
         else:
             test.verify_restored()
         if test.incomplete:

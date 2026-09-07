@@ -20,6 +20,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 
@@ -650,11 +651,17 @@ def missing_storage_rejection(result):
     return {'exit_code': result.returncode, 'category': category, 'private_stderr_bytes': len(result.stderr), 'private_stderr_sha256': hashlib.sha256(result.stderr).hexdigest()}
 
 
-def api(vm, phase, evidence_name):
+def api(vm, phase, evidence_name, *, state_name="api-state.json", timeout=900):
+    if state_name not in ("api-state.json", "audit-pending-state.json"):
+        raise VerificationError("unexpected private API state name")
     extra = f" --filebridge-bin {GUEST}/filebrowser-agentctl" if phase == "protocols" else ""
-    result = vm.command_on_guest(f"python3 -B {SOURCE}/scripts/tests/shared-host-api.py {phase} --url https://{TLS_NAME}:{TLS_PORT} --ca-file {GUEST}/ca.crt --admin-password-file {GUEST}/admin-password --state-file {GUEST}/api-state.json --evidence {GUEST}/{evidence_name}{extra}", check=False, timeout=900)
+    result = vm.command_on_guest(f"python3 -B {SOURCE}/scripts/tests/shared-host-api.py {phase} --url https://{TLS_NAME}:{TLS_PORT} --ca-file {GUEST}/ca.crt --admin-password-file {GUEST}/admin-password --state-file {GUEST}/{state_name} --evidence {GUEST}/{evidence_name}{extra}", check=False, timeout=timeout)
     try:
-        report = json.loads(vm.read_file(GUEST + "/" + evidence_name))
+        if phase.startswith("audit-pending-"):
+            raw = vm.command_on_guest("cat -- " + shlex.quote(GUEST + "/" + evidence_name), timeout=15).stdout
+        else:
+            raw = vm.read_file(GUEST + "/" + evidence_name)
+        report = json.loads(raw)
     except (VerificationError, ValueError, OSError):
         report = {"phase": phase, "passed": False, "failure": "API helper did not produce its sanitized evidence; private output suppressed"}
     if result.returncode or not report.get("passed"):
@@ -662,6 +669,209 @@ def api(vm, phase, evidence_name):
         error.api_evidence = report
         raise error
     return report
+
+
+def pending_container_script(image_id, container_id=None, *, kill=False):
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) or (container_id is not None and not re.fullmatch(r"[0-9a-f]{64}", container_id)):
+        raise VerificationError("invalid pending probe container identity")
+    if kill and container_id is None:
+        raise VerificationError("pending probe kill requires the previously verified container")
+    source = "import json, re, subprocess\nexpected_image=" + repr(image_id) + "\nexpected_id=" + repr(container_id) + "\nkill=" + repr(kill) + "\n"
+    source += r'''def docker(*args, timeout=5):
+    return subprocess.run(['docker','--host','unix:///var/run/docker.sock',*args], capture_output=True, check=True, timeout=timeout,
+                          env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','HOME':'/root'}).stdout
+ids=docker('container','ls','--all','--quiet','--filter','label=com.docker.compose.project=cf-filebrowser').decode().split()
+if len(ids)!=1 or not re.fullmatch(r'[0-9a-f]{12,64}',ids[0]): raise RuntimeError('pending container selection rejected')
+info=json.loads(docker('container','inspect',ids[0]))[0]
+def valid(value):
+    labels=value.get('Config',{}).get('Labels',{})
+    return (re.fullmatch(r'[0-9a-f]{64}',value.get('Id','')) is not None
+            and (expected_id is None or value['Id']==expected_id) and value.get('Image')==expected_image
+            and labels.get('com.docker.compose.project')=='cf-filebrowser'
+            and labels.get('com.docker.compose.service')=='filebrowser-enterprise'
+            and value.get('HostConfig',{}).get('RestartPolicy',{}).get('Name')=='unless-stopped')
+if not valid(info): raise RuntimeError('pending container identity rejected')
+if kill:
+    if info.get('State',{}).get('Running') is not True: raise RuntimeError('pending container already stopped')
+    before=info
+    docker('container','kill','--signal','KILL',info['Id'],timeout=15)
+    info=json.loads(docker('container','inspect',before['Id']))[0]
+    if (not valid(info) or info.get('State',{}).get('Running') is not False or info['State'].get('ExitCode')!=137
+            or info['State'].get('OOMKilled') is not False or info.get('RestartCount')!=before.get('RestartCount')):
+        raise RuntimeError('pending container interruption not verified')
+print(json.dumps({'id':info['Id'],'image':info['Image'],'running':info.get('State',{}).get('Running'),
+                  'restart_count':info.get('RestartCount'),'healthy':info.get('State',{}).get('Health',{}).get('Status')=='healthy'},sort_keys=True))
+'''
+    return "python3 -B - <<'PENDING_CONTAINER'\n" + source + "PENDING_CONTAINER\n"
+
+
+def pending_filesystem_script():
+    return f"""python3 -B - <<'PENDING_FILES'
+import importlib.util, json
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('pending_api', '{SOURCE}/scripts/tests/shared-host-api.py')
+api=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(api)
+control=json.loads(api.protected_path('{GUEST}/audit-pending-state.control.json',secret=True).read_bytes())
+print(json.dumps(api.audit_pending_filesystem(control),sort_keys=True))
+PENDING_FILES
+"""
+
+
+PENDING_API_PHASES = ("audit-pending-prepare", "audit-pending-hold", "audit-pending-verify")
+PENDING_API_CHECKS = frozenset((
+    "administrator_login", "administrator_login_session_shape", "administrator_identity", "administrator_privilege",
+    "pending_create", "pending_lookup", "pending_created_once", "pending_login", "pending_login_session_shape", "pending_ordinary_identity",
+    "audit_pending_directory_create", "audit_pending_original_create", "audit_pending_original_read", "audit_pending_original_download",
+    "audit_pending_query", "audit_pending_query_bounded", "audit_pending_no_prior_modify", "audit_pending_prepared",
+    "audit_pending_writer_login", "audit_pending_writer_login_session_shape", "audit_pending_prefix_shape", "audit_pending_connection_interrupted",
+    "audit_pending_hold_completed", "audit_pending_one_recovered_event", "audit_pending_event_shape", "audit_pending_recovered_identity",
+    "audit_pending_recovered_terminal", "audit_pending_real_request_id", "audit_pending_exact_request_lookup",
+    "audit_pending_restarted_writer_login", "audit_pending_restarted_writer_login_session_shape", "audit_pending_restarted_download",
+    "audit_pending_original_not_overwritten", "audit_pending_following_write", "audit_pending_following_download", "audit_pending_following_read",
+))
+
+
+def pending_api_failure(report, phase):
+    if phase not in PENDING_API_PHASES:
+        raise VerificationError("invalid pending API evidence phase")
+    fallback = {"version": 1, "phase": phase, "passed": False, "checks": [], "failure": "invalid_api_evidence"}
+    if (not isinstance(report, dict) or type(report.get("version")) is not int or report["version"] != 1
+            or report.get("phase") != phase or type(report.get("passed")) is not bool
+            or not isinstance(report.get("checks"), list) or len(report["checks"]) > 100):
+        return fallback
+    checks = []
+    for check in report["checks"]:
+        if (not isinstance(check, dict) or not set(check).issubset({"check", "passed", "http_status", "record_count"})
+                or check.get("check") not in PENDING_API_CHECKS or type(check.get("passed")) is not bool):
+            return fallback
+        for key, minimum, maximum in (("http_status", 100, 599), ("record_count", 0, 100)):
+            if key in check and (type(check[key]) is not int or not minimum <= check[key] <= maximum):
+                return fallback
+        checks.append(dict(check))
+    safe = {"version": 1, "phase": phase, "passed": False, "checks": checks,
+            "failure": "api_check_failed" if any(not check["passed"] for check in checks) else "api_phase_failed"}
+    if type(report.get("requests")) is int and 0 <= report["requests"] <= 100:
+        safe["requests"] = report["requests"]
+    # Never copy failure text, arbitrary response fields, credentials or IDs.
+    return safe
+
+
+def audit_pending_interrupt(server, client, args, evidence, image_id, baseline):
+    """Only a dedicated synthetic namespace, before the main acceptance seed."""
+    operation = "sentinel"
+    summary = {"passed": False, "operation": operation, "checks": []}
+    evidence["audit_pending"] = summary
+    def check(label, condition, count=None):
+        entry = {"check": label, "passed": bool(condition)}
+        if count is not None:
+            entry["count"] = count
+        summary["operation"] = operation
+        summary["checks"].append(entry)
+        record_stage(args, evidence, label)
+        if not condition:
+            raise VerificationError(label)
+    def phase(name):
+        expected_phase = "audit-pending-" + name
+        try:
+            return api(client, expected_phase, expected_phase + ".json",
+                       state_name="audit-pending-state.json", timeout=140 if name == "hold" else 300)
+        except VerificationError as error:
+            failure = VerificationError("pending API phase failed; sanitized evidence retained")
+            failure.pending_phase = expected_phase
+            failure.api_evidence = pending_api_failure(getattr(error, "api_evidence", None), expected_phase)
+            raise failure from None
+    def filesystem():
+        return json.loads(server.command_on_guest(pending_filesystem_script(), timeout=15).stdout)
+    holder, outcome = None, {}
+    try:
+        for vm in (server, client):
+            check("audit_pending_sentinel_before", sentinel_state(vm) == baseline[vm.name])
+        operation = "prepare"
+        prepared = phase("prepare")
+        check("audit_pending_prepared", prepared.get("passed") is True, len(prepared.get("checks", [])))
+        server.write_file(GUEST + "/audit-pending-state.control.json", client.read_file(GUEST + "/audit-pending-state.control.json"))
+        operation = "observe"
+        original = filesystem()
+        check("audit_pending_clean_namespace", original.get("temporary") is None)
+        operation = "identity"
+        container = json.loads(server.command_on_guest(pending_container_script(image_id), timeout=20).stdout)
+        check("audit_pending_fixed_image_running", container.get("running") is True and container.get("healthy") is True)
+        def hold():
+            try:
+                outcome["report"] = phase("hold")
+            except Exception as error:
+                outcome["failed"] = True
+                if hasattr(error, "api_evidence"):
+                    outcome["api_evidence"] = pending_api_failure(error.api_evidence, "audit-pending-hold")
+        operation = "hold"
+        holder = threading.Thread(target=hold, name="audit-pending-client")
+        holder.start()
+        deadline = time.monotonic() + 45
+        ready = None
+        operation = "observe"
+        summary["operation"] = operation
+        record_stage(args, evidence, "audit_pending_wait_for_persisted_prefix")
+        while time.monotonic() < deadline:
+            observed = filesystem()
+            check_same = observed.get("target") == original["target"] and observed.get("directory") == original["directory"]
+            if not check_same:
+                check("audit_pending_original_unchanged_before_kill", False)
+            if observed.get("temporary") and observed["temporary"].get("complete") is True:
+                ready = observed
+                break
+            if not holder.is_alive():
+                break
+            time.sleep(0.25)
+        check("audit_pending_persisted_prefix_observed", ready is not None, 1 if ready is not None else 0)
+        operation = "kill"
+        stopped = json.loads(server.command_on_guest(pending_container_script(image_id, container["id"], kill=True), timeout=35).stdout)
+        check("audit_pending_only_verified_service_killed", stopped.get("running") is False and stopped.get("id") == container["id"])
+        operation = "hold"
+        holder.join(timeout=20)
+        if "api_evidence" in outcome:
+            summary["failed_api"] = outcome["api_evidence"]
+        check("audit_pending_client_interruption_observed", not holder.is_alive() and not outcome.get("failed") and outcome.get("report", {}).get("passed") is True)
+        operation = "observe"
+        check("audit_pending_stopped_files_preserved", filesystem() == ready)
+        operation = "start"
+        server.command_on_guest(f"bash {SOURCE}/deploy/shared-host/manage.sh start --hostname {server.name}", timeout=900)
+        healthy(server)
+        restarted = json.loads(server.command_on_guest(pending_container_script(image_id, container["id"]), timeout=20).stdout)
+        check("audit_pending_formal_same_image_restart", restarted.get("running") is True and restarted.get("healthy") is True)
+        operation = "observe"
+        check("audit_pending_restart_files_preserved", filesystem() == ready)
+        operation = "verify"
+        verified = phase("verify")
+        check("audit_pending_recovered_and_following_write", verified.get("passed") is True, len(verified.get("checks", [])))
+        for label in ("audit_pending_recovered_terminal", "audit_pending_exact_request_lookup",
+                      "audit_pending_original_not_overwritten", "audit_pending_following_write", "audit_pending_following_read"):
+            matches = [entry for entry in verified.get("checks", []) if entry.get("check") == label]
+            check(label, len(matches) == 1 and matches[0].get("passed") is True)
+        operation = "sentinel"
+        for vm in (server, client):
+            check("audit_pending_sentinel_after", sentinel_state(vm) == baseline[vm.name])
+        summary["passed"] = True
+        record_stage(args, evidence, "audit_pending_interruption_recovery_verified")
+    except Exception as error:
+        summary["passed"] = False
+        summary["operation"] = operation
+        if hasattr(error, "api_evidence") and getattr(error, "pending_phase", None) in PENDING_API_PHASES:
+            summary["failed_api"] = pending_api_failure(error.api_evidence, error.pending_phase)
+        record_stage(args, evidence, "audit_pending_interruption_probe_failed")
+        raise VerificationError("audit_pending_interruption_probe_failed; private evidence retained") from None
+    finally:
+        if holder is not None:
+            # Client socket finally closes by 120s; existing SSH execution has
+            # an independent 140s timeout plus a bounded 15s evidence read.
+            # Never clear its files or kill a VM.
+            holder.join(timeout=160)
+            if not summary["passed"] and "api_evidence" in outcome:
+                summary["failed_api"] = outcome["api_evidence"]
+                record_stage(args, evidence, "audit_pending_interruption_probe_failed")
+            if holder.is_alive():
+                summary["passed"] = False
+                check("audit_pending_client_deadline", False)
 
 
 def build_filebridge(vm):
@@ -679,6 +889,8 @@ test -z "$(git -C {SOURCE} status --porcelain=v1)"
 
 UI_CASE_IDS = ('crud', 'png', 'jpg', 'xlsx', 'logout')
 UI_CASE_STATUSES = ('passed', 'failed', 'timedOut', 'skipped', 'interrupted')
+UI_CASE_STAGES = {case: ('login', 'listing') + (('upload', 'edit', 'save', 'rename', 'download', 'delete')
+                  if case == 'crud' else (case,)) for case in UI_CASE_IDS}
 
 
 def ui_case_evidence(raw):
@@ -691,14 +903,19 @@ def ui_case_evidence(raw):
         attempts, final, last_retry = [], {}, {}
         for line in lines:
             record = json.loads(line)
-            if not isinstance(record, dict) or set(record) != {'case', 'status', 'retry'}:
+            if not isinstance(record, dict) or set(record) != {'case', 'status', 'retry', 'stage'}:
                 raise ValueError('case fields invalid')
             case, status, retry = record['case'], record['status'], record['retry']
             if case not in UI_CASE_IDS or status not in UI_CASE_STATUSES or type(retry) is not int or not 0 <= retry <= 2:
                 raise ValueError('case values invalid')
+            stage = record['stage']
+            if stage is not None and (type(stage) is not str or stage not in UI_CASE_STAGES[case]):
+                raise ValueError('case operation invalid')
+            if status == 'passed' and stage != UI_CASE_STAGES[case][-1]:
+                raise ValueError('passed case has no final operation')
             if retry != last_retry.get(case, -1) + 1:
                 raise ValueError('case retry order invalid')
-            attempts.append({'case': case, 'status': status, 'retry': retry})
+            attempts.append({'case': case, 'status': status, 'retry': retry, 'stage': stage})
             final[case], last_retry[case] = status, retry
         return {'schema': 1, 'attempts': attempts, 'final': final,
                 'passed': set(final) == set(UI_CASE_IDS) and all(status == 'passed' for status in final.values())}
@@ -1131,6 +1348,8 @@ test ! -e /srv/storage/cf-filebrowser-enterprise
         record_stage(args, evidence, "second-vm-real-lan-and-https-boundaries")
         evidence["initial_lan_boundary"] = lan_boundary(client)
         evidence["checks"].append("second-VM HTTPS UI/API controls before/after, curl certificate rejection, connected denied TCP peer refused before TLS, forwarded headers ignored on allowed HTTPS")
+        record_stage(args, evidence, "audit-pending-process-interruption")
+        audit_pending_interrupt(server, client, args, evidence, image_id, baseline)
         record_stage(args, evidence, "initial-real-api-exercise")
         evidence["initial_api"] = api(client, "exercise", "api-initial.json")
         record_stage(args, evidence, "fixed-source-filebridge-build")

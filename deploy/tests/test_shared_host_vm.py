@@ -92,7 +92,8 @@ class UIRasterEvidenceTests(unittest.TestCase):
             {'width': 640, 'height': 480, 'nonWhitePixels': 180, 'pixelSha256': 'b' * 64}]}
 
     def case_log(self):
-        return b''.join(json.dumps({'case': case, 'status': 'passed', 'retry': 0}).encode() + b'\n'
+        return b''.join(json.dumps({'case': case, 'status': 'passed', 'retry': 0,
+                                    'stage': 'delete' if case == 'crud' else case}).encode() + b'\n'
                         for case in ('crud', 'png', 'jpg', 'xlsx', 'logout'))
 
     def test_case_summary_requires_every_fixed_case_final_success(self):
@@ -100,7 +101,7 @@ class UIRasterEvidenceTests(unittest.TestCase):
         self.assertTrue(report['passed'])
         self.assertEqual(set(report['final']), {'crud', 'png', 'jpg', 'xlsx', 'logout'})
         retry = self.case_log().replace(b'"passed"', b'"failed"', 1)
-        retry += b'{"case":"crud","status":"passed","retry":1}\n'
+        retry += b'{"case":"crud","status":"passed","retry":1,"stage":"delete"}\n'
         self.assertTrue(harness.ui_case_evidence(retry)['passed'])
         partial = self.case_log().splitlines(keepends=True)[0]
         self.assertFalse(harness.ui_case_evidence(partial)['passed'])
@@ -114,14 +115,51 @@ class UIRasterEvidenceTests(unittest.TestCase):
                        {'case': 'crud', 'status': 'passed', 'retry': 3},
                        {'case': 'crud', 'status': 'passed', 'retry': '0'},
                        {'case': 'crud', 'status': 'passed', 'retry': 0, 'title': 'PRIVATE-PASSWORD'}):
+            record['stage'] = 'delete'
             bad.append(json.dumps(record).encode() + b'\n')
         bad.append(self.case_log() + self.case_log().splitlines(keepends=True)[0])
-        bad.append(b'{"case":"crud","status":"passed","retry":2}\n')
+        bad.append(b'{"case":"crud","status":"passed","retry":2,"stage":"delete"}\n')
         for raw in bad:
             with self.subTest(raw=raw):
                 with self.assertRaises(harness.VerificationError) as caught:
                     harness.ui_case_evidence(raw)
                 self.assertNotIn('PRIVATE', str(caught.exception))
+
+    def test_case_summary_retains_only_last_entered_operation(self):
+        for case, stages in {'crud': ('login', 'listing', 'upload', 'edit', 'save', 'rename', 'download', 'delete'),
+                             'png': ('login', 'listing', 'png'), 'jpg': ('login', 'listing', 'jpg'),
+                             'xlsx': ('login', 'listing', 'xlsx'), 'logout': ('login', 'listing', 'logout')}.items():
+            for stage in stages:
+                with self.subTest(case=case, stage=stage):
+                    record = {'case': case, 'status': 'failed', 'retry': 0, 'stage': stage}
+                    report = harness.ui_case_evidence(json.dumps(record).encode())
+                    self.assertFalse(report['passed'])
+                    self.assertEqual(report['attempts'], [record])
+
+    def test_case_summary_rejects_invalid_and_cross_case_operations(self):
+        for case, stage in (('crud', 'png'), ('png', 'edit'), ('xlsx', 'logout'), ('logout', 'xlsx'),
+                            ('jpg', 'PRIVATE-URL-TOKEN'), ('crud', True), ('crud', 1), ('crud', [])):
+            with self.subTest(case=case, stage=stage):
+                record = {'case': case, 'status': 'failed', 'retry': 0, 'stage': stage}
+                with self.assertRaises(harness.VerificationError) as caught:
+                    harness.ui_case_evidence(json.dumps(record).encode())
+                self.assertNotIn('PRIVATE', str(caught.exception))
+
+    def test_passed_case_requires_known_final_operation(self):
+        for case in ('crud', 'png', 'jpg', 'xlsx', 'logout'):
+            for stage in (None, 'login', 'listing'):
+                with self.subTest(case=case, stage=stage):
+                    record = {'case': case, 'status': 'passed', 'retry': 0, 'stage': stage}
+                    with self.assertRaises(harness.VerificationError):
+                        harness.ui_case_evidence(json.dumps(record).encode())
+
+    def test_failed_unknown_operation_is_retained_without_claiming_progress(self):
+        for status in ('failed', 'timedOut', 'skipped', 'interrupted'):
+            with self.subTest(status=status):
+                record = {'case': 'crud', 'status': status, 'retry': 0, 'stage': None}
+                report = harness.ui_case_evidence(json.dumps(record).encode())
+                self.assertFalse(report['passed'])
+                self.assertIsNone(report['attempts'][0]['stage'])
 
     def test_ui_failure_retains_before_each_case_failure_with_no_private_output(self):
         vm = mock.Mock()

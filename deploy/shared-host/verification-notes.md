@@ -1015,3 +1015,138 @@ CI because this Windows workspace has no Go toolchain. The preceding red test
 is preserved above. The protected-parent backup repair was independently
 rerun locally: 20 backup tests and 10 restore-evidence tests passed. These local
 checks do not establish a successful actual blank-VM recovery.
+
+
+## e5deaed7 complete backend and deployment checks
+
+Source `e5deaed7a1a37d78051434953acb9e8e9617512f` passed the actual complete
+`go test -race -v ./... -timeout 5m` command in [backend job
+101743498489](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34122486563/job/101743498489)
+with Go 1.26.8 linux/amd64. The HTTP package completed in 108.335 seconds.
+Both real-index logical/physical size cases passed, including the same SQL
+physical bucket with two different logical lengths returning no duplicate.
+Invalid-stat and retained ACL/secure-open/identity/cache/alias checks passed.
+The Windows-specific allocation rounding branch was not executed on Linux.
+
+[Deployment job 101743497377](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34122486488/job/101743497377)
+passed the existing `make validate-deployment` entry point: 25 and 170 tests,
+including unsafe-parent rejection and the protected-parent control, followed by
+the retained configuration, systemd, Dockerfile and clean-worktree checks.
+These results repair the prior two red regressions. They do not establish a
+successful full Lint run or actual blank-environment recovery.
+
+## ac9f7a5b actual FileBridge and WebDAV pass; UI still failed
+
+The completed [fixed-image job
+101735729918](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34119115840/job/101735729918)
+used source `ac9f7a5b3154ce3e5ded83293687a0fa8decfc3c`. Both Debian 13.6/systemd
+guests used Docker 29.8.0 and Compose 5.5.1; total virtual disk and RAM were
+78,383,906,816 and 4,294,967,296 bytes. Its registry/guest Image ID was
+`sha256:16182283f3d865533b0d6c313e8d85e3397e758c462a43a25401b3256eec6229`;
+the builder/configuration ID was
+`sha256:7fb87e18bf4153185f6e7a8004eb5d0cc6b9e1e824c7814f6bdd9fa63dce23d2`.
+
+All eight actual second-VM LAN checks passed (denied-source TLS EOF after 19 ms,
+zero application bytes, wrong CA curl 60). Initial API acceptance passed 226
+checks over 167 requests. The real protocol phase then passed all 235 checks
+over 80 HTTP requests and 33 actual FileBridge binary calls. It verified the
+repaired list display size while retaining byte-exact upload/read/download,
+trusted HTTPS, least privileges, Token intersections/revocation, source/root/
+traversal/dangerous-command refusal and local audit redaction. The real WebDAV
+client exercised PROPFIND, MKCOL, PUT, GET/HEAD/Range, COPY/MOVE/DELETE, scoped
+hrefs, ordinary-user Create/Modify/Download/Delete restrictions, Token
+intersections/revocation and destination boundary rejection.
+
+The first failure was `initial-existing-playwright-ui`: the ordinary management
+user's existing `npx playwright test --project shared-host` exited 1. Node/npm,
+Chromium dependencies and NSS CA trust setup had completed. This older head did
+not yet retain per-case or raster diagnostics, so the specific browser failure
+is unknown; it is not attributed to the later XLSX repair. No private browser
+logs were fetched. Only the permitted VM result and build-input artifacts were
+retrieved. UI, container/daemon/host restart and blank restore did not pass or
+complete in this run. This protocol client evidence does not certify a real
+OnlyOffice Document Server, Hermes or WeChat integration.
+
+
+The e5deaed7 regular frontend job 101743498431 also passed 137 tests in 18
+files (Vitest 4.1.8, 12.64 seconds) using the existing `npm i && npm run test`
+command. The retained full Lint job 101743498488 still failed: 112 findings
+across 27 files (errcheck 8, govet 84, ineffassign 1, staticcheck 13, unused 6).
+No new duplicate implementation/helper/test diagnostic was introduced. Compared
+with cf1b6bc9, 111 diagnostics match exactly; the remaining unchanged-file
+finding at `http/audit_token_test.go:320:17` still concerns a redundant explicit
+`*users.User` type but was reported as QF1011 instead of ST1023. This is not a
+claim that all diagnostic text is identical or an explanation of analyzer
+selection. The broader source cleanup scope remains unresolved; no rules,
+checks or assertions were disabled to obtain a green result.
+
+
+## e5deaed7 existing source UI advances to proxy setup
+
+[Source regression job 101744099651](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34122486557/job/101744099651)
+passed frontend types/lint/unit/build and the independent FileBridge tests,
+then ran the unchanged full `make test-playwright` entry point. Sharing passed
+13/13 (36.2 s), Settings 25/25 (52.7 s), Noauth 29/29 (1.1 min), and General
+23/23 (57.6 s). The latter now includes the actual duplicate/context-menu and
+copy-label regressions. JWT passed its four applicable cases (16.5 s); its 12
+existing project-mismatch skips remain visible and were not added by this task.
+
+The next proxy image failed at `Dockerfile.playwright-proxy:15`, specifically
+the existing `proxy-setup.ts:16` page-title assertion after 5 seconds. The title
+was the allowlisted `Graham's Filebrowser - Files`, while the test expected an
+additional proxy username suffix. This is still being investigated; no title,
+authentication or sharing assertion was removed. The previews, OIDC, no-config
+and screenshot images after proxy were not executed in this run. This source
+UI run is separate from the real fixed-image VM UI failure on ac9f7a5b.
+
+
+CI checkout provenance was checked separately: regular backend/frontend jobs
+101743498489 / 101743498431 used GitHub's PR merge checkout
+`0f740b270a7e8187b8748b207d8ef3d7b243fc37`, while shared-host source job
+101744099651 checked out the explicit head `e5deaed7a1a37d78051434953acb9e8e9617512f`.
+The GitHub commit API confirms their tracked tree SHA is identical:
+`b3db392a0f962c19ff02a32ca6c7f491cdd561cd`. Thus the regular results apply to the same
+tracked content, with the actual merge commit distinguished from the PR head.
+The fixed-source build/VM workflow explicitly checks out the head SHA.
+
+
+## Bounded Pending interruption and failure diagnostics, awaiting a real VM run
+
+The existing VM/API harness now prepares a dedicated synthetic directory and
+ordinary scoped user before the main acceptance seed. It sends 64 KiB of a
+finite 1 MiB PUT, holds the trusted TLS connection with a 120-second bound,
+and observes only a stable, matching new temporary prefix while the original
+file is unchanged. Only then may it kill the uniquely verified project/service
+container. Its image, identity, stopped state and both unrelated sentinels are
+checked. The formal start entry must restart the same image/container; the
+real audit API must then return the single `unknown/process_interrupted` event,
+match its exact request ID, preserve the original bytes and allow a subsequent
+ordinary write/read. Failure preserves the scene; fixed operation labels and
+strictly allowlisted API check/status/count evidence identify the failing stage.
+
+Two review-time harness defects were reproduced before repair. A fixture read
+from the real Compose YAML rejected the old hardcoded service label; the guard
+now matches `filebrowser-enterprise`, retaining wrong-service/container/image
+rejection. A real Client.request URL test, checked against the backend query
+allowlist, rejected the old `requestId` parameter; the query now uses `requestID`
+while the returned DTO still uses `requestId`. This avoids a mock-only apparent
+pass followed by a real API 400. No product contract or assertion changed.
+
+The existing shared-host UI case summary now additionally retains only the
+last entered operation from a fixed enum. A failed/unknown stage cannot become
+a pass; passed cases require their final operation. Original CRUD/preview/
+logout assertions and timeouts remain. For the existing proxy setup failure,
+the original title assertion runs first with its original deadline. Only on
+failure do two bounded same-browser probes check actual identity, permissions,
+source scope and directory metadata using fixed booleans/statuses. Even if
+those probes pass, the original title error is rethrown. Credentials, raw API
+bodies, browser errors and URLs are not copied into diagnostics.
+
+Executed locally after integration: `python -B -m unittest
+ deploy.tests.test_shared_host_audit_pending deploy.tests.test_shared_host_vm
+ deploy.tests.test_shared_host_protocols` passed 92 tests (19 + 56 + 17).
+Both modified existing Playwright files passed Node 22.23.1 strip-types syntax
+checks; Python compilation and `git diff --check` also passed. These are harness
+regressions, not actual Docker/browser/Pending acceptance. The running e5deaed7
+VM has none of these new Pending/operation diagnostics. Actual Store EIO
+injection is separate, remains unexecuted, and is not implied by Pending recovery.

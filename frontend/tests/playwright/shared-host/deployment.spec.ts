@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type TestInfo } from "@playwright/test";
 
 let credentials: { username: string; password: string };
 let source: string;
@@ -31,6 +31,12 @@ const evidenceCaseIds: Record<string, string> = {
   "ordinary user logs out and loses access to the listing": "logout",
 };
 
+type UIStage = "login" | "listing" | "upload" | "edit" | "save" | "rename" | "download" | "delete" |
+  "png" | "jpg" | "xlsx" | "logout";
+// A stage means only the last operation entered, never that it completed.
+const enteredStage = new WeakMap<TestInfo, UIStage>();
+const enterStage = (testInfo: TestInfo, stage: UIStage) => enteredStage.set(testInfo, stage);
+
 test.afterEach(async ({}, testInfo) => {
   const caseId = evidenceCaseIds[testInfo.title];
   const status = testInfo.status;
@@ -41,33 +47,38 @@ test.afterEach(async ({}, testInfo) => {
   }
   await mkdir(output, { recursive: true, mode: 0o700 });
   await appendFile(resolve(output, "ui-case-evidence.ndjson"),
-    JSON.stringify({ case: caseId, status, retry: testInfo.retry }) + "\n", { mode: 0o600 });
+    JSON.stringify({ case: caseId, status, retry: testInfo.retry, stage: enteredStage.get(testInfo) ?? null }) + "\n", { mode: 0o600 });
 });
 
-test.beforeEach(async ({ page }) => {
+test.beforeEach(async ({ page }, testInfo) => {
+  enterStage(testInfo, "login");
   await page.goto("/login");
   await page.getByPlaceholder("Username").fill(credentials.username);
   await page.getByPlaceholder("Password").fill(credentials.password);
   await page.getByRole("button", { name: "Login", exact: true }).click();
   await page.waitForURL("**/files/**");
+  enterStage(testInfo, "listing");
   await page.goto(listing());
   await expect(page.locator(".listing-items")).toBeVisible();
 });
 
-test("ordinary user uploads, edits, renames, downloads exact bytes and deletes", async ({ page }) => {
+test("ordinary user uploads, edits, renames, downloads exact bytes and deletes", async ({ page }, testInfo) => {
   const originalName = `ui-${Date.now()} 中文 空格.txt`;
   const renamedBase = `ui-${Date.now()} renamed`;
   const renamedName = renamedBase + ".txt";
   const original = Buffer.from("UI upload with Chinese filename.\n", "utf8");
   const edited = Buffer.from("Saved through the existing editor.\n", "utf8");
 
+  enterStage(testInfo, "upload");
   await page.locator("#upload-input").setInputFiles({ name: originalName, mimeType: "text/plain", buffer: original });
   await expect(item(page, originalName)).toBeVisible({ timeout: 30000 });
+  enterStage(testInfo, "edit");
   await item(page, originalName).dblclick();
   await expect(page.locator(".ace_text-layer")).toContainText("UI upload with Chinese filename.");
   await page.locator(".ace_content").click();
   await page.keyboard.press("ControlOrMeta+A");
   await page.keyboard.insertText(edited.toString("utf8"));
+  enterStage(testInfo, "save");
   const saved = page.waitForResponse((response) =>
     response.url().includes("/api/resources") && ["PUT", "POST"].includes(response.request().method()));
   await page.locator(".overflow-menu-button").click();
@@ -75,6 +86,7 @@ test("ordinary user uploads, edits, renames, downloads exact bytes and deletes",
   expect((await saved).ok()).toBeTruthy();
   await page.goto(listing());
 
+  enterStage(testInfo, "rename");
   await item(page, originalName).click({ button: "right" });
   await page.locator('button[aria-label="Rename"]').click();
   await page.locator('input[aria-label="New Name"]').fill(renamedBase);
@@ -82,6 +94,7 @@ test("ordinary user uploads, edits, renames, downloads exact bytes and deletes",
   await expect(item(page, renamedName)).toBeVisible();
   await expect(item(page, originalName)).toHaveCount(0);
 
+  enterStage(testInfo, "download");
   await item(page, renamedName).click({ button: "right" });
   const downloading = page.waitForEvent("download");
   await page.locator('button[aria-label="Download"]').click();
@@ -91,6 +104,7 @@ test("ordinary user uploads, edits, renames, downloads exact bytes and deletes",
   if (!filename) throw new Error("Browser download did not produce a file");
   expect(digest(await readFile(filename))).toBe(digest(edited));
 
+  enterStage(testInfo, "delete");
   await item(page, renamedName).click({ button: "right" });
   await page.locator('button[aria-label="Delete"]').click();
   await page.locator('button[aria-label="Confirm-Delete"]').click();
@@ -98,7 +112,8 @@ test("ordinary user uploads, edits, renames, downloads exact bytes and deletes",
 });
 
 for (const filename of ["picture.png", "photo.jpg"]) {
-  test(`decodes the actual ${filename} preview`, async ({ page }) => {
+  test(`decodes the actual ${filename} preview`, async ({ page }, testInfo) => {
+    enterStage(testInfo, filename === "picture.png" ? "png" : "jpg");
     await item(page, filename).dblclick();
     await expect(page.locator("#previewer")).toBeVisible();
     await expect.poll(() => page.locator("#previewer img").evaluateAll((images) =>
@@ -107,7 +122,8 @@ for (const filename of ["picture.png", "photo.jpg"]) {
   });
 }
 
-test("renders distinct nonblank XLSX content in the actual document viewer", async ({ page }) => {
+test("renders distinct nonblank XLSX content in the actual document viewer", async ({ page }, testInfo) => {
+  enterStage(testInfo, "xlsx");
   const observations: Array<{ width: number; height: number; nonWhitePixels: number; pixelSha256: string }> = [];
   for (const filename of ["spreadsheet.xlsx", "spreadsheet-alternative.xlsx"]) {
     await page.goto(listing());
@@ -163,7 +179,8 @@ test("renders distinct nonblank XLSX content in the actual document viewer", asy
   expect(observations[0].pixelSha256).not.toBe(observations[1].pixelSha256);
 });
 
-test("ordinary user logs out and loses access to the listing", async ({ page }) => {
+test("ordinary user logs out and loses access to the listing", async ({ page }, testInfo) => {
+  enterStage(testInfo, "logout");
   await page.locator('button[aria-label="logout-button"]').click();
   await page.waitForURL("**/login**");
   await page.goto(listing());
