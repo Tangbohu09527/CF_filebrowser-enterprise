@@ -755,3 +755,37 @@ using Python 3.12.10 and the existing OpenSSL 3.5.6. Shell syntax and diff check
 passed. The intermediate test-only shared workflow 34114138692 was cancelled
 after its regular workflow produced the preview red test; its unfinished VM
 steps are not passes. The subsequent complete head workflow remains required.
+
+## a276d255 backend pass, source-copy race investigation and formatter evidence
+
+Both the 890a351e and a276d255 complete regular backend race suites passed.
+The 890a351e HTTP package took 86.556 seconds; new directory/preview checks and
+original bad-image/oversized-image 500 and permission-revocation 403 regressions
+passed. The 890a351e source workflow passed Sharing 13/13, Settings 25/25 and
+Noauth 28/29. Both original indexing-size UI cases passed. The remaining copy
+case reached its final error check after both PATCH payload/result and visible
+file assertions succeeded, then reported two browser NetworkErrors. Its retries
+encountered data left by that first attempt. No data was cleared to hide this.
+
+The old log lacks the failed request URLs, so navigation cancelling an in-flight
+refresh is an inference from the application and test sequence, not a proven
+historical transport cause. Copy starts a directory refresh before displaying
+its success notification; the test immediately performed a full navigation.
+The existing copy helper now tracks only current-directory GET requests started
+after its copy PATCH, verifies the refresh's 200 status and completed body, then
+continues the original notification/navigation/assertions. It also reports at
+most eight failed requests as fixed endpoint/method/error categories, without
+URLs, query strings, headers or bodies. The original five-second response wait,
+retry policy and zero-error assertions remain. Node syntax and diff checks
+passed; the existing Playwright entry must provide the runtime result.
+
+a276d255 frontend unit tests passed 115/115 across 17 files, with frontend Lint,
+translations and generated-doc checks passing. Its Lint remained the identical
+112 findings in 27 baseline files, with no added/removed diagnostic. The
+analyzer took 43.558 seconds with the pinned Go 1.26.8 / golangci-lint 2.12.2.
+The existing format job reports success after `go fmt ./...`, but that command
+rewrote 19 CI-workspace files, including two aggregate files from this task.
+It has no cleanliness gate, so success is not proof of clean source formatting.
+Temporary read-only diff output after the unchanged full formatter command
+will retrieve those two official Go 1.26.8 formatting patches. The other 17
+files will not be reformatted in this worktree as incidental cleanup.
