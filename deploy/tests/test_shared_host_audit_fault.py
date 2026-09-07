@@ -78,6 +78,53 @@ class TraceTests(unittest.TestCase):
         counts.feed(b"[pid 101] <... pwrite64 resumed>) = -1 EIO (Input/output error) (INJECTED)\n")
         self.assertEqual(counts.finish()["injected_eio"], 1)
 
+    def test_valid_stream_accepts_partial_line_followed_by_full_read_block(self):
+        line = b'pwrite64(0x3, 0xabcd, 0x1000, 0x1000) = 0x1000\n'
+        stream = line * 1600
+        expected = {"writes": 1600, "successful": 1600, "injected_eio": 0}
+        regular = fault.TraceCounts(100, [3])
+        for offset in range(0, len(stream), 4096):
+            regular.feed(stream[offset:offset + 4096])
+        self.assertEqual(regular.finish(), expected)
+        fragmented = fault.TraceCounts(100, [3])
+        fragmented.feed(stream[:1])
+        fragmented.feed(stream[1:65537])
+        fragmented.feed(stream[65537:])
+        self.assertEqual(fragmented.finish(), expected)
+
+    def test_read_block_line_fragment_and_completed_write_limits_stay_bounded(self):
+        line = b'pwrite64(0x3, 0xabcd, 0x1000, 0x1000) = 0x1000\n'
+        cases = ((line * 1600, "trace_buffer_limit"),
+                 (b'X' * 4097 + b'\n', "trace_line_invalid"),
+                 (b'X' * 4097, "trace_line_limit"))
+        for raw, code in cases:
+            with self.subTest(bound=code):
+                parser = fault.TraceCounts(100, [3])
+                with self.assertRaises(fault.FaultError) as caught:
+                    parser.feed(raw)
+                self.assertEqual(str(caught.exception), code)
+                self.assertEqual(parser.summary()["writes"], 0)
+        parser = fault.TraceCounts(100, [3])
+        for _ in range(100):
+            parser.feed(line * 100)
+        self.assertEqual(parser.finish()["writes"], 10000)
+        with self.assertRaises(fault.FaultError) as caught:
+            parser.feed(line)
+        self.assertEqual(str(caught.exception), "trace_count_limit")
+
+    def test_cumulative_input_limit_rejects_before_buffering_another_small_chunk(self):
+        line = b'pwrite64(0x3, 0xabcd, 0x1000, 0x1000) = 0x1000\n'
+        parser = fault.TraceCounts(100, [3])
+        # Position the accumulator at its boundary without an 80 MiB fixture.
+        parser.input_bytes = 10000 * 2 * 4097 - len(line)
+        parser.feed(line)
+        self.assertEqual(parser.finish()["writes"], 1)
+        with self.assertRaises(fault.FaultError) as caught:
+            parser.feed(b'p')
+        self.assertEqual(str(caught.exception), "trace_input_limit")
+        self.assertEqual(parser.buffer, b'')
+        self.assertEqual(parser.summary()["writes"], 1)
+
     def test_uncertain_trace_never_passes_or_echoes_secrets(self):
         for raw in (b'pwrite64(3, "SECRET_PASSWORD", 4, 0) = 4\n',
                     b'pwrite64(0x4, 0xabc, 0x10, 0) = 0x10\n',

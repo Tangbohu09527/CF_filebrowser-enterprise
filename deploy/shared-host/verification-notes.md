@@ -1402,3 +1402,24 @@ attempt 0 reached the final check with exactly one fixed Firefox NetworkError;
 both copy notifications and the final title had passed. Retries 1 and 2 failed
 at the first notification. There was no failed-HTTP-response block identifying
 an endpoint or status. This run predates the new failed-fetch collector.
+
+
+## Fragmented trace reads retain finite parsing limits
+
+A local counterexample reproduced a false failure in the EIO probe parser:
+1,600 identical valid raw pwrite records passed with 4,096-byte reads but failed
+when one byte was followed by a 65,536-byte read. The old check applied the
+read-size bound to that new block plus the previous partial line. This has not
+been observed as the cause of any real VM result.
+
+The parser now limits each input block to 65,536 bytes, parses complete lines,
+and retains the existing 4,096-byte complete-line/residual limit and 10,000
+completed-write limit. Temporary combined storage is bounded by 65,536 + 4,096
+bytes. A new cumulative raw-input limit of 81,940,000 bytes rejects additional
+input before buffering; this was not an existing cumulative limit. Unknown
+trace forms, wrong descriptors/threads and unmarked EIO remain refused. The
+fragmented-stream red-to-green case and all boundary counterexamples passed;
+the existing VM/Pending/EIO modules passed 117/117 tests locally (1.077 s).
+This changes only the test probe and its existing tests, not product I/O,
+authentication, Audit ordering or timeout contracts. Real strace/VM acceptance
+remains separate from these local parser checks.

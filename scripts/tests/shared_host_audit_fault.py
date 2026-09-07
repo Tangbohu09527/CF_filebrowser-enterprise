@@ -84,14 +84,20 @@ class TraceCounts:
         self.pid, self.fds = pid, set(fds)
         self.thread_check = thread_check
         self.buffer, self.pending = b"", set()
+        self.input_bytes = 0
         self.writes = self.successful = self.injected_eio = 0
 
     def summary(self):
         return {"writes": self.writes, "successful": self.successful, "injected_eio": self.injected_eio}
 
     def feed(self, chunk):
+        require(len(chunk) <= 65536, "trace_buffer_limit")
+        self.input_bytes += len(chunk)
+        # At most 10,000 calls, each at most two 4,096-byte lines plus newline.
+        require(self.input_bytes <= 10000 * 2 * 4097, "trace_input_limit")
+        # The previous bounded fragment may precede a full-sized pipe read.
+        # Parse complete lines before reapplying the 4,096-byte residual bound.
         self.buffer += chunk
-        require(len(self.buffer) <= 65536, "trace_buffer_limit")
         while b"\n" in self.buffer:
             line, self.buffer = self.buffer.split(b"\n", 1)
             require(0 < len(line) <= 4096, "trace_line_invalid")
