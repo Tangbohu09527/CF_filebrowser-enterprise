@@ -18,28 +18,55 @@ services:
       FILEBROWSER_JWT_TOKEN_SECRET_FILE: /run/filebrowser-secrets/jwt_token_secret
       FILEBROWSER_TOTP_SECRET_FILE: /run/filebrowser-secrets/totp_secret
       FILEBROWSER_BOOTSTRAP_PASSWORD_FILE: /run/filebrowser-secrets/bootstrap_admin_password
+      FILEBROWSER_STORAGE_EXPECTED_FILE: /etc/filebrowser-enterprise/storage.identity
+      FILEBROWSER_STORAGE_IDENTITY_FILE: /run/filebrowser-storage-identity
+      FILEBROWSER_STORAGE_FILES_ROOT: /srv/filebrowser/files
     volumes:
       - type: bind
         source: "${CONFIG_ROOT:?CONFIG_ROOT is required}/config.yaml"
         target: /etc/filebrowser-enterprise/config.yaml
         read_only: true
+        bind:
+          create_host_path: false
       - type: bind
         source: "${CONFIG_ROOT:?CONFIG_ROOT is required}/secrets"
         target: /run/filebrowser-secrets
         read_only: true
+        bind:
+          create_host_path: false
       - type: bind
         source: "${DATA_ROOT:?DATA_ROOT is required}"
         target: /var/lib/filebrowser-enterprise
+        bind:
+          create_host_path: false
       - type: bind
         source: "${CACHE_ROOT:?CACHE_ROOT is required}"
         target: /var/cache/filebrowser-enterprise
+        bind:
+          create_host_path: false
       - type: bind
         source: "${FILES_ROOT:?FILES_ROOT is required}"
         target: /srv/filebrowser/files
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${CONFIG_ROOT:?CONFIG_ROOT is required}/storage.identity"
+        target: /etc/filebrowser-enterprise/storage.identity
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/storage/cf-filebrowser-enterprise/.storage-identity
+        target: /run/filebrowser-storage-identity
+        read_only: true
+        bind:
+          create_host_path: false
       - type: bind
         source: "${SOURCE_ROOT:?SOURCE_ROOT is required}/scripts/container-entrypoint.sh"
         target: /opt/filebrowser-enterprise/scripts/container-entrypoint.sh
         read_only: true
+        bind:
+          create_host_path: false
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
     expose:

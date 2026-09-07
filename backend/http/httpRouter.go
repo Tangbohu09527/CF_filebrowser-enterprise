@@ -342,7 +342,14 @@ func StartHttp(ctx context.Context, storage *bolt.BoltStore, shutdownComplete ch
 
 		}
 
-		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+		guardedListener, guardErr := restrictClientNetworks(listener, config.Server.AllowedClientCIDRs)
+		if guardErr != nil {
+			_ = listener.Close()
+			logger.Fatalf("Client network configuration: %v", guardErr)
+			return
+		}
+
+		if err := srv.Serve(guardedListener); err != nil && err != http.ErrServerClosed {
 			logger.Fatalf("Server error: %v", err)
 		}
 	}()

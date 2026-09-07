@@ -6,6 +6,35 @@ die() {
   exit 1
 }
 
+read_storage_identity() {
+  identity_file=$1
+  [ -f "$identity_file" ] && [ ! -L "$identity_file" ] && [ -r "$identity_file" ] ||
+    die "storage identity file is missing, unsafe, or unreadable"
+  [ "$(wc -c < "$identity_file")" -eq 65 ] || die "storage identity must contain 64 hexadecimal characters and one newline"
+  awk '
+    NR == 1 && length($0) == 64 && $0 !~ /[^0-9a-f]/ { value = $0; next }
+    { invalid = 1 }
+    END { if (NR != 1 || invalid || value == "") exit 1; printf "%s", value }
+  ' "$identity_file" || die "storage identity must be one line of 64 lowercase hexadecimal characters"
+}
+
+# Shared-host binds both identities read-only; the disk identity is outside the
+# user-writable files tree. Refuse before opening Secrets or starting the server.
+# Legacy standalone deployment does not set these shared-host-only inputs.
+if [ -n "${FILEBROWSER_STORAGE_EXPECTED_FILE+x}${FILEBROWSER_STORAGE_IDENTITY_FILE+x}${FILEBROWSER_STORAGE_FILES_ROOT+x}" ]; then
+  [ -n "${FILEBROWSER_STORAGE_EXPECTED_FILE:-}" ] &&
+    [ -n "${FILEBROWSER_STORAGE_IDENTITY_FILE:-}" ] &&
+    [ -n "${FILEBROWSER_STORAGE_FILES_ROOT:-}" ] || die "storage identity guard is incompletely configured"
+  expected_identity=$(read_storage_identity "$FILEBROWSER_STORAGE_EXPECTED_FILE")
+  actual_identity=$(read_storage_identity "$FILEBROWSER_STORAGE_IDENTITY_FILE")
+  [ "$expected_identity" = "$actual_identity" ] || die "storage identity does not match the prepared device"
+  [ -d "$FILEBROWSER_STORAGE_FILES_ROOT" ] && [ ! -L "$FILEBROWSER_STORAGE_FILES_ROOT" ] ||
+    die "storage files directory is missing or unsafe"
+  files_device=$(stat -c '%d' "$FILEBROWSER_STORAGE_FILES_ROOT") || die "storage files device could not be read"
+  identity_device=$(stat -c '%d' "$FILEBROWSER_STORAGE_IDENTITY_FILE") || die "storage identity device could not be read"
+  [ "$files_device" = "$identity_device" ] || die "storage files and identity are on different devices"
+fi
+
 read_secret() {
   secret_file=$1
   minimum_length=$2
