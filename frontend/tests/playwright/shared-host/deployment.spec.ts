@@ -32,7 +32,7 @@ const evidenceCaseIds: Record<string, string> = {
 };
 
 type WorkbookStage = `xlsx${1 | 2}_${"request" | "response" | "status" | "viewer" | "decode"}`;
-type UIStage = "login" | "listing" | "upload" | "edit" | "save_menu" | "save_response" | "save_navigation" |
+type UIStage = "login" | "listing" | "upload" | "edit" | "edit_open" | "edit_render" | "edit_focus" | "edit_replace" | "save_menu" | "save_response" | "save_navigation" |
   "rename" | "download" | "delete" | "png" | "jpg" | "xlsx" | "xlsx_evidence" | "xlsx_checks" | "logout" | WorkbookStage;
 // A stage means only the last operation entered, never that it completed.
 const enteredStage = new WeakMap<TestInfo, UIStage>();
@@ -73,10 +73,13 @@ test("ordinary user uploads, edits, renames, downloads exact bytes and deletes",
   enterStage(testInfo, "upload");
   await page.locator("#upload-input").setInputFiles({ name: originalName, mimeType: "text/plain", buffer: original });
   await expect(item(page, originalName)).toBeVisible({ timeout: 30000 });
-  enterStage(testInfo, "edit");
+  enterStage(testInfo, "edit_open");
   await item(page, originalName).dblclick();
+  enterStage(testInfo, "edit_render");
   await expect(page.locator(".ace_text-layer")).toContainText("UI upload with Chinese filename.");
+  enterStage(testInfo, "edit_focus");
   await page.locator(".ace_content").click();
+  enterStage(testInfo, "edit_replace");
   await page.keyboard.press("ControlOrMeta+A");
   await page.keyboard.insertText(edited.toString("utf8"));
   enterStage(testInfo, "save_menu");

@@ -1268,3 +1268,101 @@ The preceding cf8c23f3 deployment CI job 101760200165 passed the existing
 tests (12.616 s). That run predates this restore revision repair. The new
 Pending/EIO probe still awaits its real VM execution; unit/deployment CI
 success does not establish Audit syscall fault or blank restore acceptance.
+
+
+## 49ea34bc real Pending recovery passes; editor failure is earlier than save
+
+[Real VM job 101755076733](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34125846128/job/101755076733)
+completed with failure at the original initial UI stage. All 19 public Pending
+orchestration checks passed: observed persisted partial-upload bytes, exact
+service/container interruption, client disconnect, same-image formal restart,
+recovered terminal event and exact request-ID lookup, unchanged original file,
+subsequent real write/read, and unchanged unrelated sentinels before/after.
+The controlled audit interruption proves that specific restart/recovery path;
+it does not complete normal container/daemon/host reboot acceptance.
+
+The source was `49ea34bcae2ee568d81b01813fd26e106b98fcb8`. The guest Image ID /
+registry manifest was
+`sha256:7119a35e8a57bd4a8ed2bba23f6c00d55419d2c28df7658fdcb6a0558ac2ac46`;
+the builder/config identity was
+`sha256:4659a235b5e876f865927326ae27614bfab3033bae2b7dfb23b12ed7d3b5ba1e`.
+API 169 requests/229 checks and FileBridge/WebDAV 80 HTTP requests/236 checks,
+including 33 real FileBridge invocations, passed. The two guests stayed within
+4,294,967,296 RAM bytes and 78,383,906,816 sparse disk-capacity bytes.
+
+CRUD failed after entering `edit`: upload had reached its visible listing
+assertion, but save had not been entered. This rules out attributing this run
+to a save/navigation race. It does not identify which editor interaction failed.
+XLSX failed with no acceptable raster summary; PNG, JPEG and logout passed.
+The later fine XLSX stages and real Store EIO probe were absent from this head.
+Normal lifecycle, backup and blank recovery were not reached. Four new fixed
+editor stages now separate opening, rendering, focusing and replacement while
+keeping original interactions, assertions and deadlines.
+
+## b35e1588: regular/deployment passes, upstream pull and source UI fail
+
+Regular backend job 101763571240 passed the full race command (HTTP 102.919 s),
+and frontend job 101763571063 passed all 137 unit tests. Deployment job
+101763571275 passed the existing entry with 25 tests (0.039 s) and 223
+shared-host tests (10.974 s), including the restore revision guard. These jobs
+checked out PR merge `7eeaaef4a7a1fa57f821910f1cb87c5830f39426`; the GitHub
+commit API confirms its tree equals head
+`b35e15885d8083d3fc35bb1999ddb8b488a8476f`:
+`568c520ff22bbcbc9c945fa05260cad4d1874e12`.
+
+Lint job 101763571384 still reported 112 findings across 27 files. Read-only
+source mapping found 26 file blobs unchanged from the handoff baseline; the
+four reported lines in the remaining storage test file exist unchanged at
+shifted line numbers. All 112 reported source lines are present in the baseline.
+This is a source comparison, not a new execution of baseline Lint, and does not
+turn the failing required check green.
+
+[Fixed-image job 101766997278](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34128764701/job/101766997278)
+failed at the first `gtstef/ffmpeg:8.1-decode` pull with HTTP 502 Bad Gateway
+and exit 1. No fixed application image or VM artifact was produced; the VM
+step did not run. It supplies no installation, EIO or restore result and is
+not a source/image-identity guard failure.
+
+[Source job 101766997523](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34128764701/job/101766997523)
+passed frontend/FileBridge prerequisites and progressed beyond sharing setup.
+Its unique failing spec was `2x copy from listing to new folder`. Parsing the
+attempts separately corrected the initial combined diagnosis: attempt 0 reached
+the final `checkForErrors` at `general/file-actions.spec.ts:113`, after both
+copy-success notifications and the final directory-title assertion. It failed
+because the existing console-error check expected 0 and received 1, classified
+as NetworkError. Only retries 1 and 2 failed at the first notification wait
+(:82), with no notification/toast. Those later failures do not establish the
+first attempt's cause. The prior Create checkbox failure was not reproduced.
+The network error remains under investigation; proxy completion is not inferred
+from absent diagnostic labels. Raw error bodies, URLs, credentials and private
+browser artifacts were not retained in public evidence.
+
+
+## Preserve a failed UI disk snapshot before independent lifecycle checks
+
+The real UI runner still executes the same five cases once, with every original
+assertion and timeout. Only a complete, strictly validated set of case failures
+with process exit 1 can enter a continuation path. Missing/unknown stages,
+interruption/skips, inconsistent results, missing raster proof for a supposedly
+passed XLSX case, or dispatch/setup/evidence failures stop the run. A review
+counterexample initially admitted unknown-stage reports; the narrow admission
+guard now rejects them while the general collector retains their failure
+information.
+
+For an eligible initial UI failure, the original failure remains recorded.
+The formal stopped-backup entry creates a new private 0600 archive containing
+business files, database/audit, configuration and keys; no existing package is
+overwritten. Its protected regular inode, size and digest are checked before
+the same container/image is formally started. Both sentinels must be unchanged.
+The client UI output and archive remain private for the runner lifetime; only
+bounded metadata is published. This preserves disk data, not process memory.
+No UI retry or database cleanup is introduced.
+
+The original container/daemon/host reboot, missing/late storage and blank-restore
+checks then continue independently. A failed backup, identity, health, isolation
+or later stage still stops execution. Even if subsequent restored UI succeeds,
+the initial UI failure is retained and the final runner returns exit 1 instead
+of reporting full acceptance. Existing VM/Pending/EIO regressions passed
+114/114 after red-to-green admission and final-exit tests; this is not a real
+failure-snapshot or lifecycle/restore pass. The new editor stages passed Node
+syntax checking, with unchanged controls and content/hash assertions.

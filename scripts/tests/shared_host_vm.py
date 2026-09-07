@@ -1093,7 +1093,7 @@ test -z "$(git -C {SOURCE} status --porcelain=v1)"
 UI_CASE_IDS = ('crud', 'png', 'jpg', 'xlsx', 'logout')
 UI_CASE_STATUSES = ('passed', 'failed', 'timedOut', 'skipped', 'interrupted')
 UI_CASE_STAGES = {
-    'crud': ('login', 'listing', 'upload', 'edit', 'save_menu', 'save_response', 'save_navigation', 'rename', 'download', 'delete'),
+    'crud': ('login', 'listing', 'upload', 'edit', 'edit_open', 'edit_render', 'edit_focus', 'edit_replace', 'save_menu', 'save_response', 'save_navigation', 'rename', 'download', 'delete'),
     'xlsx': ('login', 'listing', 'xlsx', 'xlsx1_request', 'xlsx1_response', 'xlsx1_status', 'xlsx1_viewer', 'xlsx1_decode',
              'xlsx2_request', 'xlsx2_response', 'xlsx2_status', 'xlsx2_viewer', 'xlsx2_decode', 'xlsx_evidence', 'xlsx_checks'),
     **{case: ('login', 'listing', case) for case in ('png', 'jpg', 'logout')},
@@ -1193,6 +1193,117 @@ test -z "$(git -C {SOURCE} status --porcelain=v1)"
         error.ui_evidence = report
         raise error from None
     return report
+
+
+def continuable_initial_ui_failure(error):
+    """Only completed case failures qualify; transport/setup failures still stop."""
+    report = getattr(error, "ui_evidence", None)
+    required = {"passed", "process_exit_code", "cases", "raster_passed"}
+    try:
+        if (not isinstance(report, dict) or not required.issubset(report)
+                or set(report) - required - {"raster"} or report["passed"] is not False
+                or type(report["process_exit_code"]) is not int or report["process_exit_code"] != 1
+                or type(report["raster_passed"]) is not bool):
+            return None
+        cases = report["cases"]
+        if (not isinstance(cases, dict) or set(cases) != {"schema", "attempts", "final", "passed"}
+                or type(cases["schema"]) is not int or cases["schema"] != 1 or cases["passed"] is not False
+                or not isinstance(cases["attempts"], list) or len(cases["attempts"]) != len(UI_CASE_IDS)):
+            return None
+        verified = ui_case_evidence(b"\n".join(json.dumps(item).encode() for item in cases["attempts"]))
+        if (verified != cases or verified["passed"] is not False or set(verified["final"]) != set(UI_CASE_IDS)
+                or any(item["retry"] != 0 or item["stage"] is None for item in verified["attempts"])
+                or any(status not in ("passed", "failed", "timedOut") for status in verified["final"].values())
+                or not any(status in ("failed", "timedOut") for status in verified["final"].values())):
+            return None
+        safe = {"passed": False, "process_exit_code": 1, "cases": verified, "raster_passed": False}
+        if "raster" in report:
+            safe["raster"] = ui_raster_evidence(report["raster"], require_content=False)
+            try:
+                ui_raster_evidence(safe["raster"])
+                safe["raster_passed"] = True
+            except VerificationError:
+                pass
+        if verified["final"]["xlsx"] == "passed" and not safe["raster_passed"]:
+            return None
+        return safe if safe["raster_passed"] == report["raster_passed"] else None
+    except (VerificationError, ValueError, TypeError, KeyError, UnicodeError):
+        return None
+
+
+def initial_ui_with_preservation(server, client, args, evidence, image_id, pinned, baseline):
+    try:
+        evidence["initial_ui"] = real_ui(client)
+        return
+    except VerificationError as error:
+        report = continuable_initial_ui_failure(error)
+        if report is None:
+            raise
+    evidence["initial_ui"] = report
+    evidence["result"] = "failed"
+    evidence.setdefault("ui_failures", []).append("initial_ui")
+    snapshot = {"passed": False, "kind": "controlled_stop_disk_snapshot",
+                "includes": ["business_files", "database_and_audit", "configuration_and_keys"],
+                "private_ui_output_retained": True, "process_memory_preserved": False}
+    evidence["initial_ui_preservation"] = snapshot
+    record_stage(args, evidence, "initial-ui-failure-preservation")
+    for vm in (server, client):
+        if sentinel_state(vm) != baseline[vm.name]:
+            raise VerificationError("UI failure preservation refused: unrelated project changed")
+    original = json.loads(server.command_on_guest(pending_container_script(image_id), timeout=20).stdout)
+    if (original.get("running") is not True or original.get("healthy") is not True or original.get("image") != image_id
+            or re.fullmatch(r"[a-f0-9]{64}", original.get("id", "")) is None):
+        raise VerificationError("UI failure preservation requires the healthy original fixed-image service")
+    archive = "/srv/storage/cf-filebrowser-enterprise/backups/ui-failure-initial.tar"
+    flags = shlex.join(["--hostname", server.name, "--source-sha", args.source_sha, "--image-ref", pinned, "--image-id", image_id])
+    server.command_on_guest(f"bash {SOURCE}/deploy/shared-host/backup.sh create {archive} {flags}", timeout=900)
+    # The formal backup is create-only and validates its entire archive. Recheck
+    # its protected inode before resuming; keep it private for the runner lifetime.
+    raw = server.command_on_guest("""python3 -B - <<'UI_FAILURE_SNAPSHOT'
+import hashlib,json,os,stat
+path='/srv/storage/cf-filebrowser-enterprise/backups/ui-failure-initial.tar'
+fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+with os.fdopen(fd,'rb') as stream:
+    before=os.fstat(stream.fileno())
+    if (not stat.S_ISREG(before.st_mode) or stat.S_IMODE(before.st_mode)!=0o600
+            or before.st_uid!=0 or before.st_gid!=0 or before.st_nlink!=1 or before.st_size<=0):
+        raise SystemExit(1)
+    checksum=hashlib.file_digest(stream,'sha256').hexdigest()
+    after=os.fstat(stream.fileno())
+    if (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns):
+        raise SystemExit(1)
+print(json.dumps({'version':1,'verified':True,'sha256':checksum,'size':before.st_size}))
+UI_FAILURE_SNAPSHOT
+""", timeout=120).stdout
+    try:
+        saved = json.loads(raw)
+        if (not isinstance(saved, dict) or set(saved) != {"version", "verified", "sha256", "size"}
+                or type(saved["version"]) is not int or saved["version"] != 1 or saved["verified"] is not True
+                or type(saved["size"]) is not int or saved["size"] <= 0
+                or not isinstance(saved["sha256"], str) or re.fullmatch(r"[a-f0-9]{64}", saved["sha256"]) is None):
+            raise ValueError("invalid snapshot summary")
+    except (ValueError, TypeError, UnicodeError):
+        raise VerificationError("UI failure snapshot metadata is invalid; private data retained") from None
+    snapshot.update(passed=True, archive_sha256=saved["sha256"], archive_bytes=saved["size"])
+    record_stage(args, evidence, "initial-ui-failure-private-snapshot-retained")
+    server.command_on_guest(f"bash {SOURCE}/deploy/shared-host/manage.sh start --hostname {server.name}", timeout=900)
+    healthy(server)
+    resumed = json.loads(server.command_on_guest(pending_container_script(image_id, original["id"]), timeout=20).stdout)
+    if resumed.get("id") != original["id"] or resumed.get("image") != image_id or resumed.get("healthy") is not True or resumed.get("running") is not True:
+        raise VerificationError("UI failure preservation did not resume the original healthy fixed-image service")
+    for vm in (server, client):
+        if sentinel_state(vm) != baseline[vm.name]:
+            raise VerificationError("unrelated project changed during UI failure preservation")
+    record_stage(args, evidence, "initial-ui-failed-independent-lifecycle-continuing")
+
+
+def complete_scenario(args, evidence):
+    if evidence.get("ui_failures") or any(evidence.get(phase, {}).get("passed") is not True for phase in ("initial_ui", "restored_ui")):
+        evidence["result"] = "failed"
+        record_stage(args, evidence, "completed-with-ui-failure")
+        raise VerificationError("UI acceptance failed; completed independent lifecycle/restore results and private disk snapshot retained")
+    evidence["result"] = "passed"
+    record_stage(args, evidence, "completed")
 
 
 LAN_PROBE_STAGES = ('guest-dispatch', 'allowed-health-before', 'allowed-ui', 'trusted-context',
@@ -1568,8 +1679,9 @@ test ! -e /srv/storage/cf-filebrowser-enterprise
         evidence["protocols"] = api(client, "protocols", "api-protocols.json")
         evidence["checks"].append("fixed-source FileBridge binary and WebDAV exercised over strictly verified HTTPS with ordinary-user/Token denial boundaries")
         record_stage(args, evidence, "initial-existing-playwright-ui")
-        evidence["initial_ui"] = real_ui(client)
-        evidence["checks"].append("existing Playwright shared-host project passed in second VM with normal-user Chromium and explicit trusted CA")
+        initial_ui_with_preservation(server, client, args, evidence, image_id, pinned, baseline)
+        if evidence["initial_ui"]["passed"]:
+            evidence["checks"].append("existing Playwright shared-host project passed in second VM with normal-user Chromium and explicit trusted CA")
         record_stage(args, evidence, "formal-stop-start-and-container-restart")
         server.command_on_guest(f"{manage} stop --hostname {server.name}\n{manage} start --hostname {server.name}")
         server.command_on_guest("docker restart $(docker ps -q --filter label=com.docker.compose.project=cf-filebrowser) >/dev/null")
@@ -1690,8 +1802,7 @@ if bash {SOURCE}/deploy/shared-host/backup.sh restore {GUEST}/verification.tar -
                 raise VerificationError("unrelated project's container/network/port/data changed during backup/restore")
         evidence["checks"].append("unrelated Docker project's container ID, image, network, ports, mounts and data unchanged throughout")
         evidence["boundaries"] = {"B": "real Debian13 systemd VMs; actual host boot IDs recorded", "C": "not run: no actual target device or user client accessed", "WebDAV": "real HTTPS protocol requests and persistence/revocation assertions completed by the protocol client; no separate desktop WebDAV application is claimed", "OnlyOffice": "not completed without a real Document Server and client", "UI": "existing Playwright shared-host project executed in each client VM before and after restore, without disabling TLS verification"}
-        evidence["result"] = "passed"
-        record_stage(args, evidence, "completed")
+        complete_scenario(args, evidence)
     finally:
         evidence["qemu_diagnostics"] = {vm.name: vm.startup_diagnostic() for vm in vms if vm.process is not None and vm.process.poll() not in (None, 0)}
         for vm in reversed(vms):

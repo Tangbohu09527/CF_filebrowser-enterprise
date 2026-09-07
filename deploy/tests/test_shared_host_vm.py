@@ -128,7 +128,7 @@ class UIRasterEvidenceTests(unittest.TestCase):
                 self.assertNotIn('PRIVATE', str(caught.exception))
 
     def test_case_summary_retains_only_last_entered_operation(self):
-        for case, stages in {'crud': ('login', 'listing', 'upload', 'edit', 'save_menu', 'save_response', 'save_navigation', 'rename', 'download', 'delete'),
+        for case, stages in {'crud': ('login', 'listing', 'upload', 'edit', 'edit_open', 'edit_render', 'edit_focus', 'edit_replace', 'save_menu', 'save_response', 'save_navigation', 'rename', 'download', 'delete'),
                              'png': ('login', 'listing', 'png'), 'jpg': ('login', 'listing', 'jpg'),
                              'xlsx': ('login', 'listing', 'xlsx', 'xlsx1_request', 'xlsx1_response', 'xlsx1_status', 'xlsx1_viewer', 'xlsx1_decode',
                                       'xlsx2_request', 'xlsx2_response', 'xlsx2_status', 'xlsx2_viewer', 'xlsx2_decode', 'xlsx_evidence', 'xlsx_checks'), 'logout': ('login', 'listing', 'logout')}.items():
@@ -157,7 +157,7 @@ class UIRasterEvidenceTests(unittest.TestCase):
                         harness.ui_case_evidence(json.dumps(record).encode())
 
     def test_intermediate_save_or_spreadsheet_step_cannot_be_reported_passed(self):
-        stages = {'crud': ('save_menu', 'save_response', 'save_navigation'),
+        stages = {'crud': ('edit_open', 'edit_render', 'edit_focus', 'edit_replace', 'save_menu', 'save_response', 'save_navigation'),
                   'xlsx': ('xlsx', 'xlsx1_request', 'xlsx1_response', 'xlsx1_status', 'xlsx1_viewer', 'xlsx1_decode',
                            'xlsx2_request', 'xlsx2_response', 'xlsx2_status', 'xlsx2_viewer', 'xlsx2_decode', 'xlsx_evidence')}
         for case, values in stages.items():
@@ -938,6 +938,214 @@ class AuditStoreFaultTests(unittest.TestCase):
             self.assertFalse(any("manage.sh start" in str(entry) for entry in self.events))
             self.assertFalse(self.evidence["audit_store_fault"]["passed"])
             self.assertNotIn("PRIVATE", json.dumps(self.evidence))
+
+
+class InitialUIContinuationTests(unittest.TestCase):
+    IMAGE = "sha256:" + "b" * 64
+    CONTAINER = "a" * 64
+    PINNED = "localhost:1234/cf-test@sha256:" + "c" * 64
+
+    def failure(self):
+        attempts = [{'case': case, 'status': 'failed' if case == 'crud' else 'passed', 'retry': 0,
+                     'stage': 'edit' if case == 'crud' else 'xlsx_checks' if case == 'xlsx' else case}
+                    for case in harness.UI_CASE_IDS]
+        cases = harness.ui_case_evidence(b'\n'.join(json.dumps(item).encode() for item in attempts))
+        error = harness.VerificationError('PRIVATE_ERROR')
+        error.ui_evidence = {'passed': False, 'process_exit_code': 1, 'cases': cases, 'raster_passed': True,
+                             'raster': UIRasterEvidenceTests().fixture()}
+        return error
+
+    def invoke(self, error=None, *, backup_failure=False, invalid_snapshot=False, ui_passed=False):
+        events, evidence = [], {'result': 'failed', 'checks': []}
+        server, client = SimpleNamespace(name='cf-verification-1'), SimpleNamespace(name='cf-verification-2')
+        args = SimpleNamespace(source_sha='d' * 40)
+        def command(script, **kwargs):
+            if 'backup.sh create' in script:
+                events.append('backup')
+                self.assertIn('ui-failure-initial.tar', script)
+                self.assertIn('--source-sha ' + args.source_sha, script)
+                self.assertIn('--image-id ' + self.IMAGE, script)
+                self.assertNotIn('PRIVATE', script)
+                if backup_failure:
+                    raise harness.VerificationError('private backup command failed')
+                output = b''
+            elif 'manage.sh start' in script:
+                events.append('start')
+                output = b''
+            elif 'UI_FAILURE_SNAPSHOT' in script:
+                events.append('snapshot')
+                output = json.dumps({'version': 1, 'verified': not invalid_snapshot,
+                                     'sha256': 'e' * 64, 'size': 10240}).encode()
+            else:
+                events.append('identity')
+                output = json.dumps({'id': self.CONTAINER, 'image': self.IMAGE,
+                                     'running': True, 'healthy': True}).encode()
+            return subprocess.CompletedProcess([], 0, output, b'')
+        server.command_on_guest = command
+        self.events, self.evidence = events, evidence
+        with contextlib.ExitStack() as stack:
+            ui = stack.enter_context(mock.patch.object(harness, 'real_ui'))
+            if ui_passed:
+                ui.return_value = {'passed': True}
+            else:
+                ui.side_effect = error or self.failure()
+            stack.enter_context(mock.patch.object(harness, 'record_stage'))
+            stack.enter_context(mock.patch.object(harness, 'sentinel_state', return_value={'stable': True}))
+            stack.enter_context(mock.patch.object(harness, 'healthy', side_effect=lambda vm: events.append('healthy')))
+            harness.initial_ui_with_preservation(server, client, args, evidence, self.IMAGE, self.PINNED,
+                                                 {server.name: {'stable': True}, client.name: {'stable': True}})
+            events.append('subsequent-lifecycle')
+            ui.assert_called_once_with(client)
+        return evidence
+
+    def test_real_ui_failure_snapshots_before_start_and_continues_without_passing(self):
+        evidence = self.invoke()
+        self.assertLess(self.events.index('backup'), self.events.index('snapshot'))
+        self.assertLess(self.events.index('snapshot'), self.events.index('start'))
+        self.assertLess(self.events.index('start'), self.events.index('subsequent-lifecycle'))
+        self.assertEqual(evidence['result'], 'failed')
+        self.assertEqual(evidence['ui_failures'], ['initial_ui'])
+        self.assertFalse(evidence['initial_ui']['passed'])
+        self.assertTrue(evidence['initial_ui_preservation']['passed'])
+        self.assertFalse(evidence['initial_ui_preservation']['process_memory_preserved'])
+        self.assertTrue(evidence['initial_ui_preservation']['private_ui_output_retained'])
+        self.assertNotIn('PRIVATE', json.dumps(evidence))
+
+    def test_invalid_or_incomplete_ui_evidence_never_starts_preservation_or_lifecycle(self):
+        for variant in ('missing', 'exit-zero', 'exit-bool', 'partial', 'forged-final', 'all-passed', 'private-stage', 'missing-raster', 'skipped-case', 'transport'):
+            error = self.failure()
+            if variant == 'missing':
+                del error.ui_evidence
+            elif variant == 'exit-zero':
+                error.ui_evidence['process_exit_code'] = 0
+            elif variant == 'exit-bool':
+                error.ui_evidence['process_exit_code'] = True
+            elif variant == 'partial':
+                error.ui_evidence['cases']['attempts'].pop()
+            elif variant == 'forged-final':
+                error.ui_evidence['cases']['final']['crud'] = 'passed'
+            elif variant == 'all-passed':
+                error.ui_evidence['cases']['attempts'][0].update(status='passed', stage='delete')
+                error.ui_evidence['cases'] = harness.ui_case_evidence(b'\n'.join(
+                    json.dumps(item).encode() for item in error.ui_evidence['cases']['attempts']))
+            elif variant == 'private-stage':
+                error.ui_evidence['cases']['attempts'][0]['stage'] = 'PRIVATE_STAGE'
+            elif variant == 'missing-raster':
+                del error.ui_evidence['raster']
+                error.ui_evidence['raster_passed'] = False
+            elif variant == 'skipped-case':
+                error.ui_evidence['cases']['attempts'][1]['status'] = 'skipped'
+                error.ui_evidence['cases']['final']['png'] = 'skipped'
+            else:
+                error = OSError('PRIVATE_TRANSPORT')
+            with self.subTest(variant=variant), self.assertRaises((harness.VerificationError, OSError)):
+                self.invoke(error)
+            self.assertNotIn('backup', self.events)
+            self.assertNotIn('start', self.events)
+            self.assertNotIn('subsequent-lifecycle', self.events)
+
+    def test_unknown_case_stage_never_authorizes_continuation(self):
+        for all_unknown in (False, True):
+            error = self.failure()
+            attempts = error.ui_evidence['cases']['attempts']
+            for item in (attempts if all_unknown else attempts[:1]):
+                item.update(status='failed', stage=None)
+            # Generic diagnostics must still retain unknown stages. Only the
+            # continuation gate rejects possible browser/page fixture failures.
+            error.ui_evidence['cases'] = harness.ui_case_evidence(b'\n'.join(json.dumps(item).encode() for item in attempts))
+            if all_unknown:
+                error.ui_evidence['raster_passed'] = False
+                del error.ui_evidence['raster']
+            with self.subTest(all_unknown=all_unknown):
+                with self.assertRaises(harness.VerificationError):
+                    self.invoke(error)
+                self.assertNotIn('backup', self.events)
+                self.assertNotIn('start', self.events)
+                self.assertNotIn('subsequent-lifecycle', self.events)
+                self.assertIsNone(error.ui_evidence['cases']['attempts'][0]['stage'])
+
+    def test_failed_spreadsheet_case_can_preserve_absent_raster_without_claiming_decode(self):
+        error = self.failure()
+        error.ui_evidence['cases']['attempts'][3].update(status='failed', stage='xlsx1_response')
+        error.ui_evidence['cases']['final']['xlsx'] = 'failed'
+        error.ui_evidence['raster_passed'] = False
+        del error.ui_evidence['raster']
+        evidence = self.invoke(error)
+        self.assertEqual(evidence['initial_ui']['cases']['final']['xlsx'], 'failed')
+        self.assertFalse(evidence['initial_ui']['raster_passed'])
+        self.assertNotIn('raster', evidence['initial_ui'])
+        self.assertIn('subsequent-lifecycle', self.events)
+
+    def test_backup_or_snapshot_refusal_preserves_failure_and_never_restarts(self):
+        for flag in ('backup_failure', 'invalid_snapshot'):
+            with self.subTest(flag=flag), self.assertRaises(harness.VerificationError):
+                self.invoke(**{flag: True})
+            self.assertIn('backup', self.events)
+            self.assertNotIn('start', self.events)
+            self.assertNotIn('subsequent-lifecycle', self.events)
+            self.assertFalse(self.evidence['initial_ui_preservation']['passed'])
+            self.assertEqual(self.evidence['ui_failures'], ['initial_ui'])
+
+    def test_initial_success_does_not_make_a_failure_backup_or_mark_sticky_failure(self):
+        evidence = self.invoke(ui_passed=True)
+        self.assertNotIn('backup', self.events)
+        self.assertNotIn('start', self.events)
+        self.assertTrue(evidence['initial_ui']['passed'])
+        self.assertNotIn('ui_failures', evidence)
+
+    def test_completion_cannot_overwrite_initial_failure_after_restored_ui_passes(self):
+        evidence = self.invoke()
+        evidence['restored_ui'] = {'passed': True}
+        with mock.patch.object(harness, 'record_stage'), self.assertRaises(harness.VerificationError):
+            harness.complete_scenario(SimpleNamespace(), evidence)
+        self.assertEqual(evidence['result'], 'failed')
+        self.assertTrue(evidence['restored_ui']['passed'])
+        self.assertFalse(evidence['initial_ui']['passed'])
+
+    def test_completion_passes_when_both_actual_ui_phases_passed(self):
+        evidence = {'result': 'failed', 'initial_ui': {'passed': True}, 'restored_ui': {'passed': True}}
+        with mock.patch.object(harness, 'record_stage'):
+            harness.complete_scenario(SimpleNamespace(), evidence)
+        self.assertEqual(evidence['result'], 'passed')
+
+    def test_main_returns_one_after_independent_stages_finish_with_sticky_failure(self):
+        import io
+        with tempfile.TemporaryDirectory(prefix='cf-ui-sticky-result-') as directory:
+            root = Path(directory)
+            output = root / 'evidence'
+            def scenario(args, work, evidence):
+                evidence.update(initial_ui={'passed': False}, restored_ui={'passed': True}, ui_failures=['initial_ui'])
+                harness.complete_scenario(args, evidence)
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(harness.sys, 'platform', 'linux'))
+                stack.enter_context(mock.patch.dict(harness.os.environ, {'GITHUB_ACTIONS': 'true'}))
+                stack.enter_context(mock.patch.object(harness.shutil, 'which', return_value='available'))
+                stack.enter_context(mock.patch.object(harness.tempfile, 'mkdtemp', return_value=str(root / 'private')))
+                stack.enter_context(mock.patch.object(harness, 'scenario', side_effect=scenario))
+                stack.enter_context(mock.patch.object(harness.sys, 'argv', ['shared_host_vm.py', '--source-sha', 'a' * 40,
+                    '--image-ref', self.PINNED, '--evidence', str(output), '--accelerator', 'tcg']))
+                stdout, stderr = io.StringIO(), io.StringIO()
+                stack.enter_context(contextlib.redirect_stdout(stdout))
+                stack.enter_context(contextlib.redirect_stderr(stderr))
+                self.assertEqual(harness.main(), 1)
+            stored = json.loads((output / 'vm-result.json').read_bytes())
+            self.assertEqual(stored['result'], 'failed')
+            self.assertFalse(stored['initial_ui']['passed'])
+            self.assertTrue(stored['restored_ui']['passed'])
+            self.assertNotIn('verification passed', stdout.getvalue())
+
+    def test_scenario_preserves_full_remaining_sequence_and_uses_sticky_completion(self):
+        import inspect
+        source = inspect.getsource(harness.scenario)
+        self.assertLess(source.index('initial_ui_with_preservation('), source.index('"formal-stop-start-and-container-restart"'))
+        for phase in ('"docker-daemon-restart-and-api"', '"real-host-reboot-and-api"',
+                      '"missing-business-mount-real-reboot"', '"container-recreation-and-persistence"',
+                      '"formal-controlled-stop-backup"', '"blank-target-backup-rejection-tests-and-formal-restore"',
+                      '"restored-real-api-verification"', '"restored-existing-playwright-ui"'):
+            self.assertIn(phase, source)
+        self.assertIn('evidence["restored_ui"] = real_ui(server)', source)
+        self.assertIn('complete_scenario(args, evidence)', source)
+        self.assertNotIn('evidence["result"] = "passed"', source)
 
 
 if __name__ == "__main__":
