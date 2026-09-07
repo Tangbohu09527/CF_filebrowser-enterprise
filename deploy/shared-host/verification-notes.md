@@ -114,7 +114,12 @@ but the resulting destination was unreadable because the FileInfo wrapper
 returned mode zero before global file modes were initialized. The minimal fix
 uses the already-existing effective permission helpers; existing security
 assertions remain. The new direct mode test checks defaults and configured
-modes, so root/Windows cannot hide a mode-zero regression. Actual rerun is pending.
+modes, so root/Windows cannot hide a mode-zero regression. At source
+`c86c8cf54b1687caa74c5e3470354f5ceaa194be`, both complete backend race-test
+entries passed: [regular backend](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34100236777/job/101672768936)
+and `make test-backend` in [shared-host backend regression](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34100236812/job/101672769879).
+The latter job remains failed because its subsequent full Lint reports the
+78 unchanged-baseline findings; passing tests do not imply passing Lint.
 The four new TCP-source listener tests and bootstrap-password log regression
 passed in this job.
 
@@ -146,3 +151,50 @@ guest's recorded local Image ID. Only that probe container is removed. Both
 clean Debian guests must resolve the same local ID before backup/restore.
 Actual CI execution is required to confirm this transfer, and failure evidence
 is saved before each comparison. No registry, TLS or digest check is disabled.
+
+## Existing Sharing Playwright setup selector (2026-09-07)
+
+[Source-regression job 101672769623](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34100236812/job/101672769623),
+source `c86c8cf54b1687caa74c5e3470354f5ceaa194be`, failed in the first existing
+Sharing Docker test entry point. The server was listening after 0.37 seconds;
+login succeeded and the administrator's root share request returned HTTP 200.
+At 38.80 seconds the global setup timed out waiting for the old input label
+`allow creating and uploading files and folders toggle` at line 73.
+
+The handoff baseline `48380c3f31cb37b01d0c05b8db0cfa49680a17f9` already contained
+this mismatch: `Share.vue` uses `data-testid="configured-capabilities"` with
+stable input labels `create` and `modify`, while global setup used old translated
+sentences. The existing `share-capabilities-ui.test.js` also verifies the current
+labels, their enabled state and their initial unchecked values.
+
+Only the existing `frontend/tests/playwright/global-setup.ts` was changed: scope
+the two locators to the capability editor, retain attachment checks and real
+slider clicks, and assert enabled/unchecked before each click and checked after.
+No product behavior, timeout, test configuration, dependency or existing test
+assertion was removed or relaxed.
+
+Local `node --experimental-strip-types --check frontend/tests/playwright/global-setup.ts`
+and `git diff --check` passed. The existing focused command
+`npm test -- --run src/components/prompts/share-capabilities-ui.test.js` was
+attempted in `frontend` but could not execute because this checkout has no
+`node_modules`/Vitest. No dependencies were installed. The corrected full
+`make test-playwright` run still requires the next actual Docker CI execution.
+
+## Actual runtime identity checks and local verification limits
+
+The VM harness now checks the running image under its configured service user
+without a `docker exec --user` override: numeric UID/GID including PID 1,
+dependency versions, the embedded source commit, byte I/O in fresh owned
+temporary files in files/data/cache, denied root/config writes and read-only
+protected mounts. It checks Secret access metadata without reading or exporting
+Secret values. The sanitized record is saved before assertions. This new stage
+requires the next actual VM run; its Python counterexamples are not runtime proof.
+
+Local `python -B -m unittest discover -s deploy/tests -p 'test_shared_host_*.py'`
+ran 87 tests: 84 passed and three failed because this Windows checkout has no
+Docker CLI (two real Compose merge tests and the validator integration test).
+No assertions were skipped and no Docker installation was performed. The
+previous source c86c8cf passed the complete
+[CI deployment validation job](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34100236812/job/101672769802),
+including actual Compose validation and every tracked Shell file's syntax.
+The new runtime assertions still require CI at their own source SHA.

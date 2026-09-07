@@ -141,5 +141,36 @@ class FailureEvidenceTests(unittest.TestCase):
         self.assertFalse(caught.exception.api_evidence["passed"])
 
 
+class RuntimeReadinessTests(unittest.TestCase):
+    def fixture(self):
+        return {"image_id": "sha256:" + "a" * 64, "health": "healthy", "running": True, "readonly_rootfs": True, "exec_uid": 10001, "exec_gid": 10001, "pid1_uid": [10001] * 4, "pid1_gid": [10001] * 4, "tools": {name: {"exit_code": 0, "version": "1.2.3"} for name in ("ffmpeg", "ffprobe", "exiftool", "curl", "filebrowser")}, "filebrowser_commit": "b" * 40, "writable": {name: True for name in ("files", "data", "cache")}, "denied_writes": {"root": True, "config": True}, "readable": {name: True for name in ("entrypoint", "config", "jwt", "totp", "storage_identity", "tls_certificate", "tls_key", "tls_ca")}, "entrypoint_executable": True, "entrypoint_syntax_valid": True, "readonly_bind_mounts": True, "bootstrap_absent": True}
+
+    def test_runtime_contract_requires_real_numeric_identity_and_all_boundaries(self):
+        record = self.fixture()
+        harness.verify_runtime_readiness(record, record["image_id"], record["filebrowser_commit"])
+        for key, bad in (("exec_uid", 0), ("exec_gid", 0), ("pid1_uid", [0] * 4), ("health", "unhealthy"), ("readonly_rootfs", False), ("readonly_bind_mounts", False), ("bootstrap_absent", False)):
+            with self.subTest(key=key):
+                changed = copy.deepcopy(record)
+                changed[key] = bad
+                with self.assertRaises(harness.VerificationError):
+                    harness.verify_runtime_readiness(changed, record["image_id"], record["filebrowser_commit"])
+        for section, key, bad in (("tools", "ffmpeg", {"exit_code": 1, "version": ""}), ("writable", "files", False), ("denied_writes", "config", False), ("readable", "jwt", False)):
+            with self.subTest(section=section):
+                changed = copy.deepcopy(record)
+                changed[section][key] = bad
+                with self.assertRaises(harness.VerificationError):
+                    harness.verify_runtime_readiness(changed, record["image_id"], record["filebrowser_commit"])
+
+    def test_runtime_script_uses_service_identity_and_only_temporary_writes(self):
+        script = harness.runtime_readiness_script()
+        self.assertNotIn('"--user"', script)
+        self.assertNotIn('chown', script)
+        self.assertNotIn('chmod', script)
+        self.assertNotIn('database.db', script)
+        self.assertIn('mktemp', script)
+        self.assertIn('test -r', script)
+        self.assertIn('exec 3>>', script)
+
+
 if __name__ == "__main__":
     unittest.main()

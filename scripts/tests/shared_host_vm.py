@@ -486,6 +486,85 @@ exit 1
 """, timeout=210)
 
 
+
+def runtime_readiness_script():
+    return r"""
+python3 - <<'CF_RUNTIME_IDENTITY'
+import json,re,subprocess
+
+def run(argv):
+    return subprocess.run(argv,capture_output=True,text=True,check=False,timeout=60)
+
+ids=run(['docker','ps','-q','--filter','label=com.docker.compose.project=cf-filebrowser','--filter','label=com.docker.compose.service=filebrowser-enterprise']).stdout.split()
+if len(ids)!=1:
+    raise SystemExit('one running FileBrowser service is required for runtime verification')
+container=ids[0]
+info=json.loads(run(['docker','inspect',container]).stdout)[0]
+
+def inside(*argv):
+    # No --user override: all probes run with the real configured service identity.
+    return run(['docker','exec',container,*argv])
+
+def numeric(*argv):
+    result=inside(*argv)
+    return int(result.stdout.strip()) if result.returncode==0 and result.stdout.strip().isdigit() else None
+
+def identity(kind):
+    result=inside('awk','$1=="'+kind+':" {print $2,$3,$4,$5}','/proc/1/status')
+    fields=result.stdout.split()
+    return [int(value) for value in fields] if result.returncode==0 and len(fields)==4 and all(value.isdigit() for value in fields) else []
+
+record={'container_id':container,'image_id':info.get('Image'),'health':info.get('State',{}).get('Health',{}).get('Status'),'running':info.get('State',{}).get('Running'),'readonly_rootfs':info.get('HostConfig',{}).get('ReadonlyRootfs'),'exec_uid':numeric('id','-u'),'exec_gid':numeric('id','-g'),'pid1_uid':identity('Uid'),'pid1_gid':identity('Gid'),'tools':{},'writable':{},'denied_writes':{},'readable':{}}
+versions={'ffmpeg':(['ffmpeg','-version'],r'^ffmpeg version (\S+)'),'ffprobe':(['ffprobe','-version'],r'^ffprobe version (\S+)'),'exiftool':(['exiftool','-ver'],r'^(\d+(?:\.\d+)+)'),'curl':(['curl','--version'],r'^curl (\S+)'),'filebrowser':(['/home/filebrowser/filebrowser','version'],r'(?m)^\s*Version\s*:\s*(\S+)')}
+for name,(argv,pattern) in versions.items():
+    result=inside(*argv)
+    match=re.search(pattern,result.stdout)
+    record['tools'][name]={'exit_code':result.returncode,'version':match.group(1)[:160] if match else None}
+    if name=='filebrowser':
+        commit=re.search(r'(?m)^\s*Commit\s*:\s*([0-9a-f]{40})\s*$',result.stdout)
+        record['filebrowser_commit']=commit.group(1) if commit else None
+
+# Each probe owns a fresh mktemp file, performs byte I/O only on that file and
+# removes exactly that file even after a failed assertion. No database is opened.
+write_probe='set -eu; probe=$(mktemp "$1/.cf-runtime-XXXXXXXXXX"); trap \'rm -f -- "$probe"\' EXIT HUP INT TERM; printf "cf-runtime-check\\n" > "$probe"; test "$(cat "$probe")" = cf-runtime-check; rm -f -- "$probe"; trap - EXIT HUP INT TERM'
+for name,path in {'files':'/srv/filebrowser/files','data':'/var/lib/filebrowser-enterprise','cache':'/var/cache/filebrowser-enterprise'}.items():
+    record['writable'][name]=inside('sh','-c',write_probe,'sh',path).returncode==0
+
+# A successful open-for-append would be an error, but writes no bytes and never
+# truncates/replaces the configuration. The root probe cleans up only its own file.
+record['denied_writes']['config']=inside('sh','-c','exec 3>> "$1"; exec 3>&-','sh','/etc/filebrowser-enterprise/config.yaml').returncode!=0
+root_probe='test -d "$1" || exit 1; probe=$(mktemp "$1/.cf-runtime-XXXXXXXXXX" 2>/dev/null) || exit 0; rm -f -- "$probe"; exit 1'
+record['denied_writes']['root']=inside('sh','-c',root_probe,'sh','/').returncode==0
+paths={'entrypoint':'/opt/filebrowser-enterprise/scripts/container-entrypoint.sh','config':'/etc/filebrowser-enterprise/config.yaml','jwt':'/run/filebrowser-secrets/jwt_token_secret','totp':'/run/filebrowser-secrets/totp_secret','storage_identity':'/run/filebrowser-storage-identity','tls_certificate':'/etc/filebrowser-enterprise/tls/server.crt','tls_key':'/etc/filebrowser-enterprise/tls/server.key','tls_ca':'/etc/filebrowser-enterprise/tls/ca.crt'}
+for name,path in paths.items():
+    # Access metadata only: never read or echo Secret/config/certificate contents.
+    record['readable'][name]=inside('sh','-c','test -f "$1" && test -r "$1"','sh',path).returncode==0
+record['entrypoint_executable']=inside('test','-x',paths['entrypoint']).returncode==0
+record['entrypoint_syntax_valid']=inside('sh','-n',paths['entrypoint']).returncode==0
+record['bootstrap_absent']=inside('test','!','-e','/run/filebrowser-secrets/bootstrap_admin_password').returncode==0
+readonly={'/etc/filebrowser-enterprise/config.yaml','/run/filebrowser-secrets','/etc/filebrowser-enterprise/storage.identity','/run/filebrowser-storage-identity','/opt/filebrowser-enterprise/scripts/container-entrypoint.sh','/etc/filebrowser-enterprise/tls'}
+mounts={entry['Destination']:entry for entry in info.get('Mounts',[])}
+record['readonly_bind_mounts']=all(path in mounts and mounts[path].get('Type')=='bind' and mounts[path].get('RW') is False for path in readonly)
+print(json.dumps(record,sort_keys=True))
+CF_RUNTIME_IDENTITY
+"""
+
+
+def verify_runtime_readiness(record, image_id, revision):
+    expected = {'image_id': image_id, 'health': 'healthy', 'running': True, 'readonly_rootfs': True, 'exec_uid': 10001, 'exec_gid': 10001, 'pid1_uid': [10001] * 4, 'pid1_gid': [10001] * 4, 'filebrowser_commit': revision, 'entrypoint_executable': True, 'entrypoint_syntax_valid': True, 'readonly_bind_mounts': True, 'bootstrap_absent': True}
+    for name, value in expected.items():
+        if record.get(name) != value:
+            raise VerificationError('actual service runtime check failed: ' + name)
+    for section, names in {'writable': ('files', 'data', 'cache'), 'denied_writes': ('root', 'config'), 'readable': ('entrypoint', 'config', 'jwt', 'totp', 'storage_identity', 'tls_certificate', 'tls_key', 'tls_ca')}.items():
+        for name in names:
+            if record.get(section, {}).get(name) is not True:
+                raise VerificationError('actual service runtime check failed: ' + section + '/' + name)
+    for name in ('ffmpeg', 'ffprobe', 'exiftool', 'curl', 'filebrowser'):
+        tool = record.get('tools', {}).get(name, {})
+        if tool.get('exit_code') != 0 or not tool.get('version'):
+            raise VerificationError('actual service dependency check failed: ' + name)
+
+
 def api(vm, phase, evidence_name):
     extra = f" --filebridge-bin {GUEST}/filebrowser-agentctl" if phase == "protocols" else ""
     result = vm.command_on_guest(f"python3 -B {SOURCE}/scripts/tests/shared-host-api.py {phase} --url https://{TLS_NAME}:{TLS_PORT} --ca-file {GUEST}/ca.crt --admin-password-file {GUEST}/admin-password --state-file {GUEST}/api-state.json --evidence {GUEST}/{evidence_name}{extra}", check=False, timeout=900)
@@ -656,6 +735,11 @@ test ! -e /srv/storage/cf-filebrowser-enterprise
         server.command_on_guest(f"{manage} start --hostname {server.name}", timeout=900)
         record_stage(args, evidence, "bootstrap-admin-verification-stop-remove-restart-login")
         server.command_on_guest(f"{manage} bootstrap-finish --hostname {server.name}\ntest ! -e /etc/cf-filebrowser-enterprise/secrets/bootstrap_admin_password", timeout=900)
+        record_stage(args, evidence, "actual-service-identity-tools-and-directory-access")
+        evidence["runtime_readiness"] = json.loads(server.command_on_guest(runtime_readiness_script(), timeout=900).stdout)
+        record_stage(args, evidence, "verify-actual-service-runtime-contract")
+        verify_runtime_readiness(evidence["runtime_readiness"], image_id, args.source_sha)
+        evidence["checks"].append("actual service and PID1 UID/GID 10001, dependency versions, writable files/data/cache and denied root/config writes, readable protected inputs without reading their values")
         record_stage(args, evidence, "idempotent-prepare-after-bootstrap")
         server.command_on_guest(f"{manage} prepare --hostname {server.name} --source-sha {args.source_sha} --image-ref {shlex.quote(pinned)} --mode staging --exposure lan --test-disk --enable-share-source --enable-webdav --bootstrap-password-file {GUEST}/admin-password", timeout=900)
         evidence["checks"].append("formal empty-root install, admin verification, bootstrap removal, same-image login, idempotent prepare")

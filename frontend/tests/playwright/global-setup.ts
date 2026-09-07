@@ -69,13 +69,16 @@ async function globalSetup() {
     await openContextMenuHelper(page);
     await page.locator('button[aria-label="Share"]').click();
   });
-  // Toggle "Allow creating and uploading files and folders" setting
-  await page.locator('input[aria-label="allow creating and uploading files and folders toggle"]').waitFor({ state: 'attached' });
-  await page.locator('input[aria-label="allow creating and uploading files and folders toggle"] + .slider').click();
-
-  // Toggle "Allow creating and uploading files and folders" setting
-  await page.locator('input[aria-label="allow editing files toggle"]').waitFor({ state: 'attached' });
-  await page.locator('input[aria-label="allow editing files toggle"] + .slider').click();
+  // Enable the current V1 Create and Modify controls through the visible sliders.
+  const capabilityEditor = page.getByTestId("configured-capabilities");
+  for (const capability of ["create", "modify"]) {
+    const input = capabilityEditor.locator(`input[aria-label="${capability}"]`);
+    await input.waitFor({ state: "attached" });
+    await expect(input).toBeEnabled();
+    await expect(input).not.toBeChecked();
+    await capabilityEditor.locator(`input[aria-label="${capability}"] + .slider`).click();
+    await expect(input).toBeChecked();
+  }
 
   await page.locator('button[aria-label="Share-Confirm"]').click();
   await expect(page.locator("div[aria-label='share-prompt'] .card-content table tbody tr:not(:has(th))")).toHaveCount(1);
