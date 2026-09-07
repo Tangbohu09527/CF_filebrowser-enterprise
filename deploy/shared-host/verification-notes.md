@@ -1366,3 +1366,39 @@ of reporting full acceptance. Existing VM/Pending/EIO regressions passed
 114/114 after red-to-green admission and final-exit tests; this is not a real
 failure-snapshot or lifecycle/restore pass. The new editor stages passed Node
 syntax checking, with unchanged controls and content/hash assertions.
+
+
+## 6610366d regression and bounded failed-fetch diagnostics
+
+At source `6610366dcf6d86a4332b3b074b290fc7d2ee4610`, regular backend
+job 101772276479 passed the full race suite (HTTP 102.644 s), frontend job
+101772276245 passed 18 files / 137 tests, and deployment job 101772275841
+passed the existing entry with 25 + 233 tests. These regular/deployment jobs
+used PR merge `d43402b9e1650933e5052c7580e885c3fcac20c4`; GitHub metadata verifies the
+same tree as the source head: `782d01b17794de08910b9c8d6542e363b8558457`.
+Full Lint remains failed with 112 findings / 27 files / 5 rules. The required
+check remains enabled; source mapping to baseline does not mean Lint passed.
+
+The existing Playwright error-tracking fixture now records at most 16 failed
+fetch categories and a truncation flag, only when its original console/API
+error-count check fails. Output contains fixed endpoint/method/resource/error
+categories and a navigation boolean. Request URLs, queries, headers, bodies
+and arbitrary failure text are not retained by this new collector. Original
+console/API collection and assertions are unchanged; no failure category is
+ignored and no timing budget or retry count is changed. The added listener is
+removed when the fixture exits.
+
+This addresses the missing diagnostic information in b35e1588's initial copy
+attempt, not an established product defect: its original fixed Firefox
+NetworkError has no identified endpoint or status. Node syntax and an in-memory
+call of the real tracking function checked sensitive URL inputs, unknown values,
+the 16-record bound, silence on expected counts, continued assertion failure
+and listener disposal. These checks do not constitute a browser regression;
+the new diagnostics still require execution through the existing UI entry.
+
+
+The current source UI job 101772276349 also reproduced the copy failure:
+attempt 0 reached the final check with exactly one fixed Firefox NetworkError;
+both copy notifications and the final title had passed. Retries 1 and 2 failed
+at the first notification. There was no failed-HTTP-response block identifying
+an endpoint or status. This run predates the new failed-fetch collector.
