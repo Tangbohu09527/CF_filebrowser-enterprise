@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -182,6 +185,103 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(events, ["login-present", "stop", "stopped", "start", "login-absent", "save"])
             self.assertFalse(paths.bootstrap.exists())
             self.assertTrue(deployment["bootstrap_complete"])
+
+
+
+class TLSInputOpenSSLTests(unittest.TestCase):
+    """Real crypto checks with synthetic files; POSIX ownership stays in VM tests."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.openssl = shutil.which("openssl")
+        if not cls.openssl:
+            raise RuntimeError("OpenSSL is required for the TLS input regression")
+        cls.temporary = tempfile.TemporaryDirectory(prefix="cf-lifecycle-tls-")
+        cls.addClassCleanup(cls.temporary.cleanup)
+        cls.root = Path(cls.temporary.name)
+        cls.ca, cls.ca_key = cls.root / "ca.crt", cls.root / "ca.key"
+        cls.cert, cls.key = cls.root / "server.crt", cls.root / "server.key"
+        cls.csr = cls.root / "server.csr"
+        cls.empty = cls.root / "empty-password"
+        cls.empty.write_bytes(b"")
+        cls.openssl_run(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3",
+                         "-subj", "/CN=Isolated lifecycle regression CA", "-keyout", str(cls.ca_key), "-out", str(cls.ca)])
+        cls.openssl_run(["req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=files.cf.test",
+                         "-keyout", str(cls.key), "-out", str(cls.csr)])
+        extension = cls.root / "server.extensions"
+        extension.write_text("subjectAltName=DNS:files.cf.test,IP:192.0.2.11\nextendedKeyUsage=serverAuth\n", encoding="ascii")
+        cls.signing = ["x509", "-req", "-in", str(cls.csr), "-CA", str(cls.ca), "-CAkey",
+                       str(cls.ca_key), "-CAcreateserial", "-extfile", str(extension)]
+        cls.openssl_run([*cls.signing, "-days", "3", "-out", str(cls.cert)])
+        cls.short_cert = cls.root / "short-lived.crt"
+        cls.openssl_run([*cls.signing, "-days", "1", "-out", str(cls.short_cert)])
+        cls.other_ca = cls.root / "untrusted.crt"
+        cls.openssl_run(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3",
+                         "-subj", "/CN=Untrusted lifecycle regression CA",
+                         "-keyout", str(cls.root / "untrusted.key"), "-out", str(cls.other_ca)])
+        cls.encrypted_key = cls.root / "encrypted.key"
+        cls.openssl_run(["pkey", "-in", str(cls.key), "-aes-256-cbc", "-passout", "stdin",
+                         "-out", str(cls.encrypted_key)], b"synthetic-fixture-passphrase\n")
+
+    @classmethod
+    def openssl_run(cls, arguments, input_bytes=None):
+        result = subprocess.run([cls.openssl, *arguments], input=input_bytes,
+                                capture_output=True, timeout=30, check=False)
+        if result.returncode:
+            # Never expose process output, private key data or synthetic passwords.
+            raise lifecycle.DeploymentError("openssl " + arguments[0] + " failed")
+        return result.stdout
+
+    def inputs(self, **changes):
+        values = dict(lan_bind_address="192.0.2.11", lan_port=18443,
+                      lan_allowed_cidrs="192.0.2.12/32", tls_name="files.cf.test",
+                      tls_cert_file=self.cert, tls_key_file=self.key, tls_ca_file=self.ca)
+        values.update(changes)
+        return SimpleNamespace(**values)
+
+    def check_inputs(self, **changes):
+        def actual_command(command, input_bytes=None):
+            self.assertEqual(command[0], "openssl")
+            # /dev/null is an existing empty stream on Linux. Map that exact
+            # pre-fix input to an existing empty file for the Windows regression.
+            arguments = ["file:" + str(self.empty) if value == "file:/dev/null" else value
+                         for value in command[1:]]
+            return self.openssl_run(arguments, input_bytes)
+        with mock.patch.object(lifecycle, "run", side_effect=actual_command), \
+             mock.patch.object(lifecycle, "assert_safe_path"), \
+             mock.patch.object(lifecycle.stat, "S_IMODE", return_value=0o600):
+            return lifecycle.tls_inputs(self.inputs(**changes))
+
+    def test_valid_unencrypted_private_key_and_matching_dns_are_accepted(self):
+        result = self.check_inputs()
+        self.assertTrue(result["server.crt"] == self.cert.read_bytes(), "accepted certificate bytes changed")
+        self.assertTrue(result["server.key"] == self.key.read_bytes(), "accepted private key bytes changed")
+        self.assertTrue(result["ca.crt"] == self.ca.read_bytes(), "accepted CA bytes changed")
+
+    def test_wrong_dns_is_rejected_by_chain_and_name_verification(self):
+        with self.assertRaisesRegex(lifecycle.DeploymentError, "openssl verify failed"):
+            self.check_inputs(tls_name="wrong.cf.test")
+
+    def test_ip_subject_alternative_name_is_checked(self):
+        self.check_inputs(tls_name="192.0.2.11")
+        with self.assertRaisesRegex(lifecycle.DeploymentError, "openssl verify failed"):
+            self.check_inputs(tls_name="192.0.2.99")
+
+    def test_untrusted_ca_is_rejected(self):
+        with self.assertRaisesRegex(lifecycle.DeploymentError, "openssl verify failed"):
+            self.check_inputs(tls_ca_file=self.other_ca)
+
+    def test_certificate_with_less_than_one_day_remaining_is_rejected(self):
+        with self.assertRaisesRegex(lifecycle.DeploymentError, "openssl x509 failed"):
+            self.check_inputs(tls_cert_file=self.short_cert)
+
+    def test_encrypted_private_key_is_rejected_without_prompting(self):
+        with self.assertRaisesRegex(lifecycle.DeploymentError, "openssl pkey failed"):
+            self.check_inputs(tls_key_file=self.encrypted_key)
+
+    def test_mismatched_private_key_is_rejected(self):
+        with self.assertRaisesRegex(lifecycle.DeploymentError, "do not match"):
+            self.check_inputs(tls_key_file=self.ca_key)
 
 
 if __name__ == "__main__":

@@ -47,9 +47,18 @@ test("share private source", async ({ page, checkForErrors, openContextMenu }) =
    await openContextMenu();
    await page.locator('button[aria-label="Share"]').click();
    await expect(page.locator('div[aria-label="share-path"]')).toHaveText('Path: /');
-   await page.locator('button[aria-label="Share-Confirm"]').click();
+   const [denied] = await Promise.all([
+     page.waitForResponse(response =>
+       new URL(response.url()).pathname === "/api/share" && response.request().method() === "POST"),
+     page.locator('button[aria-label="Share-Confirm"]').click(),
+   ]);
+  expect(denied.status()).toBe(403);
+  await expect(denied.json()).resolves.toMatchObject({
+    status: 403,
+    message: "the target source is private, sharing is not permitted",
+  });
   await expect(page.locator("div[aria-label='share-prompt'] .card-content table tbody tr:not(:has(th))")).toHaveCount(0);
-  await checkForNotification(page, "403: the target source is private, sharing is not permitted");
+  await checkForNotification(page, "Error creating share");
   checkForErrors(1,1); // 1 error is expected for the private source
 });
 

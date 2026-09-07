@@ -565,6 +565,81 @@ def verify_runtime_readiness(record, image_id, revision):
             raise VerificationError('actual service dependency check failed: ' + name)
 
 
+
+def missing_storage_state(vm, container_id, sentinel_id, *, timeout=900):
+    if not all(re.fullmatch(r"[0-9a-f]{64}", value) for value in (container_id, sentinel_id)):
+        raise VerificationError("missing-storage verification requires precise pre-reboot container IDs")
+    return json.loads(vm.command_on_guest(f"""
+python3 - <<'CF_MISSING_STORAGE'
+import json,os,subprocess
+from pathlib import Path
+
+def run(*args):
+    return subprocess.run(args,capture_output=True,text=True,check=False)
+
+def inspect(container):
+    result=run('docker','inspect',container)
+    return json.loads(result.stdout)[0] if result.returncode==0 else {{}}
+
+docker_active=run('systemctl','is-active','--quiet','docker').returncode==0
+# Do not touch docker.socket before automatic docker.service activation: even a
+# read-only Docker API request could otherwise trigger systemd socket activation.
+service=inspect('{container_id}') if docker_active else {{}}
+sentinel=inspect('{sentinel_id}') if docker_active else {{}}
+service_ids=run('docker','ps','--no-trunc','-aq','--filter','label=com.docker.compose.project=cf-filebrowser').stdout.split() if docker_active else []
+root=Path('/srv/storage')
+print(json.dumps({{'docker_active':docker_active,'sentinel_id':sentinel.get('Id'),'sentinel_running':sentinel.get('State',{{}}).get('Running'),'service_ids':service_ids,'service_id':service.get('Id'),'service_running':service.get('State',{{}}).get('Running'),'service_status':service.get('State',{{}}).get('Status'),'storage_mounted':run('mountpoint','--quiet',str(root)).returncode==0,'storage_directory_exists':root.is_dir(),'storage_device_is_root':root.is_dir() and root.stat().st_dev==Path('/').stat().st_dev,'business_path_exists':os.path.lexists(root/'cf-filebrowser-enterprise')}},sort_keys=True))
+CF_MISSING_STORAGE
+""", timeout=timeout).stdout)
+
+
+
+def wait_missing_storage_ready(vm, container_id, sentinel_id, record):
+    # Reuse the existing health wait's 180-second budget. Observation only:
+    # neither Docker nor the sentinel is started by this readiness wait.
+    deadline = time.monotonic() + 180
+    record.update(readiness_budget_seconds=180, readiness_observations=0)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise VerificationError("missing-storage Docker/sentinel autostart readiness timed out after 180 seconds; last state retained")
+        try:
+            state = missing_storage_state(vm, container_id, sentinel_id, timeout=remaining)
+        except subprocess.TimeoutExpired as error:
+            record["readiness_observation_timed_out"] = True
+            raise VerificationError("missing-storage Docker/sentinel observation timed out within the 180 seconds budget; last state retained") from error
+        # The surrounding scenario owns this dictionary and persists it even if
+        # an invariant fails or readiness expires before a final successful sample.
+        record["before_explicit_start"] = state
+        record["readiness_observations"] += 1
+        safe = {'storage_mounted': False, 'storage_directory_exists': True, 'storage_device_is_root': True, 'business_path_exists': False}
+        for name, expected in safe.items():
+            if state.get(name) != expected:
+                raise VerificationError('missing-storage safety check failed while awaiting autostart: ' + name)
+        if state.get('service_running') is True:
+            raise VerificationError('missing-storage service ran while awaiting Docker/sentinel autostart')
+        if state.get('service_id') not in (None, container_id) or state.get('sentinel_id') not in (None, sentinel_id):
+            raise VerificationError('missing-storage original container identity changed while awaiting autostart')
+        if state.get('service_ids') and state['service_ids'] != [container_id]:
+            raise VerificationError('missing-storage project containers changed while awaiting autostart')
+        if state.get('docker_active') is True and state.get('sentinel_running') is True and state.get('sentinel_id') == sentinel_id and state.get('service_id') == container_id and state.get('service_ids') == [container_id] and state.get('service_running') is False:
+            return
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+
+def verify_missing_storage_state(record, container_id, sentinel_id):
+    expected = {'docker_active': True, 'sentinel_id': sentinel_id, 'sentinel_running': True, 'service_ids': [container_id], 'service_id': container_id, 'service_running': False, 'storage_mounted': False, 'storage_directory_exists': True, 'storage_device_is_root': True, 'business_path_exists': False}
+    for name, value in expected.items():
+        if record.get(name) != value:
+            raise VerificationError('missing-storage refusal check failed: ' + name)
+
+
+def missing_storage_rejection(result):
+    causes = ((b'bind source path does not exist', 'missing-bind-source'), (b'no such file or directory', 'missing-bind-path'), (b'storage identity', 'storage-identity-refused'))
+    category = next((label for marker, label in causes if marker in result.stderr), 'unclassified-start-refusal')
+    return {'exit_code': result.returncode, 'category': category, 'private_stderr_bytes': len(result.stderr), 'private_stderr_sha256': hashlib.sha256(result.stderr).hexdigest()}
+
+
 def api(vm, phase, evidence_name):
     extra = f" --filebridge-bin {GUEST}/filebrowser-agentctl" if phase == "protocols" else ""
     result = vm.command_on_guest(f"python3 -B {SOURCE}/scripts/tests/shared-host-api.py {phase} --url https://{TLS_NAME}:{TLS_PORT} --ca-file {GUEST}/ca.crt --admin-password-file {GUEST}/admin-password --state-file {GUEST}/api-state.json --evidence {GUEST}/{evidence_name}{extra}", check=False, timeout=900)
@@ -633,6 +708,25 @@ def record_stage(args, evidence, name):
     evidence["stage"] = name
     (args.evidence / "vm-result.json").write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
     print("[shared-host-vm] stage=" + name, flush=True)
+
+
+
+def recovery_probe(vm, args, evidence, name, arguments):
+    command = "python3 " + SOURCE + "/scripts/tests/shared_host_restore_evidence.py " + shlex.join(arguments)
+    process = vm.command_on_guest(command, check=False)
+    try:
+        report = json.loads(process.stdout)
+        if not isinstance(report, dict):
+            raise ValueError("invalid report")
+    except (ValueError, UnicodeError):
+        report = {"verified": False, "failure": "guest recovery probe did not return a valid report",
+                  "private_output_sha256": hashlib.sha256(process.stdout).hexdigest()}
+    evidence[name] = report
+    # Persist the sanitized guest outcome before failing the scenario.
+    record_stage(args, evidence, name)
+    if process.returncode != 0 or report.get("verified") is not True:
+        raise VerificationError("protected recovery evidence validation failed: " + name)
+    return report
 
 
 def scenario(args, work, evidence):
@@ -774,9 +868,27 @@ test ! -e /srv/storage/cf-filebrowser-enterprise
         evidence["checks"].append("controlled stop/start, Docker container restart, Docker daemon restart, real systemd host reboot and retained permissions/data")
         # Do not manually stop the app before reboot: unless-stopped must attempt
         # normal daemon recovery against the deliberately absent business mount.
+        record_stage(args, evidence, "capture-original-container-before-missing-storage-reboot")
+        missing_container_id = server.command_on_guest("docker ps --no-trunc -q --filter label=com.docker.compose.project=cf-filebrowser").stdout.decode().strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", missing_container_id):
+            raise VerificationError("missing-storage test requires exactly one running original service")
+        evidence["missing_storage"] = {"original_container_id": missing_container_id, "original_sentinel_id": baseline[server.name]["id"]}
         record_stage(args, evidence, "missing-business-mount-real-reboot")
         server.command_on_guest("cp --preserve=mode /etc/fstab /root/cf-verification/fstab.saved\nsed -i '\\| /srv/storage |s/^/# missing-disk-test /' /etc/fstab")
         evidence["missing_disk_reboot"] = server.reboot()
+        record_stage(args, evidence, "missing-storage-docker-and-original-sentinel-readiness")
+        missing = evidence["missing_storage"]
+        wait_missing_storage_ready(server, missing_container_id, baseline[server.name]["id"], missing)
+        record_stage(args, evidence, "verify-missing-storage-before-explicit-start")
+        verify_missing_storage_state(missing["before_explicit_start"], missing_container_id, baseline[server.name]["id"])
+        record_stage(args, evidence, "explicit-original-container-start-with-missing-storage")
+        rejected = server.command_on_guest("docker start " + missing_container_id, check=False)
+        missing["explicit_start"] = missing_storage_rejection(rejected)
+        missing["after_explicit_start"] = missing_storage_state(server, missing_container_id, baseline[server.name]["id"])
+        record_stage(args, evidence, "verify-real-missing-storage-refusal-and-no-system-disk-writes")
+        if rejected.returncode == 0:
+            raise VerificationError("original container unexpectedly started while business storage was absent")
+        verify_missing_storage_state(missing["after_explicit_start"], missing_container_id, baseline[server.name]["id"])
         server.command_on_guest("""
 ! mountpoint -q /srv/storage
 test ! -e /srv/storage/cf-filebrowser-enterprise
@@ -804,6 +916,7 @@ mount /srv/storage
         record_stage(args, evidence, "formal-controlled-stop-backup")
         server.command_on_guest(f"bash {SOURCE}/deploy/shared-host/backup.sh create {backup} --hostname {server.name} {flags}")
         checksum = server.command_on_guest("sha256sum " + backup).stdout.decode().split()[0]
+        original_identity = recovery_probe(server, args, evidence, "original_storage_identity", ["snapshot"])["storage_identity_sha256"]
         # Transfer only between these two isolated VM states, over authenticated
         # SSH. The bytes never become an uploaded artifact or an ordinary log.
         record_stage(args, evidence, "private-authenticated-backup-transfer")
@@ -836,6 +949,10 @@ bash {SOURCE}/deploy/shared-host/backup.sh restore {GUEST}/verification.tar --ho
 test ! -e /etc/cf-filebrowser-enterprise/secrets/bootstrap_admin_password
 if bash {SOURCE}/deploy/shared-host/backup.sh restore {GUEST}/verification.tar --hostname {client.name} {flags} --sha256 {checksum}; then exit 1; fi
 """, timeout=900)
+        recovery_probe(client, args, evidence, "restored_storage_identity", [
+            "restore", "--archive-name", "verification.tar", "--archive-sha256", checksum,
+            "--source-sha", args.source_sha, "--image-ref", pinned, "--image-id", image_id,
+            "--previous-identity-sha256", original_identity])
         record_stage(args, evidence, "restored-address-transfer-and-formal-start")
         # A restored fixed LAN config assumes the same address. Transfer that
         # address after stopping the original, instead of editing restored data.

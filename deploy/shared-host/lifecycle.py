@@ -379,15 +379,22 @@ def tls_inputs(args) -> dict[str, bytes]:
         if (name == "server.key" and mode not in (0o400, 0o600)) or mode & 0o022 or source.stat().st_size > 1024 * 1024:
             raise DeploymentError("TLS source ownership, permissions or size is invalid")
         result[name] = source.read_bytes()
-    run(["openssl", "verify", "-CAfile", str(args.tls_ca_file), str(args.tls_cert_file)])
     try:
         ipaddress.ip_address(args.tls_name)
-        check = "-checkip"
+        check = "-verify_ip"
     except ValueError:
-        check = "-checkhost"
-    run(["openssl", "x509", "-in", str(args.tls_cert_file), "-noout", "-checkend", "86400", check, args.tls_name])
-    public_cert = run(["openssl", "x509", "-in", str(args.tls_cert_file), "-pubkey", "-noout"])
-    public_key = run(["openssl", "pkey", "-in", str(args.tls_key_file), "-pubout", "-passin", "file:/dev/null"])
+        check = "-verify_hostname"
+    with phase("TLS certificate chain and name verification"):
+        run(["openssl", "verify", "-CAfile", str(args.tls_ca_file), check, args.tls_name, str(args.tls_cert_file)])
+    # x509 -checkend may finish without performing other requested checks.
+    with phase("TLS certificate remaining lifetime"):
+        run(["openssl", "x509", "-in", str(args.tls_cert_file), "-noout", "-checkend", "86400"])
+    with phase("TLS certificate public key"):
+        public_cert = run(["openssl", "x509", "-in", str(args.tls_cert_file), "-pubkey", "-noout"])
+    with phase("TLS unencrypted private key"):
+        # An empty file is EOF, not an empty password. Never prompt or accept
+        # an encrypted private key that needs a separately supplied password.
+        public_key = run(["openssl", "pkey", "-in", str(args.tls_key_file), "-pubout", "-passin", "pass:"])
     if public_cert != public_key:
         raise DeploymentError("TLS certificate and unencrypted private key do not match")
     return result

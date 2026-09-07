@@ -172,5 +172,96 @@ class RuntimeReadinessTests(unittest.TestCase):
         self.assertIn('exec 3>>', script)
 
 
+class MissingStorageTests(unittest.TestCase):
+    def fixture(self):
+        return {"docker_active": True, "sentinel_id": "b" * 64, "sentinel_running": True, "service_ids": ["a" * 64], "service_id": "a" * 64, "service_running": False, "storage_mounted": False, "storage_directory_exists": True, "storage_device_is_root": True, "business_path_exists": False}
+
+    def test_daemon_not_restored_yet_cannot_count_as_missing_disk_refusal(self):
+        # This met the old SSH-boot-ID/nonrunning/no-project-path assertions.
+        record = self.fixture()
+        record.update(docker_active=False, sentinel_running=False)
+        with self.assertRaises(harness.VerificationError):
+            harness.verify_missing_storage_state(record, "a" * 64, "b" * 64)
+
+    def test_exact_original_containers_and_no_system_disk_writes_are_required(self):
+        record = self.fixture()
+        harness.verify_missing_storage_state(record, "a" * 64, "b" * 64)
+        for field, value in (("sentinel_id", "c" * 64), ("sentinel_running", False), ("service_id", "c" * 64), ("service_running", True), ("business_path_exists", True), ("storage_mounted", True), ("storage_device_is_root", False)):
+            with self.subTest(field=field):
+                changed = dict(record)
+                changed[field] = value
+                with self.assertRaises(harness.VerificationError):
+                    harness.verify_missing_storage_state(changed, "a" * 64, "b" * 64)
+
+    def test_wait_allows_delayed_autostart_without_starting_anything(self):
+        ready = self.fixture()
+        waiting = dict(ready, docker_active=False, sentinel_running=False)
+        record = {}
+        with mock.patch.object(harness, "missing_storage_state", side_effect=[waiting, ready]) as read, mock.patch.object(harness.time, "monotonic", return_value=0), mock.patch.object(harness.time, "sleep") as sleep:
+            harness.wait_missing_storage_ready(mock.Mock(), "a" * 64, "b" * 64, record)
+        self.assertEqual(read.call_count, 2)
+        sleep.assert_called_once_with(2)
+        self.assertEqual(record["before_explicit_start"], ready)
+        self.assertEqual(record["readiness_observations"], 2)
+
+    def test_wait_retries_a_snapshot_taken_during_daemon_transition(self):
+        ready = self.fixture()
+        transitional = dict(ready, service_id=None, service_ids=[], service_running=None)
+        record = {}
+        with mock.patch.object(harness, "missing_storage_state", side_effect=[transitional, ready]) as read, mock.patch.object(harness.time, "monotonic", return_value=0), mock.patch.object(harness.time, "sleep"):
+            harness.wait_missing_storage_ready(mock.Mock(), "a" * 64, "b" * 64, record)
+        self.assertEqual(read.call_count, 2)
+        self.assertEqual(record["before_explicit_start"], ready)
+
+    def test_inactive_daemon_probe_never_triggers_docker_socket_activation(self):
+        vm = mock.Mock()
+        vm.command_on_guest.return_value = subprocess.CompletedProcess([], 0, b"{}", b"")
+        harness.missing_storage_state(vm, "a" * 64, "b" * 64)
+        script = vm.command_on_guest.call_args.args[0]
+        body = script.split("<<'CF_MISSING_STORAGE'\n", 1)[1].rsplit("\nCF_MISSING_STORAGE", 1)[0]
+        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 3, "", "")) as commands, mock.patch("builtins.print"):
+            exec(compile(body, "missing-storage-guest", "exec"), {})
+        self.assertTrue(commands.called)
+        self.assertTrue(all(call.args[0][0] != "docker" for call in commands.call_args_list))
+
+    def test_wait_times_out_and_retains_last_state(self):
+        waiting = dict(self.fixture(), docker_active=False, sentinel_running=False)
+        record = {}
+        with mock.patch.object(harness, "missing_storage_state", return_value=waiting), mock.patch.object(harness.time, "monotonic", side_effect=[0, 0, 0, 180]), mock.patch.object(harness.time, "sleep"):
+            with self.assertRaisesRegex(harness.VerificationError, "180 seconds"):
+                harness.wait_missing_storage_ready(mock.Mock(), "a" * 64, "b" * 64, record)
+        self.assertEqual(record["before_explicit_start"], waiting)
+
+    def test_wait_never_tolerates_a_system_disk_write_or_returned_mount(self):
+        for field, value in (("business_path_exists", True), ("storage_mounted", True), ("service_running", True)):
+            with self.subTest(field=field):
+                unsafe = dict(self.fixture(), docker_active=False, sentinel_running=False)
+                unsafe[field] = value
+                record = {}
+                with mock.patch.object(harness, "missing_storage_state", return_value=unsafe), mock.patch.object(harness.time, "monotonic", return_value=0), mock.patch.object(harness.time, "sleep") as sleep:
+                    with self.assertRaises(harness.VerificationError):
+                        harness.wait_missing_storage_ready(mock.Mock(), "a" * 64, "b" * 64, record)
+                sleep.assert_not_called()
+                self.assertEqual(record["before_explicit_start"], unsafe)
+
+    def test_missing_storage_probe_uses_full_saved_container_ids(self):
+        vm = mock.Mock()
+        vm.command_on_guest.return_value = subprocess.CompletedProcess([], 0, json.dumps(self.fixture()).encode(), b"")
+        harness.missing_storage_state(vm, "a" * 64, "b" * 64)
+        script = vm.command_on_guest.call_args.args[0]
+        self.assertIn("'--no-trunc'", script)
+        self.assertIn("inspect('" + "a" * 64 + "')", script)
+        with self.assertRaises(harness.VerificationError):
+            harness.missing_storage_state(vm, "a" * 12, "b" * 64)
+
+    def test_explicit_start_rejection_retains_only_known_error_category(self):
+        report = harness.missing_storage_rejection(subprocess.CompletedProcess([], 1, b"SECRET", b"Error: bind source path does not exist: /private/path\nTOKEN"))
+        self.assertEqual(report["exit_code"], 1)
+        self.assertEqual(report["category"], "missing-bind-source")
+        self.assertNotIn("SECRET", json.dumps(report))
+        self.assertNotIn("TOKEN", json.dumps(report))
+        self.assertNotIn("/private/path", json.dumps(report))
+
+
 if __name__ == "__main__":
     unittest.main()

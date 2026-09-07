@@ -198,3 +198,84 @@ previous source c86c8cf passed the complete
 [CI deployment validation job](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34100236812/job/101672769802),
 including actual Compose validation and every tracked Shell file's syntax.
 The new runtime assertions still require CI at their own source SHA.
+
+## Actual cross-store transfer passed; installation stopped at TLS verification
+
+At source `c86c8cf54b1687caa74c5e3470354f5ceaa194be`,
+[real image/VM job 101672769848](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34100236812/job/101672769848)
+completed the full frontend/backend build, isolated TLS registry publication,
+both clean Debian 13.6 systemd boots, Docker 29.8.0 / Compose 5.5.1 installation,
+independent ext4 `/dev/vdb` mounts, and both empty-store registry pulls.
+
+The builder's configuration-based Image ID was
+`sha256:9ca7d205a8b8f3d75844a8dfd4d7f1f4e400e13b14e2362f8b4a95701033d2d2`.
+Both guests recorded the manifest-based local Image ID
+`sha256:8d59866975356e518572bd55851a4c16202520903f1d0599de5e856a5bca5fe4`,
+matching the published registry digest. Raw manifest/config checksums, source
+revision, runtime configuration and every filesystem diff ID passed. Each
+never-started isolated container matched its guest's actual Image ID. These are
+observed values, unlike the uncaptured guest ID in the earlier b614 failure.
+
+The run then stopped at `formal-empty-root-prepare`: OpenSSL returned exit 1
+during TLS input validation. No first start, administrator initialization,
+application LAN/API/UI, reboot or restoration passed in this run. Existing data
+was retained; no database reset or certificate-verification bypass was used.
+The sanitized artifact includes source/image/environment and exact stage; no
+Secret, sensitive backup or VM disk was uploaded.
+
+## TLS-input failure reproduction and correction
+
+Real local OpenSSL 3.5.6 (7 Apr 2026) reproduced the failure: `pkey` with
+`-passin file:/dev/null` rejects EOF before parsing even an unencrypted key.
+The explicit empty `-passin pass:` accepts that key without prompting or putting
+a password in arguments. The installed-deployment validator already uses this
+form. A second negative case showed that combined `x509 -checkend -checkhost`
+returned zero for the wrong DNS name; `verify -verify_hostname` rejected it with
+exit 2. Preparation now verifies chain and DNS/IP name with `verify`, checks
+24-hour remaining validity separately, and retains exact public-key comparison.
+Fixed phase names add diagnostic context without reflecting OpenSSL output or
+Secret values. No TLS verification was removed.
+
+Seven new real-OpenSSL tests initially produced two failures and two errors.
+After only the passphrase-input fix, the wrong-DNS case still failed because no
+DeploymentError was raised. With both corrections, all 22 lifecycle tests passed
+(the original 15 plus seven real certificate/key cases). Real VM preparation
+still needs to pass at the next fixed source SHA.
+
+## Existing private-source Sharing UI regression
+
+At `b461f99e3670cb342fa71cedd002afef515d64f3`,
+[source job 101676832148](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34101372332/job/101676832148)
+ran the existing Sharing suite: 12 passed, one failed. The private-source case
+expected the previous detailed UI text; actual notifications contained only
+`Error creating share`, exactly as the integration baseline's `api/share.js`
+already specifies. The setup selector repair therefore passed its actual use.
+
+The existing private-source test now waits for the actual POST response before
+asserting status 403 and the unchanged specific private-source refusal reason
+in its JSON body, then checks the current error notification. It retains the
+zero-share-row assertion and original console/API error counts. It does not
+replace a security denial check with a generic message alone or change product
+behavior, retries or timeouts. Its corrected full Playwright run is pending.
+
+## Missing-mount and blank-restore evidence strengthened
+
+A counterexample demonstrated that a new boot ID plus a stopped FileBrowser
+could be observed before Docker had restored anything. The missing-mount test
+now observes normal Docker/sentinel autostart for at most 180 seconds, without
+starting either service or touching an inactive Docker socket. Every observation
+checks the absent mount, underlying system disk, no business path and no running
+FileBrowser. It then checks exact pre-reboot container IDs, requires an explicit
+start of that same FileBrowser container to fail, and repeats the no-write checks
+before the original late-mount/formal-start flow. Last state and fixed error
+categories/hashes are retained before assertions. No product timeout changed.
+
+Blank restoration now reads the actual protected recovery record and compares
+its archive/source/image/identity fields with independently captured inputs.
+Both installed storage markers must agree with the recovered value and differ
+from the old value. Only hashes leave the guest. Missing/duplicate/modified
+evidence, unsafe modes and unchanged/mismatched identities fail the probe.
+Local lifecycle (22), VM harness (19) and restore-evidence (10) tests passed,
+along with syntax of the changed existing Playwright test. These counterexamples
+strengthen acceptance; they do not replace actual missing-disk boot or live
+blank-recovery evidence, which is still pending.
