@@ -54,13 +54,14 @@ func HashSHA256(data string) string {
 	return hex.EncodeToString(bytes[:])
 }
 
+// GenerateKey returns 512 random bits encoded losslessly for JSON persistence.
 func GenerateKey() string {
 	b := make([]byte, 64)
 	_, err := rand.Read(b)
 	if err != nil {
 		return ""
 	}
-	return string(b)
+	return hex.EncodeToString(b)
 }
 
 // CSPNonce returns a base64-encoded random value suitable for Content-Security-Policy nonces

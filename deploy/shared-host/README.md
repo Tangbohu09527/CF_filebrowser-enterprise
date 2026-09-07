@@ -24,21 +24,124 @@ Record these inputs before installation:
 | LAN (optional) | Assigned IPv4 address, port 1024–65535, explicit allowed client CIDRs, TLS DNS name, certificate/key/CA input files |
 | Recovery | Archive, separately recorded SHA-256, exact source SHA/image reference/Image ID, and protected independent key custody |
 
-The human management account stays separate from the service identity. Do not
-add it to `root` or `docker`. The commands below use explicitly authorized sudo
-for individual operations. Daily management is not an unrestricted root shell.
+The human management account stays separate from the service identity. It must
+already have explicitly authorized `sudo` access from host provisioning; do not
+add it to `root` or `docker`, or change sudo policy for this application. Run the
+following blocks in order from that account. Each block stops on failure. Inspect
+the reported stage before continuing; do not delete existing configuration to
+make a rerun pass.
 
-Follow [Docker's Debian installation instructions](https://docs.docker.com/engine/install/debian/)
-for the signed Docker apt repository and an explicitly selected package version.
-Install Docker Engine, CLI, containerd, Buildx and Compose v2 (2.20+). Record the
-package versions with the installation evidence. Also install the Debian
-packages `git ca-certificates curl openssl python3 python3-yaml util-linux iproute2`.
-These are deliberate host preparation operations; `manage.sh` does not run an
-installer, change users, format disks, configure RAID, or alter mounts.
+The following signed APT setup follows [Docker's Debian installation instructions](https://docs.docker.com/engine/install/debian/).
+It is for a clean Debian 13 amd64 host. The preflight stops if Docker packages,
+a Docker APT source/key, or daemon overrides already exist: review that host's
+existing installation separately instead of overwriting or removing it.
+
+```bash
+bash <<'PREPARE_DOCKER_APT'
+set -euo pipefail
+trap 'printf "Dependency preparation failed at line %s; inspect before continuing.\n" "$LINENO" >&2' ERR
+test "$(id -u)" -ne 0
+sudo -v
+. /etc/os-release
+test "$ID" = debian
+test "$VERSION_ID" = 13
+test "$(dpkg --print-architecture)" = amd64
+test "$(ps -p 1 -o comm=)" = systemd
+if id -nG | tr ' ' '\n' | grep -Eq '^(root|docker)$'; then
+  printf 'Use the separately provisioned management account.\n' >&2
+  exit 1
+fi
+installed=$(dpkg-query -W -f='${db:Status-Status} ${binary:Package}\n' |
+  awk '$1 == "installed" && $2 ~ /^(docker[^ :]*|podman-docker|containerd(\.io)?|runc)(:amd64)?$/ {print $2}')
+if test -n "$installed" || command -v docker >/dev/null; then
+  printf 'Existing container packages/CLI require review before host preparation.\n%s\n' "$installed" >&2
+  exit 1
+fi
+for path in /etc/apt/keyrings/docker.asc /etc/apt/keyrings/docker.gpg \
+  /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker.sources \
+  /etc/docker/daemon.json /etc/systemd/system/docker.service \
+  /etc/systemd/system/docker.service.d /etc/systemd/system/docker.socket.d; do
+  if sudo test -e "$path" || sudo test -L "$path"; then
+    printf 'Existing Docker configuration requires review: %s\n' "$path" >&2
+    exit 1
+  fi
+done
+if sudo grep -rlE 'download[.]docker[.]com' /etc/apt; then
+  printf 'Existing Docker APT source requires review.\n' >&2
+  exit 1
+else
+  test "$?" -eq 1
+fi
+sudo apt-get update
+sudo apt-get install --no-upgrade --no-install-recommends \
+  git ca-certificates curl openssl python3 python3-yaml util-linux iproute2 </dev/tty
+sudo test ! -L /etc/apt/keyrings
+if ! sudo test -d /etc/apt/keyrings; then
+  sudo mkdir -m 0755 /etc/apt/keyrings
+fi
+sudo bash -c 'set -euo pipefail; set -o noclobber; umask 022
+  curl --fail --silent --show-error https://download.docker.com/linux/debian/gpg > /etc/apt/keyrings/docker.asc'
+sudo bash -c 'set -euo pipefail; set -o noclobber; umask 022
+  cat > /etc/apt/sources.list.d/docker.sources' <<'DOCKER_SOURCE'
+Types: deb
+URIs: https://download.docker.com/linux/debian
+Suites: trixie
+Components: stable
+Architectures: amd64
+Signed-By: /etc/apt/keyrings/docker.asc
+DOCKER_SOURCE
+sudo apt-get update
+apt-cache madison docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+PREPARE_DOCKER_APT
+```
+
+Select exact available versions from that output. Engine and CLI use the same
+version string; containerd, Buildx and the Docker Compose plugin have their own
+versions. Compose must be at least 2.20. Run the next block from a terminal and
+enter all four reviewed values when prompted. It refuses already installed
+Docker packages and does not add an APT hold or run a system upgrade. Keep APT's
+proposed changes reviewable; stop if they exceed the authorized host preparation.
+
+```bash
+bash <<'INSTALL_DOCKER'
+set -euo pipefail
+trap 'printf "Docker installation failed at line %s; inspect before continuing.\n" "$LINENO" >&2' ERR
+installed=$(dpkg-query -W -f='${db:Status-Status} ${binary:Package}\n' |
+  awk '$1 == "installed" && $2 ~ /^(docker[^ :]*|podman-docker|containerd(\.io)?|runc)(:amd64)?$/ {print $2}')
+test -z "$installed"
+read -r -p 'Exact Docker Engine and CLI version: ' DOCKER_VERSION </dev/tty
+read -r -p 'Exact containerd.io version: ' CONTAINERD_VERSION </dev/tty
+read -r -p 'Exact docker-buildx-plugin version: ' BUILDX_VERSION </dev/tty
+read -r -p 'Exact docker-compose-plugin version (>=2.20): ' COMPOSE_VERSION </dev/tty
+for version in "$DOCKER_VERSION" "$CONTAINERD_VERSION" "$BUILDX_VERSION" "$COMPOSE_VERSION"; do
+  test -n "$version"
+  [[ "$version" != *[[:space:]]* ]]
+done
+sudo apt-get install --no-upgrade --no-install-recommends \
+  "docker-ce=$DOCKER_VERSION" "docker-ce-cli=$DOCKER_VERSION" \
+  "containerd.io=$CONTAINERD_VERSION" "docker-buildx-plugin=$BUILDX_VERSION" \
+  "docker-compose-plugin=$COMPOSE_VERSION" </dev/tty
+sudo systemctl enable --now docker
+sudo systemctl is-enabled docker
+sudo systemctl is-active docker
+dpkg-query -W -f='${binary:Package}\t${Version}\n' \
+  git ca-certificates curl openssl python3 python3-yaml util-linux iproute2 \
+  docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo docker version
+sudo docker compose version
+INSTALL_DOCKER
+```
+
+Save the package and Docker/Compose version output with the installation
+evidence. On an already prepared host, review those same read-only version and
+service checks rather than rerunning package installation. Continue with the
+fixed checkout in section 2, then the formal `image.sh` and `manage.sh` stages;
+those tools do not install packages or change users, RAID, disks, or mounts.
 
 Docker uses its normal operating-system service/autostart. FileBrowser uses
-Docker's `unless-stopped` policy. A deliberately stopped container stays stopped
-until an explicit start. Confirm Docker's normal boot behavior before acceptance.
+Docker's `unless-stopped` policy; a deliberately stopped container stays stopped
+until an explicit start. No FileBrowser systemd service or timer is installed.
+Confirm normal Docker autostart during the host-reboot acceptance below.
 
 Validate `/srv/storage` with `findmnt --mountpoint /srv/storage`. Never create a
 same-named fallback on the root filesystem. Record RAID evidence separately when

@@ -348,3 +348,28 @@ Windows checkout has no Go/gofmt, so these new Go tests have not run locally;
 full backend race tests, Lint, format checking and existing Playwright must run
 in CI at the new source SHA. Existing migration and bootstrap-log assertions
 remain unchanged.
+
+## Generated signing key serialization: actual failing regression
+
+At `52136fcac5075d2a537bed557edb7f9151caccfb`,
+[backend job 101689135180](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34105398684/job/101689135180)
+failed the new storage package tests in 9.515 seconds: generated first-setup key
+was not equal to its stored value, and the explicit-restart test found the same
+initial discrepancy. Explicit first setup and missing/empty/corrupt persisted
+key cases passed. The corresponding shared-host backend job also failed; this
+SHA is not a passing backend result. Format checking passed and compatible
+Lint continued to report the same 78 integration-baseline findings.
+
+`utils.GenerateKey` returned a string containing 64 raw random bytes. Storm's
+default JSON codec replaces invalid UTF-8 bytes while saving that string,
+changing the signing key. Only the first-generation return value now uses hex
+encoding of the same 64 random bytes. Existing keys are neither regenerated nor
+re-encoded. The strict storage equality, explicit override, restart and
+fail-closed assertions remain, with an additional hex-length and JSON round-trip
+test. Local diff checks passed; actual Go execution remains pending CI.
+
+The dependency preparation tutorial now includes signed official Docker APT
+setup, explicit package-version inputs, existing-installation refusal and normal
+Docker service autostart. Its four outer/embedded Shell snippets passed syntax
+checking. No installation was run on Windows, and these syntax checks do not
+establish a clean Debian installation result.
