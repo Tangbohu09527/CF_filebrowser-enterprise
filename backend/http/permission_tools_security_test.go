@@ -1,6 +1,7 @@
 package http
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -465,6 +466,102 @@ func TestPermissionReadSecurity_DuplicateCacheHitDoesNotWaitForSearchLock(t *tes
 	}
 	if !strings.Contains(recorder.Body.String(), fmt.Sprintf("%d", markerSize)) {
 		t.Errorf("cached duplicate response was not served while search lock was held: %s", recorder.Body.String())
+	}
+}
+
+func TestPermissionReadSecurity_DuplicatesFromRealIndexSizeModes(t *testing.T) {
+	for _, logical := range []bool{false, true} {
+		t.Run(fmt.Sprintf("useLogicalSize=%t", logical), func(t *testing.T) {
+			sourcePath := setupResourcePutTestEnv(t)
+			resetPermissionDuplicateResultsCache(t)
+			idx := indexing.GetIndex("source1")
+			if idx == nil {
+				t.Fatal("test source index is unavailable")
+			}
+			// Enable only the synchronous real-directory refresh; the test helper
+			// initialized this source without starting background scanners.
+			idx.Config.ResolvedRules.IndexingDisabled = false
+			idx.Config.UseLogicalSize = false
+			content := bytes.Repeat([]byte{0}, 1126*1024)
+			if len(content)%4096 == 0 {
+				t.Fatal("duplicate fixture must not be aligned to a 4 KiB block")
+			}
+			names := []string{"duplicate-size-a.bin", "duplicate-size-b.bin"}
+			var allocatedSize int64
+			for _, name := range names {
+				realPath := filepath.Join(sourcePath, "public", name)
+				if writeErr := os.WriteFile(realPath, content, 0o644); writeErr != nil {
+					t.Fatal(writeErr)
+				}
+				info, statErr := os.Stat(realPath)
+				if statErr != nil {
+					t.Fatal(statErr)
+				}
+				// Read the actual platform scanner size, rather than rounding the
+				// fixture length or constructing synthetic index metadata.
+				physical, physicalErr := idx.GetFsInfoCore("/public/"+name, indexing.Options{})
+				if physicalErr != nil {
+					t.Fatal(physicalErr)
+				}
+				t.Logf("fixture=%s logical_bytes=%d scanner_allocated_bytes=%d", name, info.Size(), physical.Size)
+				if info.Size() != int64(len(content)) || physical.Size == info.Size() {
+					t.Fatal("fixture must expose distinct actual logical and scanner allocated sizes")
+				}
+				if allocatedSize != 0 && allocatedSize != physical.Size {
+					t.Fatal("identical duplicate fixtures have different allocated sizes")
+				}
+				allocatedSize = physical.Size
+			}
+			idx.Config.UseLogicalSize = logical
+			if refreshErr := idx.RefreshDirectory("/public/", true); refreshErr != nil {
+				t.Fatal(refreshErr)
+			}
+			wantSize := allocatedSize
+			if logical {
+				wantSize = int64(len(content))
+			}
+			indexed, indexErr := indexing.GetIndexDB().GetFilesForMultipleSizes("source1", []int64{wantSize}, "/")
+			if indexErr != nil {
+				t.Fatal(indexErr)
+			}
+			if len(indexed[wantSize]) != len(names) {
+				t.Fatalf("real index has %d duplicate candidates at size %d, want %d", len(indexed[wantSize]), wantSize, len(names))
+			}
+			user := &users.User{
+				Username:    "duplicate-real-index-user",
+				Permissions: users.Permissions{Browse: true, Download: true},
+				Scopes:      []users.SourceScope{{Name: sourcePath, Scope: "/"}},
+			}
+			savePermissionReadUser(t, user)
+			query := url.Values{"source": {"source1"}, "scope": {"/"}, "minSizeMb": {"1"}}
+			request := httptest.NewRequest(http.MethodGet, "/api/tools/duplicateFinder?"+query.Encode(), nil)
+			recorder := httptest.NewRecorder()
+			returned, handlerErr := duplicatesHandler(recorder, request, &requestContext{user: user})
+			if got := permissionHandlerStatus(returned, recorder); got != http.StatusOK || handlerErr != nil {
+				t.Fatalf("real-index duplicate status=%d, want 200 (err: %v)", got, handlerErr)
+			}
+			var response duplicateResponse
+			if decodeErr := json.Unmarshal(recorder.Body.Bytes(), &response); decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			if response.Incomplete || len(response.Groups) != 1 {
+				t.Fatalf("real-index duplicate groups=%d incomplete=%t, want one complete group", len(response.Groups), response.Incomplete)
+			}
+			group := response.Groups[0]
+			if group.Size != wantSize || group.Count != len(names) || len(group.Files) != len(names) {
+				t.Fatalf("duplicate group size=%d count=%d files=%d, want size=%d count=2 files=2", group.Size, group.Count, len(group.Files), wantSize)
+			}
+			wantPaths := map[string]bool{"/public/duplicate-size-a.bin": true, "/public/duplicate-size-b.bin": true}
+			for _, file := range group.Files {
+				if file == nil || file.Source != "source1" || file.Size != wantSize || !wantPaths[file.Path] {
+					t.Fatal("duplicate response changed source, indexed size, or expected file identity")
+				}
+				delete(wantPaths, file.Path)
+			}
+			if len(wantPaths) != 0 {
+				t.Fatal("duplicate response omitted an indexed fixture")
+			}
+		})
 	}
 }
 

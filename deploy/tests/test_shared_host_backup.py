@@ -5,7 +5,9 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import stat
 import tarfile
 import tempfile
 import unittest
@@ -15,6 +17,9 @@ MODULE = Path(__file__).resolve().parents[1] / "shared-host" / "backup.py"
 spec = importlib.util.spec_from_file_location("shared_host_backup", MODULE)
 backup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(backup)
+lifecycle_spec = importlib.util.spec_from_file_location("backup_guard_lifecycle", MODULE.with_name("lifecycle.py"))
+lifecycle = importlib.util.module_from_spec(lifecycle_spec)
+lifecycle_spec.loader.exec_module(lifecycle)
 
 
 class BackupArchiveTests(unittest.TestCase):
@@ -252,6 +257,65 @@ class BackupArchiveTests(unittest.TestCase):
         with self.assertRaises(backup.BackupError):
             self.run_restore_cli(archive, checksum="0" * 64)
         self.assertEqual(list(self.root.iterdir()), [archive])
+
+    @contextlib.contextmanager
+    def guard_environment(self, writable_parent=None, mode=0o755):
+        paths = lifecycle.Paths(self.root / "guard-layout")
+        for directory in (paths.source, paths.config.parent, paths.data.parent,
+                          paths.cache.parent, paths.storage):
+            directory.mkdir(parents=True, exist_ok=True)
+        changed = {"storage": paths.storage, "config": paths.config.parent}.get(writable_parent)
+        real_stat = Path.stat
+
+        def posix_metadata(path, *args, **kwargs):
+            # Paths and existence are real temporary filesystems. Only POSIX
+            # ownership/mode metadata is modeled so Windows runs the same guard.
+            info = real_stat(path, *args, **kwargs)
+            fields = list(info)
+            permissions = mode if path == changed else (0o755 if stat.S_ISDIR(info.st_mode) else 0o600)
+            fields[0] = stat.S_IFMT(info.st_mode) | permissions
+            fields[4], fields[5] = 0, 0
+            return os.stat_result(fields)
+
+        roots = {"config": paths.config, "data": paths.data, "files": paths.files}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(Path, "stat", posix_metadata))
+            stack.enter_context(mock.patch.object(backup, "lifecycle_module", return_value=lifecycle))
+            stack.enter_context(mock.patch.object(lifecycle, "host_checks"))
+            stack.enter_context(mock.patch.object(lifecycle, "Paths", return_value=paths))
+            stack.enter_context(mock.patch.multiple(backup, ROOTS=roots, SOURCE_ROOT=paths.source,
+                CONFIG_ROOT=paths.config, DATA_ROOT=paths.data, CACHE_ROOT=paths.cache,
+                FILES_ROOT=paths.files, BACKUP_ROOT=paths.backups))
+            yield paths
+
+    def test_restore_guard_accepts_protected_existing_parents(self):
+        with self.guard_environment() as paths:
+            backup.production_guard("isolated-test")
+            self.assertFalse(paths.config.exists())
+            self.assertFalse(paths.data.exists())
+            self.assertFalse(paths.storage_project.exists())
+
+    def test_restore_guard_rejects_writable_parent_before_archive_work(self):
+        archive = self.archive()
+        backup.validate_archive(archive, self.version)
+        arguments = ["restore", str(archive), "--hostname", "isolated-test",
+                     "--source-sha", self.version["source_sha"], "--image-ref", self.version["image_ref"],
+                     "--image-id", self.version["image_id"],
+                     "--sha256", hashlib.sha256(archive.read_bytes()).hexdigest()]
+        for parent, mode in (("storage", 0o777), ("config", 0o775)):
+            with self.subTest(parent=parent, mode=oct(mode)), self.guard_environment(parent, mode) as paths:
+                with mock.patch.object(backup, "lifecycle_lock", side_effect=AssertionError(
+                        "unsafe restore parent passed preflight")) as lock, \
+                        mock.patch.object(backup, "create_archive") as create, \
+                        mock.patch.object(backup, "restore_archive") as restore:
+                    with self.assertRaises(backup.BackupError):
+                        backup.cli(arguments)
+                lock.assert_not_called()
+                create.assert_not_called()
+                restore.assert_not_called()
+                self.assertFalse(paths.config.exists())
+                self.assertFalse(paths.data.exists())
+                self.assertFalse(paths.storage_project.exists())
 
     def test_controlled_backup_stop_only_targets_project_container(self):
         running = {"Id": "owned", "Image": self.version["image_id"], "State": {"Running": True}}
