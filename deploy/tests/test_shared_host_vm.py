@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import copy
+import contextlib
 import hashlib
 import json
 from pathlib import Path
@@ -13,6 +14,7 @@ import subprocess
 import threading
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -93,7 +95,7 @@ class UIRasterEvidenceTests(unittest.TestCase):
 
     def case_log(self):
         return b''.join(json.dumps({'case': case, 'status': 'passed', 'retry': 0,
-                                    'stage': 'delete' if case == 'crud' else case}).encode() + b'\n'
+                                    'stage': 'delete' if case == 'crud' else 'xlsx_checks' if case == 'xlsx' else case}).encode() + b'\n'
                         for case in ('crud', 'png', 'jpg', 'xlsx', 'logout'))
 
     def test_case_summary_requires_every_fixed_case_final_success(self):
@@ -126,9 +128,10 @@ class UIRasterEvidenceTests(unittest.TestCase):
                 self.assertNotIn('PRIVATE', str(caught.exception))
 
     def test_case_summary_retains_only_last_entered_operation(self):
-        for case, stages in {'crud': ('login', 'listing', 'upload', 'edit', 'save', 'rename', 'download', 'delete'),
+        for case, stages in {'crud': ('login', 'listing', 'upload', 'edit', 'save_menu', 'save_response', 'save_navigation', 'rename', 'download', 'delete'),
                              'png': ('login', 'listing', 'png'), 'jpg': ('login', 'listing', 'jpg'),
-                             'xlsx': ('login', 'listing', 'xlsx'), 'logout': ('login', 'listing', 'logout')}.items():
+                             'xlsx': ('login', 'listing', 'xlsx', 'xlsx1_request', 'xlsx1_response', 'xlsx1_status', 'xlsx1_viewer', 'xlsx1_decode',
+                                      'xlsx2_request', 'xlsx2_response', 'xlsx2_status', 'xlsx2_viewer', 'xlsx2_decode', 'xlsx_evidence', 'xlsx_checks'), 'logout': ('login', 'listing', 'logout')}.items():
             for stage in stages:
                 with self.subTest(case=case, stage=stage):
                     record = {'case': case, 'status': 'failed', 'retry': 0, 'stage': stage}
@@ -137,7 +140,7 @@ class UIRasterEvidenceTests(unittest.TestCase):
                     self.assertEqual(report['attempts'], [record])
 
     def test_case_summary_rejects_invalid_and_cross_case_operations(self):
-        for case, stage in (('crud', 'png'), ('png', 'edit'), ('xlsx', 'logout'), ('logout', 'xlsx'),
+        for case, stage in (('crud', 'save'), ('crud', 'png'), ('png', 'edit'), ('xlsx', 'logout'), ('logout', 'xlsx'),
                             ('jpg', 'PRIVATE-URL-TOKEN'), ('crud', True), ('crud', 1), ('crud', [])):
             with self.subTest(case=case, stage=stage):
                 record = {'case': case, 'status': 'failed', 'retry': 0, 'stage': stage}
@@ -152,6 +155,15 @@ class UIRasterEvidenceTests(unittest.TestCase):
                     record = {'case': case, 'status': 'passed', 'retry': 0, 'stage': stage}
                     with self.assertRaises(harness.VerificationError):
                         harness.ui_case_evidence(json.dumps(record).encode())
+
+    def test_intermediate_save_or_spreadsheet_step_cannot_be_reported_passed(self):
+        stages = {'crud': ('save_menu', 'save_response', 'save_navigation'),
+                  'xlsx': ('xlsx', 'xlsx1_request', 'xlsx1_response', 'xlsx1_status', 'xlsx1_viewer', 'xlsx1_decode',
+                           'xlsx2_request', 'xlsx2_response', 'xlsx2_status', 'xlsx2_viewer', 'xlsx2_decode', 'xlsx_evidence')}
+        for case, values in stages.items():
+            for stage in values:
+                with self.subTest(case=case, stage=stage), self.assertRaises(harness.VerificationError):
+                    harness.ui_case_evidence(json.dumps({'case': case, 'status': 'passed', 'retry': 0, 'stage': stage}).encode())
 
     def test_failed_unknown_operation_is_retained_without_claiming_progress(self):
         for status in ('failed', 'timedOut', 'skipped', 'interrupted'):
@@ -771,6 +783,161 @@ class MissingStorageTests(unittest.TestCase):
         self.assertNotIn("SECRET", json.dumps(report))
         self.assertNotIn("TOKEN", json.dumps(report))
         self.assertNotIn("/private/path", json.dumps(report))
+
+
+
+class AuditStoreFaultTests(unittest.TestCase):
+    IMAGE = "sha256:" + "b" * 64
+    CONTAINER = "a" * 64
+
+    def test_private_reports_only_export_fixed_whitelist_values(self):
+        raw = {"version": 1, "phase": "server", "mode": "inject", "passed": True, "detached": True,
+               "stage": "complete", "strace_version": "6.13", "coverage_samples": 4,
+               "counts": {"writes": 3, "successful": 0, "injected_eio": 3},
+               "identity": {"pid": 12, "container": self.CONTAINER, "token": "PRIVATE_TOKEN"},
+               "request_id": "PRIVATE_ID", "nonce": "PRIVATE_NONCE", "trace": "PRIVATE_TRACE",
+               "failure": None, "body": "PRIVATE_BODY"}
+        safe = harness.fault_public_report(raw, "server", mode="inject")
+        self.assertTrue(safe["passed"])
+        self.assertEqual(safe["counts"], raw["counts"])
+        encoded = json.dumps(safe)
+        self.assertNotIn("PRIVATE", encoded)
+        self.assertNotIn(self.CONTAINER, encoded)
+        self.assertNotIn("identity", encoded)
+        for key, value in (("phase", "verify"), ("passed", 1), ("stage", "PRIVATE_STAGE"),
+                           ("coverage_samples", True), ("counts", {"writes": 0, "successful": 0, "injected_eio": 0})):
+            bad = dict(raw, **{key: value})
+            rejected = harness.fault_public_report(bad, "server", mode="inject")
+            self.assertFalse(rejected["passed"])
+            self.assertNotIn("PRIVATE", json.dumps(rejected))
+
+    def test_ready_requires_exact_current_container_image_and_nonce_without_echo(self):
+        worker = mock.Mock()
+        worker.is_alive.return_value = True
+        baseline = {"version": 1, "ready": True, "mode": "inject", "container": self.CONTAINER,
+                    "image": self.IMAGE, "nonce": "c" * 32, "control_sha256": "d" * 64, "body": "PRIVATE_BODY"}
+        server = mock.Mock()
+        server.command_on_guest.return_value = subprocess.CompletedProcess([], 0, stdout=json.dumps(baseline).encode(), stderr=b"")
+        safe = harness.fault_wait_ready(server, "inject", self.CONTAINER, self.IMAGE, worker)
+        self.assertNotIn("PRIVATE", json.dumps(safe))
+        for key, value in (("version", True), ("ready", 1), ("mode", "observe"), ("container", "f" * 64),
+                           ("image", "sha256:" + "e" * 64), ("nonce", "PRIVATE_NONCE")):
+            changed = dict(baseline, **{key: value})
+            server.command_on_guest.return_value.stdout = json.dumps(changed).encode()
+            with self.subTest(field=key), self.assertRaises(harness.VerificationError) as caught:
+                harness.fault_wait_ready(server, "inject", self.CONTAINER, self.IMAGE, worker)
+            self.assertNotIn("PRIVATE", str(caught.exception))
+
+    def test_source_stage_uses_existing_sequence_and_only_guest_apt_dependency(self):
+        import inspect
+        source = inspect.getsource(harness.scenario)
+        self.assertLess(source.index("audit_pending_interrupt("), source.index("audit_store_fault("))
+        self.assertLess(source.index("audit_store_fault("), source.index('"initial-real-api-exercise"'))
+        fake = mock.Mock()
+        harness.prerequisites(fake, "a" * 40)
+        script = fake.command_on_guest.call_args.args[0]
+        self.assertIn("apt-get install --yes --no-install-recommends ca-certificates", script)
+        self.assertIn("e2fsprogs strace", script)
+        self.assertNotIn("ptrace_scope", script)
+        self.assertNotIn("SYS_PTRACE", script)
+
+    def run_probe(self, *, failed_client=None, missing_ready=False, detach_failure=False, release_failure=False):
+        events, evidence = [], {}
+        released = {mode: threading.Event() for mode in ("observe", "inject")}
+        server = SimpleNamespace(name="cf-verification-1")
+        client = SimpleNamespace(name="cf-verification-2")
+        server.read_file = client.read_file = mock.Mock(return_value=b"PRIVATE_CONTROL")
+        def write(path, data, mode="0600"):
+            events.append(("write", path))
+            if "release" in path:
+                which = "observe" if "observe" in path else "inject"
+                if release_failure:
+                    released[which].set()
+                    raise harness.VerificationError("PRIVATE_RELEASE_ERROR")
+                self.assertEqual(json.loads(data), {"version": 1, "nonce": "c" * 32})
+                released[which].set()
+        server.write_file = client.write_file = write
+        def command(script, **kwargs):
+            events.append(("command", script))
+            body = {"id": self.CONTAINER, "image": self.IMAGE, "running": True, "healthy": True}
+            return subprocess.CompletedProcess([], 0, stdout=json.dumps(body).encode(), stderr=b"")
+        server.command_on_guest = command
+        def call(machine, phase, evidence_name, *arguments, **kwargs):
+            mode = arguments[arguments.index("--mode") + 1] if "--mode" in arguments else None
+            events.append((phase, mode))
+            if phase == "server":
+                self.assertIs(machine, server)
+                self.assertIn(self.CONTAINER, arguments)
+                self.assertIn(self.IMAGE, arguments)
+                released[mode].wait(timeout=0.2)
+                return {"version": 1, "phase": phase, "mode": mode, "passed": True, "detached": True,
+                        "stage": "complete", "strace_version": "6.13", "coverage_samples": 4,
+                        "counts": {"writes": 1, "successful": int(mode == "observe"), "injected_eio": int(mode == "inject")}}
+            if phase == "detached":
+                return {"version": 1, "phase": phase, "passed": not detach_failure, "detached": not detach_failure}
+            if phase == failed_client:
+                failure = harness.VerificationError("PRIVATE_CLIENT_ERROR")
+                failure.fault_evidence = {"version": 1, "phase": phase, "passed": False,
+                                          "failure": "PRIVATE_BODY", "request_id": "PRIVATE_ID", "trace": "PRIVATE_TRACE"}
+                raise failure
+            return {"version": 1, "phase": phase, "passed": True, "requests": 1, "check_count": 2}
+        def ready(machine, mode, container, image, worker):
+            self.assertEqual((container, image), (self.CONTAINER, self.IMAGE))
+            if missing_ready:
+                raise harness.VerificationError("PRIVATE_READY_ERROR")
+            return {"version": 1, "ready": True, "mode": mode, "nonce": "c" * 32,
+                    "container": self.CONTAINER, "image": self.IMAGE, "control_sha256": "d" * 64}
+        self.events, self.evidence = events, evidence
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(harness, "fault_guest", side_effect=call))
+            stack.enter_context(mock.patch.object(harness, "fault_wait_ready", side_effect=ready))
+            stack.enter_context(mock.patch.object(harness, "record_stage"))
+            stack.enter_context(mock.patch.object(harness, "sentinel_state", return_value={"stable": True}))
+            stack.enter_context(mock.patch.object(harness, "healthy"))
+            harness.audit_store_fault(server, client, SimpleNamespace(), evidence, self.IMAGE,
+                                      {server.name: {"stable": True}, client.name: {"stable": True}})
+        return events, evidence
+
+    def test_real_probe_order_uses_two_windows_then_formal_restart_and_verify(self):
+        events, evidence = self.run_probe()
+        phases = [entry[0] for entry in events if entry[0] not in ("write", "command")]
+        self.assertEqual(phases, ["prepare", "server", "control", "detached", "server", "fault", "detached", "restarted", "verify"])
+        commands = [entry[1] for entry in events if entry[0] == "command"]
+        formal = [item for item in commands if "manage.sh stop" in item]
+        self.assertEqual(len(formal), 1)
+        self.assertIn("manage.sh start", formal[0])
+        self.assertTrue(evidence["audit_store_fault"]["passed"])
+        self.assertNotIn("PRIVATE", json.dumps(evidence))
+        self.assertNotIn(self.CONTAINER, json.dumps(evidence))
+        self.assertFalse(any(thread.name.startswith("audit-store-") for thread in threading.enumerate()))
+
+    def test_not_ready_sends_no_put_but_joins_and_verifies_detach(self):
+        with self.assertRaises(harness.VerificationError):
+            self.run_probe(missing_ready=True)
+        phases = [entry[0] for entry in self.events]
+        self.assertNotIn("control", phases)
+        self.assertNotIn("fault", phases)
+        self.assertIn("detached", phases)
+        self.assertFalse(any("manage.sh start" in str(entry) for entry in self.events))
+        self.assertNotIn("PRIVATE", json.dumps(self.evidence))
+
+    def test_client_failure_releases_joins_verifies_detach_and_stops(self):
+        with self.assertRaises(harness.VerificationError):
+            self.run_probe(failed_client="fault")
+        self.assertEqual(sum(entry == ("detached", None) for entry in self.events), 2)
+        self.assertTrue(any(entry[0] == "write" and "inject-release" in entry[1] for entry in self.events))
+        self.assertFalse(any("manage.sh start" in str(entry) for entry in self.events))
+        self.assertNotIn("PRIVATE", json.dumps(self.evidence))
+        self.assertFalse(any(thread.name.startswith("audit-store-") for thread in threading.enumerate()))
+
+    def test_release_or_detach_failure_never_enters_next_window_or_restart(self):
+        for option in ("detach_failure", "release_failure"):
+            with self.subTest(option=option), self.assertRaises(harness.VerificationError):
+                self.run_probe(**{option: True})
+            self.assertNotIn(("server", "inject"), self.events)
+            self.assertFalse(any("manage.sh start" in str(entry) for entry in self.events))
+            self.assertFalse(self.evidence["audit_store_fault"]["passed"])
+            self.assertNotIn("PRIVATE", json.dumps(self.evidence))
 
 
 if __name__ == "__main__":

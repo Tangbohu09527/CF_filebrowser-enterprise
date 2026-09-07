@@ -31,8 +31,9 @@ const evidenceCaseIds: Record<string, string> = {
   "ordinary user logs out and loses access to the listing": "logout",
 };
 
-type UIStage = "login" | "listing" | "upload" | "edit" | "save" | "rename" | "download" | "delete" |
-  "png" | "jpg" | "xlsx" | "logout";
+type WorkbookStage = `xlsx${1 | 2}_${"request" | "response" | "status" | "viewer" | "decode"}`;
+type UIStage = "login" | "listing" | "upload" | "edit" | "save_menu" | "save_response" | "save_navigation" |
+  "rename" | "download" | "delete" | "png" | "jpg" | "xlsx" | "xlsx_evidence" | "xlsx_checks" | "logout" | WorkbookStage;
 // A stage means only the last operation entered, never that it completed.
 const enteredStage = new WeakMap<TestInfo, UIStage>();
 const enterStage = (testInfo: TestInfo, stage: UIStage) => enteredStage.set(testInfo, stage);
@@ -78,12 +79,14 @@ test("ordinary user uploads, edits, renames, downloads exact bytes and deletes",
   await page.locator(".ace_content").click();
   await page.keyboard.press("ControlOrMeta+A");
   await page.keyboard.insertText(edited.toString("utf8"));
-  enterStage(testInfo, "save");
+  enterStage(testInfo, "save_menu");
   const saved = page.waitForResponse((response) =>
     response.url().includes("/api/resources") && ["PUT", "POST"].includes(response.request().method()));
   await page.locator(".overflow-menu-button").click();
   await page.locator('button[aria-label="Save"]').click();
+  enterStage(testInfo, "save_response");
   expect((await saved).ok()).toBeTruthy();
+  enterStage(testInfo, "save_navigation");
   await page.goto(listing());
 
   enterStage(testInfo, "rename");
@@ -125,8 +128,9 @@ for (const filename of ["picture.png", "photo.jpg"]) {
 test("renders distinct nonblank XLSX content in the actual document viewer", async ({ page }, testInfo) => {
   enterStage(testInfo, "xlsx");
   const observations: Array<{ width: number; height: number; nonWhitePixels: number; pixelSha256: string }> = [];
-  for (const filename of ["spreadsheet.xlsx", "spreadsheet-alternative.xlsx"]) {
+  for (const [workbook, filename] of [[1, "spreadsheet.xlsx"], [2, "spreadsheet-alternative.xlsx"]] as const) {
     await page.goto(listing());
+    enterStage(testInfo, `xlsx${workbook}_request`);
     const rendered = page.waitForResponse(response => {
       const requested = new URL(response.url());
       return response.request().method() === "GET" && requested.pathname === "/api/resources/preview" &&
@@ -134,13 +138,17 @@ test("renders distinct nonblank XLSX content in the actual document viewer", asy
         requested.searchParams.get("size") === "xlarge";
     });
     await item(page, filename).dblclick();
+    enterStage(testInfo, `xlsx${workbook}_response`);
     const response = await rendered;
+    enterStage(testInfo, `xlsx${workbook}_status`);
     expect(response.status()).toBe(200);
     expect(await response.finished()).toBeNull();
+    enterStage(testInfo, `xlsx${workbook}_viewer`);
     await expect(page.locator("#previewer")).toBeVisible();
     // Select the full viewer image, never its cached thumbnail placeholder.
     const fullImage = page.locator('#previewer img.image-ex-img[src*="size=xlarge"]');
     await expect(fullImage).toHaveCount(1);
+    enterStage(testInfo, `xlsx${workbook}_decode`);
     const pixels = await fullImage.evaluate(async element => {
       if (!(element instanceof HTMLImageElement)) throw new Error("Document viewer image is missing");
       await element.decode();
@@ -169,11 +177,13 @@ test("renders distinct nonblank XLSX content in the actual document viewer", asy
     });
     observations.push(pixels);
   }
+  enterStage(testInfo, "xlsx_evidence");
   const output = process.env.FILEBROWSER_ACCEPTANCE_OUTPUT;
   if (!output) throw new Error("A private acceptance output directory is required");
   await mkdir(output, { recursive: true, mode: 0o700 });
   await writeFile(resolve(output, "xlsx-raster-evidence.json"),
     JSON.stringify({ schema: 1, rasters: observations }) + "\n", { mode: 0o600, flag: "wx" });
+  enterStage(testInfo, "xlsx_checks");
   for (const pixels of observations) expect(pixels.nonWhitePixels).toBeGreaterThan(10);
   // A shared placeholder image fails even if it decodes and is not blank.
   expect(observations[0].pixelSha256).not.toBe(observations[1].pixelSha256);

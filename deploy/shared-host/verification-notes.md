@@ -1150,3 +1150,94 @@ checks; Python compilation and `git diff --check` also passed. These are harness
 regressions, not actual Docker/browser/Pending acceptance. The running e5deaed7
 VM has none of these new Pending/operation diagnostics. Actual Store EIO
 injection is separate, remains unexecuted, and is not implied by Pending recovery.
+
+
+## e5deaed7 real VM narrows the remaining browser failures
+
+[Real VM job 101744099980](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34122486557/job/101744099980)
+completed with failure at `initial-existing-playwright-ui`. The public case
+summary records CRUD and XLSX as failed, and PNG, JPEG and logout as passed,
+all on retry 0. The process exited 1; no acceptable XLSX raster summary was
+produced. This head did not retain the last entered operation, so the failing
+CRUD step and XLSX cause remain unknown. Storage/API success is not preview
+success, and no private browser artifact was retrieved to guess the cause.
+
+Before the browser failure, the fixed-source real-image install, bootstrap
+removal and same-image login, actual service UID/GID and protected mounts,
+second-VM verified HTTPS/actual denied TCP peer checks passed. The initial API
+ran 169 requests and 229 checks successfully; the actual FileBridge/WebDAV
+phase ran 80 HTTP requests and 236 checks, including 33 FileBridge executable
+invocations, successfully. These results are specific to source
+`e5deaed7a1a37d78051434953acb9e8e9617512f`; they do not certify the later Pending
+or Store EIO harness. Container/daemon/host reboot and blank restore were not
+reached after the browser failure and remain unverified.
+
+Both Debian 13.6 systemd guests used the registry manifest/actual guest Image ID
+`sha256:1aa8e0dad658c194bd5de0519196a7d9ddc879fd2c3a40b56b1e2322d01d92de`;
+the builder Image ID/config digest was
+`sha256:f5275a41d21ec38f18bc3f6b0f942f827dcbff20fc5e425775290e23f4308ecc`.
+The two guests used 4,294,967,296 bytes of configured RAM and
+78,383,906,816 bytes of total sparse virtual disk capacity, within the explicit
+decimal limits. Independent ext4 test disks validate mounting, not RAID.
+
+
+## 49ea34bc ordinary regressions and source setup failure
+
+The regular backend job 101754209194 passed the retained `go test -race -v
+./... -timeout 5m` command (HTTP package 105.039 s). Frontend job 101754209274
+passed all 137 unit tests. The complete Lint job 101754209261 still reported
+112 findings across 27 files; an initial narrow log parser matched none,
+then the complete position/rule extraction matched all 112 with no unknown
+position lines. An empty parser result is not a clean Lint result.
+
+[Source job 101755076863](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34125846128/job/101755076863)
+passed frontend types/lint/unit/build and the independent FileBridge checks.
+The unchanged full Playwright entry stopped in the sharing setup at
+`global-setup.ts:116`: the enabled Create checkbox remained unchecked after
+its visible slider was clicked. The previous e5deaed7 run passed this setup;
+a cause has not been established. Proxy setup and its newly added diagnostics
+were not reached. An attempt to rerun only this source job was rejected by
+GitHub with HTTP 403 because its original workflow was still running; no
+rerun or extra VM was started. The original failure remains recorded.
+
+## Real Audit Store write-failure probe, implementation awaits execution
+
+The existing VM flow now also invokes a separate disposable-guest-only probe
+after Pending recovery. An ordinary scoped user's saved session first writes
+and verifies a different payload, verifies the terminal audit record, and
+restores the original payload. The observer verifies writes to the real
+FileBrowser Bolt database descriptor. A second finite window injects EIO into
+that descriptor's `pwrite64` calls while exactly one valid ordinary-session PUT
+is attempted. It requires the exact HTTP 503 audit-unavailable response,
+unchanged target bytes/inode and no remaining temporary file, then detaches.
+The formal stop/start entry must retain the same container and image while
+starting a new process. The same saved session must read the original bytes,
+retain prior terminal audit records, find no recovered event for the failed
+request ID, and successfully perform and audit the same write afterward.
+
+The pinned Debian strace 6.13 runs only in the already authorized disposable
+VM. [Its documented thread/descriptor controls](https://manpages.debian.org/trixie/strace/strace.1.en.html)
+are combined with local-daemon/container/image, executable, UID, namespace,
+DB inode/FD and per-record thread-membership checks. The main window is 60 s
+with an independent 70 s watchdog; exact process descriptors bound termination
+and every completed window independently verifies all service threads detached.
+Guest SSH/report/join bounds remain finite. Raw syscall arguments remain in an
+anonymous pipe and are never saved; public evidence contains only fixed stages,
+booleans and bounded counts. No host kernel, Docker capability, product timeout,
+Windows setting or public registry is changed.
+
+The database also receives scanner writes, so an EIO count alone is not an
+audit failure proof. The positive controls, exact response and existing
+write-before-file-open ordering support attribution. FD/thread checks are
+samples, not proof against transient descriptor reuse; before/after temporary
+file checks prove no residue, not that a temporary file never existed. These
+limits remain explicit. Failure preserves data, joins the bounded worker,
+checks detachment where reachable, and stops subsequent windows/restart.
+
+Local implementation regressions passed: VM orchestration/collector 64 tests
+and Audit helper tests 40 (21 Store EIO + 19 Pending), 104 total. AST/whitespace,
+Node strip-types syntax and `git diff --check` passed. The existing browser
+case recorder now identifies fixed workbook 1/2 response/viewer/decode stages
+and editor save stages, keeping every original interaction, timeout and
+assertion. All of these are implementation checks; actual Store EIO, syscall
+coverage and the revised browser diagnostics have not yet run in a VM.

@@ -275,7 +275,7 @@ def prerequisites(vm, revision):
     vm.command_on_guest(f"""
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install --yes --no-install-recommends ca-certificates curl git python3-yaml openssl util-linux iproute2 e2fsprogs
+apt-get install --yes --no-install-recommends ca-certificates curl git python3-yaml openssl util-linux iproute2 e2fsprogs strace
 install -d -m 0755 /etc/apt/keyrings
 curl --fail --silent --show-error https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
 chmod 0644 /etc/apt/keyrings/docker.asc
@@ -874,6 +874,209 @@ def audit_pending_interrupt(server, client, args, evidence, image_id, baseline):
                 check("audit_pending_client_deadline", False)
 
 
+
+FAULT_PHASES = frozenset(("prepare", "control", "fault", "verify", "server", "detached", "restarted"))
+FAULT_STAGES = frozenset(("preflight", "identity", "attach", "ready_window", "release", "complete"))
+
+
+def fault_public_report(report, phase, *, mode=None):
+    """Private syscall/process/request identities never enter runner evidence."""
+    if phase not in FAULT_PHASES or (phase == "server" and mode not in ("observe", "inject")):
+        raise VerificationError("invalid fault evidence phase")
+    fallback = {"version": 1, "phase": phase, "passed": False, "failure": "invalid_fault_evidence"}
+    if (not isinstance(report, dict) or type(report.get("version")) is not int or report["version"] != 1
+            or report.get("phase") != phase or type(report.get("passed")) is not bool):
+        return fallback
+    safe = {"version": 1, "phase": phase, "passed": report["passed"] is True and report.get("failure") is None,
+            "failure": None if report["passed"] is True and report.get("failure") is None else "fault_phase_failed"}
+    if phase == "server":
+        if (report.get("mode") != mode or report.get("stage") not in FAULT_STAGES
+                or type(report.get("detached")) is not bool):
+            return fallback
+        safe.update(mode=mode, stage=report["stage"], detached=report["detached"])
+        if "coverage_samples" in report:
+            if type(report["coverage_samples"]) is not int or not 0 <= report["coverage_samples"] <= 10000:
+                return fallback
+            safe["coverage_samples"] = report["coverage_samples"]
+        if report.get("strace_version") == "6.13":
+            safe["strace_version"] = "6.13"
+        counts = report.get("counts")
+        if counts is not None:
+            if (not isinstance(counts, dict) or set(counts) != {"writes", "successful", "injected_eio"}
+                    or any(type(value) is not int or not 0 <= value <= 10000 for value in counts.values())):
+                return fallback
+            safe["counts"] = dict(counts)
+        if safe["passed"] and (not safe["detached"] or safe.get("strace_version") != "6.13"
+                or safe.get("coverage_samples", 0) < 1 or not counts or counts["writes"] < 1
+                or counts["writes"] != counts["injected_eio" if mode == "inject" else "successful"]
+                or counts["successful" if mode == "inject" else "injected_eio"] != 0
+                or safe["stage"] != "complete"):
+            return fallback
+    elif phase == "detached":
+        if type(report.get("detached")) is not bool or safe["passed"] and not report["detached"]:
+            return fallback
+        safe["detached"] = report["detached"]
+    elif phase != "restarted":
+        checks = report.get("checks")
+        if (not isinstance(checks, list) or len(checks) > 100 or type(report.get("requests")) is not int
+                or not 0 <= report["requests"] <= 100
+                or any(not isinstance(item, dict) or type(item.get("passed")) is not bool for item in checks)):
+            return fallback
+        if safe["passed"] and any(not item["passed"] for item in checks):
+            return fallback
+        required = {"fault": {"audit_store_exact_503_response"}, "verify": {
+            "same_saved_session_write_and_terminal_after_formal_restart",
+            "failed_request_absent_after_startup_pending_recovery"}}.get(phase, set())
+        if safe["passed"] and not required.issubset({item.get("check") for item in checks if item["passed"]}):
+            return fallback
+        safe.update(requests=report["requests"], check_count=len(checks))
+    return safe
+
+
+def fault_guest(vm, phase, evidence_name, *arguments, timeout=120):
+    if phase not in FAULT_PHASES or not re.fullmatch(r"fault-[a-z-]+\.json", evidence_name):
+        raise VerificationError("invalid fault guest phase")
+    mode = arguments[arguments.index("--mode") + 1] if "--mode" in arguments else None
+    argv = ["python3", "-B", SOURCE + "/scripts/tests/shared_host_audit_fault.py", phase,
+            "--evidence", GUEST + "/" + evidence_name, *arguments]
+    if phase in ("prepare", "control", "fault", "verify"):
+        argv += ["--url", f"https://{TLS_NAME}:{TLS_PORT}", "--ca-file", GUEST + "/ca.crt",
+                 "--admin-password-file", GUEST + "/admin-password", "--state-file", GUEST + "/audit-fault-state.json"]
+    result = vm.command_on_guest(shlex.join(argv), check=False, timeout=timeout)
+    try:
+        raw = vm.command_on_guest("cat -- " + shlex.quote(GUEST + "/" + evidence_name), timeout=15).stdout
+        report = fault_public_report(json.loads(raw), phase, mode=mode)
+    except (VerificationError, ValueError, UnicodeError, TypeError):
+        report = fault_public_report(None, phase, mode=mode)
+    if result.returncode or not report["passed"]:
+        report["passed"] = False
+        error = VerificationError("audit Store guest phase failed; private output suppressed")
+        error.fault_evidence = report
+        raise error
+    return report
+
+
+def fault_wait_ready(server, mode, container, image, worker):
+    path = GUEST + "/fault-" + mode + "-ready.json"
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        result = server.command_on_guest(f"if test -f {shlex.quote(path)}; then cat -- {shlex.quote(path)}; else printf '{{}}'; fi", timeout=5)
+        try:
+            ready = json.loads(result.stdout)
+        except (ValueError, UnicodeError):
+            raise VerificationError("fault ready evidence invalid") from None
+        if ready:
+            if (not isinstance(ready, dict) or type(ready.get("version")) is not int or ready["version"] != 1
+                    or ready.get("ready") is not True or ready.get("mode") != mode
+                    or ready.get("container") != container or ready.get("image") != image
+                    or not isinstance(ready.get("nonce"), str) or not re.fullmatch(r"[a-f0-9]{32}", ready["nonce"])
+                    or not isinstance(ready.get("control_sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", ready["control_sha256"])):
+                raise VerificationError("fault ready identity rejected")
+            # Copy only these fields; arbitrary guest output is never forwarded.
+            return {key: ready[key] for key in ("version", "ready", "mode", "container", "image", "nonce", "control_sha256")}
+        if not worker.is_alive():
+            break
+        time.sleep(0.1)
+    raise VerificationError("fault server did not become ready")
+
+
+def audit_store_fault(server, client, args, evidence, image_id, baseline):
+    summary = {"passed": False, "operation": "sentinel", "checks": [], "phases": {}}
+    evidence["audit_store_fault"] = summary
+    def check(label, condition):
+        summary["checks"].append({"check": label, "passed": bool(condition)})
+        record_stage(args, evidence, label)
+        if not condition:
+            raise VerificationError(label)
+    def run(machine, phase, name, *arguments):
+        try:
+            report = fault_guest(machine, phase, name, *arguments)
+        except VerificationError as error:
+            if hasattr(error, "fault_evidence"):
+                failed = fault_public_report(error.fault_evidence, phase)
+                failed.update(passed=False, failure="fault_phase_failed")
+                summary["phases"][name] = failed
+            raise VerificationError("fault phase rejected") from None
+        summary["phases"][name] = report
+        return report
+    try:
+        for vm in (server, client):
+            check("audit_store_sentinel_before", sentinel_state(vm) == baseline[vm.name])
+        summary["operation"] = "identity"
+        container = json.loads(server.command_on_guest(pending_container_script(image_id), timeout=20).stdout)
+        check("audit_store_fixed_image_running", container.get("running") is True and container.get("healthy") is True
+              and container.get("image") == image_id and re.fullmatch(r"[a-f0-9]{64}", container.get("id", "")) is not None)
+        identity = ("--expected-container", container["id"], "--expected-image", image_id)
+        summary["operation"] = "prepare"
+        check("audit_store_prepared", run(client, "prepare", "fault-prepare.json")["passed"])
+        server.write_file(GUEST + "/audit-fault-state.control.json", client.read_file(GUEST + "/audit-fault-state.control.json"))
+        for mode, phase in (("observe", "control"), ("inject", "fault")):
+            summary["operation"] = mode
+            outcome, ready, release_ok = {}, None, True
+            def serve():
+                try:
+                    extra = ("--observation-file", GUEST + "/fault-observe.json") if mode == "inject" else ()
+                    outcome["report"] = fault_guest(server, "server", "fault-" + mode + ".json",
+                        "--mode", mode, "--control-file", GUEST + "/audit-fault-state.control.json",
+                        "--ready-file", GUEST + "/fault-" + mode + "-ready.json",
+                        "--release-file", GUEST + "/fault-" + mode + "-release.json", *identity, *extra)
+                except Exception as error:
+                    outcome["failed"] = True
+                    if hasattr(error, "fault_evidence"):
+                        failed = fault_public_report(error.fault_evidence, "server", mode=mode)
+                        failed.update(passed=False, failure="fault_phase_failed")
+                        outcome["report"] = failed
+            worker = threading.Thread(target=serve, name="audit-store-" + mode)
+            worker.start()
+            try:
+                ready = fault_wait_ready(server, mode, container["id"], image_id, worker)
+                check("audit_store_" + mode + "_ready", True)
+                ready_name = GUEST + "/fault-" + mode + "-ready.json"
+                client.write_file(ready_name, json.dumps(ready).encode())
+                summary["operation"] = phase
+                check("audit_store_" + phase + "_complete", run(client, phase, "fault-" + phase + ".json",
+                       "--ready-file", ready_name)["passed"])
+            finally:
+                # Even if client PUT/transport/evidence fails, release exactly
+                # this window and join its bounded server + independent watchdog.
+                if ready is not None:
+                    try:
+                        server.write_file(GUEST + "/fault-" + mode + "-release.json",
+                                          json.dumps({"version": 1, "nonce": ready["nonce"]}).encode())
+                    except Exception:
+                        release_ok = False
+                worker.join(timeout=140)
+                joined = not worker.is_alive()
+                check("audit_store_" + mode + "_worker_joined", joined)
+                if "report" in outcome:
+                    summary["phases"]["fault-" + mode + ".json"] = outcome["report"]
+                # Independent read-only check also runs when server report is
+                # missing. It never signals arbitrary PIDs or alters product data.
+                detached = run(server, "detached", "fault-" + mode + "-detached.json", *identity)
+                check("audit_store_" + mode + "_detached", detached.get("detached") is True)
+                check("audit_store_" + mode + "_release", release_ok)
+            check("audit_store_" + mode + "_window_passed", not outcome.get("failed")
+                  and outcome.get("report", {}).get("passed") is True and outcome["report"].get("detached") is True)
+        summary["operation"] = "formal_restart"
+        server.command_on_guest(f"bash {SOURCE}/deploy/shared-host/manage.sh stop --hostname {server.name}\nbash {SOURCE}/deploy/shared-host/manage.sh start --hostname {server.name}", timeout=900)
+        healthy(server)
+        run(server, "restarted", "fault-restarted.json", "--server-report", GUEST + "/fault-inject.json", *identity)
+        for name in ("fault-inject.json", "fault-restarted.json"):
+            client.write_file(GUEST + "/" + name, server.read_file(GUEST + "/" + name))
+        summary["operation"] = "verify"
+        check("audit_store_restarted_session_and_audit", run(client, "verify", "fault-verify.json",
+              "--server-report", GUEST + "/fault-inject.json", "--restart-report", GUEST + "/fault-restarted.json")["passed"])
+        summary["operation"] = "sentinel"
+        for vm in (server, client):
+            check("audit_store_sentinel_after", sentinel_state(vm) == baseline[vm.name])
+        summary["passed"] = True
+        record_stage(args, evidence, "audit_store_write_failure_verified")
+    except Exception:
+        summary["passed"] = False
+        record_stage(args, evidence, "audit_store_write_failure_probe_failed")
+        raise VerificationError("audit_store_write_failure_probe_failed; private state preserved") from None
+
+
 def build_filebridge(vm):
     vm.command_on_guest(f"""
 export DEBIAN_FRONTEND=noninteractive
@@ -889,8 +1092,12 @@ test -z "$(git -C {SOURCE} status --porcelain=v1)"
 
 UI_CASE_IDS = ('crud', 'png', 'jpg', 'xlsx', 'logout')
 UI_CASE_STATUSES = ('passed', 'failed', 'timedOut', 'skipped', 'interrupted')
-UI_CASE_STAGES = {case: ('login', 'listing') + (('upload', 'edit', 'save', 'rename', 'download', 'delete')
-                  if case == 'crud' else (case,)) for case in UI_CASE_IDS}
+UI_CASE_STAGES = {
+    'crud': ('login', 'listing', 'upload', 'edit', 'save_menu', 'save_response', 'save_navigation', 'rename', 'download', 'delete'),
+    'xlsx': ('login', 'listing', 'xlsx', 'xlsx1_request', 'xlsx1_response', 'xlsx1_status', 'xlsx1_viewer', 'xlsx1_decode',
+             'xlsx2_request', 'xlsx2_response', 'xlsx2_status', 'xlsx2_viewer', 'xlsx2_decode', 'xlsx_evidence', 'xlsx_checks'),
+    **{case: ('login', 'listing', case) for case in ('png', 'jpg', 'logout')},
+}
 
 
 def ui_case_evidence(raw):
@@ -1350,6 +1557,8 @@ test ! -e /srv/storage/cf-filebrowser-enterprise
         evidence["checks"].append("second-VM HTTPS UI/API controls before/after, curl certificate rejection, connected denied TCP peer refused before TLS, forwarded headers ignored on allowed HTTPS")
         record_stage(args, evidence, "audit-pending-process-interruption")
         audit_pending_interrupt(server, client, args, evidence, image_id, baseline)
+        record_stage(args, evidence, "audit-store-real-write-failure")
+        audit_store_fault(server, client, args, evidence, image_id, baseline)
         record_stage(args, evidence, "initial-real-api-exercise")
         evidence["initial_api"] = api(client, "exercise", "api-initial.json")
         record_stage(args, evidence, "fixed-source-filebridge-build")
