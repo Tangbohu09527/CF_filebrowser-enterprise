@@ -267,7 +267,9 @@ func TestResourceAggregateBudgetsAndReadErrorsDiscardWholeResult(t *testing.T) {
 			case "cancelled":
 				cancel()
 			case "read-error":
-				limits.readDir = func(*os.File, int) ([]os.FileInfo, error) { return nil, errors.New("injected bounded directory read failure") }
+				limits.readDir = func(*os.File, int) ([]os.FileInfo, error) {
+					return nil, errors.New("injected bounded directory read failure")
+				}
 			}
 			walk, collectErr := collectAuthenticatedResourceAggregatesWithLimits(ctx, &requestContext{user: user, token: token}, target, limits)
 			if collectErr != nil || walk != nil {

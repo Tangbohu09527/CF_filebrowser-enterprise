@@ -789,3 +789,13 @@ It has no cleanliness gate, so success is not proof of clean source formatting.
 Temporary read-only diff output after the unchanged full formatter command
 will retrieve those two official Go 1.26.8 formatting patches. The other 17
 files will not be reformatted in this worktree as incidental cleanup.
+
+The temporary formatter diagnostics ran in regular workflow 34116707213,
+format job 101725110964, using Go 1.26.8 linux/amd64. Its official patch changed
+only two field alignments in `resource_aggregate.go` and expanded one test
+function literal in `resource_aggregate_test.go` (+5/-3). The patch passed
+`git apply --check` and was applied only to those two task files. Temporary
+CI diff output was then removed, preserving the original full `go fmt ./...`
+entry. The remaining 17 baseline formatting changes were not applied. The next
+head's actual formatter output is still required to confirm these files are
+clean; a successful command alone is not used as that proof.

@@ -18,8 +18,8 @@ import (
 // handles. A deadline cannot interrupt a filesystem syscall blocked in the kernel.
 type resourceAggregateLimits struct {
 	entries, depth, pathBytes, batch int
-	duration                       time.Duration
-	readDir                        func(*os.File, int) ([]os.FileInfo, error)
+	duration                         time.Duration
+	readDir                          func(*os.File, int) ([]os.FileInfo, error)
 }
 
 var resourceAggregateCollectedHook func()
