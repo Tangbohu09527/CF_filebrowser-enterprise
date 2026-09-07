@@ -742,3 +742,16 @@ Success now requires every original LAN control and its validated observation;
 failures retain only fixed stages, completed checks, bounded numeric codes and
 allowlisted categories. No API, authentication, network or process deadline was
 relaxed. The actual 692e4010 LAN cause remains unclassified until a new run.
+
+Independent review additionally required failed reports to retain only the
+ordered completed prefix before the current stage, and to discard observations
+from future stages. The corresponding new prefix cases failed before the fix.
+The existing millisecond representation already used integer truncation; new
+4.9996-second and 5.0000-second cases confirm the unchanged real five-second
+boundary, not a timeout relaxation or a second reproduced timing bug.
+After this refinement, the actual local command
+`python.exe -B -m unittest -v deploy.tests.test_shared_host_vm` passed 44/44
+using Python 3.12.10 and the existing OpenSSL 3.5.6. Shell syntax and diff checks
+passed. The intermediate test-only shared workflow 34114138692 was cancelled
+after its regular workflow produced the preview red test; its unfinished VM
+steps are not passes. The subsequent complete head workflow remains required.

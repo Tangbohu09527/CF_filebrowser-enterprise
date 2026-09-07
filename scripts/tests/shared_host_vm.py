@@ -751,9 +751,16 @@ def sanitized_lan_report(value):
     if value.get('stage') in LAN_PROBE_STAGES:
         report['stage'] = value['stage']
     if isinstance(value.get('completed'), list):
-        report['completed'] = [stage for stage in value['completed'] if stage in LAN_PROBE_STAGES[1:-1]]
+        expected_prefix = LAN_PROBE_STAGES[1:LAN_PROBE_STAGES.index(report['stage'])]
+        for expected, claimed in zip(expected_prefix, value['completed']):
+            if claimed != expected:
+                break
+            report['completed'].append(expected)
+    observable = set(report['completed'])
+    if report['stage'] in LAN_PROBE_STAGES[1:-1]:
+        observable.add(report['stage'])
     if isinstance(value.get('observations'), dict):
-        report['observations'] = {stage: lan_safe_fields(fields) for stage, fields in value['observations'].items() if stage in LAN_PROBE_STAGES[1:-1]}
+        report['observations'] = {stage: lan_safe_fields(fields) for stage, fields in value['observations'].items() if stage in observable}
     failure = lan_safe_fields(value.get('failure'))
     report['failure'] = failure if 'category' in failure else report['failure']
     required = {stage: {'curl_exit_code': 0, 'http_status': 200, 'body_expected': True}

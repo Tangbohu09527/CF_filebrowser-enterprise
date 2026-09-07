@@ -197,6 +197,20 @@ class LANBoundaryTests(unittest.TestCase):
                 wrong['observations'][stage][name] = value
                 self.assertFalse(harness.sanitized_lan_report(wrong)['passed'])
 
+    def test_report_preserves_the_original_just_under_five_second_boundary(self):
+        with mock.patch.object(harness.time, 'monotonic', side_effect=[10.0, 14.9996]):
+            report = harness.lan_probe_report('/protected/ca.crt', '/protected/wrong-ca.crt', '/protected/empty-trust')
+        self.assertTrue(report['passed'])
+        self.assertEqual(report['observations']['denied-tls-handshake']['elapsed_ms'], 4999)
+
+    def test_report_rejects_exactly_five_seconds_without_marking_tls_complete(self):
+        with mock.patch.object(harness.time, 'monotonic', side_effect=[10.0, 15.0]):
+            report = harness.lan_probe_report('/protected/ca.crt', '/protected/wrong-ca.crt', '/protected/empty-trust')
+        self.assertFalse(report['passed'])
+        self.assertEqual(report['stage'], 'denied-tls-handshake')
+        self.assertEqual(report['observations']['denied-tls-handshake']['elapsed_ms'], 5000)
+        self.assertNotIn('denied-tls-handshake', report['completed'])
+
     def test_requires_connected_correct_socket_then_prompt_tls_eof(self):
         result = self.probe()
         self.assertEqual(result['denied_source']['socket_source'], harness.DENIED_IP)
@@ -439,6 +453,25 @@ class FailureEvidenceTests(unittest.TestCase):
                     harness.lan_boundary(vm)
                 self.assertFalse(caught.exception.lan_evidence['passed'])
                 self.assertNotIn('PRIVATE', str(caught.exception) + json.dumps(caught.exception.lan_evidence))
+
+    def test_failed_lan_keeps_only_completed_prefix_before_current_stage(self):
+        stages = list(harness.LAN_PROBE_STAGES[1:-1])
+        cases = [('allowed-health-before', stages, []),
+                 ('denied-tls-handshake', stages, stages[:5]),
+                 ('wrong-ca', [stages[0], stages[0], *stages[1:]], stages[:1]),
+                 ('wrong-ca', [stages[1], stages[0]], []),
+                 ('wrong-ca', [stages[0], 'PRIVATE-STAGE', stages[1]], stages[:1]),
+                 ('guest-dispatch', stages, [])]
+        for current, claimed, expected in cases:
+            with self.subTest(current=current, claimed=claimed):
+                value = {'schema': 'cf-lan-boundary/v1', 'passed': False, 'stage': current,
+                         'completed': claimed, 'observations': {stage: {'http_status': 200} for stage in stages},
+                         'failure': {'category': 'assertion'}}
+                report = harness.sanitized_lan_report(value)
+                self.assertEqual(report['completed'], expected)
+                allowed = set(expected + ([current] if current in stages else []))
+                self.assertEqual(set(report['observations']), allowed)
+                self.assertFalse(report['passed'])
 
     def test_api_configuration_failure_does_not_mask_original_exit(self):
         vm = mock.Mock(name="guest")
