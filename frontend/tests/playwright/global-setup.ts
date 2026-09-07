@@ -62,13 +62,49 @@ async function globalSetup() {
     localStorage.setItem('shareHashFile', hash);
   }, shareHashFile);
 
-  // Create a share of root folder "/"
-  await page.goto("http://127.0.0.1/files/playwright%20%2B%20files/", { timeout: 1000 });
-  await page.locator('a[aria-label="share"]').waitFor({ state: 'visible' });
-  await openShareAndExpectPath(page, 'Path: /', async () => {
-    await openContextMenuHelper(page);
-    await page.locator('button[aria-label="Share"]').click();
-  });
+  // Create a share of root folder "/".
+  const pageErrorCounts = { type: 0, reference: 0, syntax: 0, other: 0 };
+  const recordRootShareError = (error: Error) => {
+    const category = error.name === "TypeError" ? "type" :
+      error.name === "ReferenceError" ? "reference" : error.name === "SyntaxError" ? "syntax" : "other";
+    pageErrorCounts[category] += 1;
+  };
+  page.on("pageerror", recordRootShareError);
+  try {
+    await page.goto("http://127.0.0.1/files/playwright%20%2B%20files/", { timeout: 1000 });
+    await page.locator('a[aria-label="share"]').waitFor({ state: 'visible' });
+    let rootShareStatus: number | undefined;
+    await openShareAndExpectPath(page, 'Path: /', async () => {
+      await openContextMenuHelper(page);
+      const menu = page.locator("#context-menu:visible");
+      await expect(menu).toBeVisible({ timeout: 2000 });
+      await expect(menu.locator(".selected-count-header")).toHaveCount(0, { timeout: 2000 });
+      const [response] = await Promise.all([
+        page.waitForResponse(response => {
+          const url = new URL(response.url());
+          return response.request().method() === "GET" && url.pathname === "/api/share" &&
+            url.searchParams.get("path") === "/" &&
+            url.searchParams.get("source") === "playwright + files";
+        }, { timeout: 2000 }),
+        menu.getByRole("button", { name: "Share", exact: true }).click({ timeout: 2000 }),
+      ]);
+      rootShareStatus = response.status();
+    });
+    // A visible prompt must not let the helper's retry hide a missing/rejected GET.
+    expect(rootShareStatus).toBe(200);
+  } catch (error) {
+    const pathname = new URL(page.url()).pathname;
+    const fixturePaths = ["/files/", "/files/playwright%20%2B%20files/", "/files/playwright%20+%20files/", "/login"];
+    console.error("Root share setup diagnostics", JSON.stringify({
+      pageErrorCounts,
+      visiblePromptCount: await page.locator('.floating-window[aria-label$="-prompt"]:visible').count(),
+      visibleSharePromptCount: await page.locator('div[aria-label="share-prompt"]:visible').count(),
+      pathname: fixturePaths.includes(pathname) ? pathname : "<other>",
+    }));
+    throw error;
+  } finally {
+    page.off("pageerror", recordRootShareError);
+  }
   // Enable the current V1 Create and Modify controls through the visible sliders.
   const capabilityEditor = page.getByTestId("configured-capabilities");
   for (const capability of ["create", "modify"]) {

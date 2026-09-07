@@ -484,6 +484,13 @@ func resourceGetHandler(w http.ResponseWriter, r *http.Request, d *requestContex
 			fileInfo.Files[i].Metadata = nil
 		}
 	}
+	if fileInfo.Type == "directory" {
+		// Only resource listings use display sizes. Shared filtering keeps real
+		// byte sizes for preview and WebDAV; directory aggregates stay redacted.
+		for i := range fileInfo.Files {
+			fileInfo.Files[i].Size = authenticatedListingFileSize(fileInfo.Files[i].Size, currentTarget.Index.Config.UseLogicalSize)
+		}
+	}
 	return renderJSON(w, r, fileInfo)
 
 }
@@ -539,6 +546,15 @@ func filterAuthenticatedDirectoryFileInfo(user *users.User, source string, direc
 		return errors.ErrAccessDenied
 	}
 	return nil
+}
+
+// authenticatedListingFileSize uses the same 4 KiB display rule as
+// indexing.getFileSizeForDisplay, after fresh filtering supplied the real size.
+func authenticatedListingFileSize(size int64, logical bool) int64 {
+	if logical || size == 0 {
+		return size
+	}
+	return ((size + 4095) / 4096) * 4096
 }
 
 func filterAuthenticatedDirectoryItems(user *users.User, source string, directoryTarget authenticatedReadTarget, items files.Items) (files.Items, error) {

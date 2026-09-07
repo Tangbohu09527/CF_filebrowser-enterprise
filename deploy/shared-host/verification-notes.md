@@ -462,3 +462,35 @@ notification and error-count checks. Both real copy requests and their complete
 success DTOs, final destination file visibility, and the actual inaccessible
 read status/DTO are additionally asserted. Both files passed Node syntax and
 diff checks. Actual browser execution of these edits is pending.
+
+## Resource display boundary and root-share setup diagnostics
+
+The two noauth directory-size assertions remain unresolved. Source review found
+that simply retaining cached folder aggregates after filtering can expose the
+capacity of denied descendants: `CheckChildItemAccess` filters children without
+recomputing the global aggregate. The speculative uncommitted folder change was
+withdrawn before commit. Shared identity/filter functions retain their original
+fresh filesystem sizes; the existing directory-size UI expectations are intact.
+
+A separate file-size mismatch can be repaired safely: after the resource GET's
+final authorization/filter/audit-target checks, directory JSON listings now apply
+the existing source logical/physical display rule to already refreshed regular
+file sizes. File detail, preview and WebDAV Readdir keep real byte lengths; their
+shared filter is unchanged. New tests cover file boundaries, fresh changes,
+deletions/type changes, withdrawal of Browse and suppression of direct/nested
+hidden capacity. Local diff checking passed; actual Go execution is pending CI.
+A safe directory total needs bounded descendant authorization and an explicit
+unknown/partial contract, not a bypass or unbounded recursive listing.
+
+[Source job 101697741673](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34107517392/job/101697741673)
+at a42d1bd5 passed Sharing 13/13 in 35.3 seconds, then failed Settings global
+setup before tests began: the root Share prompt content was absent. Two earlier
+shares and root resource reads returned 200, but no root share GET was observed.
+This is not evidence that the new child-path join caused the failure or that the
+NoAuth repairs passed. Settings setup now scopes the click to the visible root
+context menu, asserts no selection and captures the real root share GET. It
+requires 200 after the existing helper returns, retaining the exact root-path
+assertion and the original two-/twenty-second helper boundaries. Failure output
+contains only fixed browser-error categories, prompt counts and a fixture-path
+allowlist. Syntax/diff checks passed; the original fault still needs real CI
+revalidation and is not declared solved by added synchronization alone.
