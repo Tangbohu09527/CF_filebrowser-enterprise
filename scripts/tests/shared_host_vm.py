@@ -688,20 +688,92 @@ test -z "$(git -C {SOURCE} status --porcelain=v1)"
 """, timeout=1800)
 
 
+def probe_lan_boundary(ca_file, untrusted_ca_file, empty_trust):
+    """Run in the disposable client guest; never treat transport trouble as denial."""
+    base = f"https://{TLS_NAME}:{TLS_PORT}"
+    common = ["curl", "--fail", "--silent", "--show-error", "--noproxy", "*",
+              "--interface", CLIENT_IP, "--max-time", "5", "--write-out", "\n%{http_code}"]
+
+    def curl(path, ca, *extra):
+        try:
+            return subprocess.run(common + ["--cacert", str(ca), *extra, base + path],
+                                  capture_output=True, check=False, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise VerificationError("LAN curl probe did not complete; private output suppressed") from error
+
+    def allowed(path, *headers):
+        response = curl(path, ca_file, *headers)
+        body, _, status = response.stdout.rpartition(b"\n")
+        expected = b'<html' in body if path == '/' else body.strip() == b'{"message":"ok"}'
+        if response.returncode != 0 or status != b'200' or not expected:
+            raise VerificationError("allowed-source HTTPS control failed; private output suppressed")
+        return 200
+
+    before = allowed('/health')
+    allowed('/')
+    context = ssl.create_default_context(cafile=str(ca_file))
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    raw = secured = None
+    try:
+        try:
+            raw = socket.create_connection((TLS_NAME, TLS_PORT), timeout=5, source_address=(DENIED_IP, 0))
+        except OSError as error:
+            raise VerificationError("denied-source TCP must connect before testing listener refusal") from error
+        source, peer = raw.getsockname()[0], raw.getpeername()[0]
+        if source != DENIED_IP or peer != SERVER_IP:
+            raise VerificationError("denied-source socket identity differs from the isolated LAN fixture")
+        secured = context.wrap_socket(raw, server_hostname=TLS_NAME, do_handshake_on_connect=False)
+        started = time.monotonic()
+        try:
+            secured.do_handshake()
+        except ssl.SSLEOFError:
+            rejection = 'tls-eof'
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            rejection = 'tcp-reset'
+        except OSError as error:
+            # Timeout, invalid certificate and other TLS/protocol errors do not
+            # establish that the native listener refused this TCP peer.
+            raise VerificationError("denied-source probe failed without a prompt EOF/reset") from error
+        else:
+            raise VerificationError("denied-source socket unexpectedly completed TLS")
+        elapsed = time.monotonic() - started
+        if elapsed >= 5:
+            raise VerificationError("denied-source refusal was not prompt")
+    finally:
+        if secured is not None:
+            secured.close()
+        elif raw is not None:
+            raw.close()
+
+    untrusted = curl('/health', untrusted_ca_file, '--capath', str(empty_trust))
+    if untrusted.returncode != 60:
+        raise VerificationError("untrusted CA probe must fail with curl certificate verification exit 60")
+    # The denied peer cannot send HTTP headers: TLS is refused first. Exercise
+    # forged forwarding headers over valid HTTPS from the allowed socket instead.
+    after = allowed('/health', '-H', 'X-Forwarded-For: ' + DENIED_IP,
+                    '-H', 'X-Real-IP: ' + DENIED_IP)
+    return {'allowed_before_status': before, 'allowed_after_status': after,
+            'allowed_source': CLIENT_IP, 'forwarded_headers_ignored_on_allowed_tls': True,
+            'untrusted_ca_exit_code': untrusted.returncode,
+            'denied_source': {'tcp_connected': True, 'socket_source': source, 'socket_peer': peer,
+                              'tls_handshake_completed': False, 'rejection': rejection,
+                              'application_bytes_received': 0, 'elapsed_ms': round(elapsed * 1000)}}
+
+
 def lan_boundary(vm):
-    vm.command_on_guest(f"""
-curl --fail --silent --show-error --cacert {GUEST}/ca.crt https://{TLS_NAME}:{TLS_PORT}/health >/dev/null
-curl --fail --silent --show-error --cacert {GUEST}/ca.crt https://{TLS_NAME}:{TLS_PORT}/ > {GUEST}/ui.html
-grep -q '<html' {GUEST}/ui.html
+    response = vm.command_on_guest(f"""
 ip address add {DENIED_IP}/24 dev cflan
-if curl --interface {DENIED_IP} --max-time 5 --fail --silent --show-error --cacert {GUEST}/ca.crt -H 'X-Forwarded-For: {CLIENT_IP}' -H 'X-Real-IP: {CLIENT_IP}' https://{TLS_NAME}:{TLS_PORT}/health > /dev/null 2>&1; then
-  ip address del {DENIED_IP}/24 dev cflan
-  exit 1
-fi
-ip address del {DENIED_IP}/24 dev cflan
+trap 'ip address del {DENIED_IP}/24 dev cflan' EXIT
 mkdir -p {GUEST}/empty-trust
-if curl --max-time 5 --fail --silent --show-error --cacert {GUEST}/untrusted-ca.crt --capath {GUEST}/empty-trust https://{TLS_NAME}:{TLS_PORT}/health >/dev/null 2>&1; then exit 1; fi
+python3 -B - <<'CF_LAN_BOUNDARY'
+import importlib.util,json
+spec=importlib.util.spec_from_file_location('cf_vm_lan_probe','{SOURCE}/scripts/tests/shared_host_vm.py')
+module=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(json.dumps(module.probe_lan_boundary('{GUEST}/ca.crt','{GUEST}/untrusted-ca.crt','{GUEST}/empty-trust'),sort_keys=True))
+CF_LAN_BOUNDARY
 """)
+    return json.loads(response.stdout)
 
 
 def record_stage(args, evidence, name):
@@ -838,8 +910,8 @@ test ! -e /srv/storage/cf-filebrowser-enterprise
         server.command_on_guest(f"{manage} prepare --hostname {server.name} --source-sha {args.source_sha} --image-ref {shlex.quote(pinned)} --mode staging --exposure lan --test-disk --enable-share-source --enable-webdav --bootstrap-password-file {GUEST}/admin-password", timeout=900)
         evidence["checks"].append("formal empty-root install, admin verification, bootstrap removal, same-image login, idempotent prepare")
         record_stage(args, evidence, "second-vm-real-lan-and-https-boundaries")
-        lan_boundary(client)
-        evidence["checks"].append("second-VM HTTPS UI/API, trusted CA, untrusted CA rejection, actual denied-source socket with spoofed forwarding headers")
+        evidence["initial_lan_boundary"] = lan_boundary(client)
+        evidence["checks"].append("second-VM HTTPS UI/API controls before/after, curl certificate rejection, connected denied TCP peer refused before TLS, forwarded headers ignored on allowed HTTPS")
         record_stage(args, evidence, "initial-real-api-exercise")
         evidence["initial_api"] = api(client, "exercise", "api-initial.json")
         record_stage(args, evidence, "fixed-source-filebridge-build")
@@ -863,7 +935,7 @@ test ! -e /srv/storage/cf-filebrowser-enterprise
         record_stage(args, evidence, "real-host-reboot-and-api")
         evidence["host_reboot"] = server.reboot()
         healthy(server)
-        lan_boundary(client)
+        evidence["host_restart_lan_boundary"] = lan_boundary(client)
         evidence["host_restart_api"] = api(client, "verify-restored", "api-host-restart.json")
         evidence["checks"].append("controlled stop/start, Docker container restart, Docker daemon restart, real systemd host reboot and retained permissions/data")
         # Do not manually stop the app before reboot: unless-stopped must attempt

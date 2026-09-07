@@ -95,7 +95,7 @@ class SharedHostDeploymentAssetTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         return json.loads(completed.stdout)
 
-    def run_validator(self, directory: Path, mode: str = "staging") -> subprocess.CompletedProcess[str]:
+    def run_validator(self, directory: Path, mode: str = "staging", *options: str) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         with tempfile.TemporaryDirectory() as docker_config:
             environment["DOCKER_CONFIG"] = docker_config
@@ -108,6 +108,7 @@ class SharedHostDeploymentAssetTests(unittest.TestCase):
                     mode,
                     "--env-file",
                     (directory / "compose.env.example").as_posix(),
+                    *options,
                 ],
                 cwd=ROOT,
                 env=environment,
@@ -271,6 +272,52 @@ class SharedHostDeploymentAssetTests(unittest.TestCase):
         self.assertEqual(self.lan_config, expected)
         for key in ("LAN_BIND_IP", "LAN_PORT", "LAN_TLS_SERVER_NAME", "LAN_ALLOW_CIDRS"):
             self.assertNotIn(key, self.env, "LAN must have no silently deployable defaults")
+
+    def test_rendered_lan_healthcheck_keeps_compose_dollar_escaping(self) -> None:
+        source = (SHARED_HOST / "validate.sh").read_text(encoding="utf-8")
+        blocks = re.findall(r"<<'PY'\n(.*?)\nPY(?:\n|$)", source, re.S)
+        module = next(ast.parse(block) for block in blocks if "def bind_refuses_host_creation(" in block)
+        functions = [item for item in module.body if isinstance(item, ast.FunctionDef) and item.name in ("fail", "expect")]
+        check = next(item for item in ast.walk(module) if isinstance(item, ast.Expr)
+                     and isinstance(item.value, ast.Call) and isinstance(item.value.func, ast.Name)
+                     and item.value.func.id == "expect" and len(item.value.args) == 2
+                     and isinstance(item.value.args[1], ast.Constant)
+                     and item.value.args[1].value == "LAN healthcheck must verify CA and hostname")
+        compiled = compile(ast.Module(body=functions + [check], type_ignores=[]), "lan-health-contract", "exec")
+        raw = self.lan["services"]["filebrowser-enterprise"]["healthcheck"]["test"][1]
+        # Both Compose 2.20 and 5.5.1 cmd/compose/config.go re-escape every $
+        # after JSON serialization; this is config output, not container inspect.
+        cases = {
+            "reviewed rendered command": (["CMD-SHELL", raw], True),
+            "missing CA": (["CMD-SHELL", raw.replace("--cacert /etc/filebrowser-enterprise/tls/ca.crt ", "")], False),
+            "different hostname routing": (["CMD-SHELL", raw.replace("--resolve", "--connect-to")], False),
+            "HTTP downgrade": (["CMD-SHELL", raw.replace("https://", "http://")], False),
+            "disabled certificate validation": (["CMD-SHELL", raw.replace("curl --fail", "curl --insecure --fail")], False),
+            "false successful health": (["CMD-SHELL", raw + " || true"], False),
+            "wrong command type": (["CMD", raw], False),
+            "unexpected extra command": (["CMD-SHELL", raw, "true"], False),
+        }
+        for label, (command, allowed) in cases.items():
+            with self.subTest(label=label), contextlib.redirect_stderr(io.StringIO()):
+                namespace = {"sys": sys, "lan_health": raw, "lan_service": {"healthcheck": {"test": command}}}
+                if allowed:
+                    exec(compiled, namespace)
+                else:
+                    with self.assertRaises(SystemExit):
+                        exec(compiled, namespace)
+
+    def test_validator_accepts_real_lan_compose_rendering(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            copied = Path(temp_dir) / "shared-host"
+            shutil.copytree(SHARED_HOST, copied)
+            with (copied / "compose.env.example").open("a", encoding="utf-8") as env_file:
+                env_file.write("\nLAN_BIND_IP=192.0.2.11\nLAN_PORT=18443\nLAN_TLS_SERVER_NAME=files.cf.test\nLAN_ALLOW_CIDRS=192.0.2.12/32\n")
+            rendered = self.compose_config(copied, "compose.yaml", "compose.lan.yaml")
+            self.assertEqual(rendered["services"]["filebrowser-enterprise"]["healthcheck"]["test"],
+                             self.lan["services"]["filebrowser-enterprise"]["healthcheck"]["test"])
+            result = self.run_validator(copied, "staging", "--lan")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("host preparation checks were not run", result.stdout)
 
     def test_normalized_bind_guard_accepts_serialized_false_but_rejects_true(self) -> None:
         source = (SHARED_HOST / "validate.sh").read_text(encoding="utf-8")

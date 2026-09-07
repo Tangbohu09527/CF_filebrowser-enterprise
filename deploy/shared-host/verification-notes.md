@@ -373,3 +373,65 @@ setup, explicit package-version inputs, existing-installation refusal and normal
 Docker service autostart. Its four outer/embedded Shell snippets passed syntax
 checking. No installation was run on Windows, and these syntax checks do not
 establish a clean Debian installation result.
+
+## Precise 52136fca VM and existing browser results
+
+[Fixed-image job 101689134762](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34105398656/job/101689134762)
+at `52136fcac5075d2a537bed557edb7f9151caccfb` built the real image
+`sha256:7c135ca521973d60b1ade5dce60f327eb1bf8193ebce7c869feec5d8706ff0a1`.
+The isolated TLS registry manifest was
+`sha256:cefb7f78fc177223af640de95733049d6abe1ba45225f5e18955d2579f9f1e59`.
+Both actual Debian 13.6/systemd guests completed fixed-source checkout,
+independent ext4 storage and verified image transfer. Formal preparation failed
+at the Compose-contract block, relative line 331: the rendered LAN healthcheck
+comparison. This precise failure does not establish the rendered value or a
+passing installation. Initialization, functional checks, reboots and recovery
+were not reached. The sanitized VM result is retained locally; no protected
+backup, credentials or VM disk was downloaded.
+
+[Existing Playwright job 101689134931](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34105398656/job/101689134931)
+at the same SHA passed Sharing 13/13 in 37.7 seconds and Settings 25/25 in
+57.2 seconds. NoAuth then passed 21 and failed eight tests in 4.4 minutes.
+Failures include nested navigation/preview requests missing a path separator,
+plus file-action/indexing checks. The full browser run remains failed; later
+projects were not reached. No title timeout, error-count assertion or test was
+removed to classify these results as passing.
+
+## Follow-up fixes and stronger network evidence
+
+At `8b04af77958ecc91f0d106fd42fe534e36e5340a`,
+[regular backend job 101693501369](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34106777472/job/101693501369)
+passed the full existing race-enabled suite, including all new signing-key tests.
+Storage completed in 10.095 seconds and HTTP in 131.745 seconds. Format, frontend
+tests/Lint, translations and docs passed. Lint still reported exactly 78 baseline
+findings; the workflow remains failed.
+
+The Compose failure was reproduced against the existing exact assertion:
+reviewed escaped healthcheck text failed while seven malicious changes were
+rejected. Both [Compose 2.20](https://github.com/docker/compose/blob/v2.20.0/cmd/compose/config.go)
+and [Compose 5.5.1](https://github.com/docker/compose/blob/v5.5.1/cmd/compose/config.go)
+re-escape dollars after serializing config output. The comparison now requires
+the exact reviewed escaped string, retaining strict CA/hostname/HTTPS, health
+body and command checks. Eight cases and existing diagnostic tests passed
+locally. A real LAN Compose render/validator test was added to the existing
+assets suite; it awaits CI because Windows has no Docker.
+
+The noauth nested-path failure was traced to `adjustedData`, which concatenated
+parent path and child name without ensuring a separator. Backend normalized
+paths may lack a trailing slash. Three actual-function counterexamples reproduced
+the observed bad paths before repair. Reusing the existing `joinPath` passed six
+cases, including root, trailing slash, nested paths, hash and Chinese/space names.
+All original unit assertions remain, with six new cases. JavaScript syntax passed;
+this local function probe is not Vitest or Playwright, which must rerun in CI.
+
+A LAN test counterexample showed that curl connection error 7 incorrectly
+satisfied the old generic-failure negative probe. The real-VM probe now requires
+successful TCP connection with exact source/peer, then prompt TLS EOF/reset from
+the denied peer; timeout, certificate/protocol errors and successful TLS all fail.
+Allowed-source strict HTTPS succeeds before and after, wrong CA requires curl 60,
+and forged forwarding headers are tested over valid allowed-source HTTPS.
+A denied peer cannot transmit HTTP headers because refusal precedes TLS; no
+plaintext request is sent to misrepresent that boundary. The existing VM harness
+suite passed 27 tests locally, including eight new counterexamples. This is not
+actual Docker LAN-path evidence. All 22 tracked Shell files passed individual
+`bash -n` checks; no unrelated newline normalization was performed.

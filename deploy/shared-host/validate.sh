@@ -642,7 +642,9 @@ if os.environ["SHARED_HOST_LAN_JSON"]:
     expect(port.get("host_ip") == os.environ["SHARED_HOST_LAN_BIND_IP"], "LAN must use the explicit bind IP")
     expect(str(port.get("published")) == os.environ["SHARED_HOST_LAN_PORT"] and port.get("target") == 8080 and port.get("protocol") == "tcp", "LAN port mapping is invalid")
     expect(lan_service["environment"].pop("FILEBROWSER_TLS_SERVER_NAME", None) == os.environ["SHARED_HOST_LAN_TLS_SERVER_NAME"], "LAN TLS name is invalid")
-    expect(lan_service["healthcheck"].get("test") == ["CMD-SHELL", lan_health.replace("$$", "$")], "LAN healthcheck must verify CA and hostname")
+    # Compose config re-escapes dollars in JSON; unlike container inspect,
+    # its reviewed healthcheck still contains the original $$ shell escapes.
+    expect(lan_service["healthcheck"].get("test") == ["CMD-SHELL", lan_health], "LAN healthcheck must verify CA and hostname")
     lan_service["healthcheck"] = copy.deepcopy(service["healthcheck"])
     tls_mounts = [item for item in lan_service.get("volumes", []) if item.get("target") == "/etc/filebrowser-enterprise/tls"]
     expect(len(tls_mounts) == 1, "LAN must contain one TLS trust mount")

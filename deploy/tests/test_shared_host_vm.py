@@ -19,6 +19,100 @@ harness = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(harness)
 
 
+class LANBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.tcp = mock.Mock()
+        self.tcp.getsockname.return_value = (harness.DENIED_IP, 42000)
+        self.tcp.getpeername.return_value = (harness.SERVER_IP, harness.TLS_PORT)
+        self.tls = mock.Mock()
+        self.tls.do_handshake.side_effect = harness.ssl.SSLEOFError(8, "closed before handshake")
+        self.context = mock.Mock()
+        self.context.wrap_socket.return_value = self.tls
+        self.dial = mock.patch.object(harness.socket, "create_connection", return_value=self.tcp).start()
+        self.trust = mock.patch.object(harness.ssl, "create_default_context", return_value=self.context).start()
+        self.curl = mock.patch.object(harness.subprocess, "run", side_effect=[
+            subprocess.CompletedProcess([], 0, b'{"message":"ok"}\n200', b''),
+            subprocess.CompletedProcess([], 0, b'<html></html>\n200', b''),
+            subprocess.CompletedProcess([], 60, b'', b'private-certificate-diagnostic'),
+            subprocess.CompletedProcess([], 0, b'{"message":"ok"}\n200', b''),
+        ]).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def probe(self):
+        return harness.probe_lan_boundary('/protected/ca.crt', '/protected/wrong-ca.crt', '/protected/empty-trust')
+
+    def test_requires_connected_correct_socket_then_prompt_tls_eof(self):
+        result = self.probe()
+        self.assertEqual(result['denied_source']['socket_source'], harness.DENIED_IP)
+        self.assertEqual(result['denied_source']['socket_peer'], harness.SERVER_IP)
+        self.assertEqual(result['denied_source']['rejection'], 'tls-eof')
+        self.assertFalse(result['denied_source']['tls_handshake_completed'])
+        self.assertEqual(result['denied_source']['application_bytes_received'], 0)
+        self.assertEqual(result['untrusted_ca_exit_code'], 60)
+        self.assertEqual(result['allowed_before_status'], 200)
+        self.assertEqual(result['allowed_after_status'], 200)
+        self.dial.assert_called_once_with((harness.TLS_NAME, harness.TLS_PORT), timeout=5, source_address=(harness.DENIED_IP, 0))
+        self.context.wrap_socket.assert_called_once_with(self.tcp, server_hostname=harness.TLS_NAME, do_handshake_on_connect=False)
+        self.assertEqual(self.context.minimum_version, harness.ssl.TLSVersion.TLSv1_2)
+        self.tcp.sendall.assert_not_called()
+        self.tls.sendall.assert_not_called()
+        self.tls.close.assert_called_once_with()
+        final_curl = self.curl.call_args_list[-1].args[0]
+        self.assertIn('X-Forwarded-For: ' + harness.DENIED_IP, final_curl)
+        self.assertIn('X-Real-IP: ' + harness.DENIED_IP, final_curl)
+
+    def test_prompt_reset_is_a_valid_pre_http_refusal(self):
+        self.tls.do_handshake.side_effect = ConnectionResetError()
+        self.assertEqual(self.probe()['denied_source']['rejection'], 'tcp-reset')
+
+    def test_connection_failure_is_not_cidr_denial(self):
+        self.dial.side_effect = ConnectionRefusedError()
+        with self.assertRaises(harness.VerificationError):
+            self.probe()
+        self.context.wrap_socket.assert_not_called()
+
+    def test_wrong_actual_source_or_peer_is_rejected(self):
+        for method, address in ((self.tcp.getsockname, (harness.CLIENT_IP, 42000)),
+                                (self.tcp.getpeername, ('192.0.2.13', harness.TLS_PORT))):
+            with self.subTest(address=address):
+                method.return_value = address
+                self.curl.side_effect = [subprocess.CompletedProcess([], 0, b'{"message":"ok"}\n200', b''), subprocess.CompletedProcess([], 0, b'<html></html>\n200', b'')]
+                with self.assertRaises(harness.VerificationError):
+                    self.probe()
+                self.tcp.getsockname.return_value = (harness.DENIED_IP, 42000)
+                self.tcp.getpeername.return_value = (harness.SERVER_IP, harness.TLS_PORT)
+        self.context.wrap_socket.assert_not_called()
+
+    def test_tls_success_timeout_certificate_error_and_other_ssl_errors_fail(self):
+        for error in (None, TimeoutError(), harness.ssl.SSLCertVerificationError(1, 'bad certificate'), harness.ssl.SSLError(1, 'protocol error')):
+            with self.subTest(error=type(error).__name__):
+                self.curl.side_effect = [subprocess.CompletedProcess([], 0, b'{"message":"ok"}\n200', b''), subprocess.CompletedProcess([], 0, b'<html></html>\n200', b'')]
+                self.tls.do_handshake.side_effect = error
+                with self.assertRaises(harness.VerificationError):
+                    self.probe()
+
+    def test_eof_after_the_deadline_is_not_prompt_listener_refusal(self):
+        with mock.patch.object(harness.time, "monotonic", side_effect=[10.0, 15.0]):
+            with self.assertRaises(harness.VerificationError):
+                self.probe()
+
+    def test_untrusted_ca_requires_exit_60_not_any_transport_failure(self):
+        for code in (0, 7, 22, 28, 35, 56):
+            with self.subTest(code=code):
+                self.curl.side_effect = [subprocess.CompletedProcess([], 0, b'{"message":"ok"}\n200', b''), subprocess.CompletedProcess([], 0, b'<html></html>\n200', b''), subprocess.CompletedProcess([], code, b'', b'private-output')]
+                with self.assertRaises(harness.VerificationError):
+                    self.probe()
+
+    def test_allowed_source_must_work_before_and_after_negative_probes(self):
+        for failing in (0, 3):
+            with self.subTest(failing=failing):
+                results = [subprocess.CompletedProcess([], 0, b'{"message":"ok"}\n200', b''), subprocess.CompletedProcess([], 0, b'<html></html>\n200', b''), subprocess.CompletedProcess([], 60, b'', b''), subprocess.CompletedProcess([], 0, b'{"message":"ok"}\n200', b'')]
+                results[failing] = subprocess.CompletedProcess([], 28, b'', b'private-output')
+                self.curl.side_effect = results
+                with self.assertRaises(harness.VerificationError):
+                    self.probe()
+
+
 class QemuLaunchTests(unittest.TestCase):
     def make_vm(self, directory):
         root = Path(directory)
