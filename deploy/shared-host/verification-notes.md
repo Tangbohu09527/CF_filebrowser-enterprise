@@ -435,3 +435,30 @@ plaintext request is sent to misrepresent that boundary. The existing VM harness
 suite passed 27 tests locally, including eight new counterexamples. This is not
 actual Docker LAN-path evidence. All 22 tracked Shell files passed individual
 `bash -n` checks; no unrelated newline normalization was performed.
+
+## Actual a42d1bd5 regression results and remaining UI repairs
+
+At `a42d1bd5320ff088b65f470119b900c7a12b2e4d`, the
+[existing deployment job 101695837538](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34107517391/job/101695837538)
+passed all 130 deployment tests, including the new real LAN Compose rendering
+and validator case. [Vitest job 101695838354](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34107517449/job/101695838354)
+passed 115 tests in 17 files, including all 12 API utils tests. The complete
+backend suite, frontend Lint, format, translations and docs passed; backend Lint
+remains failed. These results are bound to this SHA, not later changes.
+
+The preceding 8b04af77 VM job 101693501549 completed with the same pre-fix
+Compose-contract line 331 failure. Its real image was
+`sha256:00cab8318cf5580f9761338ce560c0a62cbb9fa8b9bbde307f2b07ad0e1bf9db`,
+with isolated registry digest
+`sha256:2feb90e0e5cc50f4e15309be23061f5abca0f47371bf80441fadfecf827b747e`.
+Initialization and later A/B stages were not reached. The a42d1bd5 VM job is the
+first running with the repaired comparison; its result is still pending.
+
+Two existing noauth expectations were traced to current, intentional behavior:
+current-directory selection displays the normalized path without a trailing
+slash, and inaccessible reads return the existing redacted error message.
+The tests now use those exact values while retaining all visibility, success,
+notification and error-count checks. Both real copy requests and their complete
+success DTOs, final destination file visibility, and the actual inaccessible
+read status/DTO are additionally asserted. Both files passed Node syntax and
+diff checks. Actual browser execution of these edits is pending.

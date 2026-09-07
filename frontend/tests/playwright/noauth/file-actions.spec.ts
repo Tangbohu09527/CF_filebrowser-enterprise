@@ -43,6 +43,20 @@ test("open from search", async({ page, checkForErrors }) => {
 })
 
 test("2x copy from listing to new folder", async({ page, checkForErrors }) => {
+  const copyAndCheck = async (fromPath: string, toPath: string) => {
+    const item = { fromSource: NOAUTH_COPY_SOURCE, fromPath, toSource: NOAUTH_COPY_SOURCE, toPath };
+    const copied = page.waitForResponse(response =>
+      response.request().method() === "PATCH" &&
+      new URL(response.url()).pathname === "/files/api/resources"
+    );
+    await page.locator('button[aria-label="Copy"]').click();
+    const response = await copied;
+    expect(response.request().postDataJSON()).toEqual({
+      items: [item], action: "copy", overwrite: false, rename: false,
+    });
+    expect(response.status()).toBe(200);
+    expect(await response.json()).toEqual({ succeeded: [item], failed: [] });
+  };
   await page.goto("/files/");
   await expect(page).toHaveTitle("Graham's Filebrowser - Files - playwright-files");
   await page.locator('a[aria-label="copyme.txt"]').waitFor({ state: 'visible' });
@@ -54,7 +68,7 @@ test("2x copy from listing to new folder", async({ page, checkForErrors }) => {
   await expect(page.locator('div[aria-label="copy-prompt"] .listing-item[aria-selected="true"]')).toHaveCount(0);
   await page.locator('div[aria-label="copy-prompt"] .listing-item[aria-label="myfolder"]').dblclick();
   await expect(copyDestLabel(page)).toHaveText(`/myfolder/ (${NOAUTH_COPY_SOURCE})`);
-  await page.locator('button[aria-label="Copy"]').click();
+  await copyAndCheck("/copyme.txt", "/myfolder/copyme.txt");
   await checkForNotification(page, "Files copied successfully!");
   await page.goto("/files/files/exclude/myfolder/");
   await expect(page).toHaveTitle("Graham's Filebrowser - Files - myfolder");
@@ -80,13 +94,14 @@ test("2x copy from listing to new folder", async({ page, checkForErrors }) => {
   await page.locator('.selected-count-header').waitFor({ state: 'visible' });
   await expect(page.locator('.selected-count-header')).toHaveText('1');
   await page.locator('button[aria-label="Copy file"]').click();
-  await expect(copyDestLabel(page)).toHaveText(`/myfolder/ (${NOAUTH_COPY_SOURCE})`);
+  await expect(copyDestLabel(page)).toHaveText(`/myfolder (${NOAUTH_COPY_SOURCE})`);
   await page.locator('div[aria-label="copy-prompt"] .listing-item[aria-label="newfolder"]').dblclick();
   await expect(copyDestLabel(page)).toHaveText(`/myfolder/newfolder/ (${NOAUTH_COPY_SOURCE})`);
-  await page.locator('button[aria-label="Copy"]').click();
+  await copyAndCheck("/myfolder/copyme.txt", "/myfolder/newfolder/copyme.txt");
   await checkForNotification(page, "Files copied successfully!");
   await page.goto("/files/files/exclude/myfolder/newfolder/");
   await expect(page).toHaveTitle(/.* - newfolder/);
+  await expect(page.locator('a[aria-label="copyme.txt"]')).toBeVisible();
   checkForErrors();
 })
 
