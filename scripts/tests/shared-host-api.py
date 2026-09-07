@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import socket
 import ssl
 import stat
 import struct
@@ -36,6 +37,35 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class AcceptanceError(RuntimeError):
     pass
+
+
+def transport_failure(error):
+    # Exception messages, class names and verification messages may contain secrets.
+    if isinstance(error, ssl.SSLCertVerificationError):
+        category = "tls_certificate_verify"
+    elif isinstance(error, (socket.gaierror, socket.herror)):
+        category = "dns"
+    elif isinstance(error, TimeoutError):
+        category = "timeout"
+    elif isinstance(error, (ssl.SSLEOFError, http.client.RemoteDisconnected)):
+        category = "eof"
+    elif isinstance(error, ConnectionResetError):
+        category = "connection_reset"
+    elif isinstance(error, ssl.SSLError):
+        category = "tls"
+    elif isinstance(error, http.client.HTTPException):
+        category = "http"
+    else:
+        category = "os"
+    fields = ["TLS or HTTP transport failed", "category=" + category]
+    number = getattr(error, "errno", None)
+    if type(number) is int and -32768 <= number <= 32767:
+        fields.append("errno=" + str(number))
+    if isinstance(error, ssl.SSLCertVerificationError):
+        number = getattr(error, "verify_code", None)
+        if type(number) is int and 0 <= number <= 255:
+            fields.append("verify_code=" + str(number))
+    return "; ".join(fields)
 
 
 class Reply:
@@ -89,8 +119,8 @@ class Client:
                 raise AcceptanceError("response exceeded the acceptance size limit")
             return Reply(response.status, {k.lower(): v for k, v in response.getheaders()}, raw)
         except (OSError, http.client.HTTPException) as error:
-            # Never stringify an exception that may contain a URL, header or body.
-            raise AcceptanceError("TLS or HTTP transport failed; diagnostics suppressed") from error
+            # Suppress the original chain as well as its potentially sensitive text.
+            raise AcceptanceError(transport_failure(error)) from None
         finally:
             connection.close()
 

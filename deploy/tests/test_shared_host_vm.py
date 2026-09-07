@@ -7,7 +7,10 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import shutil
+import socket
 import subprocess
+import threading
 import tempfile
 import unittest
 from unittest import mock
@@ -17,6 +20,69 @@ MODULE_PATH = Path(__file__).resolve().parents[2] / "scripts/tests/shared_host_v
 SPEC = importlib.util.spec_from_file_location("shared_host_vm_tests", MODULE_PATH)
 harness = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(harness)
+
+
+class CertificateTrustTests(unittest.TestCase):
+    """Real disposable certificates/TLS; this does not boot a VM or application."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("openssl"):
+            raise RuntimeError("OpenSSL is required for the strict certificate regression")
+        cls.temporary = tempfile.TemporaryDirectory(prefix="cf-vm-strict-tls-")
+        cls.addClassCleanup(cls.temporary.cleanup)
+        cls.tls = harness.certificates(Path(cls.temporary.name))
+
+    def verify(self, leaf, name, *, ca="ca.crt", flag="-verify_hostname"):
+        return subprocess.run(["openssl", "verify", "-x509_strict", "-purpose", "sslserver",
+                               "-CAfile", str(self.tls / ca), flag, name, str(self.tls / leaf)],
+                              capture_output=True, check=False, timeout=30)
+
+    def test_generated_server_and_registry_certificates_pass_strict_verification(self):
+        for leaf, name, flag in (("server.crt", harness.TLS_NAME, "-verify_hostname"),
+                                 ("registry.crt", "localhost", "-verify_hostname"),
+                                 ("registry.crt", "127.0.0.1", "-verify_ip")):
+            with self.subTest(leaf=leaf, flag=flag):
+                self.assertEqual(self.verify(leaf, name, flag=flag).returncode, 0,
+                                 "generated certificate failed strict chain/name/purpose verification; private output suppressed")
+
+    def test_strict_verification_rejects_wrong_name_and_untrusted_ca(self):
+        self.assertNotEqual(self.verify("server.crt", "wrong.cf.test").returncode, 0)
+        self.assertNotEqual(self.verify("server.crt", harness.TLS_NAME, ca="untrusted-ca.crt").returncode, 0)
+
+    def test_strict_python_client_completes_real_tls_handshake(self):
+        context = harness.ssl.create_default_context(cafile=str(self.tls / "ca.crt"))
+        # Python 3.13 enables this flag by default; exercise that same policy
+        # when the focused regression runs on an older Python installation.
+        context.verify_flags |= harness.ssl.VERIFY_X509_STRICT
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(context.verify_mode, harness.ssl.CERT_REQUIRED)
+        server_context = harness.ssl.SSLContext(harness.ssl.PROTOCOL_TLS_SERVER)
+        server_context.load_cert_chain(self.tls / "server.crt", self.tls / "server.key")
+        completed = []
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(5)
+            def serve():
+                try:
+                    with listener.accept()[0] as raw:
+                        raw.settimeout(5)
+                        with server_context.wrap_socket(raw, server_side=True) as secured:
+                            secured.sendall(b"strict-test")
+                            completed.append(True)
+                except OSError:
+                    completed.append(False)
+            thread = threading.Thread(target=serve)
+            thread.start()
+            try:
+                with socket.create_connection(listener.getsockname(), timeout=5) as raw:
+                    with context.wrap_socket(raw, server_hostname=harness.TLS_NAME) as secured:
+                        self.assertEqual(secured.recv(32), b"strict-test")
+            finally:
+                thread.join(timeout=6)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(completed, [True])
 
 
 class LANBoundaryTests(unittest.TestCase):

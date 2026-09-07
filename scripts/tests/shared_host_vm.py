@@ -315,13 +315,22 @@ def certificates(work):
     directory = work / "tls"
     directory.mkdir(mode=0o700)
     ca_key, ca = directory / "ca.key", directory / "ca.crt"
-    execute(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3", "-subj", "/CN=CF disposable verification CA", "-keyout", str(ca_key), "-out", str(ca)])
-    execute(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3", "-subj", "/CN=Untrusted isolated test CA", "-keyout", str(directory / "untrusted-ca.key"), "-out", str(directory / "untrusted-ca.crt")])
+    # Debian 13's Python client keeps X509_STRICT enabled. Make the test CA's
+    # signing authority explicit instead of relying on ambient openssl.cnf.
+    ca_extensions = ["-addext", "basicConstraints=critical,CA:TRUE",
+                     "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+                     "-addext", "subjectKeyIdentifier=hash",
+                     "-addext", "authorityKeyIdentifier=keyid:always"]
+    execute(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3", "-subj", "/CN=CF disposable verification CA", "-keyout", str(ca_key), "-out", str(ca), *ca_extensions])
+    execute(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3", "-subj", "/CN=Untrusted isolated test CA", "-keyout", str(directory / "untrusted-ca.key"), "-out", str(directory / "untrusted-ca.crt"), *ca_extensions])
     for name, san in (("registry", "DNS:localhost,IP:127.0.0.1"), ("server", "DNS:" + TLS_NAME)):
         key, csr, cert = (directory / (name + suffix) for suffix in (".key", ".csr", ".crt"))
         execute(["openssl", "req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=" + ("localhost" if name == "registry" else TLS_NAME), "-keyout", str(key), "-out", str(csr)])
         extension = directory / (name + ".extensions")
-        private_write(extension, f"subjectAltName={san}\nextendedKeyUsage=serverAuth\n")
+        private_write(extension, "basicConstraints=critical,CA:FALSE\n"
+                      "keyUsage=critical,digitalSignature,keyEncipherment\n"
+                      "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n"
+                      f"subjectAltName={san}\nextendedKeyUsage=serverAuth\n")
         execute(["openssl", "x509", "-req", "-in", str(csr), "-CA", str(ca), "-CAkey", str(ca_key), "-CAcreateserial", "-days", "3", "-extfile", str(extension), "-out", str(cert)])
     return directory
 

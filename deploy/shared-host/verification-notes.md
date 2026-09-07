@@ -494,3 +494,64 @@ assertion and the original two-/twenty-second helper boundaries. Failure output
 contains only fixed browser-error categories, prompt counts and a fixture-path
 allowlist. Syntax/diff checks passed; the original fault still needs real CI
 revalidation and is not declared solved by added synchronization alone.
+
+## Actual a42d1bd5 installation and LAN results; strict certificate repair
+
+[Real VM job 101697741297](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34107517392/job/101697741297)
+ran two clean Debian 13.6/systemd guests with independent disposable ext4 data
+volumes. Formal preparation, first healthy start, administrator login, controlled
+stop/bootstrap removal/same-image restart, second administrator login and
+idempotent preparation passed. Runtime UID/GID/PID 1 were 10001; expected writable
+mounts, read-only configuration/root, required tools and absent bootstrap were
+verified. This was actual installation, not preconfigured fixture state.
+
+Second-VM access over Docker's published path passed: allowed-source HTTPS/UI
+before and after returned 200; wrong CA was rejected with curl 60. The denied
+192.0.2.99 peer completed TCP to verified 192.0.2.11, then received TLS EOF in
+23 ms without completing a handshake or sending application bytes. Spoofed
+forwarding headers did not change the allowed TLS peer's access.
+
+The builder/config image ID was
+`sha256:857e447e2a0548c1f4476da0b0dda555d489b39e094e16e968195ed9f5b6a783`;
+the isolated registry manifest and verified guest runtime image ID were
+`sha256:a303078bf146318306b1d5b080743c15a094103d339e70a52903c1f45b5d4d73`.
+Different Docker image-store identity representations were checked against the
+same content. The sanitized `vm-result.json` is retained outside Git.
+
+The job failed at `initial-real-api-exercise`, request 1 (administrator login),
+with only the historical generic TLS/HTTP transport error. File/API permission,
+protocol, browser UI, restart, backup and blank restore stages were not reached.
+This does not establish complete A or B acceptance.
+
+A subsequent local reproduction with OpenSSL 3.5.6 and Python 3.12.10 established
+that the same fixture CA passed ordinary verification but failed strict X.509
+verification with code 92 at depth 1: missing CA Key Usage. Python 3.13 enables
+strict verification in its default client context. This is a confirmed fixture
+defect, not a recovered error code from the historical job. Disposable CA/leaf
+certificates now specify their signing, basic constraints, identifiers, SAN and
+server-auth extensions. Strict flags, CA validation and hostname checks remain.
+Real strict certificate/loopback TLS tests and protected transport diagnostics
+passed 45 targeted tests; the latter export only fixed categories and bounded
+integer codes, suppressing original exception text and chains. Real API
+revalidation is pending the next fixed-image CI run.
+
+## Actual aa1bb690 source regression and accurate audit boundary
+
+At `aa1bb69073729e31f425a121c97c5320fcccd3c8`, the complete backend race suite
+passed (HTTP 99.465 seconds), including every physical/logical resource display,
+fresh filtering, permission withdrawal and denied-directory aggregate regression.
+Format, frontend checks and deployment validation passed; backend Lint still
+reports 78 findings. No rule, assertion or scan scope was disabled.
+[Source job 101702675921](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34109331621/job/101702675921)
+passed 115 frontend unit tests, Sharing 13/13, Settings 25/25 and Noauth 27/29.
+The only two Noauth failures are unchanged directory aggregate size assertions
+at indexing-options.spec.ts:95 and :121. Root Share setup and the other previously
+failing file/navigation checks passed on this run.
+
+The API evidence field `existing_go_regression_coverage` is a classification,
+not an execution result. Real API/protocol scripts check audit query authorization,
+event contents/redaction, protocol terminal outcomes and restore retention when
+they run. They do not inject persistent audit-store failure or prove a durable
+Pending interruption at runtime. Pending/Finalize atomicity, startup recovery and
+write-before-audit failure closure currently have Go regression evidence only;
+fixed-image fault-injection acceptance remains unexecuted.

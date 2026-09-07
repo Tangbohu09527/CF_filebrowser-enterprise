@@ -5,6 +5,9 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import socket
+import ssl
+import traceback
 from pathlib import Path
 import unittest
 import urllib.parse
@@ -72,6 +75,70 @@ def use_audit(test, events):
 
 
 class ProtocolAcceptanceTests(unittest.TestCase):
+    def transport_failure(self, error, stage="request"):
+        client = api.Client.__new__(api.Client)
+        client.host, client.port, client.requests = "files.test", 18443, 0
+        client.context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        before = (client.context.check_hostname, client.context.verify_mode, client.context.verify_flags)
+        connection = mock.Mock()
+        target = connection.getresponse.return_value.read if stage == "read" else getattr(connection, stage)
+        target.side_effect = error
+        with mock.patch.object(api.http.client, "HTTPSConnection", return_value=connection) as factory:
+            with self.assertRaises(api.AcceptanceError) as caught:
+                client.request("POST", "/api/auth/login", query={"username": "admin"},
+                               token="PRIVATE_TOKEN_SENTINEL", body=b"PRIVATE_BODY_SENTINEL",
+                               headers={"X-Password": "PRIVATE_HEADER_SENTINEL"})
+        factory.assert_called_once_with("files.test", 18443, context=client.context, timeout=90)
+        connection.close.assert_called_once_with()
+        self.assertEqual(client.requests, 1)
+        self.assertEqual((client.context.check_hostname, client.context.verify_mode, client.context.verify_flags), before)
+        return caught.exception
+
+    def test_transport_failure_categories_preserve_request_and_tls_behavior(self):
+        secret = "https://private.invalid/PRIVATE_URL_SENTINEL Authorization: PRIVATE_HEADER_SENTINEL PRIVATE_BODY_SENTINEL"
+        certificate = ssl.SSLCertVerificationError(1, secret)
+        certificate.verify_code, certificate.verify_message = 92, secret
+        cases = [
+            (certificate, "tls_certificate_verify; errno=1; verify_code=92"),
+            (socket.gaierror(-2, secret), "dns; errno=-2"),
+            (TimeoutError(110, secret), "timeout; errno=110"),
+            (ConnectionResetError(104, secret), "connection_reset; errno=104"),
+            (ssl.SSLEOFError(8, secret), "eof; errno=8"),
+            (api.http.client.RemoteDisconnected(secret), "eof"),
+            (ssl.SSLError(1, secret), "tls; errno=1"),
+            (api.http.client.BadStatusLine(secret), "http"),
+            (OSError(5, secret), "os; errno=5"),
+        ]
+        for error, expected in cases:
+            for stage in ("request", "getresponse", "read"):
+                with self.subTest(category=expected, stage=stage):
+                    caught = self.transport_failure(error, stage)
+                    self.assertEqual(str(caught), "TLS or HTTP transport failed; category=" + expected)
+                    self.assertTrue(all(value not in str(caught) for value in (secret, "PRIVATE_")))
+
+    def test_transport_failure_never_formats_sensitive_exception_or_chain(self):
+        class UnprintableTransportError(OSError):
+            def __str__(self):
+                raise AssertionError("transport exception must never be stringified")
+        for error in (UnprintableTransportError(5, "PRIVATE_BODY_SENTINEL"),
+                      type("PRIVATE_TYPE_SENTINEL", (api.http.client.HTTPException,), {})(
+                          "https://private.invalid/PRIVATE_URL_SENTINEL Authorization: PRIVATE_HEADER_SENTINEL PRIVATE_BODY_SENTINEL")):
+            with self.subTest(kind="protected-exception"):
+                caught = self.transport_failure(error)
+                rendered = "".join(traceback.format_exception(caught))
+                self.assertTrue("PRIVATE_" not in rendered, "protected transport data leaked through the exception chain")
+                self.assertIsNone(caught.__cause__)
+                self.assertTrue(caught.__suppress_context__)
+
+    def test_transport_failure_omits_noninteger_or_out_of_range_codes(self):
+        for errno_value, verify_code in ((True, True), ("PRIVATE_HEADER_SENTINEL", "PRIVATE_BODY_SENTINEL"),
+                                         (-32769, -1), (32768, 256), (10 ** 100, 10 ** 100)):
+            with self.subTest(errno_type=type(errno_value).__name__):
+                error = ssl.SSLCertVerificationError(1, "PRIVATE_URL_SENTINEL")
+                error.errno, error.verify_code = errno_value, verify_code
+                caught = self.transport_failure(error)
+                self.assertEqual(str(caught), "TLS or HTTP transport failed; category=tls_certificate_verify")
+
     def test_permission_update_accepts_handler_no_content_contract(self):
         # backend/http/audit_user_actions_test.go's permission-update case asserts
         # the real userPutHandler returns 204, with no JSON response body.
