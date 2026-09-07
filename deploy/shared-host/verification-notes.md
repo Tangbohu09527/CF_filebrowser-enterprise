@@ -1241,3 +1241,30 @@ case recorder now identifies fixed workbook 1/2 response/viewer/decode stages
 and editor save stages, keeping every original interaction, timeout and
 assertion. All of these are implementation checks; actual Store EIO, syscall
 coverage and the revised browser diagnostics have not yet run in a VM.
+
+
+## Reject incompatible image revisions before creating restore targets
+
+A local regression through the formal restore CLI reproduced a preflight gap:
+with matching archive/source fields and local Image ID, a different or missing
+OCI image revision label was not rejected and the temporary restore layout was
+created. The normal prepare/validate entry already enforces this label contract;
+this does not mean a normal compatible backup was observed failing in a VM.
+The restore preflight now applies that same source-revision requirement before
+creating configuration, data, cache or business-storage directories. A further
+Docker-style `Labels: null` negative case first reproduced an AttributeError;
+the guard now treats it as missing and returns the defined BackupError.
+
+The existing backup test module passed all 21 tests after the minimal repair.
+The new CLI negative cases cover different/missing/null revision and the
+retained different-Image-ID refusal, checking every target remains absent and
+both archive bytes and unrelated sentinel remain unchanged. The compatible
+positive CLI case now also traverses the real version-check function. Host,
+source and Docker reads are simulated; no real restore pass is claimed here.
+Only backup.py and its existing test module were changed for this issue.
+
+The preceding cf8c23f3 deployment CI job 101760200165 passed the existing
+`make validate-deployment` entry with 25 tests (0.064 s) and 222 shared-host
+tests (12.616 s). That run predates this restore revision repair. The new
+Pending/EIO probe still awaits its real VM execution; unit/deployment CI
+success does not establish Audit syscall fault or blank restore acceptance.

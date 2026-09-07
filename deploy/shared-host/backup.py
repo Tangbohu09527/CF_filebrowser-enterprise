@@ -464,6 +464,8 @@ def verify_local_version(version):
         raise BackupError(str(error)) from error
     if image.get("Id") != version["image_id"]:
         raise BackupError("local image does not match the exact backup image ID; no pull was attempted")
+    if (image.get("Config", {}).get("Labels") or {}).get("org.opencontainers.image.revision") != version["source_sha"]:
+        raise BackupError("local image revision does not match the exact backup source SHA; no pull was attempted")
 
 
 def service_containers():

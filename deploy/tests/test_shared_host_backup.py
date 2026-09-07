@@ -205,7 +205,7 @@ class BackupArchiveTests(unittest.TestCase):
                 path.write_bytes(bad)
                 backup.validate_archive(path, self.version)
 
-    def run_restore_cli(self, archive, *, checksum=None):
+    def run_restore_cli(self, archive, *, checksum=None, local_image=None):
         config = self.root / "blank-config"
         data = self.root / "blank-data"
         storage = self.root / "blank-storage"
@@ -221,8 +221,14 @@ class BackupArchiveTests(unittest.TestCase):
             "FILES_ROOT": files, "BACKUP_ROOT": backups, "CACHE_ROOT": cache,
         }
         with mock.patch.multiple(backup, **patches), contextlib.ExitStack() as stack:
-            for name in ("production_guard", "verify_local_version", "require_stopped_for_restore", "set_metadata"):
+            for name in ("production_guard", "require_stopped_for_restore", "set_metadata"):
                 stack.enter_context(mock.patch.object(backup, name))
+            if local_image is None:
+                stack.enter_context(mock.patch.object(backup, "verify_local_version"))
+            else:
+                stack.enter_context(mock.patch.object(backup, "lifecycle_module", return_value=lifecycle))
+                stack.enter_context(mock.patch.object(lifecycle, "source_checks"))
+                stack.enter_context(mock.patch.object(lifecycle, "inspect_image", return_value=local_image))
             stack.enter_context(mock.patch.object(backup, "lifecycle_lock", return_value=contextlib.nullcontext()))
             stack.enter_context(mock.patch.object(backup, "backup_path", return_value=archive))
             stack.enter_context(mock.patch.object(backup, "write_private", side_effect=safe_write))
@@ -235,7 +241,10 @@ class BackupArchiveTests(unittest.TestCase):
 
     def test_restore_cli_creates_truly_blank_fixed_layout_after_validation(self):
         archive = self.archive()
-        result, targets, backups, cache = self.run_restore_cli(archive)
+        image = {"Id": self.version["image_id"], "Config": {"Labels": {
+            "org.opencontainers.image.revision": self.version["source_sha"],
+        }}}
+        result, targets, backups, cache = self.run_restore_cli(archive, local_image=image)
         self.assertEqual(result, 0)
         self.assertEqual((targets["data"] / "database.db").read_bytes(), b"initialized-db")
         self.assertEqual((targets["files"] / "example.txt").read_bytes(), b"business-file")
@@ -245,6 +254,31 @@ class BackupArchiveTests(unittest.TestCase):
         self.assertEqual(new, (targets["files"].parent / ".storage-identity").read_bytes())
         self.assertEqual(len(list(backups.glob("*.json"))), 1)
         self.assertFalse((targets["config"] / "secrets/bootstrap_admin_password").exists())
+
+    def test_restore_cli_rejects_incompatible_local_image_before_any_layout_creation(self):
+        cases = (
+            ("different_revision", self.version["image_id"], {"org.opencontainers.image.revision": "c" * 40}),
+            ("missing_revision", self.version["image_id"], {}),
+            ("null_labels", self.version["image_id"], None),
+            ("different_image_id", "sha256:" + "d" * 64,
+             {"org.opencontainers.image.revision": self.version["source_sha"]}),
+        )
+        for name, image_id, labels in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                with mock.patch.object(self, "root", Path(directory)):
+                    archive = self.archive()
+                    original_archive = archive.read_bytes()
+                    sentinel = self.root / "existing-unrelated-data"
+                    sentinel.write_bytes(b"preserve-existing-data")
+                    image = {"Id": image_id, "Config": {"Labels": labels}}
+                    with self.assertRaisesRegex(backup.BackupError, "image"):
+                        self.run_restore_cli(archive, local_image=image)
+                    self.assertEqual(set(self.root.iterdir()), {archive, sentinel})
+                    self.assertEqual(archive.read_bytes(), original_archive)
+                    self.assertEqual(sentinel.read_bytes(), b"preserve-existing-data")
+                    for target in ("blank-config", "blank-data", "blank-cache", "blank-storage",
+                                   "blank-storage/files", "blank-storage/backups"):
+                        self.assertFalse((self.root / target).exists(), target)
 
     def test_restore_cli_rejects_corruption_before_any_layout_creation(self):
         archive = self.archive(lambda m: m["entries"][-1].update(sha256="0" * 64))
