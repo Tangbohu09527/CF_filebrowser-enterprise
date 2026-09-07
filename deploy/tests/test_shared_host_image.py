@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +17,72 @@ IMAGE_ID = "sha256:" + "b" * 64
 
 
 class ImageWorkflowTests(unittest.TestCase):
+    def test_docker_commands_ignore_remote_daemon_and_builder_selectors(self):
+        poisoned = {
+            "DOCKER_HOST": "ssh://forbidden.invalid",
+            "DOCKER_CONTEXT": "forbidden-context",
+            "DOCKER_TLS": "1",
+            "DOCKER_TLS_VERIFY": "1",
+            "DOCKER_CERT_PATH": "/not-a-local-daemon",
+            "BUILDKIT_HOST": "tcp://forbidden.invalid:1234",
+            "BUILDX_BUILDER": "forbidden-builder",
+            "DOCKER_CONFIG": "/protected/registry-auth",
+            "PATH": "/test/bin",
+            "GO_IMAGE": "golang@sha256:" + "c" * 64,
+        }
+        commands = (
+            ("pull", "node:jod-slim"), ("image", "inspect", IMAGE_ID),
+            ("tag", IMAGE_ID, "registry.test:5000/app:fixed"),
+            ("push", "registry.test:5000/app:fixed"),
+            ("compose", "build", "filebrowser-enterprise"),
+            ("create", IMAGE_ID), ("cp", "container:/inputs", "/evidence"),
+            ("rm", "test-container"),
+        )
+        for explicit_environment in (False, True):
+            for command in commands:
+                with self.subTest(explicit_environment=explicit_environment, operation=command[0]):
+                    supplied = poisoned.copy() if explicit_environment else None
+                    with patch.dict(image.os.environ, poisoned, clear=True):
+                        with patch.object(image.subprocess, "run", return_value=SimpleNamespace(stdout="ok\n")) as execute:
+                            self.assertEqual(image.run("docker", *command, env=supplied), "ok")
+                        self.assertEqual(dict(image.os.environ), poisoned)
+                    self.assertEqual(execute.call_args.args[0], (
+                        "docker", "--host", "unix:///var/run/docker.sock", *command))
+                    environment = execute.call_args.kwargs["env"]
+                    self.assertEqual(environment["DOCKER_HOST"], "unix:///var/run/docker.sock")
+                    self.assertEqual(environment["BUILDX_BUILDER"], "default")
+                    for key in ("DOCKER_CONTEXT", "DOCKER_TLS", "DOCKER_TLS_VERIFY",
+                                "DOCKER_CERT_PATH", "BUILDKIT_HOST"):
+                        self.assertNotIn(key, environment)
+                    for key in ("DOCKER_CONFIG", "PATH", "GO_IMAGE"):
+                        self.assertEqual(environment[key], poisoned[key])
+                    if supplied is not None:
+                        self.assertEqual(supplied, poisoned)
+
+    def test_build_selects_default_builder_and_preserves_pinned_inputs(self):
+        args = argparse.Namespace(source_sha=SHA, image="cf-filebrowser:fixed", version="fixed",
+                                  evidence=Path("unused-evidence"),
+                                  **{name.lower(): None for name in image.BASES})
+        pinned = "registry.test:5000/base@sha256:" + "c" * 64
+        base_info = {"RepoDigests": [pinned], "Id": IMAGE_ID}
+        final_info = {"Id": IMAGE_ID, "Architecture": "amd64", "Os": "linux",
+                      "Config": {"Labels": {"org.opencontainers.image.revision": SHA}}}
+        with patch.object(image, "checked_source"), patch.object(image, "evidence_directory"):
+            with patch.object(image, "image_info", side_effect=[base_info] * 4 + [final_info]):
+                with patch.object(image, "write_record") as record:
+                    with patch.object(image, "run", return_value="test-container") as run:
+                        with patch("builtins.print"):
+                            image.build(args)
+        calls = [call for call in run.call_args_list if call.args[:2] == ("docker", "compose")
+                 and "build" in call.args]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].args[-5:], (
+            "build", "--pull", "--builder", "default", "filebrowser-enterprise"))
+        for key in image.BASES:
+            self.assertEqual(calls[0].kwargs["env"][key], pinned)
+        self.assertEqual(record.call_args.args[1]["source_sha"], SHA)
+        self.assertEqual(record.call_args.args[1]["image_id"], IMAGE_ID)
+
     def test_checkout_must_match_approved_sha(self):
         with patch.object(image, "run", return_value="c" * 40) as run:
             with self.assertRaisesRegex(ValueError, "HEAD"):

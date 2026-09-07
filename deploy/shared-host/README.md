@@ -105,7 +105,25 @@ sudo bash "$SOURCE_ROOT/deploy/shared-host/image.sh" publish \
 
 Use the resulting complete `repository@sha256:...` reference on the second
 host with `sudo docker pull --platform linux/amd64 "$APPROVED_IMAGE"`, then
-verify its Image ID and revision label. The test publication helper does not
+verify the approved RepoDigest and revision label, and record its **local** Image
+ID for lifecycle/backup operations:
+
+```bash
+sudo docker image inspect "$APPROVED_IMAGE" --format '{{json .RepoDigests}}'
+sudo docker image inspect "$APPROVED_IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+IMAGE_ID=$(sudo docker image inspect "$APPROVED_IMAGE" --format '{{.Id}}')
+```
+
+Docker's classic and containerd image stores can identify the same approved
+content differently (configuration versus manifest/index digest). Do not
+substitute an unrelated ID or compare cross-store IDs as the sole integrity
+check. Keep the immutable registry digest and build-input record; the CI transfer
+check additionally verifies manifest/config SHA-256, runtime configuration,
+root filesystem layers and the local container identity. Restore requires the
+same recorded local Image ID, so use the matching Docker image-store contract
+on the recovery host; incompatibility is refused.
+
+ The test publication helper does not
 publish to Docker Hub or GHCR. Promotion to an organization's production
 registry is a separate explicitly approved publication operation using the
 same verified image and recorded destination digest; this delivery never
@@ -193,8 +211,11 @@ the existing administration interface.
 The ordinary default user has Browse/Preview/Download; API, Admin, Share,
 Create, Modify, Delete and Realtime are initially denied. Review these source
 and default grants before promotion. WebDAV/OnlyOffice code and tests remain
-present; enabling their existing options requires actual client/Document Server
-acceptance. Storing a document does not prove its preview/editor works.
+present. To enable WebDAV, pass `--enable-webdav` during `prepare`; repeated
+preparation must retain that choice. The existing user and Token permission
+checks still apply. OnlyOffice requires a separately configured real Document
+Server and actual client acceptance. Storing a document does not prove its
+preview/editor works.
 
 ## 6. Normal operation and restarts
 

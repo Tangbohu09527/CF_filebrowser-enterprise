@@ -8,6 +8,8 @@ API contracts come from backend/http handlers and their security regression test
 from __future__ import annotations
 
 import argparse
+import base64
+from datetime import datetime, timezone
 import hashlib
 import http.client
 import io
@@ -19,8 +21,10 @@ import secrets
 import ssl
 import stat
 import struct
+import subprocess
 import sys
 import urllib.parse
+import xml.etree.ElementTree as ET
 import zipfile
 import zlib
 
@@ -58,7 +62,11 @@ class Client:
         self.requests = 0
 
     def request(self, method, endpoint, *, token=None, query=None, data=None, body=None, headers=None):
-        if not endpoint.startswith("/api/") and not endpoint.startswith("/public/api/") and endpoint != "/health":
+        endpoint_parts = urllib.parse.urlsplit(endpoint)
+        if endpoint_parts.scheme or endpoint_parts.netloc or endpoint_parts.query or endpoint_parts.fragment:
+            raise AcceptanceError("endpoint must be a local path without embedded query or credentials")
+        if (not endpoint.startswith("/api/") and not endpoint.startswith("/public/api/")
+                and not endpoint.startswith("/dav/" + SOURCE + "/") and endpoint != "/health"):
             raise AcceptanceError("unexpected API endpoint")
         if query and any(key.lower() in ("auth", "token", "password") for key in query):
             raise AcceptanceError("authentication secrets must be sent only in headers")
@@ -70,7 +78,7 @@ class Client:
             body = json.dumps(data, ensure_ascii=False).encode("utf-8")
             outgoing["Content-Type"] = "application/json"
         elif body is not None:
-            outgoing["Content-Type"] = "application/octet-stream"
+            outgoing.setdefault("Content-Type", "application/octet-stream")
         connection = http.client.HTTPSConnection(self.host, self.port, context=self.context, timeout=90)
         try:
             self.requests += 1
@@ -529,6 +537,342 @@ class Acceptance:
         owner = self.save_share("owner_withdrawn", worker, self.share_payload())
         self.public("share_owner_before_withdrawal", "/中文 空格.txt", owner)
 
+
+    def dav(self, label, method, path, token, *, statuses=(200,), body=None, headers=None):
+        # The product uses Basic's password field as an API JWT, not an account password.
+        authentication = base64.b64encode(("ignored:" + token).encode("ascii")).decode("ascii")
+        endpoint = "/dav/" + SOURCE + urllib.parse.quote(path, safe="/")
+        return self.request(label, method, endpoint, headers={"Authorization": "Basic " + authentication,
+                            **(headers or {})}, body=body, statuses=statuses)
+
+    def dav_listing(self, label, path, token, *, expected_paths=()):
+        response = self.dav(label, "PROPFIND", path, token, statuses=(207,),
+                            headers={"Depth": "1", "Content-Type": "application/xml"},
+                            body=b'<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:allprop/></d:propfind>')
+        try:
+            tree = ET.fromstring(response.body)
+        except ET.ParseError as error:
+            raise AcceptanceError(label + "_invalid_multistatus_xml") from error
+        self.check(label + "_multistatus", tree.tag == "{DAV:}multistatus")
+        hrefs = [urllib.parse.unquote(node.text or "") for node in tree.findall(".//{DAV:}href")]
+        self.check(label + "_scoped_hrefs", bool(hrefs) and all(
+            href.startswith("/dav/" + SOURCE + "/") and "/../" not in href for href in hrefs))
+        # A 207 response can contain only failed propstats; a scoped href alone
+        # does not establish that the server returned usable directory entries.
+        entries = tree.findall("{DAV:}response")
+        success = re.compile(r"HTTP/1\.[01] 2[0-9]{2}(?: .*)?")
+        for entry in entries:
+            direct_status = entry.findtext("{DAV:}status")
+            properties = [propstat.find("{DAV:}prop") for propstat in entry.findall("{DAV:}propstat")
+                          if success.fullmatch(propstat.findtext("{DAV:}status", "").strip())]
+            self.check(label + "_successful_properties",
+                       (direct_status is None or bool(success.fullmatch(direct_status.strip())))
+                       and any(prop is not None and len(prop) > 0 for prop in properties))
+        self.check(label + "_responses_present", bool(entries))
+        response_hrefs = [urllib.parse.unquote(entry.findtext("{DAV:}href", "")) for entry in entries]
+        self.check(label + "_response_hrefs", all(response_hrefs))
+        expected = {"/dav/" + SOURCE + item for item in expected_paths}
+        self.check(label + "_expected_entries", expected.issubset(response_hrefs))
+        return hrefs
+
+    def check_filebridge_listing(self, label, result, path, filename, size):
+        files = result.get("files")
+        self.check(label, result.get("source") == SOURCE and result.get("path") == path
+                   and isinstance(files, list) and any(
+                       item.get("source") == SOURCE and item.get("path") == path + "/" + filename
+                       and item.get("name") == filename and item.get("size") == size
+                       and item.get("is_dir") is False for item in files))
+
+    def revoke(self, name, session):
+        self.request(name + "_revoke", "DELETE", "/api/auth/token", token=session,
+                     query={"name": self.state["tokens"][name]["name"]})
+
+    def protocols(self):
+        self.check("protocols_completed_seed_required", self.state.get("seed_completed") is True)
+        self.check("protocols_fresh_state_required", "protocols" not in self.state)
+        self.login_admin()
+        server = self.request("webdav_formal_configuration", "GET", "/api/settings",
+                              token=self.admin, query={"property": "server"}).json()
+        self.check("webdav_explicitly_enabled", server.get("disableWebDAV") is False)
+        binary = protected_path(self.args.filebridge_bin)
+        with binary.open("rb") as stream:
+            executable_header = stream.read(4)
+        self.check("filebridge_real_executable", bool(binary.stat().st_mode & 0o111) and executable_header == b"\x7fELF")
+        self.state["protocols"] = {"complete": False, "filebridge_binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest()}
+        self.checkpoint()
+        self.filebridge_tests(binary)
+        self.webdav_tests()
+        self.protocol_audit()
+        self.state["protocols"]["complete"] = True
+        self.checkpoint()
+
+    def filebridge_tests(self, binary):
+        # All subprocess input/output and local logs remain in the private guest.
+        work = Path(self.args.state_file).parent / ("filebridge-" + self.state["id"])
+        work.mkdir(mode=0o700)
+        staging, downloads, certs = (work / name for name in ("staging", "downloads", "empty-ca-directory"))
+        for directory in (staging, downloads, certs):
+            directory.mkdir(mode=0o700)
+        local = staging / "中文 文件.txt"
+        raw = "FileBridge actual HTTPS upload\n中文 / spaces\n".encode("utf-8")
+        local.write_bytes(raw)
+        local.chmod(0o600)
+        outside = work / "outside.txt"
+        outside.write_bytes(b"outside approved staging")
+        outside.chmod(0o600)
+        config = work / "config.json"
+        write_json(config, {"base_url": self.args.url.rstrip("/") + "/",
+                           "audit_log": str(work / "audit.jsonl"),
+                           "allowed_sources": {SOURCE: {"read_roots": ["/bridge", "/中文 空格.txt"], "write_roots": ["/bridge"]}},
+                           "local_read_roots": [str(staging)], "local_write_roots": [str(downloads)],
+                           "timeout_seconds": 30, "max_retries": 1})
+        minimum = permissions(preview=False, modify=False, delete=False, share=False)
+        session = self.create_user("bridge", minimum)
+        live = self.create_token("bridge", session, "bridge_live", "api,browse,download,create")
+        narrow = self.create_token("bridge", session, "bridge_narrow", "api,browse,download")
+        revoked = self.create_token("bridge", session, "bridge_revoked", "api,browse,download")
+        environment = {"PATH": "/usr/bin:/bin", "HOME": str(work), "LANG": "C.UTF-8",
+                       "SSL_CERT_FILE": str(self.args.ca_file), "SSL_CERT_DIR": str(certs)}
+
+        def bridge(label, command, payload=None, *, token=live, apply=False, errors=(), trust=True):
+            argv = [str(binary), "--config", str(config), "--token-stdin", "--input", "-"]
+            if apply:
+                argv.append("--apply")
+            argv.append(command)
+            env = dict(environment)
+            if not trust:
+                # Empty private root store proves the supplied CA is actually necessary.
+                env["SSL_CERT_FILE"] = str(work / "empty-ca.pem")
+            data = (token + "\n" + json.dumps(payload or {}, ensure_ascii=False)).encode("utf-8")
+            try:
+                process = subprocess.run(argv, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                         env=env, cwd=work, timeout=150, check=False)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise AcceptanceError(label + "_client_execution_failed; output suppressed") from error
+            self.state["protocols"]["filebridge_invocations"] = self.state["protocols"].get("filebridge_invocations", 0) + 1
+            try:
+                response = json.loads(process.stdout)
+            except (UnicodeError, ValueError) as error:
+                raise AcceptanceError(label + "_invalid_client_json; output suppressed") from error
+            self.check(label + "_schema", response.get("schema_version") == "filebrowser-agentctl/v1")
+            if errors:
+                code = response.get("error", {}).get("code")
+                self.check(label, process.returncode in (1, 2) and response.get("ok") is False and code in errors)
+            else:
+                self.check(label, process.returncode == 0 and response.get("ok") is True)
+            return response
+
+        (work / "empty-ca.pem").write_bytes(b"")
+        bridge("filebridge_tls_rejects_untrusted_ca", "ping", errors=("connection_failed",), trust=False)
+        bridge("filebridge_https_ping", "ping")
+        caps = bridge("filebridge_least_privilege_identity", "whoami")["result"]
+        self.check("filebridge_exact_permission_intersection", caps.get("permissions") == minimum
+                   and caps.get("capabilities_exact") is True)
+        directory = {"source": SOURCE, "path": "/bridge"}
+        plan = bridge("filebridge_mkdir_dry_run", "mkdir", directory)
+        self.check("filebridge_mkdir_dry_run_not_applied", plan.get("dry_run") is True and plan["result"].get("applied") is False)
+        self.resource("filebridge_mkdir_dry_run_absent", "GET", "/bridge", session, statuses=(404,))
+        result = bridge("filebridge_mkdir_apply", "mkdir", {**directory, "operation_id": "bridge-dir-" + self.state["id"]}, apply=True)
+        self.check("filebridge_directory_verified", result["result"].get("verified") is True)
+        target = {"source": SOURCE, "path": "/bridge/中文 文件.txt", "local_file": str(local)}
+        plan = bridge("filebridge_upload_dry_run", "upload-new", target)
+        self.check("filebridge_upload_dry_run_not_applied", plan.get("dry_run") is True and plan["result"].get("applied") is False)
+        self.resource("filebridge_upload_dry_run_absent", "GET", target["path"], session, statuses=(404,))
+        approved = {**target, "operation_id": "bridge-upload-" + self.state["id"],
+                    "expected_bytes": len(raw), "expected_sha256": hashlib.sha256(raw).hexdigest()}
+        bridge("filebridge_approval_mismatch", "upload-new", {**approved, "expected_sha256": "0" * 64}, apply=True, errors=("approval_mismatch",))
+        self.resource("filebridge_mismatch_creates_nothing", "GET", target["path"], session, statuses=(404,))
+        result = bridge("filebridge_upload_apply", "upload-new", approved, apply=True)
+        self.check("filebridge_uploaded_and_verified", result["result"].get("applied") is True and result["result"].get("verified") is True)
+        self.remember_file("bridge/中文 文件.txt", raw)
+        self.check_bytes("filebridge_server_bytes", self.download("filebridge_server_read", target["path"], session).body,
+                         self.state["files"]["bridge/中文 文件.txt"])
+        result = bridge("filebridge_read", "read", {"source": SOURCE, "path": target["path"]})["result"]
+        self.check("filebridge_read_untrusted_exact", result.get("untrusted") is True and result.get("content") == raw.decode("utf-8"))
+        digest = bridge("filebridge_checksum", "checksum", {"source": SOURCE, "path": target["path"], "algorithm": "sha256"})["result"]
+        self.check("filebridge_checksum_exact", digest.get("checksums", {}).get("sha256") == hashlib.sha256(raw).hexdigest())
+        listed = bridge("filebridge_list", "list", directory)["result"]
+        self.check_filebridge_listing("filebridge_list_uploaded_entry", listed, "/bridge", local.name, len(raw))
+        destination = downloads / "roundtrip.txt"
+        transfer = {"source": SOURCE, "path": target["path"], "output_file": str(destination)}
+        bridge("filebridge_download", "download", transfer)
+        self.check("filebridge_actual_local_download_bytes", destination.read_bytes() == raw)
+        bridge("filebridge_local_overwrite_denied", "download", transfer, errors=("local_target_exists",))
+        bridge("filebridge_remote_overwrite_denied", "upload-new", approved, apply=True, errors=("target_exists",))
+        self.resource("filebridge_server_modify_denied", "PUT", target["path"], live, body=b"blocked", statuses=(403,))
+        bridge("filebridge_source_allowlist_denied", "list", {"source": "outside-source", "path": "/"}, errors=("source_denied",))
+        bridge("filebridge_read_root_denied", "stat", {"source": SOURCE, "path": "/document.pdf"}, errors=("path_denied",))
+        bridge("filebridge_write_root_denied", "mkdir", {"source": SOURCE, "path": "/outside-bridge"}, errors=("path_denied",))
+        bridge("filebridge_traversal_denied", "stat", {"source": SOURCE, "path": "/bridge/../document.pdf"}, errors=("invalid_path",))
+        bridge("filebridge_local_read_denied", "upload-new", {**target, "path": "/bridge/local-denied.txt", "local_file": str(outside)}, errors=("local_path_denied",))
+        bridge("filebridge_local_write_denied", "download", {**transfer, "output_file": str(work / "outside-download.txt")}, errors=("local_path_denied",))
+        bridge("filebridge_token_create_intersection", "upload-new", {**approved, "path": "/bridge/token-denied.txt"}, token=narrow, apply=True, errors=("forbidden",))
+        self.resource("filebridge_token_denial_creates_nothing", "GET", "/bridge/token-denied.txt", session, statuses=(404,))
+        for command in ("delete", "share", "token", "users", "http", "shell", "move", "rename", "overwrite"):
+            bridge("filebridge_dangerous_" + command, command, errors=("dangerous_command",))
+        bridge("filebridge_before_revoke", "stat", {"source": SOURCE, "path": target["path"]}, token=revoked)
+        self.revoke("bridge_revoked", session)
+        bridge("filebridge_revoked_token_denied", "stat", {"source": SOURCE, "path": target["path"]}, token=revoked, errors=("unauthorized", "forbidden"))
+        self.set_permissions("bridge", {**minimum, "create": False})
+        bridge("filebridge_user_permission_immediate_withdrawal", "upload-new",
+               {**approved, "path": "/bridge/withdrawn.txt"}, apply=True, errors=("forbidden",))
+        self.resource("filebridge_withdrawal_creates_nothing", "GET", "/bridge/withdrawn.txt", session, statuses=(404,))
+        self.check_bytes("filebridge_denials_preserve_original", self.download("filebridge_final_download", target["path"], live).body,
+                         self.state["files"]["bridge/中文 文件.txt"])
+        audit = (work / "audit.jsonl").read_bytes()
+        self.check("filebridge_local_audit_redacted", bool(audit) and all(
+            secret.encode("utf-8") not in audit for secret in (live, narrow, revoked, self.admin_password,
+                                                              self.state["users"]["bridge"]["password"])))
+
+    def webdav_tests(self):
+        full = permissions(preview=False, share=False)
+        session = self.create_user("dav", full)
+        live = self.create_token("dav", session, "dav_live", "api,browse,download,create,modify,delete")
+        readonly = self.create_token("dav", session, "dav_readonly", "api,browse,download")
+        revoked = self.create_token("dav", session, "dav_revoked", "api,browse,download")
+        self.dav("webdav_plain_password_rejected", "PROPFIND", "/", self.state["users"]["dav"]["password"], statuses=(401,), headers={"Depth": "0"})
+        self.dav_listing("webdav_root_listing", "/", live, expected_paths=("/中文 空格.txt",))
+        directory, target = "/webdav/", "/webdav/中文 空格.txt"
+        original, modified = b"WebDAV original bytes\n", "WebDAV 修改 bytes\n".encode("utf-8")
+        self.dav("webdav_mkcol", "MKCOL", directory, live, statuses=(201,))
+        self.dav("webdav_put_create", "PUT", target, live, statuses=(201,), body=original)
+        self.check("webdav_get_original_bytes", self.dav("webdav_get", "GET", target, live).body == original)
+        self.dav_listing("webdav_actual_directory_listing", directory, live, expected_paths=(target,))
+        self.set_permissions("dav", {**full, "browse": False})
+        self.dav("webdav_browse_permission_denied", "PROPFIND", directory, live, statuses=(403,), headers={"Depth": "1"})
+        self.dav("webdav_get_requires_browse", "GET", target, live, statuses=(403,))
+        self.set_permissions("dav", {**full, "download": False})
+        self.dav_listing("webdav_listing_without_download", directory, live, expected_paths=(target,))
+        for method in ("GET", "HEAD"):
+            self.dav("webdav_" + method.lower() + "_download_denied", method, target, live, statuses=(403,))
+        self.dav("webdav_range_download_denied", "GET", target, live, statuses=(403,), headers={"Range": "bytes=0-3"})
+        self.set_permissions("dav", {**full, "create": False, "modify": False})
+        self.dav("webdav_no_create_denied", "PUT", "/webdav/no-create.txt", live, statuses=(403,), body=b"blocked")
+        self.dav("webdav_no_modify_denied", "PUT", target, live, statuses=(403,), body=b"blocked")
+        self.set_permissions("dav", {**full, "modify": False})
+        self.dav("webdav_create_only_new", "PUT", "/webdav/create-only.txt", live, statuses=(201,), body=original)
+        self.dav("webdav_create_only_cannot_overwrite", "PUT", target, live, statuses=(403,), body=b"blocked")
+        self.set_permissions("dav", {**full, "create": False})
+        self.dav("webdav_modify_only_cannot_create", "PUT", "/webdav/modify-only-new.txt", live, statuses=(403,), body=b"blocked")
+        # Existing WebDAV overwrites require both Modify and Delete (Go regression contract).
+        self.dav("webdav_modify_existing", "PUT", target, live, statuses=(201,), body=modified)
+        self.set_permissions("dav", {**full, "delete": False})
+        self.dav("webdav_overwrite_requires_delete", "PUT", target, live, statuses=(403,), body=b"blocked")
+        self.dav("webdav_delete_permission_denied", "DELETE", target, live, statuses=(403,))
+        self.set_permissions("dav", full)
+        self.check("webdav_denials_preserve_modified_bytes", self.dav("webdav_verify_modify", "GET", target, live).body == modified)
+        partial = self.dav("webdav_range", "GET", target, live, statuses=(206,), headers={"Range": "bytes=0-3"})
+        self.check("webdav_range_exact", partial.body == modified[:4])
+        head = self.dav("webdav_head", "HEAD", target, live)
+        self.check("webdav_head_size", not head.body and head.headers.get("content-length") == str(len(modified)))
+        destination = lambda path: self.args.url.rstrip("/") + "/dav/" + SOURCE + urllib.parse.quote(path, safe="/")
+        self.dav("webdav_copy", "COPY", target, live, statuses=(201,), headers={"Destination": destination("/webdav/copied.txt"), "Overwrite": "F"})
+        self.dav("webdav_move", "MOVE", "/webdav/copied.txt", live, statuses=(201,), headers={"Destination": destination("/webdav/moved.txt"), "Overwrite": "F"})
+        self.dav("webdav_move_source_absent", "GET", "/webdav/copied.txt", live, statuses=(404,))
+        self.check("webdav_copy_move_bytes", self.dav("webdav_moved_download", "GET", "/webdav/moved.txt", live).body == modified)
+        self.dav("webdav_cross_host_destination_rejected", "COPY", target, live, statuses=(502,),
+                 headers={"Destination": "https://outside.test:18443/dav/" + SOURCE + "/bad.txt"})
+        self.dav("webdav_cross_source_destination_rejected", "COPY", target, live, statuses=(404,),
+                 headers={"Destination": self.args.url.rstrip("/") + "/dav/outside-source/bad.txt"})
+        self.dav("webdav_destination_traversal_rejected", "COPY", target, live, statuses=(400, 403, 404),
+                 headers={"Destination": destination("/../dav-escaped.txt")})
+        self.resource("webdav_no_traversal_output", "GET", "/dav-escaped.txt", session, statuses=(404,))
+        self.dav("webdav_token_create_intersection", "PUT", "/webdav/token-denied.txt", readonly, statuses=(403,), body=b"blocked")
+        self.dav("webdav_token_modify_intersection", "PUT", target, readonly, statuses=(403,), body=b"blocked")
+        self.dav("webdav_token_delete_intersection", "DELETE", target, readonly, statuses=(403,))
+        self.dav("webdav_delete", "DELETE", "/webdav/moved.txt", live, statuses=(204,))
+        self.dav("webdav_deleted_absent", "GET", "/webdav/moved.txt", live, statuses=(404,))
+        for missing in ("no-create.txt", "modify-only-new.txt", "token-denied.txt"):
+            self.dav("webdav_denied_target_absent", "GET", "/webdav/" + missing, live, statuses=(404,))
+        self.dav("webdav_before_revoke", "GET", target, revoked)
+        self.revoke("dav_revoked", session)
+        self.dav("webdav_revocation_immediate", "GET", target, revoked, statuses=(401, 403))
+        self.set_permissions("dav", {**full, "create": False, "modify": False, "delete": False})
+        self.dav("webdav_user_modify_withdrawal_immediate", "PUT", target, live, statuses=(403,), body=b"blocked")
+        self.remember_file("webdav/中文 空格.txt", modified)
+        self.check_bytes("webdav_final_original_integrity", self.dav("webdav_final_read", "GET", target, live).body,
+                         self.state["files"]["webdav/中文 空格.txt"])
+
+    def protocol_audit(self):
+        identifiers = {}
+        for role, required in (("bridge", {"file.upload"}), ("dav", {"webdav.read", "webdav.write"})):
+            items, cursor = [], None
+            for _ in range(20):
+                query = {"actor": self.state["users"][role]["username"], "limit": "100"}
+                if cursor:
+                    query["cursor"] = cursor
+                result = self.request("protocol_administrator_audit_query", "GET", "/api/audit", token=self.admin, query=query).json()
+                self.check("protocol_audit_page_shape", isinstance(result.get("items"), list))
+                items.extend(result["items"])
+                if not result.get("hasMore"):
+                    break
+                cursor = result.get("nextCursor")
+                self.check("protocol_audit_cursor", isinstance(cursor, str) and bool(cursor))
+            self.check(role + "_audit_actions", required.issubset({event.get("action") for event in items}))
+            account = self.state["users"][role]
+            origin = "http" if role == "bridge" else "webdav"
+
+            def terminal(event, outcome, statuses):
+                # Event has no separate finalized flag: Pending has no terminal
+                # timestamp/result/status; Finalize (writes) or AppendTerminal
+                # (reads/early denials) supplies these fields in the Go schema.
+                try:
+                    timestamp = datetime.fromisoformat(event.get("timestampUtc", ""))
+                    valid_time = event["timestampUtc"].endswith("Z") and timestamp >= datetime(1970, 1, 1, tzinfo=timezone.utc)
+                except (ValueError, TypeError, KeyError):
+                    return False
+                return (valid_time and event.get("schemaVersion") == 1
+                        and isinstance(event.get("requestId"), str) and bool(event["requestId"])
+                        and event.get("username") == account["username"] and event.get("userId") == account["id"]
+                        and event.get("origin") == origin and event.get("result") == outcome
+                        and event.get("httpStatus") in statuses)
+
+            operations = (("upload", "file.upload", "POST", "/bridge/中文 文件.txt"),) if role == "bridge" else (
+                ("read", "webdav.read", "GET", "/webdav/中文 空格.txt"),
+                ("write", "webdav.write", "PUT", "/webdav/中文 空格.txt"))
+            for name, action, method, path in operations:
+                self.check(role + "_audit_terminal_success_" + name, any(
+                    terminal(event, "success", range(200, 300)) and event.get("action") == action
+                    and event.get("source") == SOURCE and event.get("path") == self.state["root"] + path
+                    and (event.get("metadata") or {}).get("schemaVersion") == 1
+                    and (event.get("metadata") or {}).get("method") == method for event in items))
+            # Early permission denials can precede path resolution; require the
+            # real actor/action and terminal denial without inventing path fields.
+            self.check(role + "_audit_terminal_denied", any(
+                terminal(event, "denied", (401, 403)) and event.get("action") in required for event in items))
+            serialized = json.dumps(items)
+            private = [self.admin_password] + [a["password"] for a in self.state["users"].values()]
+            private += [t["value"] for t in self.state["tokens"].values()]
+            self.check(role + "_audit_redaction", all(secret not in serialized for secret in private))
+            identifiers[role] = sorted({event["requestId"] for event in items})
+            self.check(role + "_audit_nonempty", bool(identifiers[role]), record_count=len(identifiers[role]))
+        previous = self.state["protocols"].get("audit_ids")
+        if previous:
+            for role in identifiers:
+                self.check(role + "_audit_persisted", set(previous[role]).issubset(identifiers[role]))
+        else:
+            self.state["protocols"]["audit_ids"] = identifiers
+            self.checkpoint()
+
+    def verify_protocols_restored(self):
+        self.check("completed_protocol_seed_required", self.state.get("protocols", {}).get("complete") is True)
+        tokens = {key: value["value"] for key, value in self.state["tokens"].items()}
+        self.check_bytes("restored_filebridge_token_bytes",
+                         self.download("restored_filebridge_live_token", "/bridge/中文 文件.txt", tokens["bridge_live"]).body,
+                         self.state["files"]["bridge/中文 文件.txt"])
+        self.download("restored_filebridge_revoked_token", "/bridge/中文 文件.txt", tokens["bridge_revoked"], statuses=(401, 403))
+        self.resource("restored_filebridge_create_withdrawn", "POST", "/bridge/restore-denied.txt", tokens["bridge_live"], body=b"blocked", statuses=(403,))
+        self.resource("restored_filebridge_denied_output_absent", "GET", "/bridge/restore-denied.txt", tokens["bridge_live"], statuses=(404,))
+        self.dav_listing("restored_webdav_listing", "/webdav/", tokens["dav_live"], expected_paths=("/webdav/中文 空格.txt",))
+        self.check_bytes("restored_webdav_token_bytes",
+                         self.dav("restored_webdav_live_token", "GET", "/webdav/中文 空格.txt", tokens["dav_live"]).body,
+                         self.state["files"]["webdav/中文 空格.txt"])
+        self.dav("restored_webdav_revoked_token", "GET", "/webdav/中文 空格.txt", tokens["dav_revoked"], statuses=(401, 403))
+        self.dav("restored_webdav_modify_withdrawn", "PUT", "/webdav/中文 空格.txt", tokens["dav_live"], body=b"blocked", statuses=(403,))
+        self.dav("restored_webdav_readonly_create_denied", "PUT", "/webdav/restore-denied.txt", tokens["dav_readonly"], body=b"blocked", statuses=(403,))
+        self.dav("restored_webdav_denied_output_absent", "GET", "/webdav/restore-denied.txt", tokens["dav_live"], statuses=(404,))
+        self.protocol_audit()
+
     def verify_restored(self):
         self.check("completed_seed_required", self.state.get("seed_completed") is True)
         self.login_admin()
@@ -553,6 +897,8 @@ class Acceptance:
             for name in ("deleted", "download_denied", "owner_withdrawn"):
                 self.public("restored_" + name + "_share_denied", "/中文 空格.txt", self.state["shares"][name], statuses=DENIED)
         self.check_audit(sessions["worker"])
+        if "protocols" in self.state:
+            self.verify_protocols_restored()
         fresh = "/restored-readwrite-" + secrets.token_hex(8) + ".txt"
         self.resource("restored_actual_create", "POST", fresh, sessions["ui"], body=b"restored write")
         self.resource("restored_actual_modify", "PUT", fresh, sessions["ui"], body=b"restored modify")
@@ -564,13 +910,16 @@ class Acceptance:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("exercise", "verify-restored"))
+    parser.add_argument("phase", choices=("exercise", "protocols", "verify-restored"))
     parser.add_argument("--url", "--base-url", dest="url", required=True)
     parser.add_argument("--ca-file", required=True)
     parser.add_argument("--admin-password-file", required=True)
     parser.add_argument("--state-file", required=True)
     parser.add_argument("--evidence", required=True)
+    parser.add_argument("--filebridge-bin", help="required for protocols: trusted fixed-source Linux ELF client")
     args = parser.parse_args(argv)
+    if args.phase == "protocols" and not args.filebridge_bin:
+        parser.error("protocols requires --filebridge-bin")
     if sys.platform != "linux" or os.geteuid() != 0:
         raise AcceptanceError("run only as root in the explicitly authorized isolated Linux guest")
     os.umask(0o077)
@@ -594,6 +943,8 @@ def main(argv=None):
     try:
         if args.phase == "exercise":
             test.exercise()
+        elif args.phase == "protocols":
+            test.protocols()
         else:
             test.verify_restored()
         if test.incomplete:
@@ -603,6 +954,7 @@ def main(argv=None):
         failure = str(error) if isinstance(error, AcceptanceError) else type(error).__name__ + "; details suppressed"
     evidence = {"version": 1, "phase": args.phase, "passed": exit_code == 0,
                 "requests": client.requests, "checks": test.checks, "incomplete": test.incomplete,
+                "protocols": {key: state.get("protocols", {}).get(key) for key in ("complete", "filebridge_binary_sha256", "filebridge_invocations")},
                 "preview_observations": test.preview, "failure": failure,
                 "existing_go_regression_coverage": ["audit_pending_finalize", "audit_write_precommit_fail_closed"]}
     write_json(evidence_path, evidence)

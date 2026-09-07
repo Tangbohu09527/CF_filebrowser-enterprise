@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import copy
+import hashlib
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -72,6 +75,70 @@ class QemuLaunchTests(unittest.TestCase):
             self.assertNotIn("PRIVATE-KEY", str(error.exception))
             self.assertNotIn(directory, str(error.exception))
             self.assertIn("PRIVATE-KEY", private_log.read_text())
+
+
+class ImageIdentityTests(unittest.TestCase):
+    def fixture(self):
+        revision = "a" * 40
+        manifest_digest = "sha256:" + "b" * 64
+        config_digest = "sha256:" + "c" * 64
+        config = {"architecture": "amd64", "os": "linux", "config": {"User": "10001:10001", "Labels": {"org.opencontainers.image.revision": revision}, "Env": ["PATH=/usr/bin"], "Entrypoint": ["/entrypoint.sh"]}, "rootfs": {"type": "layers", "diff_ids": ["sha256:" + "d" * 64]}}
+        expected = {"registry_reference": "localhost:5001/cf-filebrowser@" + manifest_digest, "registry_digest": manifest_digest, "manifest_digest": manifest_digest, "config_digest": config_digest, "config": config}
+        info = {"Id": config_digest, "RepoDigests": [expected["registry_reference"]], "Config": copy.deepcopy(config["config"]), "Os": "linux", "Architecture": "amd64", "RootFS": {"Type": "layers", "Layers": config["rootfs"]["diff_ids"]}}
+        return revision, expected, info
+
+    def test_legacy_config_id_and_containerd_manifest_id_verify_same_content(self):
+        revision, expected, info = self.fixture()
+        harness.verify_image_identity(info, expected, revision)
+        info["Id"] = expected["manifest_digest"]
+        info["Descriptor"] = {"digest": expected["manifest_digest"], "mediaType": "application/vnd.oci.image.manifest.v1+json"}
+        harness.verify_image_identity(info, expected, revision)
+        record = harness.image_identity_record(info)
+        self.assertEqual(record["image_id"], expected["manifest_digest"])
+        self.assertEqual(record["descriptor"]["digest"], expected["manifest_digest"])
+        self.assertNotIn("Env", json.dumps(record))
+
+    def test_wrong_pin_id_configuration_layers_or_revision_are_rejected(self):
+        revision, expected, info = self.fixture()
+        mutations = [lambda x: x.update(RepoDigests=[]), lambda x: x.update(Id="sha256:" + "e" * 64), lambda x: x["Config"].update(User="0:0"), lambda x: x["Config"]["Labels"].update({"org.opencontainers.image.revision": "f" * 40}), lambda x: x["RootFS"].update(Layers=[]), lambda x: x.update(Descriptor={"digest": "sha256:" + "e" * 64})]
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                changed = copy.deepcopy(info)
+                mutate(changed)
+                with self.assertRaises(harness.VerificationError):
+                    harness.verify_image_identity(changed, expected, revision)
+
+    def test_registry_blob_bytes_must_match_digest_before_json_is_trusted(self):
+        payload = b'{"schemaVersion":2}'
+        digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+        self.assertEqual(harness.decode_registry_blob(payload, digest), {"schemaVersion": 2})
+        with self.assertRaises(harness.VerificationError):
+            harness.decode_registry_blob(payload + b" ", digest)
+
+
+class FailureEvidenceTests(unittest.TestCase):
+    def test_failed_api_retains_sanitized_checks_without_raw_output(self):
+        vm = mock.Mock(name="guest")
+        vm.name = "cf-verification-2"
+        vm.command_on_guest.return_value = subprocess.CompletedProcess([], 1, b"TOKEN-MUST-NOT-LEAK", b"PASSWORD-MUST-NOT-LEAK")
+        report = {"version": 1, "phase": "protocols", "passed": False, "checks": [{"name": "webdav_put_denied", "passed": False}], "failure": "unexpected status"}
+        vm.read_file.return_value = json.dumps(report).encode()
+        with self.assertRaises(harness.VerificationError) as caught:
+            harness.api(vm, "protocols", "api-protocols.json")
+        self.assertEqual(caught.exception.api_evidence, report)
+        self.assertNotIn("TOKEN", str(caught.exception))
+        self.assertNotIn("PASSWORD", str(caught.exception))
+        self.assertFalse(vm.command_on_guest.call_args.kwargs["check"])
+
+    def test_api_configuration_failure_does_not_mask_original_exit(self):
+        vm = mock.Mock(name="guest")
+        vm.name = "cf-verification-2"
+        vm.command_on_guest.return_value = subprocess.CompletedProcess([], 2, b"secret", b"secret")
+        vm.read_file.side_effect = harness.VerificationError("missing")
+        with self.assertRaises(harness.VerificationError) as caught:
+            harness.api(vm, "exercise", "api-initial.json")
+        self.assertIn("exit 2", str(caught.exception))
+        self.assertFalse(caught.exception.api_evidence["passed"])
 
 
 if __name__ == "__main__":

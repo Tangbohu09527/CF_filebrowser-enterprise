@@ -16,6 +16,7 @@ import re
 import shlex
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -211,6 +212,11 @@ ethernets:
         if check and result.returncode:
             lines = re.findall(rb"\[cf-vm-command-error\] line=(\d+)", result.stderr)
             detail = "; submitted guest-script line " + lines[-1].decode() if lines else ""
+            # Only lifecycle.py's explicitly sanitized error contract is added.
+            # Never include arbitrary command stderr, authentication or API text.
+            safe = re.findall(rb"^\[shared-host (?:check|prepare|validate|start|bootstrap-finish|stop|status)\] ERROR: [ -~]{1,500}$", result.stderr, re.MULTILINE)
+            if safe:
+                detail += "; " + safe[-1].decode("ascii")
             raise VerificationError(f"{self.name}: SSH guest action failed (exit {result.returncode})" + detail)
         return result
 
@@ -320,6 +326,96 @@ def certificates(work):
     return directory
 
 
+
+def decode_registry_blob(payload, digest):
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest) or "sha256:" + hashlib.sha256(payload).hexdigest() != digest:
+        raise VerificationError("registry blob does not match its immutable SHA-256 digest")
+    return json.loads(payload)
+
+
+def registry_identity(reference, ca_file):
+    match = re.fullmatch(r"(localhost:[0-9]+)/cf-filebrowser@(sha256:[0-9a-f]{64})", reference)
+    if not match:
+        raise VerificationError("identity verification requires the isolated localhost registry and fixed digest")
+    authority, pinned = match.groups()
+    context = ssl.create_default_context(cafile=str(ca_file))
+
+    def read(kind, digest):
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            raise VerificationError("invalid registry descriptor digest")
+        request = urllib.request.Request(f"https://{authority}/v2/cf-filebrowser/{kind}/{digest}", headers={"Accept": "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"})
+        with urllib.request.urlopen(request, context=context, timeout=60) as response:
+            payload = response.read(2 * 1024 * 1024 + 1)
+        if len(payload) > 2 * 1024 * 1024:
+            raise VerificationError("registry metadata exceeds the bounded identity document size")
+        return decode_registry_blob(payload, digest)
+
+    manifest = read("manifests", pinned)
+    manifest_digest = pinned
+    if "manifests" in manifest:
+        platforms = [item for item in manifest["manifests"] if item.get("platform", {}).get("os") == "linux" and item.get("platform", {}).get("architecture") == "amd64"]
+        if len(platforms) != 1:
+            raise VerificationError("registry index must identify exactly one Linux amd64 image")
+        manifest_digest = platforms[0]["digest"]
+        manifest = read("manifests", manifest_digest)
+    if manifest.get("schemaVersion") != 2 or "config" not in manifest:
+        raise VerificationError("registry identity requires a schema-2 image manifest")
+    config_digest = manifest["config"]["digest"]
+    config = read("blobs", config_digest)
+    return {"registry_reference": reference, "registry_digest": pinned, "manifest_digest": manifest_digest, "config_digest": config_digest, "config": config}
+
+
+def normalized_image_config(value):
+    # Docker inspect serializes optional zero values differently across API
+    # versions. Only omit those empty values; preserve every populated field.
+    if isinstance(value, dict):
+        return {key: normalized_image_config(item) for key, item in value.items() if item not in (None, "", [], {}, False, 0)}
+    if isinstance(value, list):
+        return [normalized_image_config(item) for item in value]
+    return value
+
+
+def image_identity_record(info):
+    configuration = normalized_image_config(info.get("Config", {}))
+    descriptor = info.get("Descriptor") or {}
+    return {"image_id": info.get("Id"), "descriptor": {key: descriptor[key] for key in ("digest", "mediaType", "size", "platform") if key in descriptor}, "repo_digests": info.get("RepoDigests", []), "os": info.get("Os"), "architecture": info.get("Architecture"), "source_sha": info.get("Config", {}).get("Labels", {}).get("org.opencontainers.image.revision"), "runtime_config_sha256": hashlib.sha256(json.dumps(configuration, sort_keys=True, separators=(",", ":")).encode()).hexdigest(), "rootfs": info.get("RootFS", {})}
+
+
+def verify_image_identity(info, expected, revision):
+    config = expected["config"]
+    if expected["registry_reference"] not in info.get("RepoDigests", []):
+        raise VerificationError("local image RepoDigests does not contain the verified registry reference")
+    # Legacy image stores identify the config; containerd stores identify the
+    # target manifest/index. Both must be in this cryptographically checked graph.
+    if info.get("Id") not in {expected["config_digest"], expected["manifest_digest"], expected["registry_digest"]}:
+        raise VerificationError("local Image ID is outside the verified registry manifest/config graph")
+    descriptor = info.get("Descriptor") or {}
+    if descriptor and descriptor.get("digest") != expected["registry_digest"]:
+        raise VerificationError("local descriptor differs from the pinned registry target")
+    if (info.get("Os"), info.get("Architecture"), config.get("os"), config.get("architecture")) != ("linux", "amd64", "linux", "amd64"):
+        raise VerificationError("local and registry image must both be Linux amd64")
+    if info.get("Config", {}).get("Labels", {}).get("org.opencontainers.image.revision") != revision or config.get("config", {}).get("Labels", {}).get("org.opencontainers.image.revision") != revision:
+        raise VerificationError("local or registry image has an unexpected source revision")
+    if normalized_image_config(info.get("Config", {})) != normalized_image_config(config.get("config", {})):
+        raise VerificationError("local runtime configuration differs from the verified registry config blob")
+    rootfs = info.get("RootFS", {})
+    if rootfs.get("Type") != config.get("rootfs", {}).get("type") or rootfs.get("Layers") != config.get("rootfs", {}).get("diff_ids"):
+        raise VerificationError("local root filesystem layers differ from the verified registry config")
+
+
+def container_image_probe(vm, reference):
+    # Create without starting, networking or project mounts. Retain only safe
+    # identity fields; remove precisely this never-started probe container.
+    container_id = vm.command_on_guest(f"docker create --pull never --network none --entrypoint /bin/true --label cf.delivery.identity-probe=true {shlex.quote(reference)}").stdout.decode().strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+        raise VerificationError("image identity probe did not return one precise container ID")
+    try:
+        value = json.loads(vm.command_on_guest("docker inspect " + container_id).stdout)[0]
+        return {"container_image_id": value.get("Image"), "image_manifest_descriptor": value.get("ImageManifestDescriptor"), "status": value.get("State", {}).get("Status"), "running": value.get("State", {}).get("Running"), "network_mode": value.get("HostConfig", {}).get("NetworkMode"), "mount_count": len(value.get("Mounts", []))}
+    finally:
+        vm.command_on_guest("docker rm " + container_id + " >/dev/null")
+
+
 def registry(work, tls, local_image, revision, registry_port):
     target = f"localhost:{registry_port}/cf-filebrowser:verification-{revision}"
     trust = f"/etc/docker/certs.d/localhost:{registry_port}"
@@ -391,8 +487,30 @@ exit 1
 
 
 def api(vm, phase, evidence_name):
-    vm.command_on_guest(f"python3 -B {SOURCE}/scripts/tests/shared-host-api.py {phase} --url https://{TLS_NAME}:{TLS_PORT} --ca-file {GUEST}/ca.crt --admin-password-file {GUEST}/admin-password --state-file {GUEST}/api-state.json --evidence {GUEST}/{evidence_name}", timeout=900)
-    return json.loads(vm.read_file(GUEST + "/" + evidence_name))
+    extra = f" --filebridge-bin {GUEST}/filebrowser-agentctl" if phase == "protocols" else ""
+    result = vm.command_on_guest(f"python3 -B {SOURCE}/scripts/tests/shared-host-api.py {phase} --url https://{TLS_NAME}:{TLS_PORT} --ca-file {GUEST}/ca.crt --admin-password-file {GUEST}/admin-password --state-file {GUEST}/api-state.json --evidence {GUEST}/{evidence_name}{extra}", check=False, timeout=900)
+    try:
+        report = json.loads(vm.read_file(GUEST + "/" + evidence_name))
+    except (VerificationError, ValueError, OSError):
+        report = {"phase": phase, "passed": False, "failure": "API helper did not produce its sanitized evidence; private output suppressed"}
+    if result.returncode or not report.get("passed"):
+        error = VerificationError(f"{vm.name}: API {phase} failed (exit {result.returncode}); sanitized check evidence retained")
+        error.api_evidence = report
+        raise error
+    return report
+
+
+def build_filebridge(vm):
+    vm.command_on_guest(f"""
+export DEBIAN_FRONTEND=noninteractive
+apt-get install --yes --no-install-recommends golang-go
+cd {SOURCE}/tools/filebrowser-agentctl
+go build -mod=readonly -trimpath -o {GUEST}/filebrowser-agentctl ./cmd/filebrowser-agentctl
+chmod 0700 {GUEST}/filebrowser-agentctl
+go version > {GUEST}/filebridge-go-version.txt
+test -z "$(git -C {SOURCE} status --porcelain=v1)"
+""".replace("\n+", "\n"), timeout=1800)
+    return {"go_version": vm.read_file(GUEST + "/filebridge-go-version.txt").decode().strip(), "binary_sha256": hashlib.sha256(vm.read_file(GUEST + "/filebrowser-agentctl")).hexdigest()}
 
 
 def real_ui(vm):
@@ -460,6 +578,14 @@ def scenario(args, work, evidence):
         registry_port = port()
         registry_id, pinned, image_id, registry_image = registry(work, tls, args.image_ref, args.source_sha, registry_port)
         evidence.update(image_id=image_id, registry_reference=pinned, registry_image_id=registry_image)
+        record_stage(args, evidence, "verify-published-registry-manifest-and-config")
+        expected_image = registry_identity(pinned, tls / "ca.crt")
+        evidence["registry_identity"] = {key: value for key, value in expected_image.items() if key != "config"}
+        builder_info = json.loads(execute(["docker", "image", "inspect", pinned]).stdout)[0]
+        evidence["builder_image"] = image_identity_record(builder_info)
+        record_stage(args, evidence, "verify-builder-image-content")
+        verify_image_identity(builder_info, expected_image, args.source_sha)
+        guest_images = {}
         peer_port = port()
         record_stage(args, evidence, "create-and-boot-two-debian-systemd-vms")
         for number in (1, 2):
@@ -493,9 +619,24 @@ install -d -m 0755 /etc/docker/certs.d/localhost:{registry_port}
 install -m 0644 {GUEST}/ca.crt /etc/docker/certs.d/localhost:{registry_port}/ca.crt
 curl --fail --silent --show-error --cacert {GUEST}/ca.crt https://localhost:{registry_port}/v2/ >/dev/null
 docker pull {shlex.quote(pinned)} >/dev/null
-test "$(docker image inspect {shlex.quote(pinned)} --format '{{{{.Id}}}}')" = {image_id}
 """, timeout=1800)
+            guest_info = json.loads(vm.command_on_guest("docker image inspect " + shlex.quote(pinned)).stdout)[0]
+            guest_images[vm.name] = guest_info["Id"]
+            evidence["environments"][vm.name]["image"] = image_identity_record(guest_info)
+            record_stage(args, evidence, "verify-pulled-image-content-" + vm.name)
+            verify_image_identity(guest_info, expected_image, args.source_sha)
+            record_stage(args, evidence, "never-started-container-image-probe-" + vm.name)
+            probe = container_image_probe(vm, pinned)
+            evidence["environments"][vm.name]["image"]["container_probe"] = probe
+            record_stage(args, evidence, "verify-local-container-image-contract-" + vm.name)
+            if probe["container_image_id"] != guest_info["Id"] or probe["status"] != "created" or probe["running"] or probe["network_mode"] != "none" or probe["mount_count"]:
+                raise VerificationError("never-started container does not match the local image identity/isolation contract")
         server, client = vms
+        image_id = guest_images[server.name]
+        if guest_images[client.name] != image_id:
+            raise VerificationError("the two clean Debian Docker environments resolve different local Image IDs; restore requires an explicit compatibility decision")
+        evidence["deployment_image_id"] = image_id
+        evidence["checks"].append("builder and both fresh guests match pinned registry/config/source/layers; each never-started isolated container matches its environment's recorded actual Image ID")
         record_stage(args, evidence, "unrelated-project-isolation-baseline")
         baseline = {vm.name: sentinel(vm) for vm in vms}
         password = os.urandom(24).hex().encode() + b"\n"
@@ -509,20 +650,26 @@ test "$(docker image inspect {shlex.quote(pinned)} --format '{{{{.Id}}}}')" = {i
 test ! -e /etc/cf-filebrowser-enterprise
 test ! -e /var/lib/cf-filebrowser-enterprise
 test ! -e /srv/storage/cf-filebrowser-enterprise
-{manage} prepare --hostname {server.name} --source-sha {args.source_sha} --image-ref {shlex.quote(pinned)} --mode staging --exposure lan --test-disk --enable-share-source --bootstrap-password-file {GUEST}/admin-password --lan-bind-address {SERVER_IP} --lan-port {TLS_PORT} --lan-allowed-cidrs {CLIENT_IP}/32 --tls-name {TLS_NAME} --tls-cert-file {GUEST}/server.crt --tls-key-file {GUEST}/server.key --tls-ca-file {GUEST}/ca.crt
+{manage} prepare --hostname {server.name} --source-sha {args.source_sha} --image-ref {shlex.quote(pinned)} --mode staging --exposure lan --test-disk --enable-share-source --enable-webdav --bootstrap-password-file {GUEST}/admin-password --lan-bind-address {SERVER_IP} --lan-port {TLS_PORT} --lan-allowed-cidrs {CLIENT_IP}/32 --tls-name {TLS_NAME} --tls-cert-file {GUEST}/server.crt --tls-key-file {GUEST}/server.key --tls-ca-file {GUEST}/ca.crt
 """, timeout=900)
         record_stage(args, evidence, "first-start")
         server.command_on_guest(f"{manage} start --hostname {server.name}", timeout=900)
         record_stage(args, evidence, "bootstrap-admin-verification-stop-remove-restart-login")
         server.command_on_guest(f"{manage} bootstrap-finish --hostname {server.name}\ntest ! -e /etc/cf-filebrowser-enterprise/secrets/bootstrap_admin_password", timeout=900)
         record_stage(args, evidence, "idempotent-prepare-after-bootstrap")
-        server.command_on_guest(f"{manage} prepare --hostname {server.name} --source-sha {args.source_sha} --image-ref {shlex.quote(pinned)} --mode staging --exposure lan --test-disk --enable-share-source --bootstrap-password-file {GUEST}/admin-password", timeout=900)
+        server.command_on_guest(f"{manage} prepare --hostname {server.name} --source-sha {args.source_sha} --image-ref {shlex.quote(pinned)} --mode staging --exposure lan --test-disk --enable-share-source --enable-webdav --bootstrap-password-file {GUEST}/admin-password", timeout=900)
         evidence["checks"].append("formal empty-root install, admin verification, bootstrap removal, same-image login, idempotent prepare")
         record_stage(args, evidence, "second-vm-real-lan-and-https-boundaries")
         lan_boundary(client)
         evidence["checks"].append("second-VM HTTPS UI/API, trusted CA, untrusted CA rejection, actual denied-source socket with spoofed forwarding headers")
         record_stage(args, evidence, "initial-real-api-exercise")
         evidence["initial_api"] = api(client, "exercise", "api-initial.json")
+        record_stage(args, evidence, "fixed-source-filebridge-build")
+        evidence["filebridge_build"] = build_filebridge(client)
+        server.write_file(GUEST + "/filebrowser-agentctl", client.read_file(GUEST + "/filebrowser-agentctl"), "0700")
+        record_stage(args, evidence, "real-filebridge-and-webdav-protocols")
+        evidence["protocols"] = api(client, "protocols", "api-protocols.json")
+        evidence["checks"].append("fixed-source FileBridge binary and WebDAV exercised over strictly verified HTTPS with ordinary-user/Token denial boundaries")
         record_stage(args, evidence, "initial-existing-playwright-ui")
         real_ui(client)
         evidence["checks"].append("existing Playwright shared-host project passed in second VM with normal-user Chromium and explicit trusted CA")
@@ -622,7 +769,7 @@ if bash {SOURCE}/deploy/shared-host/backup.sh restore {GUEST}/verification.tar -
             if sentinel_state(vm) != baseline[vm.name]:
                 raise VerificationError("unrelated project's container/network/port/data changed during backup/restore")
         evidence["checks"].append("unrelated Docker project's container ID, image, network, ports, mounts and data unchanged throughout")
-        evidence["boundaries"] = {"B": "real Debian13 systemd VMs; actual host boot IDs recorded", "C": "not run: no actual target device or user client accessed", "WebDAV": "see protocol-specific evidence; this harness makes no claim", "OnlyOffice": "not completed without a real Document Server and client", "UI": "existing Playwright shared-host project executed in each client VM before and after restore, without disabling TLS verification"}
+        evidence["boundaries"] = {"B": "real Debian13 systemd VMs; actual host boot IDs recorded", "C": "not run: no actual target device or user client accessed", "WebDAV": "real HTTPS protocol requests and persistence/revocation assertions completed by the protocol client; no separate desktop WebDAV application is claimed", "OnlyOffice": "not completed without a real Document Server and client", "UI": "existing Playwright shared-host project executed in each client VM before and after restore, without disabling TLS verification"}
         evidence["result"] = "passed"
         record_stage(args, evidence, "completed")
     finally:
@@ -663,6 +810,8 @@ def main():
     except (VerificationError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
         message = str(error) if isinstance(error, VerificationError) else "environment or operation failure; inspect private CI state"
         evidence["failure"] = message
+        if getattr(error, "api_evidence", None) is not None:
+            evidence["failed_api"] = error.api_evidence
         print("[shared-host-vm] ERROR: " + message, file=sys.stderr)
         return 1
     finally:

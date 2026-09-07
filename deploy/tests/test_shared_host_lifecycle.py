@@ -36,6 +36,14 @@ class LifecycleTests(unittest.TestCase):
         lifecycle.configure_source(config, "lan", ["192.0.2.12/32"], False)
         self.assertEqual(config["server"]["allowedClientCIDRs"], ["127.0.0.1/32", "192.0.2.12/32"])
 
+    def test_webdav_requires_explicit_input_and_preserves_user_permission_defaults(self):
+        for enabled in (False, True):
+            config = {"server": {"disableWebDAV": True, "sources": [{"config": {"private": True}}]}, "userDefaults": {"account": {"permissions": {"create": False, "modify": False, "share": False}}}}
+            lifecycle.configure_source(config, "base", [], False, enable_webdav=enabled)
+            self.assertIs(config["server"]["disableWebDAV"], not enabled)
+            self.assertIs(config["server"]["sources"][0]["config"]["private"], True)
+            self.assertEqual(config["userDefaults"]["account"]["permissions"], {"create": False, "modify": False, "share": False})
+
     def test_secret_rejects_multiline_cr_and_short_values(self):
         for value in (b"short", b"a" * 32 + b"\nextra", b"a" * 32 + b"\r\n"):
             with self.assertRaises(lifecycle.DeploymentError):

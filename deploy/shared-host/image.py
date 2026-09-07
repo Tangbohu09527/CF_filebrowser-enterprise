@@ -63,6 +63,16 @@ def checked_reference(reference: str, *, require_tag: bool = False,
 
 
 def run(*args: str, capture: bool = True, env: dict | None = None) -> str:
+    if args and args[0] == "docker":
+        # Image workflows are local to this supported Linux build host. Registry
+        # credentials stay available; remote daemon/builder selectors do not.
+        env = (os.environ if env is None else env).copy()
+        for key in ("DOCKER_CONTEXT", "DOCKER_TLS", "DOCKER_TLS_VERIFY",
+                    "DOCKER_CERT_PATH", "BUILDKIT_HOST"):
+            env.pop(key, None)
+        env["DOCKER_HOST"] = "unix:///var/run/docker.sock"
+        env["BUILDX_BUILDER"] = "default"
+        args = ("docker", "--host", env["DOCKER_HOST"], *args[1:])
     result = subprocess.run(args, cwd=ROOT, env=env, check=True, text=True,
                             stdout=subprocess.PIPE if capture else None)
     return (result.stdout or "").strip()
@@ -135,7 +145,7 @@ def build(args: argparse.Namespace) -> None:
                        BUILD_VERSION=args.version, BUILD_REVISION=args.source_sha)
     run("docker", "compose", "--env-file", str(ASSETS / "compose.env.example"),
         "-f", str(ASSETS / "compose.yaml"), "-f", str(ASSETS / "compose.build.yaml"),
-        "--profile", "approved", "build", "--pull", "filebrowser-enterprise",
+        "--profile", "approved", "build", "--pull", "--builder", "default", "filebrowser-enterprise",
         capture=False, env=environment)
     info = image_info(args.image)
     if info.get("Config", {}).get("Labels", {}).get("org.opencontainers.image.revision") != args.source_sha:

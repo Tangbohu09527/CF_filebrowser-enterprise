@@ -57,7 +57,9 @@ func TestClientNetworkListenerRejectsSocketSourceAndIgnoresForwardedHeaders(t *t
 		t.Fatal(err)
 	}
 	defer denied.Close()
-	denied.SetDeadline(time.Now().Add(time.Second))
+	if deadlineErr := denied.SetDeadline(time.Now().Add(time.Second)); deadlineErr != nil {
+		t.Fatalf("set denied socket deadline: %v", deadlineErr)
+	}
 	_, _ = io.WriteString(denied, "GET /health HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 127.0.0.1\r\nX-Real-IP: 127.0.0.1\r\n\r\n")
 	reply := make([]byte, 128)
 	count, err := denied.Read(reply)
