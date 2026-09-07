@@ -11,6 +11,7 @@ import (
 
 // FreshAggregateEntry reports scanner size semantics without reading aggregate
 // caches or changing the index. The caller must authorize and verify the entry.
+// Symlinks use only their Lstat entry size, never target data.
 // Unsupported entries require a conservative fallback, never a partial total.
 func (idx *Index) FreshAggregateEntry(indexPath string, info os.FileInfo) (size int64, indexed, supported bool) {
 	if idx == nil || info == nil || !strings.HasPrefix(indexPath, "/") || len(indexPath) > 4096 {
@@ -32,9 +33,15 @@ func (idx *Index) FreshAggregateEntry(indexPath string, info os.FileInfo) (size 
 	isDir := info.IsDir()
 	for {
 		realPath := utils.JoinPathAsUnix(idx.Path, current)
+		hidden := IsHidden(realPath)
+		// Full and quick scanners leave Options.ShowHidden false. Listing a
+		// hidden item does not add its subtree to the scanner's aggregate.
+		if current != "/" && hidden {
+			return 0, false, true
+		}
 		isSymlink := current == idx.MakeIndexPath(indexPath, info.IsDir()) && info.Mode()&os.ModeSymlink != 0
 		if (isDir && omitList[filepath.Base(strings.TrimSuffix(current, "/"))]) ||
-			idx.ShouldSkip(isDir, current, IsHidden(realPath), isSymlink, true) {
+			idx.ShouldSkip(isDir, current, hidden, isSymlink, true) {
 			return 0, false, true
 		}
 		if current == "/" {
@@ -47,7 +54,7 @@ func (idx *Index) FreshAggregateEntry(indexPath string, info os.FileInfo) (size 
 		current = idx.MakeIndexPath(current, true)
 		isDir = true
 	}
-	if info.Mode()&os.ModeSymlink != 0 || (!info.IsDir() && !info.Mode().IsRegular()) {
+	if !info.IsDir() && !info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
 		return 0, false, false
 	}
 	if info.IsDir() {

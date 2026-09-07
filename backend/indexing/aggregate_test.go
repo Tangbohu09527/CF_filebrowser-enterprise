@@ -28,6 +28,8 @@ func TestFreshAggregateEntryUsesCurrentScannerRules(t *testing.T) {
 		{name: "visible excluded ancestor", path: "/excluded/file.bin", rules: settings.ResolvedRulesConfig{FolderPaths: map[string]settings.ConditionalRule{"/excluded/": {Viewable: true}}}},
 		{name: "conditional ancestor", path: "/privateFolder/child/file.bin", rules: settings.ResolvedRulesConfig{FolderEndsWith: []settings.ConditionalRule{{FolderEndsWith: "Folder"}}}},
 		{name: "hidden ancestor", path: "/.hidden/file.bin", rules: settings.ResolvedRulesConfig{IgnoreAllHidden: true}},
+		{name: "scanner hides file without rules", path: "/.hidden", rules: settings.ResolvedRulesConfig{NoRules: true}},
+		{name: "scanner hides ancestor without rules", path: "/.hidden/file.bin", rules: settings.ResolvedRulesConfig{NoRules: true}},
 		{name: "root excluded", path: "/other/file.bin", rules: settings.ResolvedRulesConfig{IncludeRootItems: map[string]struct{}{"/allowed/": {}}}},
 		{name: "root included", path: "/allowed/file.bin", rules: settings.ResolvedRulesConfig{IncludeRootItems: map[string]struct{}{"/allowed/": {}}}, indexed: true},
 		{name: "index disabled", path: "/file.bin", rules: settings.ResolvedRulesConfig{IndexingDisabled: true}},

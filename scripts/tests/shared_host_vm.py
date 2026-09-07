@@ -698,8 +698,104 @@ test -z "$(git -C {SOURCE} status --porcelain=v1)"
 """, timeout=1800)
 
 
-def probe_lan_boundary(ca_file, untrusted_ca_file, empty_trust):
+LAN_PROBE_STAGES = ('guest-dispatch', 'allowed-health-before', 'allowed-ui', 'trusted-context',
+                    'denied-tcp-connect', 'denied-socket-identity', 'denied-tls-handshake',
+                    'wrong-ca', 'allowed-health-after', 'complete')
+LAN_ERROR_CATEGORIES = ('assertion', 'tls-certificate', 'dns', 'timeout', 'eof', 'connection',
+                        'tls', 'os', 'internal', 'invalid-report')
+LAN_INTEGER_FIELDS = {'curl_exit_code': (-255, 255), 'http_status': (100, 599),
+                      'elapsed_ms': (0, 3_600_000), 'application_bytes_received': (0, 1_048_576),
+                      'errno': (-32768, 32767), 'verify_code': (0, 255)}
+
+
+def lan_safe_fields(value):
+    if not isinstance(value, dict):
+        return {}
+    safe = {}
+    for name, (minimum, maximum) in LAN_INTEGER_FIELDS.items():
+        number = value.get(name)
+        if type(number) is int and minimum <= number <= maximum:
+            safe[name] = number
+    for name in ('body_expected', 'tcp_connected', 'source_matches', 'peer_matches', 'tls_handshake_completed'):
+        if type(value.get(name)) is bool:
+            safe[name] = value[name]
+    if value.get('category') in LAN_ERROR_CATEGORIES:
+        safe['category'] = value['category']
+    if value.get('rejection') in ('tls-eof', 'tcp-reset'):
+        safe['rejection'] = value['rejection']
+    return safe
+
+
+def lan_error_fields(error):
+    # Classify a known transport cause, never serialize its text or type name.
+    cause = error.__cause__ if isinstance(error, VerificationError) and error.__cause__ is not None else error
+    category = 'internal'
+    for kind, label in ((ssl.SSLCertVerificationError, 'tls-certificate'), (socket.gaierror, 'dns'),
+                        ((TimeoutError, subprocess.TimeoutExpired), 'timeout'), (ssl.SSLEOFError, 'eof'),
+                        (ConnectionError, 'connection'), (ssl.SSLError, 'tls'), (OSError, 'os'),
+                        (VerificationError, 'assertion')):
+        if isinstance(cause, kind):
+            category = label
+            break
+    fields = {'category': category, 'errno': getattr(cause, 'errno', None)}
+    if isinstance(cause, ssl.SSLCertVerificationError):
+        fields['verify_code'] = getattr(cause, 'verify_code', None)
+    return lan_safe_fields(fields)
+
+
+def sanitized_lan_report(value):
+    report = {'schema': 'cf-lan-boundary/v1', 'passed': False, 'stage': 'guest-dispatch',
+              'completed': [], 'observations': {}, 'failure': {'category': 'invalid-report'}}
+    if not isinstance(value, dict) or value.get('schema') != report['schema']:
+        return report
+    if value.get('stage') in LAN_PROBE_STAGES:
+        report['stage'] = value['stage']
+    if isinstance(value.get('completed'), list):
+        report['completed'] = [stage for stage in value['completed'] if stage in LAN_PROBE_STAGES[1:-1]]
+    if isinstance(value.get('observations'), dict):
+        report['observations'] = {stage: lan_safe_fields(fields) for stage, fields in value['observations'].items() if stage in LAN_PROBE_STAGES[1:-1]}
+    failure = lan_safe_fields(value.get('failure'))
+    report['failure'] = failure if 'category' in failure else report['failure']
+    required = {stage: {'curl_exit_code': 0, 'http_status': 200, 'body_expected': True}
+                for stage in ('allowed-health-before', 'allowed-ui', 'allowed-health-after')}
+    required.update({'denied-tcp-connect': {'tcp_connected': True},
+                     'denied-socket-identity': {'source_matches': True, 'peer_matches': True},
+                     'denied-tls-handshake': {'tls_handshake_completed': False, 'application_bytes_received': 0},
+                     'wrong-ca': {'curl_exit_code': 60}})
+    observed = all(report['observations'].get(stage, {}).get(name) == expected
+                   for stage, fields in required.items() for name, expected in fields.items())
+    denied = report['observations'].get('denied-tls-handshake', {})
+    prompt_refusal = denied.get('rejection') in ('tls-eof', 'tcp-reset') and type(denied.get('elapsed_ms')) is int and 0 <= denied['elapsed_ms'] < 5000
+    report['passed'] = value.get('passed') is True and 'failure' not in value and report['stage'] == 'complete' and report['completed'] == list(LAN_PROBE_STAGES[1:-1]) and observed and prompt_refusal
+    if report['passed']:
+        report.pop('failure')
+    return report
+
+
+def lan_probe_report(ca_file, untrusted_ca_file, empty_trust):
+    report = {'schema': 'cf-lan-boundary/v1', 'passed': False, 'stage': 'guest-dispatch',
+              'completed': [], 'observations': {}}
+    try:
+        probe_lan_boundary(ca_file, untrusted_ca_file, empty_trust, report=report)
+        report.update(passed=True, stage='complete')
+    except Exception as error:
+        report['failure'] = lan_error_fields(error)
+    return sanitized_lan_report(report)
+
+
+def probe_lan_boundary(ca_file, untrusted_ca_file, empty_trust, *, report=None):
     """Run in the disposable client guest; never treat transport trouble as denial."""
+    report = report if report is not None else {'stage': 'guest-dispatch', 'completed': [], 'observations': {}}
+
+    def stage(name):
+        report['stage'] = name
+
+    def observed(**fields):
+        report['observations'].setdefault(report['stage'], {}).update(lan_safe_fields(fields))
+
+    def completed():
+        report['completed'].append(report['stage'])
+
     base = f"https://{TLS_NAME}:{TLS_PORT}"
     common = ["curl", "--fail", "--silent", "--show-error", "--noproxy", "*",
               "--interface", CLIENT_IP, "--max-time", "5", "--write-out", "\n%{http_code}"]
@@ -715,23 +811,37 @@ def probe_lan_boundary(ca_file, untrusted_ca_file, empty_trust):
         response = curl(path, ca_file, *headers)
         body, _, status = response.stdout.rpartition(b"\n")
         expected = b'<html' in body if path == '/' else body.strip() == b'{"message":"ok"}'
+        observed(curl_exit_code=response.returncode, http_status=int(status) if re.fullmatch(rb'[1-5][0-9]{2}', status) else None, body_expected=expected)
         if response.returncode != 0 or status != b'200' or not expected:
             raise VerificationError("allowed-source HTTPS control failed; private output suppressed")
         return 200
 
+    stage('allowed-health-before')
     before = allowed('/health')
+    completed()
+    stage('allowed-ui')
     allowed('/')
+    completed()
+    stage('trusted-context')
     context = ssl.create_default_context(cafile=str(ca_file))
     context.minimum_version = ssl.TLSVersion.TLSv1_2
+    completed()
     raw = secured = None
     try:
+        stage('denied-tcp-connect')
         try:
             raw = socket.create_connection((TLS_NAME, TLS_PORT), timeout=5, source_address=(DENIED_IP, 0))
         except OSError as error:
             raise VerificationError("denied-source TCP must connect before testing listener refusal") from error
+        observed(tcp_connected=True)
+        completed()
+        stage('denied-socket-identity')
         source, peer = raw.getsockname()[0], raw.getpeername()[0]
+        observed(source_matches=source == DENIED_IP, peer_matches=peer == SERVER_IP)
         if source != DENIED_IP or peer != SERVER_IP:
             raise VerificationError("denied-source socket identity differs from the isolated LAN fixture")
+        completed()
+        stage('denied-tls-handshake')
         secured = context.wrap_socket(raw, server_hostname=TLS_NAME, do_handshake_on_connect=False)
         started = time.monotonic()
         try:
@@ -745,23 +855,31 @@ def probe_lan_boundary(ca_file, untrusted_ca_file, empty_trust):
             # establish that the native listener refused this TCP peer.
             raise VerificationError("denied-source probe failed without a prompt EOF/reset") from error
         else:
+            observed(tls_handshake_completed=True)
             raise VerificationError("denied-source socket unexpectedly completed TLS")
         elapsed = time.monotonic() - started
+        observed(tls_handshake_completed=False, rejection=rejection, application_bytes_received=0, elapsed_ms=int(elapsed * 1000))
         if elapsed >= 5:
             raise VerificationError("denied-source refusal was not prompt")
+        completed()
     finally:
         if secured is not None:
             secured.close()
         elif raw is not None:
             raw.close()
 
+    stage('wrong-ca')
     untrusted = curl('/health', untrusted_ca_file, '--capath', str(empty_trust))
+    observed(curl_exit_code=untrusted.returncode)
     if untrusted.returncode != 60:
         raise VerificationError("untrusted CA probe must fail with curl certificate verification exit 60")
+    completed()
+    stage('allowed-health-after')
     # The denied peer cannot send HTTP headers: TLS is refused first. Exercise
     # forged forwarding headers over valid HTTPS from the allowed socket instead.
     after = allowed('/health', '-H', 'X-Forwarded-For: ' + DENIED_IP,
                     '-H', 'X-Real-IP: ' + DENIED_IP)
+    completed()
     return {'allowed_before_status': before, 'allowed_after_status': after,
             'allowed_source': CLIENT_IP, 'forwarded_headers_ignored_on_allowed_tls': True,
             'untrusted_ca_exit_code': untrusted.returncode,
@@ -780,10 +898,21 @@ import importlib.util,json
 spec=importlib.util.spec_from_file_location('cf_vm_lan_probe','{SOURCE}/scripts/tests/shared_host_vm.py')
 module=importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-print(json.dumps(module.probe_lan_boundary('{GUEST}/ca.crt','{GUEST}/untrusted-ca.crt','{GUEST}/empty-trust'),sort_keys=True))
+report=module.lan_probe_report('{GUEST}/ca.crt','{GUEST}/untrusted-ca.crt','{GUEST}/empty-trust')
+print(json.dumps(report,sort_keys=True))
+raise SystemExit(0 if report['passed'] else 1)
 CF_LAN_BOUNDARY
-""")
-    return json.loads(response.stdout)
+""", check=False)
+    try:
+        report = sanitized_lan_report(json.loads(response.stdout))
+    except (ValueError, UnicodeError):
+        report = sanitized_lan_report(None)
+    if response.returncode or not report['passed']:
+        report['passed'] = False
+        error = VerificationError(f"{vm.name}: LAN boundary failed at {report['stage']}; sanitized check evidence retained")
+        error.lan_evidence = report
+        raise error
+    return report
 
 
 def record_stage(args, evidence, name):
@@ -1095,6 +1224,8 @@ def main():
         evidence["failure"] = message
         if getattr(error, "api_evidence", None) is not None:
             evidence["failed_api"] = error.api_evidence
+        if getattr(error, "lan_evidence", None) is not None:
+            evidence["lan_failure"] = error.lan_evidence
         print("[shared-host-vm] ERROR: " + message, file=sys.stderr)
         return 1
     finally:

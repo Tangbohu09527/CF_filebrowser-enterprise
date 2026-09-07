@@ -25,9 +25,10 @@ type resourceAggregateLimits struct {
 var resourceAggregateCollectedHook func()
 
 type resourceAggregateEntry struct {
-	target  authenticatedReadTarget
-	size    int64
-	indexed bool
+	target     authenticatedReadTarget
+	linkTarget *authenticatedReadTarget
+	size       int64
+	indexed    bool
 }
 
 type resourceAggregateWalk struct {
@@ -48,9 +49,46 @@ func (walk *resourceAggregateWalk) active() bool {
 	return !walk.failed && walk.ctx.Err() == nil && time.Now().Before(walk.deadline)
 }
 
-func (walk *resourceAggregateWalk) collect(target authenticatedReadTarget, depth int) (int64, bool, bool) {
+// A link contributes only its no-follow entry metadata. The separate resolved
+// target proves the link cannot reveal a denied, excluded or out-of-scope path;
+// targets are never traversed or included a second time in the total.
+func resolveResourceAggregateEntry(user *users.User, idx *indexing.Index, userScope, logicalPath string, isLink bool) (authenticatedReadTarget, *authenticatedReadTarget, error) {
+	if !isLink {
+		target, resolveErr := resolveAuthenticatedReadIndexTargetWithScope(user, idx, userScope, logicalPath)
+		return target, nil, resolveErr
+	}
+	var entry authenticatedReadTarget
+	scopedPath, scopedErr := publicShareScopedPath(userScope, logicalPath)
+	if scopedErr != nil {
+		return entry, nil, errors.ErrAccessDenied
+	}
+	entry, entryErr := resolveAuthenticatedEntryTarget(user, idx.Name, scopedPath)
+	if entryErr != nil || entry.Index != idx || entry.UserScope != userScope || entry.LogicalPath != logicalPath ||
+		entry.Info.Mode()&os.ModeSymlink == 0 {
+		return entry, nil, errors.ErrAccessDenied
+	}
+	target, targetErr := resolveAuthenticatedReadIndexTargetWithScope(user, idx, userScope, logicalPath)
+	if targetErr != nil || !target.Info.Mode().IsRegular() || target.SourceReal != entry.SourceReal ||
+		target.ScopeReal != entry.ScopeReal || !os.SameFile(target.ScopeInfo, entry.ScopeInfo) {
+		return entry, nil, errors.ErrAccessDenied
+	}
+	if _, indexed, supported := idx.FreshAggregateEntry(target.CanonicalPath, target.Info); !indexed || !supported {
+		return entry, nil, errors.ErrAccessDenied
+	}
+	return entry, &target, nil
+}
+
+func (walk *resourceAggregateWalk) collect(target authenticatedReadTarget, depth int, linkTarget *authenticatedReadTarget) (int64, bool, bool) {
+	pathBytes := len(target.LogicalPath)
+	isLink := target.Info.Mode()&os.ModeSymlink != 0
+	if isLink != (linkTarget != nil) {
+		return 0, false, false
+	}
+	if linkTarget != nil {
+		pathBytes += len(linkTarget.CanonicalPath)
+	}
 	if !walk.active() || depth > walk.limits.depth || len(walk.entries) >= walk.limits.entries ||
-		walk.pathBytes+len(target.LogicalPath) > walk.limits.pathBytes || !target.LogicalAccess ||
+		walk.pathBytes+pathBytes > walk.limits.pathBytes || !target.LogicalAccess ||
 		target.LogicalPath != target.CanonicalPath {
 		return 0, false, false
 	}
@@ -58,8 +96,8 @@ func (walk *resourceAggregateWalk) collect(target authenticatedReadTarget, depth
 	if !supported {
 		return 0, false, false
 	}
-	walk.pathBytes += len(target.LogicalPath)
-	walk.entries = append(walk.entries, resourceAggregateEntry{target: target, size: size, indexed: indexed})
+	walk.pathBytes += pathBytes
+	walk.entries = append(walk.entries, resourceAggregateEntry{target: target, linkTarget: linkTarget, size: size, indexed: indexed})
 	if !target.Info.IsDir() {
 		return size, indexed, true
 	}
@@ -97,15 +135,16 @@ func (walk *resourceAggregateWalk) collect(target authenticatedReadTarget, depth
 			return 0, false, false
 		}
 		for _, child := range children {
-			if child.Mode()&os.ModeSymlink != 0 || (!child.IsDir() && !child.Mode().IsRegular()) {
+			childIsLink := child.Mode()&os.ModeSymlink != 0
+			if !childIsLink && !child.IsDir() && !child.Mode().IsRegular() {
 				return 0, false, false
 			}
 			logicalPath := normalizePublicShareIndexPath(utils.JoinPathAsUnix(target.LogicalPath, child.Name()))
-			childTarget, resolveErr := resolveAuthenticatedReadIndexTargetWithScope(walk.user, target.Index, walk.root.UserScope, logicalPath)
-			if resolveErr != nil || !os.SameFile(child, childTarget.Info) || child.IsDir() != childTarget.Info.IsDir() {
+			childTarget, childLink, resolveErr := resolveResourceAggregateEntry(walk.user, target.Index, walk.root.UserScope, logicalPath, childIsLink)
+			if resolveErr != nil || !os.SameFile(child, childTarget.Info) || child.Mode().Type() != childTarget.Info.Mode().Type() {
 				return 0, false, false
 			}
-			childSize, counted, complete := walk.collect(childTarget, depth+1)
+			childSize, counted, complete := walk.collect(childTarget, depth+1, childLink)
 			if !complete || !walk.active() {
 				return 0, false, false
 			}
@@ -154,7 +193,7 @@ func collectAuthenticatedResourceAggregatesWithLimits(ctx context.Context, d *re
 	}
 	walk := resourceAggregateWalk{ctx: ctx, user: user, root: target, limits: limits,
 		deadline: time.Now().Add(limits.duration), sizes: make(map[string]int64), logical: target.Index.Config.UseLogicalSize}
-	_, _, complete := walk.collect(target, 0)
+	_, _, complete := walk.collect(target, 0, nil)
 	if resourceAggregateCollectedHook != nil {
 		resourceAggregateCollectedHook()
 	}
@@ -174,16 +213,24 @@ func collectAuthenticatedResourceAggregatesWithLimits(ctx context.Context, d *re
 		if !walk.active() {
 			return nil, nil
 		}
-		fresh, freshErr := resolveAuthenticatedReadIndexTargetWithScope(currentUser, target.Index, currentRoot.UserScope, entry.target.LogicalPath)
-		if freshErr != nil || !sameAuthenticatedReadTarget(entry.target, fresh) || fresh.Info.IsDir() != entry.target.Info.IsDir() ||
+		fresh, freshLink, freshErr := resolveResourceAggregateEntry(currentUser, target.Index, currentRoot.UserScope, entry.target.LogicalPath, entry.linkTarget != nil)
+		if freshErr != nil || !sameAuthenticatedReadTarget(entry.target, fresh) || fresh.Info.Mode().Type() != entry.target.Info.Mode().Type() ||
 			fresh.Info.Size() != entry.target.Info.Size() || !fresh.Info.ModTime().Equal(entry.target.Info.ModTime()) {
+			return nil, nil
+		}
+		if entry.linkTarget != nil && (freshLink == nil || !sameAuthenticatedReadTarget(*entry.linkTarget, *freshLink) ||
+			freshLink.Info.Size() != entry.linkTarget.Info.Size() || !freshLink.Info.ModTime().Equal(entry.linkTarget.Info.ModTime())) {
 			return nil, nil
 		}
 		size, indexed, supported := target.Index.FreshAggregateEntry(fresh.LogicalPath, fresh.Info)
 		if !supported || size != entry.size || indexed != entry.indexed {
 			return nil, nil
 		}
-		paths = append(paths, fresh.LogicalPath, fresh.CanonicalPath)
+		canonicalPath := fresh.CanonicalPath
+		if freshLink != nil {
+			canonicalPath = freshLink.CanonicalPath
+		}
+		paths = append(paths, fresh.LogicalPath, canonicalPath)
 	}
 	walk.paths = paths
 	return &walk, nil

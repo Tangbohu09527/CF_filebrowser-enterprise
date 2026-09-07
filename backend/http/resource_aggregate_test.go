@@ -141,9 +141,15 @@ func TestResourceAggregateRejectsIdentityAndPermissionChanges(t *testing.T) {
 				requestPath = "/"
 			}
 			if mutation == "api-token-revoke" || mutation == "api-token-browse" {
+				user.Permissions.Api = true
+				if updateErr := store.Users.Update(user, true, "Permissions"); updateErr != nil {
+					t.Fatal(updateErr)
+				}
 				token = issuePermissionReadAPIToken(t, user, "aggregate-token", user.Permissions)
 			}
+			collected := false
 			resourceAggregateCollectedHook = func() {
+				collected = true
 				updated := *user
 				switch mutation {
 				case "scope":
@@ -174,6 +180,9 @@ func TestResourceAggregateRejectsIdentityAndPermissionChanges(t *testing.T) {
 			request := httptest.NewRequest(http.MethodGet, "/api/resources?"+query.Encode(), nil)
 			recorder := httptest.NewRecorder()
 			status, requestErr := resourceGetHandler(recorder, request, &requestContext{user: user, token: token})
+			if !collected {
+				t.Fatal("request did not reach post-collection revocation")
+			}
 			if status != http.StatusForbidden || requestErr == nil || recorder.Body.Len() != 0 {
 				t.Fatal("changed scope, Browse or token exposed a prepared aggregate")
 			}
@@ -270,6 +279,10 @@ func TestResourceAggregateBudgetsAndReadErrorsDiscardWholeResult(t *testing.T) {
 
 func TestResourceAggregateHonorsRoutedAPITokenIntersection(t *testing.T) {
 	_, user, _ := resourceAggregateFixture(t, true)
+	user.Permissions.Api = true
+	if updateErr := store.Users.Update(user, true, "Permissions"); updateErr != nil {
+		t.Fatal(updateErr)
+	}
 	token := issuePermissionReadAPIToken(t, user, "aggregate-no-browse", users.Permissions{Download: true})
 	collected := false
 	resourceAggregateCollectedHook = func() { collected = true }
@@ -294,5 +307,32 @@ func TestResourceAggregateDoesNotRestoreHiddenDirectFileThroughTotals(t *testing
 	response := resourceDisplayRequest(t, user, token, "/public")
 	if response.Size != inodeSize || len(response.Files) != 0 {
 		t.Fatal("post-collection revocation leaked the direct file or its size")
+	}
+}
+
+func TestResourceAggregateKeepsScannerHiddenEntrySemantics(t *testing.T) {
+	source, user, token := resourceAggregateFixture(t, false)
+	root := filepath.Join(source, "public", "scanner-folders")
+	if mkdirErr := os.Mkdir(root, 0o755); mkdirErr != nil {
+		t.Fatal(mkdirErr)
+	}
+	for _, name := range []string{"one", "two", "three", "four", ".hiddenDir"} {
+		if mkdirErr := os.Mkdir(filepath.Join(root, name), 0o755); mkdirErr != nil {
+			t.Fatal(mkdirErr)
+		}
+	}
+	if writeErr := os.WriteFile(filepath.Join(root, ".hiddenDir", "nested.txt"), nil, 0o600); writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	user.ShowHidden = true
+	if updateErr := store.Users.Update(user, true, "ShowHidden"); updateErr != nil {
+		t.Fatal(updateErr)
+	}
+	response := resourceDisplayRequest(t, user, token, "/public/scanner-folders")
+	if len(response.Folders) != 5 {
+		t.Fatal("aggregate changed the user's hidden-folder listing preference")
+	}
+	if response.Size != 4*4096 {
+		t.Fatalf("scanner total must omit hidden directory contribution: got=%d want=%d", response.Size, 4*4096)
 	}
 }

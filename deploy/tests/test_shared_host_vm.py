@@ -107,6 +107,96 @@ class LANBoundaryTests(unittest.TestCase):
     def probe(self):
         return harness.probe_lan_boundary('/protected/ca.crt', '/protected/wrong-ca.crt', '/protected/empty-trust')
 
+    def test_report_retains_failed_substage_without_private_transport_output(self):
+        self.curl.side_effect = [subprocess.CompletedProcess([], 22, b'PRIVATE-BODY\n503', b'PRIVATE-TOKEN')]
+        report = harness.lan_probe_report('/protected/ca.crt', '/protected/wrong-ca.crt', '/protected/empty-trust')
+        self.assertFalse(report['passed'])
+        self.assertEqual(report['stage'], 'allowed-health-before')
+        self.assertEqual(report['failure'], {'category': 'assertion'})
+        self.assertEqual(report['observations']['allowed-health-before'], {'curl_exit_code': 22, 'http_status': 503, 'body_expected': False})
+        self.assertNotIn('PRIVATE', json.dumps(report))
+        self.assertNotIn('/protected', json.dumps(report))
+
+    def test_report_retains_completed_controls_and_only_bounded_tls_error_codes(self):
+        certificate_error = harness.ssl.SSLCertVerificationError(1, 'PRIVATE-PASSWORD')
+        certificate_error.verify_code = 92
+        self.context.wrap_socket.side_effect = certificate_error
+        report = harness.lan_probe_report('/protected/ca.crt', '/protected/wrong-ca.crt', '/protected/empty-trust')
+        self.assertFalse(report['passed'])
+        self.assertEqual(report['stage'], 'denied-tls-handshake')
+        self.assertEqual(report['failure'], {'category': 'tls-certificate', 'errno': 1, 'verify_code': 92})
+        self.assertEqual(report['completed'], ['allowed-health-before', 'allowed-ui', 'trusted-context', 'denied-tcp-connect', 'denied-socket-identity'])
+        self.assertNotIn('PRIVATE', json.dumps(report))
+        self.tcp.close.assert_called_once_with()
+
+    def test_diagnostic_codes_reject_bool_strings_and_out_of_range_values(self):
+        for number in (True, '92', -32769, 32768):
+            with self.subTest(number=number):
+                self.assertNotIn('errno', harness.lan_safe_fields({'errno': number}))
+        for number in (True, '92', -1, 256):
+            with self.subTest(number=number):
+                error = harness.ssl.SSLCertVerificationError(1, 'PRIVATE-TOKEN')
+                error.verify_code = number
+                self.assertEqual(harness.lan_error_fields(error), {'category': 'tls-certificate', 'errno': 1})
+        for name, (minimum, maximum) in harness.LAN_INTEGER_FIELDS.items():
+            self.assertEqual(harness.lan_safe_fields({name: minimum}), {name: minimum})
+            self.assertEqual(harness.lan_safe_fields({name: maximum}), {name: maximum})
+            for number in (True, str(minimum), minimum - 1, maximum + 1):
+                self.assertNotIn(name, harness.lan_safe_fields({name: number}))
+
+    def test_error_classification_never_formats_exception_text_or_class_names(self):
+        class PrivateSecretError(OSError):
+            def __str__(self):
+                raise AssertionError('must not format private error')
+        cases = [(PrivateSecretError(5, 'PRIVATE-TOKEN'), 'os'), (socket.gaierror(-2, 'PRIVATE-TOKEN'), 'dns'),
+                 (TimeoutError('PRIVATE-TOKEN'), 'timeout'), (ConnectionResetError('PRIVATE-TOKEN'), 'connection'),
+                 (harness.ssl.SSLEOFError(8, 'PRIVATE-TOKEN'), 'eof'), (harness.ssl.SSLError(1, 'PRIVATE-TOKEN'), 'tls'),
+                 (RuntimeError('PRIVATE-TOKEN'), 'internal')]
+        for error, category in cases:
+            with self.subTest(category=category):
+                report = harness.lan_error_fields(error)
+                self.assertEqual(report['category'], category)
+                self.assertNotIn('PRIVATE', json.dumps(report))
+                self.assertNotIn('PrivateSecretError', json.dumps(report))
+
+    def test_success_report_keeps_every_original_boundary_check(self):
+        report = harness.lan_probe_report('/protected/ca.crt', '/protected/wrong-ca.crt', '/protected/empty-trust')
+        self.assertTrue(report['passed'])
+        self.assertEqual(report['stage'], 'complete')
+        self.assertEqual(report['completed'], list(harness.LAN_PROBE_STAGES[1:-1]))
+        self.assertEqual(report['observations']['denied-tcp-connect']['tcp_connected'], True)
+        self.assertEqual(report['observations']['denied-socket-identity'], {'source_matches': True, 'peer_matches': True})
+        self.assertEqual(report['observations']['denied-tls-handshake']['rejection'], 'tls-eof')
+        self.assertEqual(report['observations']['wrong-ca']['curl_exit_code'], 60)
+        self.assertEqual(report['observations']['allowed-health-after']['http_status'], 200)
+
+    def test_success_report_requires_all_observed_boundaries_not_just_stage_names(self):
+        report = harness.lan_probe_report('/protected/ca.crt', '/protected/wrong-ca.crt', '/protected/empty-trust')
+        self.assertTrue(harness.sanitized_lan_report(report)['passed'])
+        self.assertEqual(harness.sanitized_lan_report(report)['observations'], report['observations'])
+        missing_all = copy.deepcopy(report)
+        missing_all['observations'] = {}
+        self.assertFalse(harness.sanitized_lan_report(missing_all)['passed'])
+        for stage, observations in report['observations'].items():
+            for name in observations:
+                with self.subTest(stage=stage, name=name):
+                    missing = copy.deepcopy(report)
+                    missing['observations'][stage].pop(name)
+                    self.assertFalse(harness.sanitized_lan_report(missing)['passed'])
+        for stage, name, value in (('allowed-health-before', 'curl_exit_code', 7),
+                                   ('allowed-ui', 'http_status', 403),
+                                   ('denied-tcp-connect', 'tcp_connected', False),
+                                   ('denied-socket-identity', 'source_matches', False),
+                                   ('denied-tls-handshake', 'tls_handshake_completed', True),
+                                   ('denied-tls-handshake', 'application_bytes_received', 1),
+                                   ('denied-tls-handshake', 'elapsed_ms', 5000),
+                                   ('wrong-ca', 'curl_exit_code', 35),
+                                   ('allowed-health-after', 'body_expected', False)):
+            with self.subTest(stage=stage, name=name):
+                wrong = copy.deepcopy(report)
+                wrong['observations'][stage][name] = value
+                self.assertFalse(harness.sanitized_lan_report(wrong)['passed'])
+
     def test_requires_connected_correct_socket_then_prompt_tls_eof(self):
         result = self.probe()
         self.assertEqual(result['denied_source']['socket_source'], harness.DENIED_IP)
@@ -319,6 +409,36 @@ class FailureEvidenceTests(unittest.TestCase):
         self.assertNotIn("TOKEN", str(caught.exception))
         self.assertNotIn("PASSWORD", str(caught.exception))
         self.assertFalse(vm.command_on_guest.call_args.kwargs["check"])
+
+    def test_failed_lan_preserves_only_allowlisted_report_and_keeps_nonzero_failure(self):
+        vm = mock.Mock(name='guest')
+        vm.name = 'cf-verification-2'
+        report = {'schema': 'cf-lan-boundary/v1', 'passed': False, 'stage': 'wrong-ca',
+                  'completed': ['allowed-health-before', 'PRIVATE-TOKEN'],
+                  'observations': {'wrong-ca': {'curl_exit_code': 35, 'body': 'PRIVATE-BODY', 'errno': True}, 'PRIVATE-STAGE': {}},
+                  'failure': {'category': 'assertion', 'message': 'PRIVATE-PASSWORD', 'verify_code': '92'},
+                  'unexpected': 'PRIVATE-KEY'}
+        vm.command_on_guest.return_value = subprocess.CompletedProcess([], 1, json.dumps(report).encode(), b'PRIVATE-STDERR')
+        with self.assertRaises(harness.VerificationError) as caught:
+            harness.lan_boundary(vm)
+        safe = caught.exception.lan_evidence
+        self.assertEqual(safe['stage'], 'wrong-ca')
+        self.assertEqual(safe['observations'], {'wrong-ca': {'curl_exit_code': 35}})
+        self.assertEqual(safe['failure'], {'category': 'assertion'})
+        self.assertEqual(safe['completed'], ['allowed-health-before'])
+        self.assertNotIn('PRIVATE', json.dumps(safe) + str(caught.exception))
+        self.assertFalse(vm.command_on_guest.call_args.kwargs['check'])
+
+    def test_lan_missing_or_forged_success_report_cannot_mask_failure(self):
+        vm = mock.Mock(name='guest')
+        vm.name = 'cf-verification-2'
+        for payload in (b'PRIVATE-TOKEN', b'{"schema":"cf-lan-boundary/v1","passed":true,"stage":"complete","completed":[]}'):
+            with self.subTest(payload=payload):
+                vm.command_on_guest.return_value = subprocess.CompletedProcess([], 0, payload, b'PRIVATE-PASSWORD')
+                with self.assertRaises(harness.VerificationError) as caught:
+                    harness.lan_boundary(vm)
+                self.assertFalse(caught.exception.lan_evidence['passed'])
+                self.assertNotIn('PRIVATE', str(caught.exception) + json.dumps(caught.exception.lan_evidence))
 
     def test_api_configuration_failure_does_not_mask_original_exit(self):
         vm = mock.Mock(name="guest")

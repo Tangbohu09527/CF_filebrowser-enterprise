@@ -663,3 +663,82 @@ budget/error fallback. Existing hidden-descendant aggregate assertions are
 unchanged. Diff checking and independent source review passed. This Windows
 workspace has no Go/gofmt/Docker: compilation, race regression, Lint and the
 original Playwright assertions must still run in CI; no runtime pass is claimed.
+
+## 692e4010 real VM prefix and remaining source regressions
+
+The first run with the corrected decimal resource limits completed with a
+failure in [fixed-image job 101712976010](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34112904456/job/101712976010).
+Its actual sparse virtual capacity was 78,383,906,816 bytes and RAM was
+4,294,967,296 bytes. Both Debian 13.6 guests ran systemd, Docker 29.8.0 and
+Compose 5.5.1, with independent ext4 test disks; this is mount verification,
+not RAID verification. The real image build, isolated TLS registry transfer,
+formal empty-root installation, administrator verification, bootstrap removal,
+same-image login, idempotent preparation and actual UID/GID/tool/read-write
+runtime checks passed. The builder/config Image ID was
+`sha256:19793a497ae28319946895e0b1053dd399ceea808ceee4d941d3387e519cc56a`;
+the registry manifest and the guests' actual containerd-store Image ID were
+`sha256:0e0ffdef2238ebbe9069ea11161ffc862e4bb2100f80250f94a692b2a6ef2fae`.
+
+The last stage was `second-vm-real-lan-and-https-boundaries`. Only a generic
+client-script exit was retained, so this run cannot establish which LAN
+assertion failed. It has no `lan_boundary`, `failed_api` or preview result.
+API, FileBridge, WebDAV, application UI, restart and backup/restore stages did
+not execute. Earlier LAN passes remain tied to their earlier SHAs and resource
+limits. The next harness repair preserves failed LAN substeps as allowlisted
+metadata without recording private command output or changing denial checks.
+
+The 692e4010 regular backend job failed in three newly added token fixture
+subcases before reaching their intended assertions: the ordinary test user
+lacked API permission required to issue a token. The fixture now explicitly
+persists that permission before issuance, and post-collection revocation tests
+also require proof that collection was reached. Token capabilities, revocation
+checks and expected denied responses remain. The unchanged source UI assertions
+still passed Sharing 13/13 and Settings 25/25 and failed two Noauth directory
+size cases (27/29 passed).
+
+Those source trees contain two tracked same-directory symlinks. The scanner
+counts the links' own Lstat bytes/allocated blocks, without traversing their
+targets; the new aggregate had instead discarded the whole result at any link.
+The repair uses existing no-follow entry and authenticated target resolvers,
+counts only the entry, and rechecks both identities and permissions. Broken,
+cyclic, directory, denied and out-of-scope aliases still discard the total.
+Canonical target paths also consume the existing path-byte budget and final
+ACL batch. Tests cover both size modes, a non-root user scope, replacement and
+revocation, including a target outside the enumerated subtree. The test added
+in this task for an allowed alias now asserts entry-only bytes rather than
+fallback; its no-double-counting safety intent remains, and no baseline safety
+or UI assertion changed. Scanner-default hidden-item exclusion is also retained
+without changing the user's ability to list hidden items.
+
+The uncapped 692e4010 Lint run reports 112 findings in 27 files, with no newly
+introduced diagnostic: the client-network test shadow finding is gone. These
+112 source statements map to the integration baseline; this was not a separate
+baseline Lint execution. Broad baseline cleanup remains outside this batch.
+
+## Actual unsupported-preview red test and minimal error classification
+
+Test-only SHA `364571a4242e06dc0f36815f33a797cd66978b30` reproduced the issue in
+[backend job 101716903338](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34114138736/job/101716903338):
+`TestAuthenticatedPreviewWithoutServerPreviewReturnsBadRequest` received HTTP
+500, zero body bytes and `this item does not have a preview`. The ordinary user
+had Browse and Preview, no Download or Admin; the real handler ran. That job
+also had the separately identified aggregate token fixture failures.
+
+Only the two authenticated unsupported-preview errors now wrap the existing
+`ErrInvalidRequestParams` sentinel. The shared-preview branch, general status
+mapper, access-denied handling, bad-image errors and security timeouts are
+unchanged. The existing 403 and genuine 500 security assertions remain. The
+acceptance client still rejects unexpected 500 responses; it is not relaxed to
+label them as unsupported previews. The new green result and all affected Go,
+original Playwright and fixed-image checks must come from the next real CI run.
+
+The LAN diagnostic regression first failed against the old reporting path
+(2 failures and 4 errors); a separate missing-observation success case also
+failed before its guard was added. The repaired existing VM harness test file
+passed 41/41 tests locally, including real strict-certificate loopback tests.
+These are harness/crypto tests, not application LAN acceptance. Generated guest
+Shell/Python syntax, the existing shell entry and diff checks also passed.
+Success now requires every original LAN control and its validated observation;
+failures retain only fixed stages, completed checks, bounded numeric codes and
+allowlisted categories. No API, authentication, network or process deadline was
+relaxed. The actual 692e4010 LAN cause remains unclassified until a new run.
