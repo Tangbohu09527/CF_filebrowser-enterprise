@@ -276,8 +276,12 @@ For LAN, select `--exposure lan` **during prepare** and additionally provide
 `--tls-name DNS_NAME`, `--tls-cert-file /PROTECTED/server.crt`,
 `--tls-key-file /PROTECTED/server.key`, and `--tls-ca-file /PROTECTED/ca.crt`.
 Inputs and their parents must have the protected ownership/modes checked by the
-entry point. The certificate must cover the selected DNS name and chain to the
-provided CA. Existing deployment settings are not silently replaced by prepare.
+entry point. The certificate must cover the selected DNS name and pass strict X.509 chain
+and server-auth purpose verification against the provided CA. In particular,
+CA certificates need valid CA basic constraints and certificate-signing Key
+Usage; client-only leaf certificates are rejected. Prepare and every runtime
+validation/start enforce this policy. Existing deployment settings are not
+silently replaced by prepare.
 
 The server enforces the explicit CIDRs against the actual TCP peer, before
 HTTP/TLS processing, including all UI/API/WebDAV routes. It does not trust

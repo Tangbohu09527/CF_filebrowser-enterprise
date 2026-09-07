@@ -88,7 +88,7 @@ lint-frontend:
 	cd frontend && npm run lint
 
 lint-backend:
-	cd backend && go tool golangci-lint run --path-prefix=backend
+	cd backend && go tool golangci-lint run --path-prefix=backend --max-issues-per-linter=0 --max-same-issues=0
 
 lint: lint-backend lint-frontend
 

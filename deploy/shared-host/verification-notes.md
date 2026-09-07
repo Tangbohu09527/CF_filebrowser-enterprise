@@ -555,3 +555,31 @@ they run. They do not inject persistent audit-store failure or prove a durable
 Pending interruption at runtime. Pending/Finalize atomicity, startup recovery and
 write-before-audit failure closure currently have Go regression evidence only;
 fixed-image fault-injection acceptance remains unexecuted.
+
+## Formal TLS input policy and complete Lint diagnostics
+
+A real OpenSSL counterexample showed that formal `tls_inputs` accepted a CA
+missing certificate-signing Key Usage although a strict client rejected its
+chain. Preparation and the existing runtime validator now both use
+`openssl verify -x509_strict -purpose sslserver` with their existing CA/name
+checks. The valid test fixture has explicit extensions; the nonconforming CA
+is retained as a negative fixture. Client-only leaf certificates are also
+rejected. All 27 lifecycle tests passed locally, including the validator's real
+cryptographic command, wrong CA/DNS/IP, lifetime, encrypted/mismatched key and
+existing bootstrap/secret assertions. `validate.sh` passed `bash -n` and the diff
+check passed. Full POSIX/Docker validation remains subject to current-SHA CI.
+Restore keeps the service stopped; the recovered certificate is checked by the
+formal validate/start stage, not claimed as a cryptographic archive-format check.
+
+The observed aa1bb690 Lint output comprised 8 errcheck, 50 govet/shadow,
+1 ineffassign, 13 staticcheck and 6 unused findings across 19 files. These 78
+locations are unchanged baseline statements (18 files unchanged in full; four
+storage-test statements only moved after added imports). This was a source
+comparison, not an independently executed baseline Lint run. **78 is the emitted
+count, not a proven upper bound**: the analyzer's default per-linter cap is 50.
+Both existing Lint entries now pass `--max-issues-per-linter=0
+--max-same-issues=0` so the next run reports the complete finding set. Only
+reporting caps change; all rules, scan scope, exit status, compatible pinned
+versions and finite time budgets remain. Workflow structure and exact Makefile
+command comparison passed; local Lint is unavailable because this Windows
+workspace has no Go installation. No baseline code cleanup was included.

@@ -392,7 +392,7 @@ def tls_inputs(args) -> dict[str, bytes]:
     except ValueError:
         check = "-verify_hostname"
     with phase("TLS certificate chain and name verification"):
-        run(["openssl", "verify", "-CAfile", str(args.tls_ca_file), check, args.tls_name, str(args.tls_cert_file)])
+        run(["openssl", "verify", "-x509_strict", "-purpose", "sslserver", "-CAfile", str(args.tls_ca_file), check, args.tls_name, str(args.tls_cert_file)])
     # x509 -checkend may finish without performing other requested checks.
     with phase("TLS certificate remaining lifetime"):
         run(["openssl", "x509", "-in", str(args.tls_cert_file), "-noout", "-checkend", "86400"])

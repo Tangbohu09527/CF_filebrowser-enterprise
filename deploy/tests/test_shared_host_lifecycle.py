@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -225,21 +227,47 @@ class TLSInputOpenSSLTests(unittest.TestCase):
         cls.csr = cls.root / "server.csr"
         cls.empty = cls.root / "empty-password"
         cls.empty.write_bytes(b"")
+        ca_extensions = ["-addext", "basicConstraints=critical,CA:TRUE",
+                         "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+                         "-addext", "subjectKeyIdentifier=hash",
+                         "-addext", "authorityKeyIdentifier=keyid:always"]
         cls.openssl_run(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3",
-                         "-subj", "/CN=Isolated lifecycle regression CA", "-keyout", str(cls.ca_key), "-out", str(cls.ca)])
+                         "-subj", "/CN=Isolated lifecycle regression CA", "-keyout", str(cls.ca_key), "-out", str(cls.ca), *ca_extensions])
         cls.openssl_run(["req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=files.cf.test",
                          "-keyout", str(cls.key), "-out", str(cls.csr)])
         extension = cls.root / "server.extensions"
-        extension.write_text("subjectAltName=DNS:files.cf.test,IP:192.0.2.11\nextendedKeyUsage=serverAuth\n", encoding="ascii")
+        extension.write_text("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\n"
+                             "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n"
+                             "subjectAltName=DNS:files.cf.test,IP:192.0.2.11\nextendedKeyUsage=serverAuth\n", encoding="ascii")
         cls.signing = ["x509", "-req", "-in", str(cls.csr), "-CA", str(cls.ca), "-CAkey",
                        str(cls.ca_key), "-CAcreateserial", "-extfile", str(extension)]
         cls.openssl_run([*cls.signing, "-days", "3", "-out", str(cls.cert)])
+        # Keep a CA without Key Usage as an explicit negative fixture, even
+        # after the accepted fixture gains the required certificate extensions.
+        cls.missing_usage_ca = cls.root / "missing-usage-ca.crt"
+        missing_usage_key = cls.root / "missing-usage-ca.key"
+        missing_usage_config = cls.root / "missing-usage-ca.cnf"
+        missing_usage_config.write_text("[req]\ndistinguished_name=dn\nx509_extensions=ca\n[dn]\n[ca]\n"
+                                       "basicConstraints=critical,CA:TRUE\nsubjectKeyIdentifier=hash\n"
+                                       "authorityKeyIdentifier=keyid:always\n", encoding="ascii")
+        cls.openssl_run(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3",
+                         "-config", str(missing_usage_config), "-subj", "/CN=Legacy CA without key usage",
+                         "-keyout", str(missing_usage_key), "-out", str(cls.missing_usage_ca)])
+        cls.missing_usage_cert = cls.root / "missing-usage-server.crt"
+        cls.openssl_run(["x509", "-req", "-in", str(cls.csr), "-CA", str(cls.missing_usage_ca),
+                         "-CAkey", str(missing_usage_key), "-CAcreateserial", "-extfile", str(extension),
+                         "-days", "3", "-out", str(cls.missing_usage_cert)])
+        wrong_purpose_extension = cls.root / "client-only.extensions"
+        wrong_purpose_extension.write_text(extension.read_text(encoding="ascii").replace("serverAuth", "clientAuth"), encoding="ascii")
+        cls.wrong_purpose_cert = cls.root / "client-only.crt"
+        cls.openssl_run(["x509", "-req", "-in", str(cls.csr), "-CA", str(cls.ca), "-CAkey", str(cls.ca_key),
+                         "-CAcreateserial", "-extfile", str(wrong_purpose_extension), "-days", "3", "-out", str(cls.wrong_purpose_cert)])
         cls.short_cert = cls.root / "short-lived.crt"
         cls.openssl_run([*cls.signing, "-days", "1", "-out", str(cls.short_cert)])
         cls.other_ca = cls.root / "untrusted.crt"
         cls.openssl_run(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3",
                          "-subj", "/CN=Untrusted lifecycle regression CA",
-                         "-keyout", str(cls.root / "untrusted.key"), "-out", str(cls.other_ca)])
+                         "-keyout", str(cls.root / "untrusted.key"), "-out", str(cls.other_ca), *ca_extensions])
         cls.encrypted_key = cls.root / "encrypted.key"
         cls.openssl_run(["pkey", "-in", str(cls.key), "-aes-256-cbc", "-passout", "stdin",
                          "-out", str(cls.encrypted_key)], b"synthetic-fixture-passphrase\n")
@@ -278,6 +306,35 @@ class TLSInputOpenSSLTests(unittest.TestCase):
         self.assertTrue(result["server.crt"] == self.cert.read_bytes(), "accepted certificate bytes changed")
         self.assertTrue(result["server.key"] == self.key.read_bytes(), "accepted private key bytes changed")
         self.assertTrue(result["ca.crt"] == self.ca.read_bytes(), "accepted CA bytes changed")
+
+    def test_ca_missing_key_usage_is_rejected(self):
+        with self.assertRaisesRegex(lifecycle.DeploymentError, "openssl verify failed"):
+            self.check_inputs(tls_ca_file=self.missing_usage_ca, tls_cert_file=self.missing_usage_cert)
+
+    def test_client_only_certificate_is_rejected_for_the_server(self):
+        with self.assertRaisesRegex(lifecycle.DeploymentError, "openssl verify failed"):
+            self.check_inputs(tls_cert_file=self.wrong_purpose_cert)
+
+    def test_runtime_validator_uses_the_same_strict_server_certificate_policy(self):
+        source = (MODULE_PATH.parent / "validate.sh").read_text(encoding="utf-8")
+        # Execute the validator's actual crypto argv on protected synthetic
+        # inputs; full POSIX path/owner/Docker validation remains the VM's job.
+        line = re.search(r"(?m)^  openssl verify [^\n]+", source).group(0)
+        arguments = shlex.split(line.split(" >/dev/null", 1)[0])[1:]
+        for label, ca, cert, name, allowed in (
+                ("valid", self.ca, self.cert, "files.cf.test", True),
+                ("missing CA usage", self.missing_usage_ca, self.missing_usage_cert, "files.cf.test", False),
+                ("wrong purpose", self.ca, self.wrong_purpose_cert, "files.cf.test", False),
+                ("wrong CA", self.other_ca, self.cert, "files.cf.test", False),
+                ("wrong hostname", self.ca, self.cert, "wrong.cf.test", False)):
+            with self.subTest(label=label):
+                substitutions = {"$CONFIG_ROOT/tls/ca.crt": str(ca), "$CONFIG_ROOT/tls/server.crt": str(cert), "$LAN_TLS_SERVER_NAME": name}
+                command = [substitutions.get(value, value) for value in arguments]
+                if allowed:
+                    self.openssl_run(command)
+                else:
+                    with self.assertRaisesRegex(lifecycle.DeploymentError, "openssl verify failed"):
+                        self.openssl_run(command)
 
     def test_wrong_dns_is_rejected_by_chain_and_name_verification(self):
         with self.assertRaisesRegex(lifecycle.DeploymentError, "openssl verify failed"):

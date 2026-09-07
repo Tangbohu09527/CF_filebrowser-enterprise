@@ -887,7 +887,7 @@ if [[ "$LAN" == true ]]; then
     assert_canonical_path "$tls_file" "TLS $tls_name"
     assert_owner_mode "$tls_file" 440 0 "$FILEBROWSER_GID" "TLS $tls_name"
   done
-  openssl verify -CAfile "$CONFIG_ROOT/tls/ca.crt" -verify_hostname "$LAN_TLS_SERVER_NAME" "$CONFIG_ROOT/tls/server.crt" >/dev/null 2>&1 ||
+  openssl verify -x509_strict -purpose sslserver -CAfile "$CONFIG_ROOT/tls/ca.crt" -verify_hostname "$LAN_TLS_SERVER_NAME" "$CONFIG_ROOT/tls/server.crt" >/dev/null 2>&1 ||
     die 'TLS certificate chain or DNS name is invalid'
   cert_public=$(openssl x509 -in "$CONFIG_ROOT/tls/server.crt" -pubkey -noout 2>/dev/null) ||
     die 'TLS certificate public key could not be read'
