@@ -303,3 +303,48 @@ the repository's other UI tests do, instead of expecting an optional shortcut.
 It retains the real save response, downloaded-byte digest, rename and delete
 checks; no fixture preference, permission or product behavior changed. Syntax
 passed; live browser execution still requires the fixed-image VM run.
+
+## Precise installed-validator diagnostics
+
+At `a1fab56b1270bafbb0535bff559f7c21b73c420c`,
+[VM job 101680879209](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34102532477/job/101680879209)
+passed the same verified two-VM image transfer. Preparation advanced beyond
+OpenSSL input checking but stopped when the installed-deployment validator
+returned exit 1. The protected child output was suppressed, so this result did
+not identify the exact rejection predicate; it is not a successful installation.
+
+The validator now emits fixed phase/kind/line/exit markers. Only its dedicated
+lifecycle invocation may extract the complete strict marker grammar and phase
+allowlist; arbitrary command output, human messages and values stay suppressed.
+All existing validation predicates remain. Local lifecycle tests (24), relevant
+real Shell/embedded-contract diagnostic tests (4), `bash -n` and diff checks
+passed. The actual rejection location remains to be established by the next VM
+run; no dependency or validation threshold was changed on a guess.
+
+## Existing Settings UI startup and persisted JWT signing key
+
+[Source job 101680879155](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34102532477/job/101680879155)
+at a1fab56b passed all 13 existing Sharing browser tests in 33.7 seconds.
+The subsequent Settings image initialized its own fresh database through a CLI
+command, exited, and started the server. Login, self and settings requests
+returned 200, but the first authenticated resource read returned 403; the
+unchanged five-second page-title assertion then failed. This was not reuse of
+the Sharing image or a request to grant the administrator extra permissions.
+
+Source tracing found that first initialization saved a generated signing key,
+while reopening a database with no explicit key left the runtime key empty.
+The authenticated-read guard correctly rejects an empty key. Initialization
+now loads only the same database's saved JWT key when no explicit config/env
+key exists; absent or unreadable saved keys close the database and fail with a
+fixed error. First setup also preserves an explicit key instead of replacing
+it. Other current configuration and persisted data are not restored wholesale.
+
+Synthetic Bolt tests were added before the fix for generated/explicit first
+setup and real close/reopen, explicit restart override without rewriting saved
+settings, and missing/empty/corrupt saved keys. They check administrator hashes
+and permissions, no replacement key, no private-content error, unchanged stored
+bytes and a bounded reopen proving the failed path released the lock. This
+Windows checkout has no Go/gofmt, so these new Go tests have not run locally;
+full backend race tests, Lint, format checking and existing Playwright must run
+in CI at the new source SHA. Existing migration and bootstrap-log assertions
+remain unchanged.

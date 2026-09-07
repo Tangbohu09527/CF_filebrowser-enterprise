@@ -35,6 +35,15 @@ func InitializeDb(path string) (*bolt.BoltStore, bool, error) {
 	if err != nil {
 		return nil, exists, errors.Join(err, db.Close())
 	}
+	// Explicit configuration (including the secret-file environment bridge) wins.
+	// Without it, restart must retain the key generated for this database.
+	if exists && settings.Config.Auth.Key == "" {
+		persisted, keyErr := store.Settings.Get()
+		if keyErr != nil || persisted == nil || persisted.Auth.Key == "" {
+			return nil, exists, errors.Join(errors.New("persisted JWT signing key is missing or unreadable"), db.Close())
+		}
+		settings.Config.Auth.Key = persisted.Auth.Key
+	}
 	// Load access rules from DB on startup
 	// ignoring errors because
 	_ = store.Access.LoadFromDB()
@@ -74,7 +83,9 @@ func dbExists(path string) (bool, error) {
 }
 
 func quickSetup(store *bolt.BoltStore) {
-	settings.Config.Auth.Key = utils.GenerateKey()
+	if settings.Config.Auth.Key == "" {
+		settings.Config.Auth.Key = utils.GenerateKey()
+	}
 	err := store.Settings.Save(&settings.Config)
 	utils.CheckErr("store.Settings.Save", err)
 	err = store.Settings.SaveServer(&settings.Config.Server)

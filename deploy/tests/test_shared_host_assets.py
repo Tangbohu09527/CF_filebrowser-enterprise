@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import ast
 import copy
+import contextlib
+import io
+import sys
 import json
 import os
 import re
@@ -282,6 +285,33 @@ class SharedHostDeploymentAssetTests(unittest.TestCase):
         self.assertTrue(check({"type": "bind"}))
         self.assertFalse(check({"type": "bind", "bind": {"create_host_path": True}}))
         self.assertFalse(check({"type": "volume"}))
+
+    def test_validator_early_rejection_has_safe_machine_location(self) -> None:
+        result = subprocess.run([bash_executable(), (SHARED_HOST / "validate.sh").as_posix(), "--mode", "not-a-mode"], capture_output=True, text=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stderr, r"(?m)^\[shared-host-validate-diag\] phase=arguments kind=shell line=[1-9][0-9]* exit=1$")
+
+    def test_validator_err_trap_reports_unexpected_command_failure(self) -> None:
+        source = (SHARED_HOST / "validate.sh").read_text(encoding="utf-8")
+        prefix = source.split("SCRIPT_DIR=", 1)[0]
+        result = subprocess.run([bash_executable(), "-c", prefix + "\nDIAG_PHASE=host\nfalse\n"], capture_output=True, text=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stderr, r"(?m)^\[shared-host-validate-diag\] phase=host kind=shell line=[1-9][0-9]* exit=1$")
+
+    def test_compose_contract_rejection_has_safe_machine_location(self) -> None:
+        source = (SHARED_HOST / "validate.sh").read_text(encoding="utf-8")
+        blocks = re.findall(r"<<'PY'\n(.*?)\nPY(?:\n|$)", source, re.S)
+        module = next(ast.parse(block) for block in blocks if "def bind_refuses_host_creation(" in block)
+        functions = [item for item in module.body if isinstance(item, ast.FunctionDef) and item.name in ("fail", "expect")]
+        namespace = {"sys": sys}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), "compose-contract", "exec"), namespace)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            namespace["expect"](False, "SECRET-MUST-NOT-ENTER-DIAGNOSTIC")
+        markers = [line for line in stderr.getvalue().splitlines() if line.startswith("[shared-host-validate-diag]")]
+        self.assertEqual(len(markers), 1)
+        self.assertRegex(markers[0], r"^\[shared-host-validate-diag\] phase=compose-contract kind=contract line=[1-9][0-9]* exit=1$")
+        self.assertNotIn("SECRET", markers[0])
 
     def test_environment_contract_uses_dedicated_host_paths(self) -> None:
         expected = {

@@ -72,7 +72,7 @@ def command_environment() -> dict[str, str]:
             "PYTHONDONTWRITEBYTECODE": "1"}
 
 
-def run(argv: list[str], input_bytes: bytes | None = None) -> bytes:
+def run(argv: list[str], input_bytes: bytes | None = None, *, validation_diagnostics: bool = False) -> bytes:
     try:
         result = subprocess.run(argv, input=input_bytes, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, check=False,
@@ -80,8 +80,15 @@ def run(argv: list[str], input_bytes: bytes | None = None) -> bytes:
     except (OSError, subprocess.TimeoutExpired) as error:
         raise DeploymentError(f"{Path(argv[0]).name} could not complete; output suppressed") from error
     if result.returncode:
+        # Only the reviewed validator call opts into fixed-format locations.
+        # Config values, human messages and every other command stay suppressed.
+        if validation_diagnostics:
+            phases = {"arguments", "dependencies", "env", "lan-inputs", "compose-render", "compose-contract", "host", "mount", "host-identity", "port", "paths", "config", "data", "storage-identity", "tls", "runtime-config", "secrets", "bootstrap"}
+            markers = re.findall(rb"^\[shared-host-validate-diag\] phase=([a-z-]+) kind=(shell|contract) line=([1-9][0-9]{0,4}) exit=([1-9][0-9]{0,2})$", result.stderr, re.MULTILINE)
+            for diagnostic_phase, kind, line, status in markers:
+                if diagnostic_phase.decode("ascii") in phases and int(status) <= 255:
+                    raise DeploymentError(f"validator rejected phase {diagnostic_phase.decode('ascii')} at {kind.decode('ascii')} line {int(line)} (exit {int(status)}); output suppressed")
         # curl login responses and Docker diagnostics may contain credentials.
-        # Keep every caller's phase while never reflecting raw tool output.
         raise DeploymentError(f"{Path(argv[0]).name} failed (exit {result.returncode}); output suppressed")
     return result.stdout
 
@@ -355,7 +362,7 @@ def validate_deployment(paths: Paths, metadata: dict) -> None:
         raise DeploymentError("storage evidence is absent from deployment metadata")
     if metadata["exposure"] in ("lan", "debug"):
         command += ["--" + metadata["exposure"]]
-    run(command)
+    run(command, validation_diagnostics=True)
 
 
 def tls_inputs(args) -> dict[str, bytes]:

@@ -19,6 +19,27 @@ SPEC.loader.exec_module(lifecycle)
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_validator_diagnostic_reports_only_machine_safe_location(self):
+        raw = b"PASSWORD-MUST-NOT-LEAK\n[shared-host-validate-diag] phase=compose-contract kind=contract line=248 exit=1\nTOKEN-MUST-NOT-LEAK\n"
+        with mock.patch.object(lifecycle.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"SECRET", raw)):
+            with self.assertRaises(lifecycle.DeploymentError) as failure:
+                lifecycle.run(["bash", "/approved/validate.sh"], validation_diagnostics=True)
+        message = str(failure.exception)
+        self.assertIn("compose-contract", message)
+        self.assertIn("contract line 248", message)
+        for secret in ("PASSWORD", "TOKEN", "SECRET"):
+            self.assertNotIn(secret, message)
+
+    def test_other_commands_and_invalid_validator_markers_remain_suppressed(self):
+        for enabled, marker in ((False, b"[shared-host-validate-diag] phase=host kind=shell line=25 exit=1"), (True, b"[shared-host-validate-diag] phase=SECRET kind=shell line=25 exit=1"), (True, b"[shared-host-validate-diag] phase=host kind=shell line=25 exit=1 SECRET")):
+            with self.subTest(enabled=enabled, marker=marker):
+                with mock.patch.object(lifecycle.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"SECRET", marker + b"\n")):
+                    with self.assertRaises(lifecycle.DeploymentError) as failure:
+                        lifecycle.run(["bash", "/approved/validate.sh"], validation_diagnostics=enabled)
+                self.assertIn("output suppressed", str(failure.exception))
+                self.assertNotIn("SECRET", str(failure.exception))
+                self.assertNotIn("line 25", str(failure.exception))
+
     def test_env_rejects_duplicate_and_shell_interpolation(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ".env"

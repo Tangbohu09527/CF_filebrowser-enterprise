@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Machine-safe failure locations contain no command, path, configuration value
+# or stderr payload. lifecycle.py accepts only this fixed diagnostic grammar.
+DIAG_PHASE=arguments
+diagnostic() {
+  printf '[shared-host-validate-diag] phase=%s kind=%s line=%s exit=%s\n' "$DIAG_PHASE" "$3" "$1" "$2" >&2
+}
+trap 'diagnostic "$LINENO" "$?" shell' ERR
+
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 MODE=staging
 DEBUG=false
@@ -17,6 +25,7 @@ log() {
 }
 
 die() {
+  diagnostic "${BASH_LINENO[0]}" 1 shell
   printf '[shared-host-validate] ERROR: %s\n' "$*" >&2
   exit 1
 }
@@ -119,6 +128,7 @@ assert_env_value() {
   [[ "$actual" == "$expected" ]] || die "$key must be $expected"
 }
 
+DIAG_PHASE=dependencies
 require_command docker
 require_command env
 require_command grep
@@ -189,6 +199,7 @@ fi
 ((compose_major > 2 || (compose_major == 2 && compose_minor >= 20))) ||
   die "Docker Compose 2.20 or newer is required; found $compose_version"
 
+DIAG_PHASE=env
 if grep -Eiq '^[[:space:]]*(export[[:space:]]+)?[A-Z0-9_]*(PASSWORD|SECRET|TOKEN|COOKIE)[A-Z0-9_]*[[:space:]]*=' "$ENV_FILE"; then
   die 'the env file must not contain password, Secret, Token, or Cookie values'
 fi
@@ -223,6 +234,7 @@ if [[ "$MODE" == candidate || "$MODE" == production ]]; then
     die "$MODE mode rejects an unapproved placeholder immutable digest"
 fi
 
+DIAG_PHASE=lan-inputs
 LAN_BIND_IP=
 LAN_PORT=
 LAN_TLS_SERVER_NAME=
@@ -279,6 +291,7 @@ compose_config() {
     docker compose --env-file "$ENV_FILE" "$@" --profile approved config --format json
 }
 
+DIAG_PHASE=compose-render
 base_json=$(compose_config -f "$SCRIPT_DIR/compose.yaml") || die 'base Compose configuration is invalid'
 debug_json=$(compose_config -f "$SCRIPT_DIR/compose.yaml" -f "$SCRIPT_DIR/compose.debug.yaml") ||
   die 'debug Compose configuration is invalid'
@@ -289,6 +302,7 @@ if [[ "$LAN" == true ]]; then
     die 'LAN Compose configuration is invalid'
 fi
 
+DIAG_PHASE=compose-contract
 SHARED_HOST_LAN_JSON=$lan_json \
 SHARED_HOST_LAN_BIND_IP=$LAN_BIND_IP \
 SHARED_HOST_LAN_PORT=$LAN_PORT \
@@ -308,14 +322,18 @@ from pathlib import Path
 import yaml
 
 
-def fail(message: str) -> None:
+def fail(message: str, *, line: int | None = None) -> None:
+    if line is None:
+        line = sys._getframe(1).f_lineno
+    # contract line is relative to this embedded Python block, not shell YAML.
+    print(f"[shared-host-validate-diag] phase=compose-contract kind=contract line={line} exit=1", file=sys.stderr)
     print(f"[shared-host-validate] ERROR: {message}", file=sys.stderr)
     raise SystemExit(1)
 
 
 def expect(condition: bool, message: str) -> None:
     if not condition:
-        fail(message)
+        fail(message, line=sys._getframe(1).f_lineno)
 
 
 def bind_refuses_host_creation(volume: dict) -> bool:
@@ -640,6 +658,7 @@ if [[ "$ASSETS_ONLY" == true ]]; then
   exit 0
 fi
 
+DIAG_PHASE=host
 case "$FILEBROWSER_IMAGE" in
   *'.invalid'*|*replace-with*) die 'FILEBROWSER_IMAGE still contains a non-deployable placeholder' ;;
 esac
@@ -671,6 +690,7 @@ fqdn_hostname=$(hostname -f 2>/dev/null || true)
 [[ "$EXPECTED_HOSTNAME" == "$actual_hostname" || "$EXPECTED_HOSTNAME" == "$fqdn_hostname" ]] ||
   die "confirmed hostname does not match this host"
 
+DIAG_PHASE=mount
 mountpoint -q /srv/storage || die '/srv/storage must be an independent mount point'
 storage_target=$(findmnt -n -o TARGET --target /srv/storage 2>/dev/null) ||
   die '/srv/storage mount details could not be determined'
@@ -712,6 +732,7 @@ elif [[ "$raid_confirmation" != true ]]; then
   die 'RAID status requires --raid-check-command or --raid-confirmed'
 fi
 
+DIAG_PHASE=host-identity
 if getent passwd "$FILEBROWSER_UID" >/dev/null 2>&1; then
   die "FILEBROWSER_UID maps to an existing host account"
 else
@@ -725,6 +746,7 @@ else
   [[ "$getent_status" == 2 ]] || die 'host group lookup failed'
 fi
 
+DIAG_PHASE=port
 if [[ "$DEBUG" == true || "$LAN" == true ]]; then
   bind_ip=127.0.0.1
   bind_port=18081
@@ -800,11 +822,13 @@ assert_secret_file() {
   ' "$path" >/dev/null || die "$label must be one non-empty line with the required length"
 }
 
+DIAG_PHASE=paths
 require_directory "$SOURCE_ROOT" 'source root'
 assert_canonical_path "$SOURCE_ROOT" 'source root'
 [[ -f "$SOURCE_ROOT/scripts/container-entrypoint.sh" && ! -L "$SOURCE_ROOT/scripts/container-entrypoint.sh" && -x "$SOURCE_ROOT/scripts/container-entrypoint.sh" ]] ||
   die 'the reviewed container entrypoint is missing, unsafe, or not executable'
 assert_canonical_path "$SOURCE_ROOT/scripts/container-entrypoint.sh" 'reviewed container entrypoint'
+DIAG_PHASE=config
 require_directory "$CONFIG_ROOT" 'configuration root'
 assert_canonical_path "$CONFIG_ROOT" 'configuration root'
 assert_owner_mode "$CONFIG_ROOT" 750 0 "$FILEBROWSER_GID" 'configuration root'
@@ -823,6 +847,7 @@ env_mode=$(stat -c '%a' -- "$ENV_FILE") || die 'env file mode could not be read'
 env_uid=$(stat -c '%u' -- "$ENV_FILE") || die 'env file owner could not be read'
 [[ "$env_uid" == 0 && "$env_mode" == 600 ]] || die 'the real env file must be root-owned with mode 0600'
 
+DIAG_PHASE=data
 assert_owned_directory "$DATA_ROOT" 'data root'
 assert_canonical_path "$DATA_ROOT" 'data root'
 assert_owned_directory "$CACHE_ROOT" 'cache root'
@@ -832,6 +857,7 @@ assert_canonical_path "$FILES_ROOT" 'files root'
 require_directory "$BACKUP_ROOT" 'future backup root'
 assert_canonical_path "$BACKUP_ROOT" 'future backup root'
 
+DIAG_PHASE=storage-identity
 storage_identity=/srv/storage/cf-filebrowser-enterprise/.storage-identity
 for identity_file in "$CONFIG_ROOT/storage.identity" "$storage_identity"; do
   [[ -f "$identity_file" && ! -L "$identity_file" ]] || die 'storage identity is missing or unsafe'
@@ -847,6 +873,7 @@ cmp -s -- "$CONFIG_ROOT/storage.identity" "$storage_identity" || die 'storage id
 [[ $(findmnt -n -o TARGET --target "$FILES_ROOT") == /srv/storage ]] ||
   die 'files root must be on the confirmed /srv/storage mount'
 
+DIAG_PHASE=tls
 if [[ "$LAN" == true ]]; then
   require_command openssl
   require_directory "$CONFIG_ROOT/tls" 'TLS directory'
@@ -866,6 +893,7 @@ if [[ "$LAN" == true ]]; then
     die 'TLS key must be valid and available without interactive passphrase'
   [[ "$cert_public" == "$key_public" ]] || die 'TLS certificate and key do not match'
 fi
+DIAG_PHASE=runtime-config
 "$PYTHON_BIN" - "$CONFIG_ROOT/config.yaml" "$LAN" "$LAN_ALLOW_CIDRS" <<'PYCONFIG'
 import sys
 import yaml
@@ -881,9 +909,11 @@ if not valid:
     raise SystemExit(1)
 PYCONFIG
 
+DIAG_PHASE=secrets
 assert_secret_file "$CONFIG_ROOT/secrets/jwt_token_secret" 32 'JWT token Secret'
 assert_secret_file "$CONFIG_ROOT/secrets/totp_secret" 32 'TOTP Secret'
 
+DIAG_PHASE=bootstrap
 database_file=$DATA_ROOT/database.db
 bootstrap_file=$CONFIG_ROOT/secrets/bootstrap_admin_password
 [[ ! -L "$database_file" ]] || die 'database.db must not be a symbolic link'
