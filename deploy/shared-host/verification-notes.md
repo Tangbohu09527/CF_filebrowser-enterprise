@@ -896,3 +896,62 @@ current-host image derivation and logical/physical display boundaries for empty,
 aligned and cross-block controlled files. `git diff --check` also passed.
 The next actual fixed-image run must confirm the FileBridge correction and
 execute all remaining WebDAV/UI/reboot/recovery stages.
+
+
+## Converted-document viewer red test and retained original UI failures
+
+Test-only source `ac9f7a5b3154ce3e5ded83293687a0fa8decfc3c` failed exactly
+six frontend unit cases in [job 101732785667](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34119115863/job/101732785667):
+XLSX, PPTX and SVG, in authenticated and shared contexts, requested `original`
+instead of a derived image. The real Preview component's computed URL was
+executed; its surrounding store/API dependencies were mocked. The other 131
+unit cases passed, including 16 original-download and HEIC/raw/Safari contract
+controls in the new file. This is a reproduced URL selection failure, not a
+claim that six real document renderers were exercised by those unit tests.
+
+The repair changes only the converted-document branch to the existing `xlarge`
+preview. Original-file download, inline PDF/TXT/image reads, HEIC/raw selection,
+backend `original` behavior and all authorization/error assertions are retained.
+The existing shared-host Playwright project now opens two distinct synthetic
+XLSX files through that actual viewer, requires a successful full-image xlarge
+response and decoded nonwhite pixels, and rejects identical raster digests.
+Its evidence contains only dimensions, nonwhite-pixel counts and pixel hashes.
+The original workbook bytes are unchanged; the alternate workbook is uploaded
+through the normal API and included in the existing stored-file and restore
+hash checks. This tests content-sensitive raster preview, not OnlyOffice or
+semantic spreadsheet interpretation. It still requires an actual VM run.
+
+The API probe now describes successful image MIME/bytes as `image_response`
+and explicitly records that it did not validate decoded content. Its requests
+use xlarge, matching the document viewer. The old small thumbnail path crops
+to fill, which could explain matching short-document white thumbnails; no
+original JPEG pixels were retained from the historical run, so that explanation
+remains an inference, not a proven renderer failure or icon fallback.
+
+[cf1b6bc9 source job 101729409747](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34117109983/job/101729409747)
+passed Sharing 13/13, Settings 25/25 and Noauth 29/29, including the copy refresh
+repair. General then passed 21 and failed two cases. Its copy test expected a
+trailing slash in the selected directory label, while the component and actual
+response displayed `/myfolder`; only that exact label expectation is corrected,
+retaining both real copies and all notification/result/error checks. The
+duplicate-finder case received HTTP 200 but did not display its two expected
+entries. It remains under investigation without changing its locator, timeout,
+fixture sizes or safety requirements. Later source suites were not executed.
+
+
+The UI evidence reader additionally requires exactly the five existing case
+IDs, finite retry/status values, successful final case outcomes, a zero process
+exit and valid distinct nonblank rasters. Failures retain only those safe case
+states and bounded raster values; raw guest/browser output stays private. Its
+new rejection tests failed before implementation; the complete existing VM
+harness file then passed 52/52 local tests, retaining all original 44 tests.
+This is reporter validation, not real application UI acceptance. Python/API
+regression, TypeScript syntax and fixture XML/CRC checks also passed locally.
+
+The later cf1b6bc9 fixed-image run repeated the complete LAN and initial API
+prefix with the same original FileBridge list assertion failure. Its guest
+Image ID was
+`sha256:bfb0e960bd0f7c5b5b8e6c3f4ac5ce505e9294f98f608750059537e31e053169`.
+Disk/RAM usage remained 78,383,906,816 / 4,294,967,296 bytes. No UI, reboot or
+restore pass is inferred from that prefix. The already committed FileBridge
+helper correction is being exercised by a later fixed-image run.

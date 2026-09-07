@@ -195,7 +195,7 @@ def pdf_fixture():
     return data + b"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n" + str(xref).encode() + b"\n%%EOF\n"
 
 
-def spreadsheet_fixture():
+def spreadsheet_fixture(*, alternate=False):
     entries = {
         "[Content_Types].xml": '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>',
         "_rels/.rels": '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
@@ -203,6 +203,13 @@ def spreadsheet_fixture():
         "xl/_rels/workbook.xml.rels": '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>',
         "xl/worksheets/sheet1.xml": '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Isolated acceptance</t></is></c><c r="B1"><v>42</v></c></row></sheetData></worksheet>',
     }
+    if alternate:
+        rows = "".join(
+            f'<row r="{row}"><c r="A{row}" t="inlineStr"><is><t>Different workbook row {row}</t></is></c>'
+            f'<c r="B{row}"><v>{9000 + row}</v></c></row>' for row in range(1, 25))
+        entries["xl/worksheets/sheet1.xml"] = (
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<sheetData>' + rows + '</sheetData></worksheet>')
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as package:
         for name, content in entries.items():
@@ -219,6 +226,7 @@ def fixtures():
     return {"中文 空格.txt": "隔离环境字节一致性\nFileBrowser acceptance\n".encode(),
             "empty.txt": b"", "large-8MiB.bin": bytes(range(256)) * 32768,
             "document.pdf": pdf_fixture(), "spreadsheet.xlsx": spreadsheet,
+            "spreadsheet-alternative.xlsx": spreadsheet_fixture(alternate=True),
             "picture.png": png_fixture(), "photo.jpg": jpeg}
 
 
@@ -403,11 +411,16 @@ class Acceptance:
         for name in ("中文 空格.txt", "document.pdf", "spreadsheet.xlsx", "picture.png", "photo.jpg"):
             metadata = self.resource("preview_metadata", "GET", "/" + name, worker).json()
             advertised = metadata.get("hasPreview") is True
-            response = self.client.request("GET", "/api/resources/preview", token=worker, query={"source": SOURCE, "path": "/" + name, "size": "small"})
+            response = self.client.request("GET", "/api/resources/preview", token=worker, query={"source": SOURCE, "path": "/" + name, "size": "xlarge"})
             kind = name.split(".")[-1]
             if response.status == 200 and response.body and response.headers.get("content-type", "").startswith("image/"):
-                self.preview[kind] = {"advertised": advertised, "observed": "image_preview", "sha256": hashlib.sha256(response.body).hexdigest()}
-                self.check("actual_preview_" + kind, True)
+                # MIME and byte presence do not prove decoded document content.
+                # Existing shared-host Playwright verifies the XLSX viewer pixels;
+                # the PDF native browser viewer remains a separate capability.
+                self.preview[kind] = {"advertised": advertised, "observed": "image_response", "size": "xlarge",
+                                      "content_validation": "not_performed_by_api_probe",
+                                      "sha256": hashlib.sha256(response.body).hexdigest()}
+                self.check("preview_image_response_" + kind, True)
             elif not advertised and response.status in (400, 501):
                 self.preview[kind] = {"advertised": False, "observed": "no_server_image_preview", "http_status": response.status}
                 self.check("preview_capability_report_" + kind, True)

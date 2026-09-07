@@ -677,10 +677,60 @@ test -z "$(git -C {SOURCE} status --porcelain=v1)"
     return {"go_version": vm.read_file(GUEST + "/filebridge-go-version.txt").decode().strip(), "binary_sha256": hashlib.sha256(vm.read_file(GUEST + "/filebrowser-agentctl")).hexdigest()}
 
 
+UI_CASE_IDS = ('crud', 'png', 'jpg', 'xlsx', 'logout')
+UI_CASE_STATUSES = ('passed', 'failed', 'timedOut', 'skipped', 'interrupted')
+
+
+def ui_case_evidence(raw):
+    try:
+        if len(raw) > 16 * 1024:
+            raise ValueError('case summary exceeds bound')
+        lines = raw.splitlines()
+        if not 1 <= len(lines) <= 15:
+            raise ValueError('case attempt count invalid')
+        attempts, final, last_retry = [], {}, {}
+        for line in lines:
+            record = json.loads(line)
+            if not isinstance(record, dict) or set(record) != {'case', 'status', 'retry'}:
+                raise ValueError('case fields invalid')
+            case, status, retry = record['case'], record['status'], record['retry']
+            if case not in UI_CASE_IDS or status not in UI_CASE_STATUSES or type(retry) is not int or not 0 <= retry <= 2:
+                raise ValueError('case values invalid')
+            if retry != last_retry.get(case, -1) + 1:
+                raise ValueError('case retry order invalid')
+            attempts.append({'case': case, 'status': status, 'retry': retry})
+            final[case], last_retry[case] = status, retry
+        return {'schema': 1, 'attempts': attempts, 'final': final,
+                'passed': set(final) == set(UI_CASE_IDS) and all(status == 'passed' for status in final.values())}
+    except (ValueError, TypeError, UnicodeError):
+        raise VerificationError('UI case evidence missing or invalid; private output suppressed') from None
+
+
+def ui_raster_evidence(value, *, require_content=True):
+    def require(condition):
+        if not condition:
+            raise VerificationError("UI raster evidence contract failed; private output suppressed") from None
+
+    require(isinstance(value, dict) and set(value) == {'schema', 'rasters'})
+    require(type(value['schema']) is int and value['schema'] == 1)
+    require(isinstance(value['rasters'], list) and len(value['rasters']) == 2)
+    rasters = []
+    for raster in value['rasters']:
+        require(isinstance(raster, dict) and set(raster) == {'width', 'height', 'nonWhitePixels', 'pixelSha256'})
+        require(all(type(raster[field]) is int for field in ('width', 'height', 'nonWhitePixels')))
+        require(1 <= raster['width'] <= 1024 and 1 <= raster['height'] <= 1024)
+        require(0 <= raster['nonWhitePixels'] <= raster['width'] * raster['height'])
+        require(not require_content or raster['nonWhitePixels'] > 10)
+        require(isinstance(raster['pixelSha256'], str) and re.fullmatch(r'[0-9a-f]{64}', raster['pixelSha256']) is not None)
+        rasters.append({name: raster[name] for name in ('width', 'height', 'nonWhitePixels', 'pixelSha256')})
+    require(not require_content or rasters[0]['pixelSha256'] != rasters[1]['pixelSha256'])
+    return {'schema': 1, 'rasters': rasters}
+
+
 def real_ui(vm):
     # Browser/API trust is installed only inside this disposable test VM. The
     # browser runs as the unprivileged management user, with private outputs.
-    vm.command_on_guest(f"""
+    result = vm.command_on_guest(f"""
 export DEBIAN_FRONTEND=noninteractive
 apt-get install --yes --no-install-recommends nodejs npm libnss3-tools
 install -m 0644 {GUEST}/ca.crt /usr/local/share/ca-certificates/cf-verification.crt
@@ -695,7 +745,30 @@ sudo -u {VM_USER} certutil -N -d sql:/home/{VM_USER}/.pki/nssdb --empty-password
 sudo -u {VM_USER} certutil -A -d sql:/home/{VM_USER}/.pki/nssdb -n 'CF disposable verification CA' -t 'C,,' -i /home/{VM_USER}/verification/ca.crt
 sudo -u {VM_USER} env HOME=/home/{VM_USER} PLAYWRIGHT_BROWSERS_PATH=/opt/cf-playwright NODE_EXTRA_CA_CERTS=/home/{VM_USER}/verification/ca.crt FILEBROWSER_ACCEPTANCE_CA=/home/{VM_USER}/verification/ca.crt FILEBROWSER_ACCEPTANCE_URL=https://{TLS_NAME}:{TLS_PORT} FILEBROWSER_ACCEPTANCE_STATE=/home/{VM_USER}/verification/api-state.json FILEBROWSER_ACCEPTANCE_OUTPUT=/home/{VM_USER}/verification/playwright-output npx playwright test --project shared-host
 test -z "$(git -C {SOURCE} status --porcelain=v1)"
-""", timeout=1800)
+""", timeout=1800, check=False)
+    report = {'passed': False, 'cases': {'passed': False, 'failure': 'missing-or-invalid'}, 'raster_passed': False}
+    if type(result.returncode) is int and -255 <= result.returncode <= 255:
+        report['process_exit_code'] = result.returncode
+    output = f"/home/{VM_USER}/verification/playwright-output/"
+    try:
+        report['cases'] = ui_case_evidence(vm.read_file(output + 'ui-case-evidence.ndjson'))
+    except (VerificationError, OSError, ValueError, TypeError):
+        pass
+    try:
+        raw = vm.read_file(output + 'xlsx-raster-evidence.json')
+        if len(raw) > 16 * 1024:
+            raise ValueError('bounded raster summary exceeded')
+        report['raster'] = ui_raster_evidence(json.loads(raw), require_content=False)
+        ui_raster_evidence(report['raster'])
+        report['raster_passed'] = True
+    except (VerificationError, OSError, ValueError, TypeError):
+        pass
+    report['passed'] = report.get('process_exit_code') == 0 and report['cases']['passed'] and report['raster_passed']
+    if not report['passed']:
+        error = VerificationError('existing Playwright UI failed; sanitized case evidence retained')
+        error.ui_evidence = report
+        raise error from None
+    return report
 
 
 LAN_PROBE_STAGES = ('guest-dispatch', 'allowed-health-before', 'allowed-ui', 'trusted-context',
@@ -1067,7 +1140,7 @@ test ! -e /srv/storage/cf-filebrowser-enterprise
         evidence["protocols"] = api(client, "protocols", "api-protocols.json")
         evidence["checks"].append("fixed-source FileBridge binary and WebDAV exercised over strictly verified HTTPS with ordinary-user/Token denial boundaries")
         record_stage(args, evidence, "initial-existing-playwright-ui")
-        real_ui(client)
+        evidence["initial_ui"] = real_ui(client)
         evidence["checks"].append("existing Playwright shared-host project passed in second VM with normal-user Chromium and explicit trusted CA")
         record_stage(args, evidence, "formal-stop-start-and-container-restart")
         server.command_on_guest(f"{manage} stop --hostname {server.name}\n{manage} start --hostname {server.name}")
@@ -1181,7 +1254,7 @@ if bash {SOURCE}/deploy/shared-host/backup.sh restore {GUEST}/verification.tar -
         record_stage(args, evidence, "restored-real-api-verification")
         evidence["restored_api"] = api(server, "verify-restored", "api-restored.json")
         record_stage(args, evidence, "restored-existing-playwright-ui")
-        real_ui(server)
+        evidence["restored_ui"] = real_ui(server)
         evidence["checks"].append("existing Playwright UI passed against restored system from the other isolated VM")
         evidence["checks"].append("consistent stopped backup, authenticated transfer, corrupt/incomplete/permission/version/occupied-target refusals, formal blank second-VM restore, bootstrap absent and same-image live read/write")
         for vm in vms:
@@ -1233,6 +1306,8 @@ def main():
             evidence["failed_api"] = error.api_evidence
         if getattr(error, "lan_evidence", None) is not None:
             evidence["lan_failure"] = error.lan_evidence
+        if getattr(error, "ui_evidence", None) is not None:
+            evidence["failed_ui"] = error.ui_evidence
         print("[shared-host-vm] ERROR: " + message, file=sys.stderr)
         return 1
     finally:

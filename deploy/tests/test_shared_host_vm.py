@@ -85,6 +85,135 @@ class CertificateTrustTests(unittest.TestCase):
             self.assertEqual(completed, [True])
 
 
+class UIRasterEvidenceTests(unittest.TestCase):
+    def fixture(self):
+        return {'schema': 1, 'rasters': [
+            {'width': 640, 'height': 480, 'nonWhitePixels': 120, 'pixelSha256': 'a' * 64},
+            {'width': 640, 'height': 480, 'nonWhitePixels': 180, 'pixelSha256': 'b' * 64}]}
+
+    def case_log(self):
+        return b''.join(json.dumps({'case': case, 'status': 'passed', 'retry': 0}).encode() + b'\n'
+                        for case in ('crud', 'png', 'jpg', 'xlsx', 'logout'))
+
+    def test_case_summary_requires_every_fixed_case_final_success(self):
+        report = harness.ui_case_evidence(self.case_log())
+        self.assertTrue(report['passed'])
+        self.assertEqual(set(report['final']), {'crud', 'png', 'jpg', 'xlsx', 'logout'})
+        retry = self.case_log().replace(b'"passed"', b'"failed"', 1)
+        retry += b'{"case":"crud","status":"passed","retry":1}\n'
+        self.assertTrue(harness.ui_case_evidence(retry)['passed'])
+        partial = self.case_log().splitlines(keepends=True)[0]
+        self.assertFalse(harness.ui_case_evidence(partial)['passed'])
+
+    def test_case_summary_rejects_unknown_keys_statuses_cases_and_retry_bounds(self):
+        bad = [b'', b'PRIVATE-TOKEN', self.case_log() * 4]
+        for record in ({'case': 'unknown', 'status': 'passed', 'retry': 0},
+                       {'case': 'crud', 'status': 'PRIVATE-STATUS', 'retry': 0},
+                       {'case': 'crud', 'status': 'passed', 'retry': True},
+                       {'case': 'crud', 'status': 'passed', 'retry': -1},
+                       {'case': 'crud', 'status': 'passed', 'retry': 3},
+                       {'case': 'crud', 'status': 'passed', 'retry': '0'},
+                       {'case': 'crud', 'status': 'passed', 'retry': 0, 'title': 'PRIVATE-PASSWORD'}):
+            bad.append(json.dumps(record).encode() + b'\n')
+        bad.append(self.case_log() + self.case_log().splitlines(keepends=True)[0])
+        bad.append(b'{"case":"crud","status":"passed","retry":2}\n')
+        for raw in bad:
+            with self.subTest(raw=raw):
+                with self.assertRaises(harness.VerificationError) as caught:
+                    harness.ui_case_evidence(raw)
+                self.assertNotIn('PRIVATE', str(caught.exception))
+
+    def test_ui_failure_retains_before_each_case_failure_with_no_private_output(self):
+        vm = mock.Mock()
+        cases = self.case_log().replace(b'"passed"', b'"timedOut"', 1)
+        vm.command_on_guest.return_value = subprocess.CompletedProcess([], 1, b'PRIVATE-STDOUT', b'PRIVATE-STDERR')
+        vm.read_file.side_effect = lambda name: cases if name.endswith('.ndjson') else json.dumps(self.fixture()).encode()
+        with self.assertRaises(harness.VerificationError) as caught:
+            harness.real_ui(vm)
+        evidence = caught.exception.ui_evidence
+        self.assertFalse(evidence['passed'])
+        self.assertEqual(evidence['cases']['final']['crud'], 'timedOut')
+        self.assertFalse(evidence['cases']['passed'])
+        self.assertNotIn('PRIVATE', json.dumps(evidence))
+
+    def test_zero_exit_cannot_override_missing_case_or_blank_or_identical_rasters(self):
+        vm = mock.Mock()
+        vm.command_on_guest.return_value = subprocess.CompletedProcess([], 0, b'', b'')
+        for kind in ('missing-case', 'blank', 'identical'):
+            with self.subTest(kind=kind):
+                raster = self.fixture()
+                cases = self.case_log()
+                if kind == 'missing-case':
+                    cases = cases.splitlines(keepends=True)[0]
+                elif kind == 'blank':
+                    raster['rasters'][0]['nonWhitePixels'] = 0
+                else:
+                    raster['rasters'][1]['pixelSha256'] = raster['rasters'][0]['pixelSha256']
+                vm.read_file.side_effect = lambda name: cases if name.endswith('.ndjson') else json.dumps(raster).encode()
+                with self.assertRaises(harness.VerificationError) as caught:
+                    harness.real_ui(vm)
+                evidence = caught.exception.ui_evidence
+                self.assertFalse(evidence['passed'])
+                self.assertEqual(evidence['raster'], raster)
+                if kind != 'missing-case':
+                    self.assertFalse(evidence['raster_passed'])
+
+    def test_accepts_only_two_distinct_nonblank_raster_summaries(self):
+        value = self.fixture()
+        safe = harness.ui_raster_evidence(value)
+        self.assertEqual(safe, value)
+        self.assertIsNot(safe, value)
+        self.assertIsNot(safe['rasters'][0], value['rasters'][0])
+
+    def test_rejects_wrong_schema_keys_blank_placeholder_and_invalid_numbers(self):
+        variants = [None, [], {'schema': 1, 'rasters': []}]
+        for schema in (True, False, '1', 1.0, 2):
+            variants.append(dict(self.fixture(), schema=schema))
+        variants.append(dict(self.fixture(), secret='PRIVATE-TOKEN'))
+        variants.append(dict(self.fixture(), rasters=self.fixture()['rasters'][:1]))
+        variants.append(dict(self.fixture(), rasters=self.fixture()['rasters'] * 2))
+        same = self.fixture()
+        same['rasters'][1]['pixelSha256'] = same['rasters'][0]['pixelSha256']
+        variants.append(same)
+        for field, invalid in (('width', 0), ('width', 1025), ('width', True), ('width', '640'),
+                               ('height', 0), ('height', 1025), ('height', False), ('height', 480.0),
+                               ('nonWhitePixels', 0), ('nonWhitePixels', 10), ('nonWhitePixels', 640 * 480 + 1),
+                               ('nonWhitePixels', True), ('nonWhitePixels', '120'),
+                               ('pixelSha256', 'a' * 63), ('pixelSha256', 'g' * 64), ('pixelSha256', True),
+                               ('secret', 'PRIVATE-PASSWORD')):
+            value = self.fixture()
+            value['rasters'][0][field] = invalid
+            variants.append(value)
+        for value in variants:
+            with self.subTest(value=value):
+                with self.assertRaises(harness.VerificationError) as caught:
+                    harness.ui_raster_evidence(value)
+                self.assertNotIn('PRIVATE', str(caught.exception))
+
+    def test_real_ui_reads_the_existing_private_output_and_returns_only_summary(self):
+        vm = mock.Mock()
+        vm.command_on_guest.return_value = subprocess.CompletedProcess([], 0, b'PRIVATE-STDOUT', b'PRIVATE-STDERR')
+        vm.read_file.side_effect = lambda name: self.case_log() if name.endswith('.ndjson') else json.dumps(self.fixture()).encode()
+        report = harness.real_ui(vm)
+        self.assertTrue(report['passed'])
+        self.assertEqual(report['raster'], self.fixture())
+        self.assertTrue(report['cases']['passed'])
+        vm.read_file.assert_any_call('/home/cf-manager/verification/playwright-output/xlsx-raster-evidence.json')
+        vm.read_file.assert_any_call('/home/cf-manager/verification/playwright-output/ui-case-evidence.ndjson')
+        self.assertFalse(vm.command_on_guest.call_args.kwargs['check'])
+
+    def test_real_ui_failures_never_include_guest_output_or_invalid_json(self):
+        vm = mock.Mock()
+        for code, payload in ((1, json.dumps(self.fixture()).encode()), (0, b'PRIVATE-PASSWORD')):
+            with self.subTest(code=code):
+                vm.command_on_guest.return_value = subprocess.CompletedProcess([], code, b'PRIVATE-TOKEN', b'PRIVATE-STDERR')
+                vm.read_file.return_value = payload
+                with self.assertRaises(harness.VerificationError) as caught:
+                    harness.real_ui(vm)
+                self.assertNotIn('PRIVATE', str(caught.exception))
+                self.assertTrue(caught.exception.__suppress_context__)
+
+
 class LANBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.tcp = mock.Mock()

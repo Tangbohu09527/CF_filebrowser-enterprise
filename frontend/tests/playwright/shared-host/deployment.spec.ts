@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
+import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { expect, test, type Page } from "@playwright/test";
 
 let credentials: { username: string; password: string };
@@ -20,6 +21,27 @@ test.beforeAll(async () => {
   if (!credentials?.username || !credentials?.password || !source) {
     throw new Error("Acceptance state requires an ordinary UI user and source");
   }
+});
+
+const evidenceCaseIds: Record<string, string> = {
+  "ordinary user uploads, edits, renames, downloads exact bytes and deletes": "crud",
+  "decodes the actual picture.png preview": "png",
+  "decodes the actual photo.jpg preview": "jpg",
+  "renders distinct nonblank XLSX content in the actual document viewer": "xlsx",
+  "ordinary user logs out and loses access to the listing": "logout",
+};
+
+test.afterEach(async ({}, testInfo) => {
+  const caseId = evidenceCaseIds[testInfo.title];
+  const status = testInfo.status;
+  const output = process.env.FILEBROWSER_ACCEPTANCE_OUTPUT;
+  if (!caseId || !status || !["passed", "failed", "timedOut", "skipped", "interrupted"].includes(status) ||
+      !Number.isInteger(testInfo.retry) || testInfo.retry < 0 || testInfo.retry > 2 || !output) {
+    throw new Error("UI case evidence metadata is invalid");
+  }
+  await mkdir(output, { recursive: true, mode: 0o700 });
+  await appendFile(resolve(output, "ui-case-evidence.ndjson"),
+    JSON.stringify({ case: caseId, status, retry: testInfo.retry }) + "\n", { mode: 0o600 });
 });
 
 test.beforeEach(async ({ page }) => {
@@ -84,6 +106,62 @@ for (const filename of ["picture.png", "photo.jpg"]) {
     )).toBe(true);
   });
 }
+
+test("renders distinct nonblank XLSX content in the actual document viewer", async ({ page }) => {
+  const observations: Array<{ width: number; height: number; nonWhitePixels: number; pixelSha256: string }> = [];
+  for (const filename of ["spreadsheet.xlsx", "spreadsheet-alternative.xlsx"]) {
+    await page.goto(listing());
+    const rendered = page.waitForResponse(response => {
+      const requested = new URL(response.url());
+      return response.request().method() === "GET" && requested.pathname === "/api/resources/preview" &&
+        requested.searchParams.get("source") === source && requested.searchParams.get("path") === "/" + filename &&
+        requested.searchParams.get("size") === "xlarge";
+    });
+    await item(page, filename).dblclick();
+    const response = await rendered;
+    expect(response.status()).toBe(200);
+    expect(await response.finished()).toBeNull();
+    await expect(page.locator("#previewer")).toBeVisible();
+    // Select the full viewer image, never its cached thumbnail placeholder.
+    const fullImage = page.locator('#previewer img.image-ex-img[src*="size=xlarge"]');
+    await expect(fullImage).toHaveCount(1);
+    const pixels = await fullImage.evaluate(async element => {
+      if (!(element instanceof HTMLImageElement)) throw new Error("Document viewer image is missing");
+      await element.decode();
+      const width = element.naturalWidth;
+      const height = element.naturalHeight;
+      // The existing xlarge endpoint fits inside 1024 x 1024 pixels.
+      if (width < 1 || height < 1 || width > 1024 || height > 1024) {
+        throw new Error("Document viewer dimensions are invalid");
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("Document viewer pixels are unavailable");
+      context.fillStyle = "white";
+      context.fillRect(0, 0, width, height);
+      context.drawImage(element, 0, 0);
+      const imageData = context.getImageData(0, 0, width, height).data;
+      let nonWhitePixels = 0;
+      for (let offset = 0; offset < imageData.length; offset += 4) {
+        if (imageData[offset] < 240 || imageData[offset + 1] < 240 || imageData[offset + 2] < 240) nonWhitePixels++;
+      }
+      const hash = await crypto.subtle.digest("SHA-256", imageData);
+      const pixelSha256 = Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("");
+      return { width, height, nonWhitePixels, pixelSha256 };
+    });
+    observations.push(pixels);
+  }
+  const output = process.env.FILEBROWSER_ACCEPTANCE_OUTPUT;
+  if (!output) throw new Error("A private acceptance output directory is required");
+  await mkdir(output, { recursive: true, mode: 0o700 });
+  await writeFile(resolve(output, "xlsx-raster-evidence.json"),
+    JSON.stringify({ schema: 1, rasters: observations }) + "\n", { mode: 0o600, flag: "wx" });
+  for (const pixels of observations) expect(pixels.nonWhitePixels).toBeGreaterThan(10);
+  // A shared placeholder image fails even if it decodes and is not blank.
+  expect(observations[0].pixelSha256).not.toBe(observations[1].pixelSha256);
+});
 
 test("ordinary user logs out and loses access to the listing", async ({ page }) => {
   await page.locator('button[aria-label="logout-button"]').click();
