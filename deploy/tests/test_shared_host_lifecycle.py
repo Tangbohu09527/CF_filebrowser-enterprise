@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 import shlex
 import shutil
@@ -209,6 +210,120 @@ class LifecycleTests(unittest.TestCase):
             self.assertFalse(paths.bootstrap.exists())
             self.assertTrue(deployment["bootstrap_complete"])
 
+
+
+class ReadmeCommandTests(unittest.TestCase):
+    """Execute documented control flow with sudo replaced; never deploy a host."""
+
+    def block(self, marker):
+        readme = (MODULE_PATH.parent / "README.md").read_text(encoding="utf-8")
+        matches = [block for block in re.findall(r"```bash\n(.*?)\n```", readme, re.S)
+                   if marker in block]
+        self.assertEqual(len(matches), 1, "documented stage must be unambiguous")
+        return matches[0]
+
+    def run_block(self, marker, fail_operation="", inherited=False):
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash, "Bash is required for documented command regression")
+        environment = os.environ.copy()
+        environment["CF_DOC_FAIL_OPERATION"] = fail_operation
+        for name in ("SOURCE_ROOT", "APPROVED_SHA", "HOSTNAME_APPROVED", "RECORDED_BACKUP_SHA256",
+                     "APPROVED_IMAGE", "IMAGE_ID", "BASH_ENV", "ENV", "SHELLOPTS"):
+            environment.pop(name, None)
+        if inherited:
+            environment.update(APPROVED_IMAGE="inherited-wrong-image:old", IMAGE_ID="sha256:" + "0" * 64)
+        # No real sudo, Docker, Git or application command runs. The stub emits
+        # only synthetic arguments and the local image ID used by this test.
+        stub = r'''
+sudo() {
+  printf 'DOC_CALL ' >&2
+  printf '%q ' "$@" >&2
+  printf '\n' >&2
+  operation="$1"
+  if [[ "$1" = bash ]]; then operation="${2##*/}:$3"; fi
+  if [[ "$operation" = "$CF_DOC_FAIL_OPERATION" ]]; then return 73; fi
+  if [[ "$1 $2 $3" = 'docker image inspect' && "${@: -1}" = '{{.Id}}' ]]; then
+    printf 'sha256:1111111111111111111111111111111111111111111111111111111111111111\n'
+  fi
+}
+export -f sudo
+'''
+        result = subprocess.run([bash, "--noprofile", "--norc", "-s"],
+                                input=stub + self.block(marker) + "\n", text=True,
+                                capture_output=True, env=environment, timeout=15)
+        calls = [shlex.split(line.removeprefix("DOC_CALL "))
+                 for line in result.stderr.splitlines() if line.startswith("DOC_CALL ")]
+        return result, calls
+
+    def test_failed_stage_never_runs_later_management_commands(self):
+        for marker, failure in (("checkout --detach", "git"),
+                                ('manage.sh" bootstrap-finish', "manage.sh:validate"),
+                                ('backup.sh" create', "backup.sh:create"),
+                                ('backup.sh" restore', "backup.sh:restore"),
+                                ('manage.sh" prepare', "docker"),
+                                ('backup.sh" create', "docker"),
+                                ('backup.sh" restore', "docker"),
+                                (".RepoDigests", "docker")):
+            with self.subTest(stage=marker):
+                result, calls = self.run_block(marker, failure, inherited=True)
+                self.assertEqual(result.returncode, 73)
+                failed = next(i for i, call in enumerate(calls)
+                              if (call[0] == failure if failure in ("git", "docker") else
+                                  call[:1] == ["bash"] and call[1].endswith(failure.split(":")[0])
+                                  and call[2] == failure.split(":")[1]))
+                self.assertEqual(calls[failed + 1:], [], "failed stage must stop before any later command")
+
+    def test_install_backup_and_restore_derive_current_host_image_id(self):
+        local_id = "sha256:" + "1" * 64
+        for marker, operation in (('manage.sh" prepare', "prepare"),
+                                  ('backup.sh" create', "create"),
+                                  ('backup.sh" restore', "restore")):
+            for inherited in (False, True):
+                with self.subTest(stage=operation, inherited=inherited):
+                    result, calls = self.run_block(marker, inherited=inherited)
+                    self.assertEqual(result.returncode, 0)
+                    inspected = [call for call in calls if call[:3] == ["docker", "image", "inspect"]
+                                 and call[-1] == "{{.Id}}"]
+                    self.assertEqual(len(inspected), 1, "derive the local ID inside this stage")
+                    self.assertTrue(inspected[0][3])
+                    self.assertNotEqual(inspected[0][3], "inherited-wrong-image:old")
+                    action = next(call for call in calls if call[0] == "bash" and call[2] == operation)
+                    self.assertEqual(action[action.index("--image-ref") + 1], inspected[0][3])
+                    self.assertLess(calls.index(inspected[0]), calls.index(action))
+                    if operation != "prepare":
+                        self.assertEqual(action[action.index("--image-id") + 1], local_id)
+                    else:
+                        self.assertIn(local_id, result.stdout)
+
+    def test_successful_backup_still_reaches_explicit_start(self):
+        result, calls = self.run_block('backup.sh" create')
+        self.assertEqual(result.returncode, 0)
+        operations = [call[2] for call in calls if call[0] == "bash"]
+        self.assertEqual(operations, ["create", "start"])
+
+    def test_documented_bash_bodies_have_valid_syntax(self):
+        readme = (MODULE_PATH.parent / "README.md").read_text(encoding="utf-8")
+        for block in re.findall(r"```bash\n(.*?)\n```", readme, re.S):
+            lines = block.splitlines()
+            # Parse the child Bash body too; parsing only the outer heredoc
+            # would treat its commands as data and miss syntax errors.
+            if lines[0].startswith("bash <<'"):
+                lines = lines[1:-1]
+            result = subprocess.run([shutil.which("bash"), "--noprofile", "--norc", "-n", "-s"],
+                                    input="\n".join(lines) + "\n", text=True, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, "documented Bash body has invalid syntax")
+
+    def test_second_host_pull_defines_image_before_using_it(self):
+        result, calls = self.run_block(".RepoDigests", inherited=True)
+        self.assertEqual(result.returncode, 0)
+        pulls = [call for call in calls if call[:2] == ["docker", "pull"]]
+        self.assertEqual(len(pulls), 1, "second host block must include the pull after defining its input")
+        pull = pulls[0]
+        self.assertTrue(pull[-1])
+        self.assertNotEqual(pull[-1], "inherited-wrong-image:old")
+        for call in calls:
+            if call[:3] == ["docker", "image", "inspect"]:
+                self.assertEqual(call[3], pull[-1])
 
 
 class TLSInputOpenSSLTests(unittest.TestCase):

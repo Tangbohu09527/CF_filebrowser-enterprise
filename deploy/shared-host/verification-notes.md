@@ -796,6 +796,103 @@ only two field alignments in `resource_aggregate.go` and expanded one test
 function literal in `resource_aggregate_test.go` (+5/-3). The patch passed
 `git apply --check` and was applied only to those two task files. Temporary
 CI diff output was then removed, preserving the original full `go fmt ./...`
-entry. The remaining 17 baseline formatting changes were not applied. The next
-head's actual formatter output is still required to confirm these files are
-clean; a successful command alone is not used as that proof.
+entry. Formatting changes to the other 17 files were not applied. Sixteen
+whole-file blobs still match the integration baseline; the seventeenth is
+`backend/swagger/docs/docs.go`, updated by this task through the existing
+generator. A successful formatter command alone is not proof of clean source.
+
+
+## a276d255 real LAN/API progress and cf1b6bc9 source checks
+
+[Fixed-image job 101723135170](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34115475187/job/101723135170)
+ran source `a276d255e2887e80e6667f90a588669d9dbf4f18` on two Debian 13.6
+systemd guests with Docker 29.8.0 and Compose 5.5.1. The actual virtual disk
+total was 78,383,906,816 bytes and configured RAM 4,294,967,296 bytes, within
+the authorized decimal limits. Each business disk was independently mounted
+ext4; this is mount evidence, not RAID validation. The registry manifest and
+both guests' actual Image ID were
+`sha256:926982f27ce87063e57ce1de2be929617685592f3deff92d3d3eca5debe10b37`;
+the builder/config ID was
+`sha256:0d0d2d655c0414e67c80b4f82a807aaf8da0637bde1fb01497c0412049f1b32d`.
+Source/config/layer identity matched across the isolated registry transfer.
+
+Formal empty-root prepare, administrator verification, bootstrap removal,
+same-image login, idempotent prepare and the actual UID/GID/directory/tool
+checks passed. All eight LAN subchecks passed: allowed-source UI and health
+returned the expected HTTP 200 bodies before/after the controls; the denied
+source really connected over TCP with the expected source and peer, then
+received TLS EOF after 23 ms, no completed handshake and zero application
+bytes. The untrusted CA control returned curl 60. No certificate or peer
+verification was bypassed. This result does not identify the earlier
+692e4010 run's unclassified failure cause.
+
+The initial API exercise passed its 226 assertions over 167 requests, including
+file byte round trips, ordinary-user and Token permission boundaries, Share
+password states, archive rejection and audit queries. These are the executed
+assertions, not a claim that every requested acceptance category is complete.
+The preview reporter observed image responses; TXT and XLSX had the same
+response digest, so their content parsing is not established by that result.
+Preview content and the real viewer route are being checked separately.
+Persistent-store failure injection and Pending interruption remain unexecuted
+in this fixed image; existing Go regressions are separate evidence.
+
+The run stopped at `real-filebridge-and-webdav-protocols`, on
+`filebridge_list_uploaded_entry`: 55 preceding protocol assertions passed,
+with 13 HTTP requests and 11 real FileBridge binary invocations. Its compiled
+client SHA-256 was
+`6d5ac02cfd4e5e5347f905583139f62119899f4931f9ac8638ad84333b3619dd`,
+using the guest's Go 1.25.0. WebDAV's remaining protocol checks, fixed-image
+Playwright, container/daemon/host reboots and blank recovery were not reached.
+The sanitized `vm-result.json` and non-secret image input artifacts retain the
+precise failed check. No private protocol output, backup or VM disk is uploaded.
+
+At source `cf1b6bc92f942a89e6aa9e88de94c057370f0f0b`, regular backend job
+101726395679 passed `go test -race -v ./... -timeout 5m` with no failures.
+Three existing Windows-only cases and one case-insensitive-filesystem alias
+case were not executed on Linux; their conditions and assertions are unchanged.
+Frontend units passed 115/115 in 17 files. Deployment job 101726395466 passed
+`make validate-deployment` (25 and 153 tests in its two suites). Each of the
+22 tracked Shell files also passed a separate local `bash -n` at this SHA.
+These static and source checks do not replace the pending complete VM run.
+
+The cf1b6bc9 formatter no longer rewrote the two task aggregate files; it still
+reported the other 17 files described above. Full Lint still failed with the
+same 112 findings in 27 files, using Go 1.26.8 / golangci-lint 2.12.2. No finding
+was added or removed relative to the preceding uncapped inventory. Broader
+source cleanup is awaiting the explicitly requested scope decision; tests,
+rules, scan scope and failure exits remain enabled.
+
+
+## Documented stage failure closure and FileBridge list-size regression
+
+The README's dependency blocks already used child Bash with `set -euo pipefail`,
+but later naked command blocks did not inherit those options. In particular, a
+failed backup command could still reach the following start. The optional
+publish example was also the only earlier Image ID assignment, and the second
+host's image reference was used before assignment. The added executable README
+control-flow tests reproduced 11 failing subcases before the documentation fix.
+Each documented stage now has its own bounded Bash block and explicit inventory
+inputs. Prepare, backup and restore inspect the image on the current host in
+that stage; no optional publication or inherited shell variable is required.
+These tests replace sudo with a synthetic stub and are not Docker acceptance.
+
+The real a276d255 FileBridge failure was a test contract mismatch: the controlled
+47-byte regular file had already passed actual client read and SHA-256 checks.
+The directory display uses 4 KiB rounding when the source's existing
+`useLogicalSize` setting is false, so its correct listed size is 4096. The old
+helper incorrectly required 47. A direct check against that old function
+reproduced the rejection, and new mode tests failed before the helper repair.
+The helper now reads the unique source's explicit boolean setting through the
+existing settings API and requires the exact existing display calculation.
+Missing/wrong entries, source/path/name/type, invalid size or ambiguous settings
+still fail. Actual read/checksum/download assertions continue to require all
+original bytes. Product and FileBridge CLI behavior are unchanged.
+
+The two affected existing files passed together locally:
+`python.exe -B -m unittest -v deploy.tests.test_shared_host_lifecycle deploy.tests.test_shared_host_protocols`
+reported 49/49 tests passing in 2.556 seconds. This includes real strict OpenSSL
+certificate checks, documented inner Bash syntax, failure-before-start cases,
+current-host image derivation and logical/physical display boundaries for empty,
+aligned and cross-block controlled files. `git diff --check` also passed.
+The next actual fixed-image run must confirm the FileBridge correction and
+execute all remaining WebDAV/UI/reboot/recovery stages.

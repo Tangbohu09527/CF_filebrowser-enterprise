@@ -27,9 +27,12 @@ Record these inputs before installation:
 The human management account stays separate from the service identity. It must
 already have explicitly authorized `sudo` access from host provisioning; do not
 add it to `root` or `docker`, or change sudo policy for this application. Run the
-following blocks in order from that account. Each block stops on failure. Inspect
-the reported stage before continuing; do not delete existing configuration to
-make a rerun pass.
+following blocks in order from that account. Each block runs in its own Bash
+process and stops on failure, without changing the management shell's options.
+Replace every input placeholder in each block from the approved inventory;
+variables do not carry over between blocks. Record the displayed local Image ID.
+Inspect the failed stage before continuing; do not delete existing configuration
+to make a rerun pass.
 
 The following signed APT setup follows [Docker's Debian installation instructions](https://docs.docker.com/engine/install/debian/).
 It is for a clean Debian 13 amd64 host. The preflight stops if Docker packages,
@@ -154,6 +157,8 @@ reviewed `--raid-confirmed` contract.
 For a new host, with a reviewed 40-character SHA:
 
 ```bash
+bash <<'CHECKOUT_SOURCE'
+set -euo pipefail
 SOURCE_ROOT=/opt/cf-filebrowser-enterprise
 APPROVED_SHA='REPLACE_WITH_APPROVED_FULL_GIT_SHA'
 sudo test ! -e "$SOURCE_ROOT"
@@ -162,6 +167,7 @@ sudo git -C "$SOURCE_ROOT" fetch origin "$APPROVED_SHA"
 sudo git -C "$SOURCE_ROOT" checkout --detach "$APPROVED_SHA"
 sudo git -C "$SOURCE_ROOT" rev-parse HEAD
 sudo git -C "$SOURCE_ROOT" status --short
+CHECKOUT_SOURCE
 ```
 
 An existing checkout must already match the approved SHA and be clean. The
@@ -172,10 +178,15 @@ tag, an old computer's image tag, or copied/uncommitted workstation assets.
 ## 3. Build, identify and transfer the real image
 
 ```bash
+bash <<'BUILD_IMAGE'
+set -euo pipefail
+SOURCE_ROOT=/opt/cf-filebrowser-enterprise
+APPROVED_SHA='REPLACE_WITH_APPROVED_FULL_GIT_SHA'
 sudo bash "$SOURCE_ROOT/deploy/shared-host/image.sh" build \
   --source-sha "$APPROVED_SHA" --version "verified-$APPROVED_SHA" \
   --image "cf-filebrowser:verified-$APPROVED_SHA" \
   --evidence /root/cf-build-evidence-UNIQUE
+BUILD_IMAGE
 ```
 
 The evidence directory must not exist and must be outside the checkout. The
@@ -198,23 +209,35 @@ explicitly approved test registry**, with trusted TLS and normal protected
 Docker authentication already configured:
 
 ```bash
-IMAGE_ID='sha256:ACTUAL_IMAGE_ID_FROM_EVIDENCE'
+bash <<'PUBLISH_TEST_IMAGE'
+set -euo pipefail
+SOURCE_ROOT=/opt/cf-filebrowser-enterprise
+APPROVED_SHA='REPLACE_WITH_APPROVED_FULL_GIT_SHA'
+APPROVED_IMAGE='EXACT_BUILT_STAGING_REFERENCE'
+IMAGE_ID=$(sudo docker image inspect "$APPROVED_IMAGE" --format '{{.Id}}')
+printf 'Local Image ID: %s\n' "$IMAGE_ID"
 TEST_REGISTRY='registry.test:5000'
 sudo bash "$SOURCE_ROOT/deploy/shared-host/image.sh" publish \
   --source-sha "$APPROVED_SHA" --image "$IMAGE_ID" \
   --target "$TEST_REGISTRY/filebrowser:$APPROVED_SHA" \
   --approved-registry "$TEST_REGISTRY" --evidence /root/cf-publish-evidence-UNIQUE
+PUBLISH_TEST_IMAGE
 ```
 
-Use the resulting complete `repository@sha256:...` reference on the second
-host with `sudo docker pull --platform linux/amd64 "$APPROVED_IMAGE"`, then
-verify the approved RepoDigest and revision label, and record its **local** Image
-ID for lifecycle/backup operations:
+On the second host, set the resulting complete `repository@sha256:...` reference
+in this independent block before pulling it. Verify the approved RepoDigest and
+revision label, and record its **local** Image ID for lifecycle/backup operations:
 
 ```bash
+bash <<'PULL_RECOVERY_IMAGE'
+set -euo pipefail
+APPROVED_IMAGE='EXACT_APPROVED_REGISTRY_DIGEST'
+sudo docker pull --platform linux/amd64 "$APPROVED_IMAGE"
 sudo docker image inspect "$APPROVED_IMAGE" --format '{{json .RepoDigests}}'
 sudo docker image inspect "$APPROVED_IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
 IMAGE_ID=$(sudo docker image inspect "$APPROVED_IMAGE" --format '{{.Id}}')
+printf 'Local Image ID: %s\n' "$IMAGE_ID"
+PULL_RECOVERY_IMAGE
 ```
 
 Docker's classic and containerd image stores can identify the same approved
@@ -250,9 +273,12 @@ Create a protected **input** password through your secret-management procedure.
 For a new isolated installation, an example that refuses to overwrite a file is:
 
 ```bash
+bash <<'PREPARE_PASSWORD_INPUT'
+set -euo pipefail
 sudo install -d -o root -g root -m 0700 /root/cf-install-inputs
 sudo bash -c 'umask 077; set -o noclobber; openssl rand -hex 24 > "$1"' \
   bash /root/cf-install-inputs/admin-password
+PREPARE_PASSWORD_INPUT
 ```
 
 Keep this input independently protected for administrator login and interrupted
@@ -262,13 +288,20 @@ It preserves an existing valid deployment on identical reruns and refuses
 partial or conflicting installations instead of filling them with new secrets.
 
 ```bash
+bash <<'PREPARE_DEPLOYMENT'
+set -euo pipefail
+SOURCE_ROOT=/opt/cf-filebrowser-enterprise
+APPROVED_SHA='REPLACE_WITH_APPROVED_FULL_GIT_SHA'
 HOSTNAME_APPROVED='EXACT_TARGET_HOSTNAME'
 APPROVED_IMAGE='EXACT_BUILT_STAGING_REFERENCE_OR_APPROVED_REGISTRY_DIGEST'
 sudo bash "$SOURCE_ROOT/deploy/shared-host/manage.sh" check --hostname "$HOSTNAME_APPROVED"
+IMAGE_ID=$(sudo docker image inspect "$APPROVED_IMAGE" --format '{{.Id}}')
+printf 'Local Image ID: %s\n' "$IMAGE_ID"
 sudo bash "$SOURCE_ROOT/deploy/shared-host/manage.sh" prepare \
   --hostname "$HOSTNAME_APPROVED" --source-sha "$APPROVED_SHA" \
   --image-ref "$APPROVED_IMAGE" --mode staging --test-disk --exposure debug \
   --bootstrap-password-file /root/cf-install-inputs/admin-password
+PREPARE_DEPLOYMENT
 ```
 
 For LAN, select `--exposure lan` **during prepare** and additionally provide
@@ -295,10 +328,15 @@ to make a failing negative test pass.
 ## 5. First start and mandatory bootstrap completion
 
 ```bash
+bash <<'COMPLETE_BOOTSTRAP'
+set -euo pipefail
+SOURCE_ROOT=/opt/cf-filebrowser-enterprise
+HOSTNAME_APPROVED='EXACT_TARGET_HOSTNAME'
 sudo bash "$SOURCE_ROOT/deploy/shared-host/manage.sh" validate --hostname "$HOSTNAME_APPROVED"
 sudo bash "$SOURCE_ROOT/deploy/shared-host/manage.sh" start --hostname "$HOSTNAME_APPROVED"
 sudo bash "$SOURCE_ROOT/deploy/shared-host/manage.sh" bootstrap-finish --hostname "$HOSTNAME_APPROVED"
 sudo bash "$SOURCE_ROOT/deploy/shared-host/manage.sh" status --hostname "$HOSTNAME_APPROVED"
+COMPLETE_BOOTSTRAP
 ```
 
 `bootstrap-finish` performs a normal password login and verifies the authenticated
@@ -349,12 +387,21 @@ reviewed metadata rules; links, devices, unsupported modes and unsafe paths
 cause refusal rather than following paths outside the project.
 
 ```bash
+bash <<'CREATE_BACKUP'
+set -euo pipefail
+SOURCE_ROOT=/opt/cf-filebrowser-enterprise
+APPROVED_SHA='REPLACE_WITH_APPROVED_FULL_GIT_SHA'
+HOSTNAME_APPROVED='EXACT_TARGET_HOSTNAME'
+APPROVED_IMAGE='EXACT_IMAGE_REFERENCE_RECORDED_FOR_THIS_DEPLOYMENT'
+IMAGE_ID=$(sudo docker image inspect "$APPROVED_IMAGE" --format '{{.Id}}')
+printf 'Local Image ID: %s\n' "$IMAGE_ID"
 ARCHIVE=/srv/storage/cf-filebrowser-enterprise/backups/backup-UNIQUE.tar
 sudo bash "$SOURCE_ROOT/deploy/shared-host/backup.sh" create "$ARCHIVE" \
   --hostname "$HOSTNAME_APPROVED" --source-sha "$APPROVED_SHA" \
   --image-ref "$APPROVED_IMAGE" --image-id "$IMAGE_ID"
 # Independently record the emitted SHA-256 before optionally starting again.
 sudo bash "$SOURCE_ROOT/deploy/shared-host/manage.sh" start --hostname "$HOSTNAME_APPROVED"
+CREATE_BACKUP
 ```
 
 The package contains keys and must remain root-only (0600 inside 0700 backup
@@ -375,11 +422,21 @@ obtain the **same** fixed GitHub checkout and registry image, retrieve the
 protected package from independent custody, and run:
 
 ```bash
+bash <<'RESTORE_BACKUP'
+set -euo pipefail
+SOURCE_ROOT=/opt/cf-filebrowser-enterprise
+APPROVED_SHA='REPLACE_WITH_APPROVED_FULL_GIT_SHA'
+HOSTNAME_APPROVED='EXACT_TARGET_HOSTNAME'
+APPROVED_IMAGE='EXACT_IMAGE_REFERENCE_RECORDED_IN_BACKUP'
+RECORDED_BACKUP_SHA256='REPLACE_WITH_INDEPENDENTLY_RECORDED_SHA256'
+IMAGE_ID=$(sudo docker image inspect "$APPROVED_IMAGE" --format '{{.Id}}')
+printf 'Local Image ID: %s\n' "$IMAGE_ID"
 sudo bash "$SOURCE_ROOT/deploy/shared-host/backup.sh" restore /root/recovery/package.tar \
   --hostname "$HOSTNAME_APPROVED" --source-sha "$APPROVED_SHA" \
   --image-ref "$APPROVED_IMAGE" --image-id "$IMAGE_ID" --sha256 "$RECORDED_BACKUP_SHA256"
 sudo bash "$SOURCE_ROOT/deploy/shared-host/manage.sh" validate --hostname "$HOSTNAME_APPROVED"
 sudo bash "$SOURCE_ROOT/deploy/shared-host/manage.sh" start --hostname "$HOSTNAME_APPROVED"
+RESTORE_BACKUP
 ```
 
 Do **not** run `prepare` before blank recovery. Restore validates the complete

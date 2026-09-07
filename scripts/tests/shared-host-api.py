@@ -605,13 +605,28 @@ class Acceptance:
         self.check(label + "_expected_entries", expected.issubset(response_hrefs))
         return hrefs
 
-    def check_filebridge_listing(self, label, result, path, filename, size):
+    def filebridge_listing_logical_size(self):
+        result = self.request("filebridge_source_configuration", "GET", "/api/settings", token=self.admin,
+                              query={"property": "sources"}).json()
+        sources = [source for source in result if source.get("name") == SOURCE]
+        self.check("filebridge_unique_source_configuration", len(sources) == 1)
+        logical = sources[0].get("config", {}).get("useLogicalSize")
+        self.check("filebridge_explicit_listing_size_mode", type(logical) is bool)
+        return logical
+
+    def check_filebridge_listing(self, label, result, path, filename, size, *, logical_size):
+        self.check(label + "_size_mode", type(logical_size) is bool)
+        # The controlled ordinary file has a known byte length. Resource lists
+        # follow authenticatedListingFileSize/getDiskUsage's 4 KiB display rule;
+        # the independent read, checksum and download checks keep real bytes.
+        displayed = size if logical_size or size == 0 else ((size + 4095) // 4096) * 4096
         files = result.get("files")
         self.check(label, result.get("source") == SOURCE and result.get("path") == path
                    and isinstance(files, list) and any(
                        item.get("source") == SOURCE and item.get("path") == path + "/" + filename
-                       and item.get("name") == filename and item.get("size") == size
-                       and item.get("is_dir") is False for item in files))
+                       and item.get("name") == filename and type(item.get("size")) is int and item.get("size") == displayed
+                       and item.get("is_dir") is False for item in files),
+                   use_logical_size=logical_size, logical_bytes=size, expected_display_size=displayed)
 
     def revoke(self, name, session):
         self.request(name + "_revoke", "DELETE", "/api/auth/token", token=session,
@@ -722,7 +737,8 @@ class Acceptance:
         digest = bridge("filebridge_checksum", "checksum", {"source": SOURCE, "path": target["path"], "algorithm": "sha256"})["result"]
         self.check("filebridge_checksum_exact", digest.get("checksums", {}).get("sha256") == hashlib.sha256(raw).hexdigest())
         listed = bridge("filebridge_list", "list", directory)["result"]
-        self.check_filebridge_listing("filebridge_list_uploaded_entry", listed, "/bridge", local.name, len(raw))
+        self.check_filebridge_listing("filebridge_list_uploaded_entry", listed, "/bridge", local.name, len(raw),
+                                      logical_size=self.filebridge_listing_logical_size())
         destination = downloads / "roundtrip.txt"
         transfer = {"source": SOURCE, "path": target["path"], "output_file": str(destination)}
         bridge("filebridge_download", "download", transfer)

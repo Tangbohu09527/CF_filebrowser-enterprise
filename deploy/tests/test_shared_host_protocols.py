@@ -217,8 +217,46 @@ class ProtocolAcceptanceTests(unittest.TestCase):
         for invalid in variants:
             with self.subTest(invalid=invalid):
                 with self.assertRaises(api.AcceptanceError):
-                    acceptance().check_filebridge_listing("listing", invalid, "/bridge", BRIDGE_FILENAME, 19)
-        acceptance().check_filebridge_listing("listing", valid, "/bridge", BRIDGE_FILENAME, 19)
+                    acceptance().check_filebridge_listing("listing", invalid, "/bridge", BRIDGE_FILENAME, 19, logical_size=True)
+        acceptance().check_filebridge_listing("listing", valid, "/bridge", BRIDGE_FILENAME, 19, logical_size=True)
+
+    def test_filebridge_listing_uses_source_display_mode_for_controlled_files(self):
+        for logical, byte_size, displayed in ((False, 0, 0), (False, 47, 4096), (False, 4096, 4096),
+                                              (False, 4097, 8192), (True, 0, 0), (True, 47, 47),
+                                              (True, 4096, 4096), (True, 4097, 4097)):
+            with self.subTest(logical=logical, byte_size=byte_size):
+                reply = {"source": api.SOURCE, "path": "/bridge", "files": [
+                    {"source": api.SOURCE, "path": "/bridge/" + BRIDGE_FILENAME,
+                     "name": BRIDGE_FILENAME, "size": displayed, "is_dir": False}]}
+                test = acceptance()
+                test.check_filebridge_listing("listing", reply, "/bridge", BRIDGE_FILENAME, byte_size, logical_size=logical)
+                self.assertEqual(test.checks[-1]["expected_display_size"], displayed)
+                self.assertEqual(test.checks[-1]["logical_bytes"], byte_size)
+                for invalid_size in (displayed + 1, displayed - 1, True, str(displayed)):
+                    invalid = copy.deepcopy(reply)
+                    invalid["files"][0]["size"] = invalid_size
+                    with self.assertRaises(api.AcceptanceError):
+                        test.check_filebridge_listing("listing", invalid, "/bridge", BRIDGE_FILENAME, byte_size, logical_size=logical)
+                with self.assertRaises(api.AcceptanceError):
+                    test.check_filebridge_listing("listing", dict(reply, files=[]), "/bridge", BRIDGE_FILENAME, byte_size, logical_size=logical)
+
+    def test_filebridge_listing_requires_explicit_unique_source_size_configuration(self):
+        for logical in (True, False):
+            test = acceptance()
+            test.request = mock.Mock(return_value=api.Reply(200, {}, json.dumps([
+                {"name": api.SOURCE, "config": {"useLogicalSize": logical}}]).encode()))
+            self.assertIs(test.filebridge_listing_logical_size(), logical)
+            self.assertEqual(test.request.call_args.kwargs['query'], {'property': 'sources'})
+        for sources in ([], [{"name": "other", "config": {"useLogicalSize": False}}],
+                        [{"name": api.SOURCE, "config": {}}],
+                        [{"name": api.SOURCE, "config": {"useLogicalSize": "false"}}],
+                        [{"name": api.SOURCE, "config": {"useLogicalSize": 0}}],
+                        [{"name": api.SOURCE, "config": {"useLogicalSize": False}}] * 2):
+            with self.subTest(sources=sources):
+                test = acceptance()
+                test.request = mock.Mock(return_value=api.Reply(200, {}, json.dumps(sources).encode()))
+                with self.assertRaises(api.AcceptanceError):
+                    test.filebridge_listing_logical_size()
 
     def test_protocol_audit_rejects_all_failed_events(self):
         events = audit_events()
