@@ -34,6 +34,10 @@ TLS_NAME = "files.cf.test"
 TLS_PORT = 18443
 GUEST = "/root/cf-verification"
 SOURCE = "/opt/cf-filebrowser-enterprise"
+GIB = 1024 ** 3
+SYSTEM_DISK_GIB = 24
+TEST_DISK_GIB = 14
+VM_MEMORY_MIB = 2048
 
 
 class VerificationError(RuntimeError):
@@ -86,6 +90,16 @@ def cloud_image(work):
     if actual != expected:
         raise VerificationError("Debian image does not match the official SHA512 manifest")
     return path, {"url": CLOUD + CLOUD_IMAGE, "sha512": actual, "checksum_url": CLOUD + "SHA512SUMS"}
+
+
+def resource_budget(base_virtual_bytes, seed_bytes=2 * 16 * 1024 ** 2):
+    total = 2 * (SYSTEM_DISK_GIB + TEST_DISK_GIB) * GIB + base_virtual_bytes + seed_bytes
+    memory = 2 * VM_MEMORY_MIB * 1024 ** 2
+    if total > 80 * GIB or memory > 8 * GIB:
+        raise VerificationError("two-VM resource budget exceeds 8 GiB RAM or 80 GiB total sparse disk capacity; no automatic expansion is allowed")
+    return {"vm_count": 2, "system_disk_gib_per_vm": SYSTEM_DISK_GIB, "test_disk_gib_per_vm": TEST_DISK_GIB,
+            "base_virtual_bytes": base_virtual_bytes, "seed_bytes": seed_bytes, "total_virtual_disk_bytes": total,
+            "maximum_virtual_disk_bytes": 80 * GIB, "configured_memory_bytes": memory, "maximum_memory_bytes": 8 * GIB}
 
 
 class VM:
@@ -157,13 +171,36 @@ ethernets:
         execute(["cloud-localds", "--network-config", str(self.directory / "network-config"), str(seed), str(self.directory / "user-data"), str(self.directory / "meta-data")])
         disk = self.directory / "system.qcow2"
         data = self.directory / "test-storage.qcow2"
-        execute(["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", str(base), str(disk), "35G"])
-        execute(["qemu-img", "create", "-f", "qcow2", str(data), "15G"])
+        execute(["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", str(base), str(disk), f"{SYSTEM_DISK_GIB}G"])
+        execute(["qemu-img", "create", "-f", "qcow2", str(data), f"{TEST_DISK_GIB}G"])
         peer = f"listen=127.0.0.1:{peer_port}" if number == 1 else f"connect=127.0.0.1:{peer_port}"
-        self.command = ["qemu-system-x86_64", "-accel", accelerator, "-machine", "q35", "-m", "2048", "-smp", "2", "-display", "none", "-monitor", "none", "-serial", f"file:{self.directory / 'serial.private.log'}", "-drive", f"file={disk},format=qcow2,if=virtio", "-drive", f"file={data},format=qcow2,if=virtio,serial=cf-test-data", "-drive", f"file={seed},format=raw,if=virtio,readonly=on", "-netdev", f"user,id=nat,hostfwd=tcp:127.0.0.1:{self.ssh_port}-:22", "-device", f"virtio-net-pci,netdev=nat,mac={nat_mac}", "-netdev", f"socket,id=lan,{peer}", "-device", f"virtio-net-pci,netdev=lan,mac={lan_mac}"]
+        self.command = ["qemu-system-x86_64", "-accel", accelerator, "-machine", "q35", "-m", str(VM_MEMORY_MIB), "-smp", "2", "-display", "none", "-monitor", "none", "-serial", f"file:{self.directory / 'serial.private.log'}", "-drive", f"file={disk},format=qcow2,if=none,id=system", "-device", "virtio-blk-pci,drive=system", "-drive", f"file={data},format=qcow2,if=none,id=storage", "-device", "virtio-blk-pci,drive=storage,serial=cf-test-data", "-drive", f"file={seed},format=raw,if=none,id=seed,readonly=on", "-device", "virtio-blk-pci,drive=seed", "-netdev", f"user,id=nat,hostfwd=tcp:127.0.0.1:{self.ssh_port}-:22", "-device", f"virtio-net-pci,netdev=nat,mac={nat_mac}", "-netdev", f"socket,id=lan,{peer}", "-device", f"virtio-net-pci,netdev=lan,mac={lan_mac}"]
 
     def launch(self):
-        self.process = subprocess.Popen(self.command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # QEMU >= 3.0 requires serial on -device, not -drive. Keep the
+        # system/storage/seed virtio devices explicit and ordered (vda/vdb/vdc).
+        # Guest serial output and QEMU host diagnostics are separate private logs.
+        log_path = self.directory / "qemu.private.stderr.log"
+        descriptor = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as stderr:
+            self.process = subprocess.Popen(self.command, stdout=subprocess.DEVNULL, stderr=stderr)
+
+    def startup_diagnostic(self):
+        log_path = self.directory / "qemu.private.stderr.log"
+        raw = log_path.read_bytes() if log_path.exists() else b""
+        # Report only fixed, recognized causes; never arbitrary stderr, paths,
+        # key contents or guest console output. Preserve the private original.
+        causes = (
+            (b"does not support the option 'serial'", "unsupported-drive-serial"),
+            (b"Address already in use", "listener-address-in-use"),
+            (b"Connection refused", "peer-listener-not-ready"),
+            (b"Permission denied", "host-resource-permission-denied"),
+            (b"Cannot allocate memory", "insufficient-host-memory"),
+            (b"No space left on device", "insufficient-host-disk-space"),
+            (b"Failed to get", "image-lock-or-resource-unavailable"),
+        )
+        cause = next((label for marker, label in causes if marker in raw), "unclassified-qemu-startup-error")
+        return {"exit_code": self.process.poll(), "cause": cause, "private_stderr_sha256": hashlib.sha256(raw).hexdigest(), "private_stderr_bytes": len(raw)}
 
     def command_on_guest(self, script, *, check=True, timeout=900):
         guard = f"set -Eeuo pipefail\ntest \"$(cat /etc/cf-shared-host-disposable)\" = {shlex.quote(self.name)}\ntest \"$(hostname)\" = {shlex.quote(self.name)}\n"
@@ -181,7 +218,8 @@ ethernets:
         deadline = time.monotonic() + 600
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
-                raise VerificationError(f"{self.name}: QEMU exited during boot")
+                diagnostic = self.startup_diagnostic()
+                raise VerificationError(f"{self.name}: QEMU exited during boot (exit {diagnostic['exit_code']}); {diagnostic['cause']}; private stderr SHA-256 {diagnostic['private_stderr_sha256']}")
             result = self.command_on_guest("true", check=False)
             if result.returncode == 0:
                 self.command_on_guest("cloud-init status --wait >/dev/null", timeout=600)
@@ -404,6 +442,14 @@ def scenario(args, work, evidence):
     record_stage(args, evidence, "official-debian-image-download-and-sha512")
     base, cloud_record = cloud_image(work)
     evidence.update(cloud_image=cloud_record)
+    record_stage(args, evidence, "two-vm-resource-preflight")
+    base_info = json.loads(execute(["qemu-img", "info", "--output=json", str(base)]).stdout)
+    evidence["resources"] = resource_budget(base_info["virtual-size"])
+    evidence["resources"]["host_free_disk_bytes"] = shutil.disk_usage(work).free
+    available = next(int(line.split()[1]) * 1024 for line in Path("/proc/meminfo").read_text().splitlines() if line.startswith("MemAvailable:"))
+    evidence["resources"]["host_available_memory_bytes"] = available
+    if evidence["resources"]["host_free_disk_bytes"] < 12 * GIB or available < evidence["resources"]["configured_memory_bytes"]:
+        raise VerificationError("runner has less than 12 GiB free disk or the configured 4 GiB RAM available; no VM or disk expansion attempted")
     key = work / "client-key"
     execute(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)])
     tls = certificates(work)
@@ -419,6 +465,10 @@ def scenario(args, work, evidence):
         for number in (1, 2):
             vm = VM(number, work, base, key, peer_port, args.accelerator)
             vms.append(vm)
+        seed_size = sum((vm.directory / "seed.iso").stat().st_size for vm in vms)
+        evidence["resources"].update(resource_budget(base_info["virtual-size"], seed_size))
+        record_stage(args, evidence, "launch-two-debian-systemd-vms")
+        for vm in vms:
             vm.launch()
         for vm in vms:
             record_stage(args, evidence, "cloud-init-and-dependencies-" + vm.name)
@@ -576,6 +626,7 @@ if bash {SOURCE}/deploy/shared-host/backup.sh restore {GUEST}/verification.tar -
         evidence["result"] = "passed"
         record_stage(args, evidence, "completed")
     finally:
+        evidence["qemu_diagnostics"] = {vm.name: vm.startup_diagnostic() for vm in vms if vm.process is not None and vm.process.poll() not in (None, 0)}
         for vm in reversed(vms):
             vm.close()
         if registry_id:

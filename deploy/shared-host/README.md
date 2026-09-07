@@ -32,7 +32,7 @@ Follow [Docker's Debian installation instructions](https://docs.docker.com/engin
 for the signed Docker apt repository and an explicitly selected package version.
 Install Docker Engine, CLI, containerd, Buildx and Compose v2 (2.20+). Record the
 package versions with the installation evidence. Also install the Debian
-packages `git ca-certificates curl openssl python3 python3-yaml util-linux`.
+packages `git ca-certificates curl openssl python3 python3-yaml util-linux iproute2`.
 These are deliberate host preparation operations; `manage.sh` does not run an
 installer, change users, format disks, configure RAID, or alter mounts.
 
@@ -183,6 +183,12 @@ completion. An initialized database with a residual bootstrap file remains a
 startup error. Never delete the database to retry. Failure preserves the stage
 and data; after interrupted removal, use the retained protected input with
 `--admin-password-file` as instructed by the error. JWT/TOTP keys remain required.
+
+The source is private by default. If this installation requires Share, pass
+`--enable-share-source` explicitly during `prepare`; it permits sharing from
+this source without granting Share to ordinary users. Repeated preparation must
+retain the same decision. Grant and test individual user Share permissions in
+the existing administration interface.
 
 The ordinary default user has Browse/Preview/Download; API, Admin, Share,
 Create, Modify, Delete and Realtime are initially denied. Review these source
