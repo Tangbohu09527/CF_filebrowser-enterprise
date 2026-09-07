@@ -66,13 +66,17 @@ jobs:
 
   fixed-image:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       - uses: docker/setup-buildx-action@v3
+      - name: Install disposable VM test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssl
       - name: Build real frontend and backend from fixed source
         run: |
           revision=$(git rev-parse HEAD)
@@ -80,6 +84,22 @@ jobs:
             --version "verification-$revision" --image "cf-filebrowser:verification-$revision" \
             --evidence "$RUNNER_TEMP/cf-image-evidence"
           docker image inspect "cf-filebrowser:verification-$revision" --format '{{.Id}}'
+      - name: Real Debian 13 install, HTTPS clients, reboot and blank recovery
+        run: |
+          revision=$(git rev-parse HEAD)
+          accelerator=tcg
+          if [[ -r /dev/kvm && -w /dev/kvm ]]; then accelerator=kvm; fi
+          bash scripts/tests/shared-host-vm.sh --source-sha "$revision" \
+            --image-ref "cf-filebrowser:verification-$revision" \
+            --evidence "$RUNNER_TEMP/cf-vm-evidence" --accelerator "$accelerator"
+      - name: Save sanitized VM acceptance results only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-host-vm-results
+          path: ${{ runner.temp }}/cf-vm-evidence/vm-result.json
+          if-no-files-found: error
+          retention-days: 14
       - name: Save non-secret build evidence
         if: always()
         uses: actions/upload-artifact@v4

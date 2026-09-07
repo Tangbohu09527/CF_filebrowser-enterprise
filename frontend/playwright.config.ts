@@ -9,10 +9,16 @@ import { defineConfig, devices } from "@playwright/test";
 /**
  * See https://playwright.dev/docs/test-configuration.
  */
+const sharedHostAcceptance = Boolean(process.env.FILEBROWSER_ACCEPTANCE_URL);
+if (sharedHostAcceptance && !process.env.FILEBROWSER_ACCEPTANCE_URL?.startsWith("https://")) {
+  throw new Error("Shared-host acceptance requires verified HTTPS");
+}
+
 export default defineConfig({
-  globalSetup: "./tests/playwright/screenshots-setup.ts",
-  timeout: 5000,
-  testDir: "./tests/playwright/screenshots",
+  globalSetup: sharedHostAcceptance ? undefined : "./tests/playwright/screenshots-setup.ts",
+  timeout: sharedHostAcceptance ? 60000 : 5000,
+  testDir: sharedHostAcceptance ? "./tests/playwright/shared-host" : "./tests/playwright/screenshots",
+  outputDir: sharedHostAcceptance ? process.env.FILEBROWSER_ACCEPTANCE_OUTPUT : undefined,
   /* Run tests in files in parallel */
   fullyParallel: false,
   /* Fail the build on CI if you accidentally left test.only in the source code. */
@@ -25,19 +31,24 @@ export default defineConfig({
   /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
   use: {
     actionTimeout: 5000,
-    storageState: "loginAuth.json",
+    storageState: sharedHostAcceptance ? undefined : "loginAuth.json",
     /* Base URL to use in actions like `await page.goto('/')`. */
-    baseURL: "http://localhost:8080",
+    baseURL: sharedHostAcceptance ? process.env.FILEBROWSER_ACCEPTANCE_URL : "http://localhost:8080",
+    ignoreHTTPSErrors: false,
 
     /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
-    trace: "on-first-retry",
+    trace: sharedHostAcceptance ? "off" : "on-first-retry",
 
     /* Set default locale to English (US) */
     locale: "en-US",
   },
 
   /* Configure projects for major browsers */
-  projects: [
+  projects: sharedHostAcceptance ? [{
+    name: "shared-host",
+    use: { ...devices["Desktop Chrome"] },
+    retries: 0,
+  }] : [
     {
       name: "dark-screenshots",
       use: {

@@ -22,6 +22,46 @@ BASES = {
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
+def checked_registry(registry: str) -> None:
+    """Accept a Docker registry authority, never a URL or credential-bearing text."""
+    host, separator, port = registry.partition(":")
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host):
+        raise ValueError("invalid registry authority")
+    if any(not label or label.startswith("-") or label.endswith("-") for label in host.split(".")):
+        raise ValueError("invalid registry authority")
+    if separator and (not re.fullmatch(r"[0-9]{1,5}", port) or not 1 <= int(port) <= 65535):
+        raise ValueError("invalid registry port")
+    if "." not in host and not separator and host != "localhost":
+        raise ValueError("registry must be an explicit hostname or host:port")
+
+
+def checked_reference(reference: str, *, require_tag: bool = False,
+                      allow_digest: bool = True) -> tuple[str, str]:
+    """Validate before subprocesses can echo bad input in errors or logs."""
+    if not isinstance(reference, str) or len(reference) > 512 or not re.fullmatch(r"[A-Za-z0-9_./:@-]+", reference):
+        raise ValueError("invalid image reference")
+    name, separator, digest = reference.partition("@")
+    if separator and (not allow_digest or not DIGEST.fullmatch(digest)):
+        raise ValueError("image reference contains an unsupported digest or credential syntax")
+    last = name.rsplit("/", 1)[-1]
+    if ":" in last:
+        repository, _, tag = name.rpartition(":")
+        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag):
+            raise ValueError("invalid image tag")
+    else:
+        repository, tag = name, ""
+    if require_tag and (not tag or separator):
+        raise ValueError("publication target must have an explicit tag, without a digest")
+    components = repository.split("/")
+    registry = ""
+    if len(components) > 1 and ("." in components[0] or ":" in components[0] or components[0] == "localhost"):
+        registry = components.pop(0)
+        checked_registry(registry)
+    if not components or any(not re.fullmatch(r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*", part) for part in components):
+        raise ValueError("invalid image repository")
+    return registry, repository
+
+
 def run(*args: str, capture: bool = True, env: dict | None = None) -> str:
     result = subprocess.run(args, cwd=ROOT, env=env, check=True, text=True,
                             stdout=subprocess.PIPE if capture else None)
@@ -63,8 +103,10 @@ def write_record(directory: Path, record: dict) -> None:
 
 def build(args: argparse.Namespace) -> None:
     checked_source(args.source_sha)
-    if not re.fullmatch(r"[a-z0-9][a-z0-9_.:/-]+", args.image):
-        raise ValueError("invalid local staging image reference")
+    checked_reference(args.image, allow_digest=False)
+    base_references = {key: getattr(args, key.lower()) or default for key, default in BASES.items()}
+    for reference in base_references.values():
+        checked_reference(reference)
     evidence_directory(args.evidence)
     environment = os.environ.copy()
     # The approved example provides paths and resource limits, never host env.
@@ -75,8 +117,7 @@ def build(args: argparse.Namespace) -> None:
         environment.pop(key, None)
     record = {"schema": "cf-filebrowser-image/v1", "source_sha": args.source_sha,
               "platform": "linux/amd64", "bases": {}, "inputs": {}}
-    for key, default in BASES.items():
-        reference = getattr(args, key.lower()) or default
+    for key, reference in base_references.items():
         run("docker", "pull", "--platform", "linux/amd64", reference, capture=False)
         info = image_info(reference)
         pinned = next((ref for ref in info.get("RepoDigests", [])
@@ -116,8 +157,9 @@ def build(args: argparse.Namespace) -> None:
 def publish(args: argparse.Namespace) -> None:
     if not DIGEST.fullmatch(args.image):
         raise ValueError("publish requires the actual sha256 Image ID")
-    registry, separator, _ = args.target.partition("/")
-    if not separator or registry != args.approved_registry or registry in {"docker.io", "ghcr.io"}:
+    registry, repository = checked_reference(args.target, require_tag=True, allow_digest=False)
+    checked_registry(args.approved_registry)
+    if not registry or registry != args.approved_registry or registry in {"docker.io", "ghcr.io"}:
         raise ValueError("target must be the explicitly approved isolated test registry")
     info = image_info(args.image)
     revision = info.get("Config", {}).get("Labels", {}).get("org.opencontainers.image.revision")
@@ -127,7 +169,6 @@ def publish(args: argparse.Namespace) -> None:
     run("docker", "tag", args.image, args.target)
     run("docker", "push", args.target, capture=False)
     digests = image_info(args.target).get("RepoDigests", [])
-    repository = args.target.rsplit(":", 1)[0]
     pinned = next((ref for ref in digests if ref.startswith(repository + "@sha256:")), None)
     if not pinned:
         raise ValueError("publish did not yield a registry digest")

@@ -92,7 +92,7 @@ func quickSetup(store *bolt.BoltStore) {
 		user.LockPassword = false
 		user.Permissions = settings.AdminPerms()
 		user.ShowFirstLogin = settings.Env.IsFirstLoad && user.Permissions.Admin
-		logger.Debugf("Creating user as admin: %v %v", user.Username, user.Password)
+		logger.Debugf("Creating user as admin: %v", user.Username)
 		err = store.Users.Save(user, true, true)
 		utils.CheckErr("store.Users.Save", err)
 	}

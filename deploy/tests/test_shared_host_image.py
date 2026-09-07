@@ -54,6 +54,85 @@ class ImageWorkflowTests(unittest.TestCase):
                         image.publish(args)
                     run.assert_not_called()
 
+    def test_base_reference_validation_preserves_tags_and_registry_digests(self):
+        for reference in (*image.BASES.values(),
+                          "registry.test:5000/team/base:fixed",
+                          "registry.test:5000/team/base@sha256:" + "c" * 64,
+                          "registry.test:5000/team/base:fixed@sha256:" + "c" * 64):
+            with self.subTest(reference=reference):
+                image.checked_reference(reference)
+
+    def test_publish_rejects_unsafe_or_implicit_targets_before_docker(self):
+        sentinel = "credential-sentinel"
+        targets = (
+            "registry.test:5000/filebrowser",
+            "registry.test/filebrowser",
+            "registry.test:5000/filebrowser@sha256:" + "c" * 64,
+            "registry.test:5000/filebrowser:fixed@sha256:" + "c" * 64,
+            "https://registry.test:5000/filebrowser:fixed",
+            "registry.test:5000/" + sentinel + "@filebrowser:fixed",
+            "registry.test:5000/filebrowser:fixed\n" + sentinel,
+            "registry.test:5000/filebrowser:fixed\x00" + sentinel,
+            "registry.test:5000/filebrowser:fixed other",
+            "registry.test:5000/filebrowser:",
+            "registry.test:5000/../filebrowser:fixed",
+        )
+        for target in targets:
+            with self.subTest(target_kind=targets.index(target)):
+                args = argparse.Namespace(image=IMAGE_ID, target=target,
+                                          approved_registry="registry.test:5000")
+                with patch.object(image, "run") as run:
+                    with patch.object(image, "image_info", side_effect=AssertionError("must reject before Docker inspection")):
+                        with self.assertRaises(ValueError) as error:
+                            image.publish(args)
+                run.assert_not_called()
+                self.assertNotIn(sentinel, str(error.exception))
+
+    def test_base_references_are_validated_before_any_pull_or_evidence_write(self):
+        sentinel = "credential-sentinel"
+        invalid = (
+            "https://user:" + sentinel + "@registry.test/base:fixed",
+            "user:" + sentinel + "@registry.test/base:fixed",
+            "node:jod-slim\n" + sentinel,
+            "node:jod-slim\x00" + sentinel,
+            "node:latest;whoami",
+            "node:latest extra",
+        )
+        for key in image.BASES:
+            for reference in invalid:
+                with self.subTest(base=key, reference_kind=invalid.index(reference)):
+                    fields = {name.lower(): None for name in image.BASES}
+                    fields[key.lower()] = reference
+                    args = argparse.Namespace(source_sha=SHA, image="cf-filebrowser:fixed",
+                                              evidence=Path("unused-evidence"), **fields)
+                    with patch.object(image, "checked_source"):
+                        with patch.object(image, "evidence_directory") as evidence:
+                            with patch.object(image, "run", side_effect=AssertionError("must reject before Docker pull")):
+                                with self.assertRaises(ValueError) as error:
+                                    image.build(args)
+                    evidence.assert_not_called()
+                    self.assertNotIn(sentinel, str(error.exception))
+
+    def test_publish_explicit_tag_preserves_registry_port_and_records_digest(self):
+        target = "registry.test:5000/team/filebrowser:fixed-sha"
+        pinned = "registry.test:5000/team/filebrowser@sha256:" + "c" * 64
+        args = argparse.Namespace(image=IMAGE_ID, target=target, approved_registry="registry.test:5000",
+                                  source_sha=SHA, evidence=Path("unused-evidence"))
+        inspected = [
+            {"Config": {"Labels": {"org.opencontainers.image.revision": SHA}}},
+            {"RepoDigests": [pinned]},
+        ]
+        with patch.object(image, "image_info", side_effect=inspected):
+            with patch.object(image, "evidence_directory"):
+                with patch.object(image, "write_record") as record:
+                    with patch.object(image, "run") as run:
+                        with patch("builtins.print"):
+                            image.publish(args)
+        self.assertEqual(run.call_args_list[0].args, ("docker", "tag", IMAGE_ID, target))
+        self.assertEqual(run.call_args_list[1].args, ("docker", "push", target))
+        self.assertEqual(record.call_args.args[1]["registry_reference"], pinned)
+        self.assertEqual(record.call_args.args[1]["image_id"], IMAGE_ID)
+
     def test_publish_revision_mismatch_does_not_tag_or_push(self):
         args = argparse.Namespace(image=IMAGE_ID, target="registry.test:5000/filebrowser:fixed",
                                   approved_registry="registry.test:5000", source_sha=SHA)

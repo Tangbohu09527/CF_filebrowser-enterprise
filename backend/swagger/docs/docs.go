@@ -952,6 +952,12 @@ const docTemplate = `{
                         "name": "permissions",
                         "in": "query",
                         "required": true
+                    },
+                    {
+                        "type": "boolean",
+                        "description": "Create a stateful token that uses current user permissions",
+                        "name": "minimal",
+                        "in": "query"
                     }
                 ],
                 "responses": {
@@ -1514,71 +1520,6 @@ const docTemplate = `{
             }
         },
         "/api/office/callback": {
-            "get": {
-                "description": "Receives callbacks from OnlyOffice document server for document status changes and saves",
-                "consumes": [
-                    "application/json"
-                ],
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "Office"
-                ],
-                "summary": "Handle OnlyOffice document server callback",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Source name",
-                        "name": "source",
-                        "in": "query"
-                    },
-                    {
-                        "type": "string",
-                        "description": "File path",
-                        "name": "path",
-                        "in": "query"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Share hash (for public shares)",
-                        "name": "hash",
-                        "in": "query"
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "Callback processed successfully",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": true
-                        }
-                    },
-                    "400": {
-                        "description": "Invalid callback data",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "string"
-                            }
-                        }
-                    },
-                    "500": {
-                        "description": "Server error",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "string"
-                            }
-                        }
-                    }
-                },
-                "security": [
-                    {
-                        "ApiKeyAuth": []
-                    }
-                ]
-            },
             "post": {
                 "description": "Receives callbacks from OnlyOffice document server for document status changes and saves",
                 "consumes": [
@@ -2496,6 +2437,15 @@ const docTemplate = `{
                             }
                         }
                     },
+                    "403": {
+                        "description": "Browse, preview, or download permission required",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
                     "404": {
                         "description": "File not found",
                         "schema": {
@@ -2720,7 +2670,7 @@ const docTemplate = `{
                         "schema": {
                             "type": "array",
                             "items": {
-                                "$ref": "#/definitions/share.Link"
+                                "$ref": "#/definitions/http.ShareResponse"
                             }
                         }
                     },
@@ -2760,9 +2710,9 @@ const docTemplate = `{
                 ],
                 "responses": {
                     "200": {
-                        "description": "Created share link",
+                        "description": "Created or updated share link",
                         "schema": {
-                            "$ref": "#/definitions/share.Link"
+                            "$ref": "#/definitions/http.ShareResponse"
                         }
                     },
                     "400": {
@@ -2992,7 +2942,7 @@ const docTemplate = `{
                         "schema": {
                             "type": "array",
                             "items": {
-                                "$ref": "#/definitions/share.Link"
+                                "$ref": "#/definitions/http.ShareResponse"
                             }
                         }
                     },
@@ -3772,6 +3722,80 @@ const docTemplate = `{
                         "description": "OK",
                         "schema": {
                             "$ref": "#/definitions/iteminfo.ExtendedFileInfo"
+                        }
+                    }
+                }
+            }
+        },
+        "/public/api/media/subtitles": {
+            "get": {
+                "produces": [
+                    "text/plain"
+                ],
+                "tags": [
+                    "Shares"
+                ],
+                "summary": "Get subtitle content from a public share",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Share hash",
+                        "name": "hash",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Path within the share",
+                        "name": "path",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Subtitle track name",
+                        "name": "name",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "boolean",
+                        "description": "Whether this is an embedded subtitle stream",
+                        "name": "embedded",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Raw subtitle content",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
                         }
                     }
                 }
@@ -4659,13 +4683,25 @@ const docTemplate = `{
                 "expiresAt": {
                     "type": "integer"
                 },
+                "fingerprint": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
                 "issuedAt": {
                     "type": "integer"
                 },
                 "name": {
                     "type": "string"
                 },
-                "token": {
+                "permissionsVersion": {
+                    "type": "integer"
+                },
+                "tokenPrefix": {
+                    "type": "string"
+                },
+                "type": {
                     "type": "string"
                 }
             }
@@ -4743,6 +4779,38 @@ const docTemplate = `{
                 }
             }
         },
+        "http.ManagementShareCapabilities": {
+            "type": "object",
+            "properties": {
+                "browse": {
+                    "type": "boolean"
+                },
+                "create": {
+                    "type": "boolean"
+                },
+                "delete": {
+                    "type": "boolean"
+                },
+                "download": {
+                    "type": "boolean"
+                },
+                "modify": {
+                    "type": "boolean"
+                },
+                "preview": {
+                    "type": "boolean"
+                },
+                "replace": {
+                    "type": "boolean"
+                },
+                "thumbnail": {
+                    "type": "boolean"
+                },
+                "viewer": {
+                    "type": "boolean"
+                }
+            }
+        },
         "http.MoveCopyItem": {
             "type": "object",
             "properties": {
@@ -4807,18 +4875,15 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "allowCreate": {
-                    "description": "allow creating files",
                     "type": "boolean"
                 },
                 "allowDelete": {
                     "type": "boolean"
                 },
                 "allowModify": {
-                    "description": "allow modifying files",
                     "type": "boolean"
                 },
                 "allowReplacements": {
-                    "description": "allow replacements of files",
                     "type": "boolean"
                 },
                 "allowedUsernames": {
@@ -4836,6 +4901,9 @@ const docTemplate = `{
                 "canEditShare": {
                     "type": "boolean"
                 },
+                "configuredCapabilities": {
+                    "$ref": "#/definitions/http.ManagementShareCapabilities"
+                },
                 "description": {
                     "type": "string"
                 },
@@ -4843,15 +4911,12 @@ const docTemplate = `{
                     "type": "boolean"
                 },
                 "disableDownload": {
-                    "description": "don't allow downloading files",
                     "type": "boolean"
                 },
                 "disableFileViewer": {
-                    "description": "don't allow viewing files",
                     "type": "boolean"
                 },
                 "disableLoginOption": {
-                    "description": "disable login option in share (true = hide, false = show)",
                     "type": "boolean"
                 },
                 "disableShareCard": {
@@ -4872,18 +4937,19 @@ const docTemplate = `{
                 "downloadsLimit": {
                     "type": "integer"
                 },
+                "effectiveCapabilities": {
+                    "$ref": "#/definitions/http.ManagementShareCapabilities"
+                },
                 "enableOnlyOffice": {
                     "type": "boolean"
                 },
                 "enforceDarkLightMode": {
-                    "description": "\"dark\" or \"light\"",
                     "type": "string"
                 },
                 "expire": {
                     "type": "integer"
                 },
                 "extractEmbeddedSubtitles": {
-                    "description": "can be io intensive for large files and take 10-30 seconds.",
                     "type": "boolean"
                 },
                 "favicon": {
@@ -4899,7 +4965,6 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "hideFileExt": {
-                    "description": "show hidden files based on extensions in shares",
                     "type": "string"
                 },
                 "hideNavButtons": {
@@ -4910,9 +4975,6 @@ const docTemplate = `{
                 },
                 "maxBandwidth": {
                     "type": "integer"
-                },
-                "password_hash": {
-                    "type": "string"
                 },
                 "path": {
                     "type": "string"
@@ -4930,28 +4992,27 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "shareType": {
-                    "description": "type of share: normal, upload, max",
                     "type": "string"
                 },
                 "shareURL": {
                     "type": "string"
                 },
                 "showHidden": {
-                    "description": "show hidden files in share (true = show, false = hide)",
                     "type": "boolean"
                 },
                 "sidebarLinks": {
-                    "description": "customizable sidebar links",
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/users.SidebarLink"
                     }
                 },
                 "source": {
-                    "description": "Override embedded field to show source name",
                     "type": "string"
                 },
                 "sourceURL": {
+                    "type": "string"
+                },
+                "status": {
                     "type": "string"
                 },
                 "themeColor": {
@@ -4960,28 +5021,10 @@ const docTemplate = `{
                 "title": {
                     "type": "string"
                 },
-                "token": {
-                    "description": "Token is a random value that will only be set when PasswordHash is set. It is\nURL-Safe and is used to download links in password-protected shares via a\nquery arg.",
-                    "type": "string"
-                },
-                "userDownloads": {
-                    "description": "Track downloads per username",
-                    "type": "object",
-                    "additionalProperties": {
-                        "type": "integer"
-                    }
-                },
-                "userID": {
-                    "type": "integer"
-                },
                 "username": {
                     "type": "string"
                 },
-                "version": {
-                    "type": "integer"
-                },
                 "viewMode": {
-                    "description": "default view mode for anonymous users: \"list\", \"compact\", \"normal\", \"gallery\"",
                     "type": "string"
                 }
             }
@@ -6160,6 +6203,13 @@ const docTemplate = `{
                 "sources"
             ],
             "properties": {
+                "allowedClientCIDRs": {
+                    "description": "optional canonical TCP peer CIDRs; ignores forwarding headers and rejects other peers before TLS/HTTP",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "baseURL": {
                     "description": "base URL for the server, the subpath that the server is running on.",
                     "type": "string"
@@ -6597,6 +6647,10 @@ const docTemplate = `{
                     "description": "allow api access",
                     "type": "boolean"
                 },
+                "browse": {
+                    "description": "allow browsing files and directories",
+                    "type": "boolean"
+                },
                 "create": {
                     "description": "allow creating or uploading files",
                     "type": "boolean"
@@ -6611,6 +6665,10 @@ const docTemplate = `{
                 },
                 "modify": {
                     "description": "allow modifying files",
+                    "type": "boolean"
+                },
+                "preview": {
+                    "description": "allow previewing file contents",
                     "type": "boolean"
                 },
                 "realtime": {
@@ -6891,6 +6949,9 @@ const docTemplate = `{
                 "canEditShare": {
                     "type": "boolean"
                 },
+                "capabilities": {
+                    "$ref": "#/definitions/share.PublicCapabilities"
+                },
                 "description": {
                     "type": "string"
                 },
@@ -7039,6 +7100,9 @@ const docTemplate = `{
                 "canEditShare": {
                     "type": "boolean"
                 },
+                "capabilities": {
+                    "$ref": "#/definitions/share.PublicCapabilities"
+                },
                 "description": {
                     "type": "string"
                 },
@@ -7166,180 +7230,23 @@ const docTemplate = `{
                 }
             }
         },
-        "share.Link": {
+        "share.PublicCapabilities": {
             "type": "object",
             "properties": {
-                "allowCreate": {
-                    "description": "allow creating files",
+                "browse": {
                     "type": "boolean"
                 },
-                "allowDelete": {
+                "download": {
                     "type": "boolean"
                 },
-                "allowModify": {
-                    "description": "allow modifying files",
+                "preview": {
                     "type": "boolean"
                 },
-                "allowReplacements": {
-                    "description": "allow replacements of files",
+                "thumbnail": {
                     "type": "boolean"
                 },
-                "allowedUsernames": {
-                    "type": "array",
-                    "items": {
-                        "type": "string"
-                    }
-                },
-                "banner": {
-                    "type": "string"
-                },
-                "bannerUrl": {
-                    "type": "string"
-                },
-                "canEditShare": {
+                "viewer": {
                     "type": "boolean"
-                },
-                "description": {
-                    "type": "string"
-                },
-                "disableAnonymous": {
-                    "type": "boolean"
-                },
-                "disableDownload": {
-                    "description": "don't allow downloading files",
-                    "type": "boolean"
-                },
-                "disableFileViewer": {
-                    "description": "don't allow viewing files",
-                    "type": "boolean"
-                },
-                "disableLoginOption": {
-                    "description": "disable login option in share (true = hide, false = show)",
-                    "type": "boolean"
-                },
-                "disableShareCard": {
-                    "type": "boolean"
-                },
-                "disableSidebar": {
-                    "type": "boolean"
-                },
-                "disableThumbnails": {
-                    "type": "boolean"
-                },
-                "downloadURL": {
-                    "type": "string"
-                },
-                "downloads": {
-                    "type": "integer"
-                },
-                "downloadsLimit": {
-                    "type": "integer"
-                },
-                "enableOnlyOffice": {
-                    "type": "boolean"
-                },
-                "enforceDarkLightMode": {
-                    "description": "\"dark\" or \"light\"",
-                    "type": "string"
-                },
-                "expire": {
-                    "type": "integer"
-                },
-                "extractEmbeddedSubtitles": {
-                    "description": "can be io intensive for large files and take 10-30 seconds.",
-                    "type": "boolean"
-                },
-                "favicon": {
-                    "type": "string"
-                },
-                "faviconUrl": {
-                    "type": "string"
-                },
-                "hasPassword": {
-                    "type": "boolean"
-                },
-                "hash": {
-                    "type": "string"
-                },
-                "hideFileExt": {
-                    "description": "show hidden files based on extensions in shares",
-                    "type": "string"
-                },
-                "hideNavButtons": {
-                    "type": "boolean"
-                },
-                "keepAfterExpiration": {
-                    "type": "boolean"
-                },
-                "maxBandwidth": {
-                    "type": "integer"
-                },
-                "password_hash": {
-                    "type": "string"
-                },
-                "path": {
-                    "type": "string"
-                },
-                "perUserDownloadLimit": {
-                    "type": "boolean"
-                },
-                "quickDownload": {
-                    "type": "boolean"
-                },
-                "shareTheme": {
-                    "type": "string"
-                },
-                "shareType": {
-                    "description": "type of share: normal, upload, max",
-                    "type": "string"
-                },
-                "shareURL": {
-                    "type": "string"
-                },
-                "showHidden": {
-                    "description": "show hidden files in share (true = show, false = hide)",
-                    "type": "boolean"
-                },
-                "sidebarLinks": {
-                    "description": "customizable sidebar links",
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/users.SidebarLink"
-                    }
-                },
-                "source": {
-                    "description": "backend source is path to maintain between name changes",
-                    "type": "string"
-                },
-                "sourceURL": {
-                    "type": "string"
-                },
-                "themeColor": {
-                    "type": "string"
-                },
-                "title": {
-                    "type": "string"
-                },
-                "token": {
-                    "description": "Token is a random value that will only be set when PasswordHash is set. It is\nURL-Safe and is used to download links in password-protected shares via a\nquery arg.",
-                    "type": "string"
-                },
-                "userDownloads": {
-                    "description": "Track downloads per username",
-                    "type": "object",
-                    "additionalProperties": {
-                        "type": "integer"
-                    }
-                },
-                "userID": {
-                    "type": "integer"
-                },
-                "version": {
-                    "type": "integer"
-                },
-                "viewMode": {
-                    "description": "default view mode for anonymous users: \"list\", \"compact\", \"normal\", \"gallery\"",
-                    "type": "string"
                 }
             }
         },
@@ -7359,13 +7266,23 @@ const docTemplate = `{
                     "type": "integer"
                 },
                 "key": {
-                    "description": "for backward compatibility",
+                    "description": "legacy database field",
                     "type": "string"
                 },
                 "name": {
                     "type": "string"
                 },
+                "permissionsVersion": {
+                    "type": "integer"
+                },
                 "token": {
+                    "description": "legacy database field",
+                    "type": "string"
+                },
+                "tokenHash": {
+                    "type": "string"
+                },
+                "tokenPrefix": {
                     "type": "string"
                 }
             }
@@ -7415,6 +7332,10 @@ const docTemplate = `{
                     "description": "allow api access",
                     "type": "boolean"
                 },
+                "browse": {
+                    "description": "allow browsing files and directories",
+                    "type": "boolean"
+                },
                 "create": {
                     "description": "allow creating or uploading files",
                     "type": "boolean"
@@ -7429,6 +7350,10 @@ const docTemplate = `{
                 },
                 "modify": {
                     "description": "allow modifying files",
+                    "type": "boolean"
+                },
+                "preview": {
+                    "description": "allow previewing file contents",
                     "type": "boolean"
                 },
                 "realtime": {

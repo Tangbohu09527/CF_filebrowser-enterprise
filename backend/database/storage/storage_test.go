@@ -2,12 +2,16 @@ package storage
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	storm "github.com/asdine/storm/v3"
 	"github.com/gtsteffaniak/filebrowser/backend/common/settings"
+	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	"github.com/gtsteffaniak/filebrowser/backend/database/storage/bolt"
+	logpkg "github.com/gtsteffaniak/go-logger/logger"
 	bbolt "go.etcd.io/bbolt"
 )
 
@@ -113,5 +117,73 @@ func TestInitializeDbFailsClosedWhenV3MigrationFails(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// bootstrapDebugCapture embeds the logger interface to keep this regression
+// scoped to Debugf, the initialization path that previously exposed passwords.
+type bootstrapDebugCapture struct {
+	logpkg.Logger
+	output strings.Builder
+}
+
+func (capture *bootstrapDebugCapture) Debugf(format string, args ...any) {
+	_, _ = fmt.Fprintf(&capture.output, format, args...)
+	_ = capture.output.WriteByte('\n')
+}
+
+func TestQuickSetupDoesNotLogBootstrapPassword(t *testing.T) {
+	previousConfig := settings.Config
+	previousEnv := settings.Env
+	t.Cleanup(func() {
+		settings.Config = previousConfig
+		settings.Env = previousEnv
+		settings.InitializeUserResolvers()
+	})
+	settings.Config = settings.SetDefaults(false)
+	settings.Config.Auth.AdminUsername = "bootstrap-log-admin"
+	const password = "bootstrap-P4ssword-should-never-be-logged"
+	settings.Config.Auth.AdminPassword = password
+	settings.Config.Auth.Methods.PasswordAuth.Enabled = true
+	settings.Env.IsFirstLoad = true
+	settings.InitializeUserResolvers()
+
+	db, err := storm.Open(filepath.Join(t.TempDir(), "bootstrap-log.db"))
+	if err != nil {
+		t.Fatalf("open bootstrap database: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("close bootstrap database: %v", closeErr)
+		}
+	})
+	store, err := bolt.NewStorage(db)
+	if err != nil {
+		t.Fatalf("create bootstrap storage: %v", err)
+	}
+	capture := &bootstrapDebugCapture{}
+	logpkg.SetGlobalLogger(capture)
+	t.Cleanup(func() { logpkg.SetGlobalLogger(nil) })
+
+	quickSetup(store)
+	admin, err := store.Users.Get("bootstrap-log-admin")
+	if err != nil {
+		t.Fatalf("load initialized administrator: %v", err)
+	}
+	if !admin.Permissions.Admin {
+		t.Fatal("bootstrap must still create an administrator")
+	}
+	if admin.Password == password || utils.CheckPwd(password, admin.Password) != nil {
+		t.Fatal("bootstrap password must be stored as a working password hash")
+	}
+	if utils.CheckPwd("incorrect-password", admin.Password) == nil {
+		t.Fatal("bootstrap administrator accepted an incorrect password")
+	}
+	output := capture.output.String()
+	if !strings.Contains(output, admin.Username) {
+		t.Fatal("initialization debug logging was not captured")
+	}
+	if strings.Contains(output, password) || strings.Contains(output, admin.Password) {
+		t.Fatal("initialization log exposed bootstrap password material")
 	}
 }

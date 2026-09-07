@@ -334,6 +334,12 @@ def validate_deployment(paths: Paths, metadata: dict) -> None:
     expected = {"SOURCE_ROOT": str(paths.source), "CONFIG_ROOT": str(paths.config), "DATA_ROOT": str(paths.data), "CACHE_ROOT": str(paths.cache), "FILES_ROOT": str(paths.files), "BACKUP_ROOT": str(paths.backups), "FILEBROWSER_UID": str(UID), "FILEBROWSER_GID": str(GID), "COMPOSE_PROJECT_NAME": PROJECT, "FILEBROWSER_IMAGE": metadata["image_ref"], "BUILD_REVISION": metadata["source_sha"]}
     if any(values.get(key) != value for key, value in expected.items()):
         raise DeploymentError("runtime env differs from fixed paths, identity or deployment version")
+    import yaml
+    config = yaml.safe_load((paths.config / "config.yaml").read_bytes())
+    sources = config.get("server", {}).get("sources", [])
+    enabled = metadata.get("enable_share_source", False)
+    if not isinstance(enabled, bool) or len(sources) != 1 or sources[0].get("config", {}).get("private") is not (not enabled):
+        raise DeploymentError("source sharing configuration differs from the explicit prepared decision")
     image = inspect_image(metadata["image_ref"])
     if image["Id"] != metadata["image_id"] or image.get("Config", {}).get("Labels", {}).get("org.opencontainers.image.revision") != metadata["source_sha"]:
         raise DeploymentError("image identity/revision changed; stop and inspect instead of silently upgrading")
@@ -384,6 +390,15 @@ def tls_inputs(args) -> dict[str, bytes]:
     return result
 
 
+def configure_source(value: dict, exposure: str, allowed_cidrs: list[str], enable_share_source: bool) -> None:
+    sources = value.get("server", {}).get("sources", [])
+    if len(sources) != 1:
+        raise DeploymentError("the shared-host template must have exactly one managed source")
+    sources[0]["config"]["private"] = not enable_share_source
+    if exposure == "lan":
+        value["server"]["allowedClientCIDRs"] = ["127.0.0.1/32"] + allowed_cidrs
+
+
 def prepare(paths: Paths, args) -> None:
     source_checks(paths, args.source_sha)
     validate_image_reference(args.image_ref, args.mode)
@@ -393,7 +408,7 @@ def prepare(paths: Paths, args) -> None:
         raise DeploymentError("record either --test-disk or separately reviewed --raid-confirmed evidence")
     if paths.metadata.exists():
         existing = load_metadata(paths)
-        if any(existing.get(key) != value for key, value in {"source_sha": args.source_sha, "image_ref": args.image_ref, "mode": args.mode, "exposure": args.exposure}.items()):
+        if any(existing.get(key) != value for key, value in {"source_sha": args.source_sha, "image_ref": args.image_ref, "mode": args.mode, "exposure": args.exposure}.items()) or existing.get("enable_share_source", False) != args.enable_share_source:
             raise DeploymentError("existing deployment inputs differ; prepare never upgrades or overwrites them")
         validate_deployment(paths, existing)
         print("[shared-host prepare] existing valid deployment retained; no secrets or data changed")
@@ -414,16 +429,16 @@ def prepare(paths: Paths, args) -> None:
     template = paths.assets / ("config.lan.yaml.example" if args.exposure == "lan" else "config.yaml.example")
     assert_safe_path(template, owner=0)
     config = template.read_bytes()
-    if args.exposure == "lan":
+    if args.exposure == "lan" or args.enable_share_source:
         import yaml
         config_value = yaml.safe_load(config)
-        config_value["server"]["allowedClientCIDRs"] = ["127.0.0.1/32"] + args.lan_allowed_cidrs.split(",")
+        configure_source(config_value, args.exposure, args.lan_allowed_cidrs.split(",") if args.exposure == "lan" else [], args.enable_share_source)
         config = yaml.safe_dump(config_value, sort_keys=False, allow_unicode=True).encode()
     values = read_env(paths.assets / "compose.env.example")
     values.update(FILEBROWSER_IMAGE=args.image_ref, FILEBROWSER_BUILD_IMAGE=args.image_ref, BUILD_REVISION=args.source_sha, BUILD_VERSION="fixed-" + args.source_sha)
     if args.exposure == "lan":
         values.update(LAN_BIND_IP=args.lan_bind_address, LAN_PORT=str(args.lan_port), LAN_TLS_SERVER_NAME=args.tls_name, LAN_ALLOW_CIDRS=args.lan_allowed_cidrs)
-    metadata = {"version": 1, "source_sha": args.source_sha, "image_ref": args.image_ref, "image_id": image["Id"], "mode": args.mode, "exposure": args.exposure, "test_disk": args.test_disk, "raid_confirmed": args.raid_confirmed, "bootstrap_complete": False, "admin_username": "admin"}
+    metadata = {"version": 1, "source_sha": args.source_sha, "image_ref": args.image_ref, "image_id": image["Id"], "mode": args.mode, "exposure": args.exposure, "test_disk": args.test_disk, "raid_confirmed": args.raid_confirmed, "bootstrap_complete": False, "admin_username": "admin", "enable_share_source": args.enable_share_source}
     if args.exposure == "lan":
         metadata["tls_name"] = args.tls_name
     # Failures from this point preserve a recognizable partial installation.
@@ -548,6 +563,7 @@ def main() -> int:
     evidence = parser.add_mutually_exclusive_group()
     evidence.add_argument("--test-disk", action="store_true", help="isolated staging disk evidence; never claims RAID validation")
     evidence.add_argument("--raid-confirmed", action="store_true", help="assert separately recorded RAID validation")
+    parser.add_argument("--enable-share-source", action="store_true", help="explicitly permit sharing from this source; user Share permission remains disabled by default")
     parser.add_argument("--bootstrap-password-file", type=Path)
     parser.add_argument("--admin-password-file", type=Path, help="retained protected input for interrupted bootstrap-finish recovery")
     parser.add_argument("--admin-username", default="admin")

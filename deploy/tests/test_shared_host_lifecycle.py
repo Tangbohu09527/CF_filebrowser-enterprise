@@ -24,6 +24,18 @@ class LifecycleTests(unittest.TestCase):
                 with self.assertRaises(lifecycle.DeploymentError):
                     lifecycle.read_env(path)
 
+    def test_share_source_requires_explicit_input_and_never_grants_default_share_permission(self):
+        for enabled in (False, True):
+            config = {"server": {"sources": [{"config": {"private": True}}]}, "userDefaults": {"account": {"permissions": {"share": False}}}}
+            lifecycle.configure_source(config, "base", [], enabled)
+            self.assertIs(config["server"]["sources"][0]["config"]["private"], not enabled)
+            self.assertIs(config["userDefaults"]["account"]["permissions"]["share"], False)
+
+    def test_lan_source_configuration_preserves_an_explicit_listener_allowlist(self):
+        config = {"server": {"sources": [{"config": {"private": True}}]}}
+        lifecycle.configure_source(config, "lan", ["192.0.2.12/32"], False)
+        self.assertEqual(config["server"]["allowedClientCIDRs"], ["127.0.0.1/32", "192.0.2.12/32"])
+
     def test_secret_rejects_multiline_cr_and_short_values(self):
         for value in (b"short", b"a" * 32 + b"\nextra", b"a" * 32 + b"\r\n"):
             with self.assertRaises(lifecycle.DeploymentError):
