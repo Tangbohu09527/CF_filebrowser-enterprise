@@ -724,7 +724,8 @@ func computeHeaderChecksum(target authenticatedReadTarget) (string, error) {
 	}
 	hash.Write(buf[:n])
 
-	checksum := fmt.Sprintf("%x", hash.Sum(nil))
+	// Logical length is part of duplicate identity even when allocated sizes match.
+	checksum := fmt.Sprintf("%d:%x", info.Size(), hash.Sum(nil))
 
 	// Cache the result
 	checksumCache.Set(cacheKey, checksum)
@@ -767,7 +768,8 @@ func computeMiddleChecksum(target authenticatedReadTarget) (string, error) {
 		}
 	}
 
-	checksum := fmt.Sprintf("%x", hash.Sum(nil))
+	// Logical length is part of duplicate identity even when allocated sizes match.
+	checksum := fmt.Sprintf("%d:%x", info.Size(), hash.Sum(nil))
 
 	// Cache the result
 	checksumCache.Set(cacheKey, checksum)
@@ -968,7 +970,12 @@ func resolveDuplicateChecksumTarget(opts *duplicatesOptions, indexPath string, e
 	if err != nil {
 		return target, err
 	}
-	if !publicSharePathWithin(opts.combinedPath, target.CanonicalPath) || target.Info == nil || target.Info.Size() != expectedSize {
+	if !publicSharePathWithin(opts.combinedPath, target.CanonicalPath) || target.Info == nil || target.Index == nil {
+		return target, fmt.Errorf("duplicate checksum target changed")
+	}
+	// The SQL bucket stores scanner/display size; checksum reads use logical bytes.
+	currentSize, ok := duplicateIndexedFileSize(target.Info, target.Index.Config.UseLogicalSize)
+	if !ok || currentSize != expectedSize {
 		return target, fmt.Errorf("duplicate checksum target changed")
 	}
 	return target, nil

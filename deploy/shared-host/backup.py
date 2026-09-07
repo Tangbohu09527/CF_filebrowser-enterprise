@@ -436,6 +436,8 @@ def production_guard(hostname, *, creating=False):
             while not parent.exists():
                 parent = parent.parent
             lifecycle.assert_safe_path(parent, owner=0, directory=True)
+            if parent.lstat().st_mode & 0o022:
+                raise BackupError("parent directory must not be writable by group or others")
         for path in (SOURCE_ROOT, CONFIG_ROOT, DATA_ROOT, CACHE_ROOT, FILES_ROOT, BACKUP_ROOT):
             no_links(path)
     except lifecycle.DeploymentError as error:

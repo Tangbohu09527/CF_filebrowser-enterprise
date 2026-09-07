@@ -955,3 +955,63 @@ Image ID was
 Disk/RAM usage remained 78,383,906,816 / 4,294,967,296 bytes. No UI, reboot or
 restore pass is inferred from that prefix. The already committed FileBridge
 helper correction is being exercised by a later fixed-image run.
+
+
+## 89c27efe confirmed source regressions and preview unit pass
+
+At source `89c27efee4180ff0d40fb931509e6dd0d069d320`, frontend job
+101738488034 passed all 137 tests in 18 files, including 22/22 preview URL
+cases. This confirms the minimal URL repair; real fixed-image rendering still
+requires the pending VM UI stage.
+
+[Backend job 101738488422](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34120918917/job/101738488422)
+ran the unchanged complete race command with Go 1.26.8 linux/amd64. The new
+real-index duplicate test recorded two real files, each 1,153,024 logical bytes
+and 1,155,072 scanner-allocated bytes. Synchronous indexing yielded the two
+expected SQL candidates; the actual ordinary-user handler returned 200 but no
+group in physical-size mode. The logical-size subcase passed. The failure at
+the group assertion reproduces the real size-contract defect, rather than an
+index setup or permission failure. Existing duplicate ACL and secure-open
+file/scope-root replacement regressions passed. The HTTP package failed after
+106.903 seconds; this head is not a backend pass.
+
+Deployment job 101738487818 also reproduced both new restore-parent rejection
+failures among 170 tests: storage parent 0777 and configuration parent 0775
+passed the old production guard and reached the test's lock sentinel. The
+protected 0755 parent control passed. These tests use real temporary layout,
+archive and guard code with modeled POSIX ownership/modes and isolated host
+checks; they are not proof of a real Linux mount or completed recovery.
+
+The restore repair adds only a check for the nearest existing parent's own
+group/other write bits after its existing path/owner checks. The existing loop
+already covers configuration, data, cache and storage roots. Unsafe parents
+are rejected before locking or archive work; no ownership or permission is
+automatically changed. After repair, the existing backup tests passed 20/20
+and restore-evidence tests 10/10 locally. The next CI and real blank-VM restore
+remain required.
+
+
+## Duplicate size repair awaiting complete CI
+
+The reproduced duplicate failure is repaired at the existing authenticated
+checksum resolver. Its already-authorized file stat is compared with the
+scanner size using the source's existing logical/allocated mode; Unix uses
+stat block allocation and Windows retains the scanner's 4 KiB rounding.
+Invalid, missing and overflowing metadata are rejected. The SQL bucket and
+public response size are unchanged. Logical byte length is included in both
+header and middle checksum identities and therefore in the final merge key.
+
+The real-index regression now also rewrites one fixture with one additional
+byte, verifies that both real SQL candidates remain in the same physical-size
+bucket, and requires no duplicate group. Missing/negative/unknown/overflowing
+stat metadata has explicit rejection tests. Existing permission, Token,
+canonical-path and secure-open checks still execute before reads/cache reuse.
+This does not turn the existing sampled MD5 algorithm into a full-file equality
+check or solve its existing read-after-stat concurrency/cache limitations.
+
+Read-only peer review and `git diff --check` passed. Go compilation and the
+complete race regression after this repair are still pending in the existing
+CI because this Windows workspace has no Go toolchain. The preceding red test
+is preserved above. The protected-parent backup repair was independently
+rerun locally: 20 backup tests and 10 restore-evidence tests passed. These local
+checks do not establish a successful actual blank-VM recovery.
