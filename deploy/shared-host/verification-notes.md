@@ -635,3 +635,31 @@ client-network test's cleanup error variable to `serveErr`. Error assertions and
 one-second socket deadlines are unchanged; diff checking passed. The remaining
 112 baseline statements were not changed, and the next actual Lint run still
 needs to confirm the task-specific fix.
+
+## Bounded authorized directory totals for the two existing UI failures
+
+The unchanged Noauth aggregate assertions are the failing reproduction for this
+batch. The repair is limited to HTTP resource display, a read-only indexing
+measurement adapter and a bounded fresh ACL batch. It never reuses a global
+folder total as user-authorized metadata. Shared preview/WebDAV filtering and
+all original resource/permission/UI assertions remain unchanged.
+
+HTTP collects a fresh candidate tree before its existing final user/scope/path
+and child-filter checks. An entire response shares 4096 entries, depth 32,
+1 MiB of paths, 128-entry reads and a one-second cooperative deadline. Kernel
+filesystem calls are not claimed to be forcibly interruptible. Every contribution
+is checked against current scope, logical/canonical permission, file identity,
+size/time and scanner exclusions; application requires a final bounded ACL/group
+snapshot. Denial, change, unknown alias/hardlink accounting, read failure or
+exhaustion discards the whole candidate total and preserves the existing safe
+filesystem size. Thus fallback values are not complete directory-capacity reports.
+Unix allocated blocks/logical bytes and the existing minimum directory sizing
+are retained; regular file detail, preview and WebDAV byte lengths are unchanged.
+
+Thirteen new test groups cover normal physical/logical trees, current and late
+user/group revocation, token intersection/revocation, scope/identity/size/type
+changes, excluded ancestors, sparse allocation, aliases/hardlinks and each
+budget/error fallback. Existing hidden-descendant aggregate assertions are
+unchanged. Diff checking and independent source review passed. This Windows
+workspace has no Go/gofmt/Docker: compilation, race regression, Lint and the
+original Playwright assertions must still run in CI; no runtime pass is claimed.

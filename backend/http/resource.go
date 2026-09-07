@@ -463,6 +463,13 @@ func resourceGetHandler(w http.ResponseWriter, r *http.Request, d *requestContex
 		fileInfo.Checksums = make(map[string]string)
 		fileInfo.Checksums[checksumAlgo] = checksum
 	}
+	var aggregates *resourceAggregateWalk
+	if fileInfo.Type == "directory" {
+		aggregates, err = collectAuthenticatedResourceAggregates(r.Context(), d, target)
+		if err != nil {
+			return http.StatusForbidden, errors.ErrAccessDenied
+		}
+	}
 	responseUser, err := revalidateAuthenticatedResourceRead(d, source, path, target, protectedMediaTargets, getContent || checksumAlgo != "", canReadMetadata)
 	if err != nil {
 		return http.StatusForbidden, errors.ErrAccessDenied
@@ -485,8 +492,9 @@ func resourceGetHandler(w http.ResponseWriter, r *http.Request, d *requestContex
 		}
 	}
 	if fileInfo.Type == "directory" {
+		aggregates.apply(responseUser, currentTarget, fileInfo)
 		// Only resource listings use display sizes. Shared filtering keeps real
-		// byte sizes for preview and WebDAV; directory aggregates stay redacted.
+		// byte sizes for preview and WebDAV.
 		for i := range fileInfo.Files {
 			fileInfo.Files[i].Size = authenticatedListingFileSize(fileInfo.Files[i].Size, currentTarget.Index.Config.UseLogicalSize)
 		}
