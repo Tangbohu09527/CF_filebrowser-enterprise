@@ -42,7 +42,9 @@ def listing(entries):
 
 
 def event(role, action, method, path, result="success", status=200):
-    return {"schemaVersion": 1, "requestId": role + "-" + method + "-" + result,
+    # Match backend/http/audit_query.go's auditQueryItem response DTO: the
+    # database Event's top-level SchemaVersion is not exposed by this endpoint.
+    return {"requestId": role + "-" + method + "-" + result,
             "timestampUtc": "2026-09-07T12:34:56.123456789Z",
             "userId": 2 if role == "bridge" else 3, "username": role + "-user",
             "authMethod": "token", "origin": "http" if role == "bridge" else "webdav",
@@ -70,6 +72,35 @@ def use_audit(test, events):
 
 
 class ProtocolAcceptanceTests(unittest.TestCase):
+    def test_permission_update_accepts_handler_no_content_contract(self):
+        # backend/http/audit_user_actions_test.go's permission-update case asserts
+        # the real userPutHandler returns 204, with no JSON response body.
+        test = acceptance()
+        granted = api.permissions(create=False)
+        test.client = mock.Mock()
+        test.client.request.return_value = api.Reply(204, {}, b"")
+        test.set_permissions("bridge", granted)
+        test.client.request.assert_called_once_with(
+            "PUT", "/api/users", token=test.admin, query={"id": 2},
+            data={"which": ["permissions"], "data": {"permissions": granted}},
+            headers={"X-Password": urllib.parse.quote(test.admin_password, safe="")})
+        self.assertEqual(test.state["users"]["bridge"]["permissions"], granted)
+        test.checkpoint.assert_called_once_with()
+        self.assertEqual(test.checks[-1]["http_status"], 204)
+
+    def test_permission_update_rejects_other_statuses_without_persisting_grants(self):
+        for status in (200, 201, 202, 401, 403, 500):
+            with self.subTest(status=status):
+                test = acceptance()
+                test.state["users"]["bridge"]["permissions"] = api.permissions()
+                before = copy.deepcopy(test.state)
+                test.client = mock.Mock()
+                test.client.request.return_value = api.Reply(status, {}, b"")
+                with self.assertRaises(api.AcceptanceError):
+                    test.set_permissions("bridge", api.permissions(create=False))
+                self.assertEqual(test.state, before)
+                test.checkpoint.assert_not_called()
+
     def test_dav_rejects_multistatus_with_only_forbidden_properties(self):
         test = acceptance()
         test.dav = mock.Mock(return_value=listing([("/webdav/", 403)]))
@@ -138,7 +169,7 @@ class ProtocolAcceptanceTests(unittest.TestCase):
             {"httpStatus": 500}, {"timestampUtc": "0001-01-01T00:00:00Z"},
             {"timestampUtc": "not-a-timestamp"}, {"path": "/test-scope/unrelated.txt"},
             {"source": "outside"}, {"username": "unrelated-user"}, {"userId": 999},
-            {"origin": "internal"}, {"schemaVersion": 99},
+            {"origin": "internal"}, {"metadata": {"schemaVersion": 99, "method": "POST"}},
             {"metadata": {"schemaVersion": 1, "method": "DELETE"}},
         ]
         for role, index in (("bridge", 0), ("dav", 0), ("dav", 1)):

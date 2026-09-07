@@ -48,7 +48,8 @@ test("ordinary user uploads, edits, renames, downloads exact bytes and deletes",
   await page.keyboard.insertText(edited.toString("utf8"));
   const saved = page.waitForResponse((response) =>
     response.url().includes("/api/resources") && ["PUT", "POST"].includes(response.request().method()));
-  await page.locator("#save-button").click();
+  await page.locator(".overflow-menu-button").click();
+  await page.locator('button[aria-label="Save"]').click();
   expect((await saved).ok()).toBeTruthy();
   await page.goto(listing());
 

@@ -279,3 +279,27 @@ Local lifecycle (22), VM harness (19) and restore-evidence (10) tests passed,
 along with syntax of the changed existing Playwright test. These counterexamples
 strengthen acceptance; they do not replace actual missing-disk boot or live
 blank-recovery evidence, which is still pending.
+
+## Acceptance client aligned with the existing product contracts
+
+Source inspection and focused counterexamples found two API-client mismatches:
+`userPutHandler` returns 204 for successful permission updates (also asserted by
+the existing Go audit user-action test), whereas the new client expected 200;
+the audit query DTO exposes schema version in event metadata, not the database
+event's top-level `schemaVersion`. The permission update now accepts exactly
+204, and persists expected grants only after that result. Audit checks use the
+actual DTO and retain metadata version, actor/source/path/method, terminal
+success/denial, redaction and persisted-event assertions.
+
+The successful-204/noncontract-200 tests first produced one error and one
+failure. Removing the invented top-level field from the audit fixture first
+failed `bridge_audit_terminal_success_upload`. After the client corrections,
+all 12 protocol-client unit tests passed. These are counterexamples and source
+contract checks, not a claim of completed live FileBridge or WebDAV protocols.
+
+The ordinary UI account retains the product default `editorQuickSave=false`.
+The deployment UI test now uses the existing overflow menu's Save action, as
+the repository's other UI tests do, instead of expecting an optional shortcut.
+It retains the real save response, downloaded-byte digest, rename and delete
+checks; no fixture preference, permission or product behavior changed. Syntax
+passed; live browser execution still requires the fixed-image VM run.

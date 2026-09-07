@@ -261,7 +261,7 @@ class Acceptance:
 
     def set_permissions(self, role, granted):
         account = self.state["users"][role]
-        self.request(role + "_permissions_update", "PUT", "/api/users", token=self.admin,
+        self.request(role + "_permissions_update", "PUT", "/api/users", token=self.admin, statuses=(204,),
                      query={"id": account["id"]}, data={"which": ["permissions"], "data": {"permissions": granted}},
                      headers={"X-Password": urllib.parse.quote(self.admin_password, safe="")})
         account["permissions"] = granted
@@ -821,7 +821,7 @@ class Acceptance:
                     valid_time = event["timestampUtc"].endswith("Z") and timestamp >= datetime(1970, 1, 1, tzinfo=timezone.utc)
                 except (ValueError, TypeError, KeyError):
                     return False
-                return (valid_time and event.get("schemaVersion") == 1
+                return (valid_time
                         and isinstance(event.get("requestId"), str) and bool(event["requestId"])
                         and event.get("username") == account["username"] and event.get("userId") == account["id"]
                         and event.get("origin") == origin and event.get("result") == outcome
