@@ -583,3 +583,55 @@ reporting caps change; all rules, scan scope, exit status, compatible pinned
 versions and finite time budgets remain. Workflow structure and exact Makefile
 command comparison passed; local Lint is unavailable because this Windows
 workspace has no Go installation. No baseline code cleanup was included.
+
+## Correct decimal resource authorization and stopped old-budget runs
+
+The earlier statement that the VM runs fit an 80 GiB limit was an incorrect
+interpretation of the user's 80 GB authorization. The aa1bb690 recorded sparse
+virtual capacity was 84,826,357,760 bytes (79 GiB plus seed media), exceeding
+80,000,000,000 bytes. Its functional prefix results remain historical evidence,
+but do not establish acceptance within the authorized decimal disk budget.
+No Windows VM or global system configuration was created or changed.
+
+The still-running af65fcef shared-host run 34110905805 and queued 1e178de4 run
+34111630090 were explicitly cancelled; both reached cancelled status. Their
+unfinished stages must not be reported as passed. Existing completed artifacts
+are retained; no live disk was resized or data reset to retry.
+
+The next fresh VM run retains each 24 GiB system disk and reduces each isolated
+data disk from 14 to 11 GiB. Including the 3 GiB base and conservative 32 MiB seed
+allowance, planned capacity is 78,416,707,584 bytes. Both preflight and evidence
+now enforce exact ceilings of 80,000,000,000 disk bytes and 8,000,000,000 memory
+bytes; configured RAM remains 4,294,967,296 bytes. Real old-capacity rejection,
+exact-byte boundaries, base/seed growth, memory units and actual QEMU argv are
+covered. The existing VM harness suite passed 33 local tests after the resource
+repair. These tests did not create VMs; a new real run is required.
+
+## Uncapped 1e178de4 Lint and complete backend results
+
+[Regular Lint job 101708974744](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34111630137/job/101708974744)
+completed analysis in 53.650 seconds with all diagnostic caps removed: 113
+findings across 28 files (errcheck 8, govet/shadow 85, ineffassign 1, staticcheck
+13, unused 6). The extra 35 previously hidden results are all shadow findings.
+Source comparison attributes 112 statements to the integration baseline and
+one to this task's client-network test cleanup variable. This is not a separate
+baseline Lint execution. The complete sanitized inventory is retained outside
+Git; broad baseline cleanup has not been applied.
+
+[Backend job 101708974844](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/34111630137/job/101708974844)
+passed the complete `go test -race -v ./... -timeout 5m` suite (HTTP 98.234
+seconds). This regular workflow was unaffected by cancellation of the separate
+shared-host VM workflows. Its pass does not waive the remaining Lint gate.
+
+The cancelled af65fcef artifact was retained separately. Its last saved stage
+was `idempotent-prepare-after-bootstrap`, with runtime healthy and bootstrap
+absent; no `failed_api` or product failure was recorded. LAN/API/protocol/UI and
+restart/restore had not begun. The initial `result: failed` field does not turn
+cancellation into a reproduced application failure. The queued 1e178de4 shared
+workflow produced no VM artifacts.
+
+The single task-introduced shadow finding was corrected only by renaming the
+client-network test's cleanup error variable to `serveErr`. Error assertions and
+one-second socket deadlines are unchanged; diff checking passed. The remaining
+112 baseline statements were not changed, and the next actual Lint run still
+needs to confirm the task-specific fix.

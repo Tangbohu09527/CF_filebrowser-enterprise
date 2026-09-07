@@ -46,8 +46,8 @@ func TestClientNetworkListenerRejectsSocketSourceAndIgnoresForwardedHeaders(t *t
 	go func() { finished <- server.Serve(guarded) }()
 	t.Cleanup(func() {
 		server.Close()
-		if err := <-finished; err != nil && !errors.Is(err, http.ErrServerClosed) {
-			t.Errorf("server: %v", err)
+		if serveErr := <-finished; serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			t.Errorf("server: %v", serveErr)
 		}
 	})
 

@@ -214,12 +214,42 @@ class QemuLaunchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             _, calls = self.make_vm(directory)
             creates = [command for command in calls if command[:2] == ["qemu-img", "create"]]
-            self.assertEqual([command[-1] for command in creates], ["24G", "14G"])
+            self.assertEqual([command[-1] for command in creates], ["24G", "11G"])
         budget = harness.resource_budget(3 * 1024 ** 3, 1024 ** 2)
-        self.assertLessEqual(budget["total_virtual_disk_bytes"], 80 * 1024 ** 3)
-        self.assertLessEqual(budget["configured_memory_bytes"], 8 * 1024 ** 3)
+        self.assertEqual(budget["system_disk_gib_per_vm"], int(creates[0][-1][:-1]))
+        self.assertEqual(budget["test_disk_gib_per_vm"], int(creates[1][-1][:-1]))
+        self.assertEqual(budget["total_virtual_disk_bytes"], 73 * 1024 ** 3 + 1024 ** 2)
+        self.assertEqual(budget["maximum_virtual_disk_bytes"], 80_000_000_000)
+        self.assertEqual(budget["maximum_memory_bytes"], 8_000_000_000)
+        self.assertLessEqual(budget["total_virtual_disk_bytes"], 80_000_000_000)
+        self.assertLessEqual(budget["configured_memory_bytes"], 8_000_000_000)
         with self.assertRaises(harness.VerificationError):
             harness.resource_budget(5 * 1024 ** 3)
+
+    def test_previous_79_gib_disk_configuration_exceeds_decimal_authorization(self):
+        # Actual aa1bb690 CI: two 24+14 GiB VMs, a 3 GiB base and 753664 seed bytes.
+        old_total = 79 * 1024 ** 3 + 753664
+        self.assertEqual(old_total, 84_826_357_760)
+        self.assertGreater(old_total, 80_000_000_000)
+        with mock.patch.object(harness, "TEST_DISK_GIB", 14):
+            with self.assertRaises(harness.VerificationError):
+                harness.resource_budget(3 * 1024 ** 3, 753664)
+
+    def test_decimal_disk_limit_accepts_exact_bytes_and_rejects_base_or_seed_growth(self):
+        base = 3 * 1024 ** 3
+        vm_disks = 2 * (24 + 11) * 1024 ** 3
+        seed_at_limit = 80_000_000_000 - vm_disks - base
+        budget = harness.resource_budget(base, seed_at_limit)
+        self.assertEqual(budget["total_virtual_disk_bytes"], 80_000_000_000)
+        for base_bytes, seed_bytes in ((base + 1, seed_at_limit), (base, seed_at_limit + 1)):
+            with self.subTest(base_bytes=base_bytes, seed_bytes=seed_bytes):
+                with self.assertRaises(harness.VerificationError):
+                    harness.resource_budget(base_bytes, seed_bytes)
+
+    def test_eight_gib_memory_is_rejected_by_eight_decimal_gb_limit(self):
+        with mock.patch.object(harness, "VM_MEMORY_MIB", 4096):
+            with self.assertRaises(harness.VerificationError):
+                harness.resource_budget(3 * 1024 ** 3)
 
     def test_qemu_error_is_retained_and_only_known_diagnostic_is_reported(self):
         with tempfile.TemporaryDirectory() as directory:

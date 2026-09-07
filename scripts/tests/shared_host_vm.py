@@ -37,7 +37,7 @@ GUEST = "/root/cf-verification"
 SOURCE = "/opt/cf-filebrowser-enterprise"
 GIB = 1024 ** 3
 SYSTEM_DISK_GIB = 24
-TEST_DISK_GIB = 14
+TEST_DISK_GIB = 11
 VM_MEMORY_MIB = 2048
 
 
@@ -96,11 +96,12 @@ def cloud_image(work):
 def resource_budget(base_virtual_bytes, seed_bytes=2 * 16 * 1024 ** 2):
     total = 2 * (SYSTEM_DISK_GIB + TEST_DISK_GIB) * GIB + base_virtual_bytes + seed_bytes
     memory = 2 * VM_MEMORY_MIB * 1024 ** 2
-    if total > 80 * GIB or memory > 8 * GIB:
-        raise VerificationError("two-VM resource budget exceeds 8 GiB RAM or 80 GiB total sparse disk capacity; no automatic expansion is allowed")
+    # QEMU's G/M disk and memory inputs are binary; the authorized GB limits are decimal.
+    if total > 80_000_000_000 or memory > 8_000_000_000:
+        raise VerificationError("two-VM resource budget exceeds 8 GB RAM or 80 GB total sparse disk capacity; no automatic expansion is allowed")
     return {"vm_count": 2, "system_disk_gib_per_vm": SYSTEM_DISK_GIB, "test_disk_gib_per_vm": TEST_DISK_GIB,
             "base_virtual_bytes": base_virtual_bytes, "seed_bytes": seed_bytes, "total_virtual_disk_bytes": total,
-            "maximum_virtual_disk_bytes": 80 * GIB, "configured_memory_bytes": memory, "maximum_memory_bytes": 8 * GIB}
+            "maximum_virtual_disk_bytes": 80_000_000_000, "configured_memory_bytes": memory, "maximum_memory_bytes": 8_000_000_000}
 
 
 class VM:
