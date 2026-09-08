@@ -5,6 +5,7 @@ server:
   socket: ""                              # socket to listen on - eg. /var/run/filebrowser.sock
   tlsKey: ""                              # path to TLS key
   tlsCert: ""                             # path to TLS cert
+  allowedClientCIDRs:                     # optional canonical TCP peer CIDRs; ignores forwarding headers and rejects other peers before TLS/HTTP
   disablePreviews: false                  # disable all previews thumbnails, simple icons will be used
   disablePreviewResize: false             # disable resizing of previews for faster loading over slow connections
   disableTypeDetectionByHeader: false     # disable type detection by header, useful if filesystem is slow.
@@ -219,6 +220,8 @@ userDefaults:
       realtime: false                     # allow realtime updates
       delete: false                       # allow deleting files
       create: false                       # allow creating or uploading files
+      browse: true                        # allow browsing files and directories
+      preview: true                       # allow previewing file contents
       download: true                      # allow downloading files
     lockPassword: false                   # disable the user from changing their password
     disableSettings: false                # disable the user from viewing the settings page

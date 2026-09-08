@@ -1,0 +1,38 @@
+server:
+  listen: "0.0.0.0"
+  port: 8080
+  tlsCert: /etc/filebrowser-enterprise/tls/server.crt
+  tlsKey: /etc/filebrowser-enterprise/tls/server.key
+  # prepare appends the explicit LAN_ALLOW_CIDRS; loopback is for container health.
+  allowedClientCIDRs:
+    - 127.0.0.1/32
+  baseURL: "/"
+  database: "/var/lib/filebrowser-enterprise/database.db"
+  cacheDir: "/var/cache/filebrowser-enterprise"
+  disableUpdateCheck: true
+  disableWebDAV: true
+  filesystem:
+    createFilePermission: "640"
+    createDirectoryPermission: "750"
+  sources:
+    - path: "/srv/filebrowser/files"
+      name: "enterprise-files"
+      config:
+        private: true
+        readOnly: false
+        denyByDefault: false
+        defaultEnabled: true
+
+userDefaults:
+  account:
+    permissions:
+      browse: true
+      preview: true
+      download: true
+      api: false
+      admin: false
+      share: false
+      create: false
+      modify: false
+      delete: false
+      realtime: false

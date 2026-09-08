@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""Unit-level rejection/order tests; these do not claim real Docker acceptance."""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import tempfile
+import unittest
+from types import SimpleNamespace
+from pathlib import Path
+from unittest import mock
+
+MODULE_PATH = Path(__file__).resolve().parents[1] / "shared-host" / "lifecycle.py"
+SPEC = importlib.util.spec_from_file_location("shared_host_lifecycle", MODULE_PATH)
+lifecycle = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(lifecycle)
+
+
+class StorageStatusTests(unittest.TestCase):
+    def test_unmounted_status_is_explicit_and_does_not_read_identity(self):
+        with mock.patch.object(lifecycle, "assert_safe_path"), \
+             mock.patch.object(lifecycle, "run", return_value=b"/\n"), \
+             mock.patch.object(Path, "read_bytes") as read:
+            result = lifecycle.storage_status(lifecycle.Paths())
+        self.assertEqual(result, {"path": "/srv/storage", "ready": False, "reason": "not-mounted"})
+        read.assert_not_called()
+
+    def test_identity_match_is_required_and_values_are_not_reported(self):
+        for actual, expected_reason in ((b"a" * 64 + b"\n", "ready"), (b"b" * 64 + b"\n", "identity-mismatch"), (b"sensitive-invalid", "identity-invalid")):
+            with self.subTest(reason=expected_reason), \
+                 mock.patch.object(lifecycle, "assert_safe_path"), \
+                 mock.patch.object(lifecycle, "run", return_value=b"/srv/storage\n"), \
+                 mock.patch.object(Path, "stat", side_effect=lambda p=None: SimpleNamespace(st_dev=2, st_size=65)), \
+                 mock.patch.object(lifecycle.os, "stat", return_value=SimpleNamespace(st_dev=1)), \
+                 mock.patch.object(Path, "read_bytes", side_effect=[b"a" * 64 + b"\n", actual]):
+                result = lifecycle.storage_status(lifecycle.Paths())
+            self.assertEqual(result["reason"], expected_reason)
+            self.assertIs(result["ready"], expected_reason == "ready")
+            self.assertNotIn("sensitive", json.dumps(result))
+            self.assertNotIn("a" * 64, json.dumps(result))
+
+    def test_root_filesystem_and_unsafe_identity_are_not_ready(self):
+        with mock.patch.object(lifecycle, "assert_safe_path"), \
+             mock.patch.object(lifecycle, "run", return_value=b"/srv/storage\n"), \
+             mock.patch.object(Path, "stat", return_value=SimpleNamespace(st_dev=1)), \
+             mock.patch.object(lifecycle.os, "stat", return_value=SimpleNamespace(st_dev=1)), \
+             mock.patch.object(Path, "read_bytes") as read:
+            self.assertEqual(lifecycle.storage_status(lifecycle.Paths())["reason"], "root-filesystem")
+            read.assert_not_called()
+        with mock.patch.object(lifecycle, "assert_safe_path", side_effect=lifecycle.DeploymentError("private-value")):
+            result = lifecycle.storage_status(lifecycle.Paths())
+        self.assertEqual(result["reason"], "unsafe-or-unreadable")
+        self.assertNotIn("private-value", json.dumps(result))
+
+
+class LifecycleTests(unittest.TestCase):
+    def test_validator_diagnostic_reports_only_machine_safe_location(self):
+        raw = b"PASSWORD-MUST-NOT-LEAK\n[shared-host-validate-diag] phase=compose-contract kind=contract line=248 exit=1\nTOKEN-MUST-NOT-LEAK\n"
+        with mock.patch.object(lifecycle.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"SECRET", raw)):
+            with self.assertRaises(lifecycle.DeploymentError) as failure:
+                lifecycle.run(["bash", "/approved/validate.sh"], validation_diagnostics=True)
+        message = str(failure.exception)
+        self.assertIn("compose-contract", message)
+        self.assertIn("contract line 248", message)
+        for secret in ("PASSWORD", "TOKEN", "SECRET"):
+            self.assertNotIn(secret, message)
+
+    def test_other_commands_and_invalid_validator_markers_remain_suppressed(self):
+        for enabled, marker in ((False, b"[shared-host-validate-diag] phase=host kind=shell line=25 exit=1"), (True, b"[shared-host-validate-diag] phase=SECRET kind=shell line=25 exit=1"), (True, b"[shared-host-validate-diag] phase=host kind=shell line=25 exit=1 SECRET")):
+            with self.subTest(enabled=enabled, marker=marker):
+                with mock.patch.object(lifecycle.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"SECRET", marker + b"\n")):
+                    with self.assertRaises(lifecycle.DeploymentError) as failure:
+                        lifecycle.run(["bash", "/approved/validate.sh"], validation_diagnostics=enabled)
+                self.assertIn("output suppressed", str(failure.exception))
+                self.assertNotIn("SECRET", str(failure.exception))
+                self.assertNotIn("line 25", str(failure.exception))
+
+    def test_env_rejects_duplicate_and_shell_interpolation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            for value in ("A=one\nA=two\n", "A=$(touch-pwned)\n", "A=${HOME}\n"):
+                path.write_text(value, encoding="utf-8")
+                with self.assertRaises(lifecycle.DeploymentError):
+                    lifecycle.read_env(path)
+
+    def test_share_source_requires_explicit_input_and_never_grants_default_share_permission(self):
+        for enabled in (False, True):
+            config = {"server": {"sources": [{"config": {"private": True}}]}, "userDefaults": {"account": {"permissions": {"share": False}}}}
+            lifecycle.configure_source(config, "base", [], enabled)
+            self.assertIs(config["server"]["sources"][0]["config"]["private"], not enabled)
+            self.assertIs(config["userDefaults"]["account"]["permissions"]["share"], False)
+
+    def test_lan_source_configuration_preserves_an_explicit_listener_allowlist(self):
+        config = {"server": {"sources": [{"config": {"private": True}}]}}
+        lifecycle.configure_source(config, "lan", ["192.0.2.12/32"], False)
+        self.assertEqual(config["server"]["allowedClientCIDRs"], ["127.0.0.1/32", "192.0.2.12/32"])
+
+    def test_webdav_requires_explicit_input_and_preserves_user_permission_defaults(self):
+        for enabled in (False, True):
+            config = {"server": {"disableWebDAV": True, "sources": [{"config": {"private": True}}]}, "userDefaults": {"account": {"permissions": {"create": False, "modify": False, "share": False}}}}
+            lifecycle.configure_source(config, "base", [], False, enable_webdav=enabled)
+            self.assertIs(config["server"]["disableWebDAV"], not enabled)
+            self.assertIs(config["server"]["sources"][0]["config"]["private"], True)
+            self.assertEqual(config["userDefaults"]["account"]["permissions"], {"create": False, "modify": False, "share": False})
+
+    def test_secret_rejects_multiline_cr_and_short_values(self):
+        for value in (b"short", b"a" * 32 + b"\nextra", b"a" * 32 + b"\r\n"):
+            with self.assertRaises(lifecycle.DeploymentError):
+                lifecycle.secret_bytes(value, 24)
+        self.assertEqual(lifecycle.secret_bytes(b"a" * 32 + b"\n", 24), b"a" * 32)
+
+    def test_candidate_requires_nonzero_registry_digest(self):
+        for value in ("project:latest", "project@sha256:" + "0" * 64):
+            with self.assertRaises(lifecycle.DeploymentError):
+                lifecycle.validate_image_reference(value, "candidate")
+        lifecycle.validate_image_reference("registry.example/project@sha256:" + "a" * 64, "candidate")
+
+    def test_partial_prepare_does_not_fill_missing_secrets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = lifecycle.Paths(Path(directory))
+            paths.config.mkdir(parents=True)
+            secret = paths.config / "secrets" / "jwt_token_secret"
+            secret.parent.mkdir()
+            secret.write_bytes(b"existing-secret")
+            with self.assertRaisesRegex(lifecycle.DeploymentError, "partial|existing"):
+                lifecycle.assert_empty_install(paths)
+            self.assertEqual(secret.read_bytes(), b"existing-secret")
+            self.assertFalse((paths.config / "secrets" / "totp_secret").exists())
+
+    def test_compose_is_fixed_project_and_never_implicit_pull_or_build(self):
+        paths = lifecycle.Paths()
+        command = lifecycle.compose_command(paths, "debug")
+        self.assertIn("cf-filebrowser", command)
+        self.assertNotIn("compose.build.yaml", " ".join(command))
+        self.assertIn("compose.debug.yaml", " ".join(command))
+        self.assertEqual(Path(command[command.index("--env-file") + 1]).as_posix(), "/etc/cf-filebrowser-enterprise/.env")
+
+    def test_host_environment_cannot_override_compose_or_docker_target(self):
+        with mock.patch.dict("os.environ", {"FILEBROWSER_IMAGE": "poison", "DOCKER_HOST": "tcp://forbidden:2375", "COMPOSE_FILE": "poison"}):
+            environment = lifecycle.command_environment()
+        self.assertNotIn("FILEBROWSER_IMAGE", environment)
+        self.assertEqual(environment["DOCKER_HOST"], "unix:///var/run/docker.sock")
+        self.assertNotIn("COMPOSE_FILE", environment)
+
+    def test_login_never_places_password_or_session_in_argv(self):
+        calls = []
+        def fake_run(command, input_bytes=None):
+            calls.append((command, input_bytes))
+            if len(calls) == 1:
+                return b"secret-session-token"
+            return json.dumps({"username": "admin", "permissions": {"admin": True}}).encode()
+        with mock.patch.object(lifecycle, "run", side_effect=fake_run):
+            lifecycle.verify_admin("abc123", b"never-in-arguments-password", "admin", {"exposure": "debug"})
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("never-in-arguments-password", repr([item[0] for item in calls]))
+        self.assertNotIn("secret-session-token", repr([item[0] for item in calls]))
+        self.assertIn(b"X-Password", calls[0][1])
+        self.assertIn(b"Cookie", calls[1][1])
+
+    def test_login_requires_actual_admin_profile(self):
+        responses = [b"session", b'{"username":"reader","permissions":{"admin":false}}']
+        with mock.patch.object(lifecycle, "run", side_effect=responses):
+            with self.assertRaises(lifecycle.DeploymentError):
+                lifecycle.verify_admin("abc123", b"password", "admin", {"exposure": "debug"})
+
+    def test_first_login_failure_preserves_bootstrap_and_running_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = lifecycle.Paths(Path(directory))
+            paths.bootstrap.parent.mkdir(parents=True)
+            paths.bootstrap.write_bytes(b"a" * 32)
+            paths.data.mkdir(parents=True)
+            (paths.data / "database.db").write_bytes(b"initialized")
+            deployment = {"image_id": "sha256:" + "a" * 64, "exposure": "debug", "bootstrap_complete": False}
+            with mock.patch.object(lifecycle, "protected_secret", return_value=b"a" * 32), \
+                 mock.patch.object(lifecycle, "container_identity", return_value=("abc123", deployment["image_id"])), \
+                 mock.patch.object(lifecycle, "verify_admin", side_effect=lifecycle.DeploymentError("login failed")), \
+                 mock.patch.object(lifecycle, "run") as command:
+                with self.assertRaises(lifecycle.DeploymentError):
+                    lifecycle.finish_bootstrap(paths, deployment, "admin")
+                command.assert_not_called()
+            self.assertTrue(paths.bootstrap.exists())
+
+    def test_stop_failure_never_removes_bootstrap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = lifecycle.Paths(Path(directory))
+            paths.bootstrap.parent.mkdir(parents=True)
+            paths.bootstrap.write_bytes(b"a" * 32)
+            paths.data.mkdir(parents=True)
+            (paths.data / "database.db").write_bytes(b"initialized")
+            deployment = {"image_id": "sha256:" + "a" * 64, "exposure": "debug", "bootstrap_complete": False}
+            with mock.patch.object(lifecycle, "protected_secret", return_value=b"a" * 32), \
+                 mock.patch.object(lifecycle, "container_identity", return_value=("abc123", deployment["image_id"])), \
+                 mock.patch.object(lifecycle, "verify_admin"), \
+                 mock.patch.object(lifecycle, "run", side_effect=lifecycle.DeploymentError("stop failed")):
+                with self.assertRaises(lifecycle.DeploymentError):
+                    lifecycle.finish_bootstrap(paths, deployment, "admin")
+            self.assertTrue(paths.bootstrap.exists())
+            self.assertFalse(deployment["bootstrap_complete"])
+
+    def test_post_restart_login_failure_does_not_recreate_bootstrap_or_claim_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = lifecycle.Paths(Path(directory))
+            paths.bootstrap.parent.mkdir(parents=True)
+            paths.bootstrap.write_bytes(b"a" * 32)
+            paths.data.mkdir(parents=True)
+            (paths.data / "database.db").write_bytes(b"initialized")
+            deployment = {"image_id": "sha256:" + "a" * 64, "exposure": "debug", "bootstrap_complete": False}
+            with mock.patch.object(lifecycle, "protected_secret", return_value=b"a" * 32), \
+                 mock.patch.object(lifecycle, "container_identity", return_value=("abc123", deployment["image_id"])), \
+                 mock.patch.object(lifecycle, "verify_admin", side_effect=[None, lifecycle.DeploymentError("restart login failed")]), \
+                 mock.patch.object(lifecycle, "run"), \
+                 mock.patch.object(lifecycle, "assert_stopped"), \
+                 mock.patch.object(lifecycle, "start_service"), \
+                 mock.patch.object(lifecycle, "save_metadata") as save:
+                with self.assertRaises(lifecycle.DeploymentError):
+                    lifecycle.finish_bootstrap(paths, deployment, "admin")
+                save.assert_not_called()
+            self.assertFalse(paths.bootstrap.exists())
+            self.assertFalse(deployment["bootstrap_complete"])
+            self.assertEqual((paths.data / "database.db").read_bytes(), b"initialized")
+
+    def test_bootstrap_finishes_only_after_stop_same_image_restart_and_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = lifecycle.Paths(Path(directory))
+            paths.bootstrap.parent.mkdir(parents=True)
+            paths.bootstrap.write_bytes(b"a" * 32)
+            paths.data.mkdir(parents=True)
+            (paths.data / "database.db").write_bytes(b"initialized")
+            deployment = {"image_id": "sha256:" + "a" * 64, "exposure": "debug", "bootstrap_complete": False}
+            events = []
+            def login(*args):
+                events.append("login-present" if paths.bootstrap.exists() else "login-absent")
+            with mock.patch.object(lifecycle, "protected_secret", return_value=b"a" * 32), \
+                 mock.patch.object(lifecycle, "container_identity", return_value=("abc123", deployment["image_id"])), \
+                 mock.patch.object(lifecycle, "verify_admin", side_effect=login), \
+                 mock.patch.object(lifecycle, "run", side_effect=lambda *args, **kwargs: events.append("stop")), \
+                 mock.patch.object(lifecycle, "assert_stopped", side_effect=lambda *args: events.append("stopped")), \
+                 mock.patch.object(lifecycle, "start_service", side_effect=lambda *args: events.append("start")), \
+                 mock.patch.object(lifecycle, "save_metadata", side_effect=lambda *args: events.append("save")):
+                lifecycle.finish_bootstrap(paths, deployment, "admin")
+            self.assertEqual(events, ["login-present", "stop", "stopped", "start", "login-absent", "save"])
+            self.assertFalse(paths.bootstrap.exists())
+            self.assertTrue(deployment["bootstrap_complete"])
+
+
+
+class ReadmeCommandTests(unittest.TestCase):
+    """Execute documented control flow with sudo replaced; never deploy a host."""
+
+    def block(self, marker):
+        readme = (MODULE_PATH.parent / "README.md").read_text(encoding="utf-8")
+        matches = [block for block in re.findall(r"```bash\n(.*?)\n```", readme, re.S)
+                   if marker in block]
+        self.assertEqual(len(matches), 1, "documented stage must be unambiguous")
+        return matches[0]
+
+    def run_block(self, marker, fail_operation="", inherited=False):
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash, "Bash is required for documented command regression")
+        environment = os.environ.copy()
+        environment["CF_DOC_FAIL_OPERATION"] = fail_operation
+        for name in ("SOURCE_ROOT", "APPROVED_SHA", "HOSTNAME_APPROVED", "RECORDED_BACKUP_SHA256",
+                     "APPROVED_IMAGE", "IMAGE_ID", "BASH_ENV", "ENV", "SHELLOPTS"):
+            environment.pop(name, None)
+        if inherited:
+            environment.update(APPROVED_IMAGE="inherited-wrong-image:old", IMAGE_ID="sha256:" + "0" * 64)
+        # No real sudo, Docker, Git or application command runs. The stub emits
+        # only synthetic arguments and the local image ID used by this test.
+        stub = r'''
+sudo() {
+  printf 'DOC_CALL ' >&2
+  printf '%q ' "$@" >&2
+  printf '\n' >&2
+  operation="$1"
+  if [[ "$1" = bash ]]; then operation="${2##*/}:$3"; fi
+  if [[ "$operation" = "$CF_DOC_FAIL_OPERATION" ]]; then return 73; fi
+  if [[ "$1 $2 $3" = 'docker image inspect' && "${@: -1}" = '{{.Id}}' ]]; then
+    printf 'sha256:1111111111111111111111111111111111111111111111111111111111111111\n'
+  fi
+}
+export -f sudo
+'''
+        result = subprocess.run([bash, "--noprofile", "--norc", "-s"],
+                                input=stub + self.block(marker) + "\n", text=True,
+                                capture_output=True, env=environment, timeout=15)
+        calls = [shlex.split(line.removeprefix("DOC_CALL "))
+                 for line in result.stderr.splitlines() if line.startswith("DOC_CALL ")]
+        return result, calls
+
+    def test_failed_stage_never_runs_later_management_commands(self):
+        for marker, failure in (("checkout --detach", "git"),
+                                ('manage.sh" bootstrap-finish', "manage.sh:validate"),
+                                ('backup.sh" create', "backup.sh:create"),
+                                ('backup.sh" restore', "backup.sh:restore"),
+                                ('manage.sh" prepare', "docker"),
+                                ('backup.sh" create', "docker"),
+                                ('backup.sh" restore', "docker"),
+                                (".RepoDigests", "docker")):
+            with self.subTest(stage=marker):
+                result, calls = self.run_block(marker, failure, inherited=True)
+                self.assertEqual(result.returncode, 73)
+                failed = next(i for i, call in enumerate(calls)
+                              if (call[0] == failure if failure in ("git", "docker") else
+                                  call[:1] == ["bash"] and call[1].endswith(failure.split(":")[0])
+                                  and call[2] == failure.split(":")[1]))
+                self.assertEqual(calls[failed + 1:], [], "failed stage must stop before any later command")
+
+    def test_install_backup_and_restore_derive_current_host_image_id(self):
+        local_id = "sha256:" + "1" * 64
+        for marker, operation in (('manage.sh" prepare', "prepare"),
+                                  ('backup.sh" create', "create"),
+                                  ('backup.sh" restore', "restore")):
+            for inherited in (False, True):
+                with self.subTest(stage=operation, inherited=inherited):
+                    result, calls = self.run_block(marker, inherited=inherited)
+                    self.assertEqual(result.returncode, 0)
+                    inspected = [call for call in calls if call[:3] == ["docker", "image", "inspect"]
+                                 and call[-1] == "{{.Id}}"]
+                    self.assertEqual(len(inspected), 1, "derive the local ID inside this stage")
+                    self.assertTrue(inspected[0][3])
+                    self.assertNotEqual(inspected[0][3], "inherited-wrong-image:old")
+                    action = next(call for call in calls if call[0] == "bash" and call[2] == operation)
+                    self.assertEqual(action[action.index("--image-ref") + 1], inspected[0][3])
+                    self.assertLess(calls.index(inspected[0]), calls.index(action))
+                    if operation != "prepare":
+                        self.assertEqual(action[action.index("--image-id") + 1], local_id)
+                    else:
+                        self.assertIn(local_id, result.stdout)
+
+    def test_successful_backup_still_reaches_explicit_start(self):
+        result, calls = self.run_block('backup.sh" create')
+        self.assertEqual(result.returncode, 0)
+        operations = [call[2] for call in calls if call[0] == "bash"]
+        self.assertEqual(operations, ["create", "start"])
+
+    def test_documented_bash_bodies_have_valid_syntax(self):
+        readme = (MODULE_PATH.parent / "README.md").read_text(encoding="utf-8")
+        for block in re.findall(r"```bash\n(.*?)\n```", readme, re.S):
+            lines = block.splitlines()
+            # Parse the child Bash body too; parsing only the outer heredoc
+            # would treat its commands as data and miss syntax errors.
+            if lines[0].startswith("bash <<'"):
+                lines = lines[1:-1]
+            result = subprocess.run([shutil.which("bash"), "--noprofile", "--norc", "-n", "-s"],
+                                    input="\n".join(lines) + "\n", text=True, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, "documented Bash body has invalid syntax")
+
+    def test_second_host_pull_defines_image_before_using_it(self):
+        result, calls = self.run_block(".RepoDigests", inherited=True)
+        self.assertEqual(result.returncode, 0)
+        pulls = [call for call in calls if call[:2] == ["docker", "pull"]]
+        self.assertEqual(len(pulls), 1, "second host block must include the pull after defining its input")
+        pull = pulls[0]
+        self.assertTrue(pull[-1])
+        self.assertNotEqual(pull[-1], "inherited-wrong-image:old")
+        for call in calls:
+            if call[:3] == ["docker", "image", "inspect"]:
+                self.assertEqual(call[3], pull[-1])
+
+
+class TLSInputOpenSSLTests(unittest.TestCase):
+    """Real crypto checks with synthetic files; POSIX ownership stays in VM tests."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.openssl = shutil.which("openssl")
+        if not cls.openssl:
+            raise RuntimeError("OpenSSL is required for the TLS input regression")
+        cls.temporary = tempfile.TemporaryDirectory(prefix="cf-lifecycle-tls-")
+        cls.addClassCleanup(cls.temporary.cleanup)
+        cls.root = Path(cls.temporary.name)
+        cls.ca, cls.ca_key = cls.root / "ca.crt", cls.root / "ca.key"
+        cls.cert, cls.key = cls.root / "server.crt", cls.root / "server.key"
+        cls.csr = cls.root / "server.csr"
+        cls.empty = cls.root / "empty-password"
+        cls.empty.write_bytes(b"")
+        ca_extensions = ["-addext", "basicConstraints=critical,CA:TRUE",
+                         "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+                         "-addext", "subjectKeyIdentifier=hash",
+                         "-addext", "authorityKeyIdentifier=keyid:always"]
+        cls.openssl_run(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3",
+                         "-subj", "/CN=Isolated lifecycle regression CA", "-keyout", str(cls.ca_key), "-out", str(cls.ca), *ca_extensions])
+        cls.openssl_run(["req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=files.cf.test",
+                         "-keyout", str(cls.key), "-out", str(cls.csr)])
+        extension = cls.root / "server.extensions"
+        extension.write_text("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\n"
+                             "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n"
+                             "subjectAltName=DNS:files.cf.test,IP:192.0.2.11\nextendedKeyUsage=serverAuth\n", encoding="ascii")
+        cls.signing = ["x509", "-req", "-in", str(cls.csr), "-CA", str(cls.ca), "-CAkey",
+                       str(cls.ca_key), "-CAcreateserial", "-extfile", str(extension)]
+        cls.openssl_run([*cls.signing, "-days", "3", "-out", str(cls.cert)])
+        # Keep a CA without Key Usage as an explicit negative fixture, even
+        # after the accepted fixture gains the required certificate extensions.
+        cls.missing_usage_ca = cls.root / "missing-usage-ca.crt"
+        missing_usage_key = cls.root / "missing-usage-ca.key"
+        missing_usage_config = cls.root / "missing-usage-ca.cnf"
+        missing_usage_config.write_text("[req]\ndistinguished_name=dn\nx509_extensions=ca\n[dn]\n[ca]\n"
+                                       "basicConstraints=critical,CA:TRUE\nsubjectKeyIdentifier=hash\n"
+                                       "authorityKeyIdentifier=keyid:always\n", encoding="ascii")
+        cls.openssl_run(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3",
+                         "-config", str(missing_usage_config), "-subj", "/CN=Legacy CA without key usage",
+                         "-keyout", str(missing_usage_key), "-out", str(cls.missing_usage_ca)])
+        cls.missing_usage_cert = cls.root / "missing-usage-server.crt"
+        cls.openssl_run(["x509", "-req", "-in", str(cls.csr), "-CA", str(cls.missing_usage_ca),
+                         "-CAkey", str(missing_usage_key), "-CAcreateserial", "-extfile", str(extension),
+                         "-days", "3", "-out", str(cls.missing_usage_cert)])
+        wrong_purpose_extension = cls.root / "client-only.extensions"
+        wrong_purpose_extension.write_text(extension.read_text(encoding="ascii").replace("serverAuth", "clientAuth"), encoding="ascii")
+        cls.wrong_purpose_cert = cls.root / "client-only.crt"
+        cls.openssl_run(["x509", "-req", "-in", str(cls.csr), "-CA", str(cls.ca), "-CAkey", str(cls.ca_key),
+                         "-CAcreateserial", "-extfile", str(wrong_purpose_extension), "-days", "3", "-out", str(cls.wrong_purpose_cert)])
+        cls.short_cert = cls.root / "short-lived.crt"
+        cls.openssl_run([*cls.signing, "-days", "1", "-out", str(cls.short_cert)])
+        cls.other_ca = cls.root / "untrusted.crt"
+        cls.openssl_run(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3",
+                         "-subj", "/CN=Untrusted lifecycle regression CA",
+                         "-keyout", str(cls.root / "untrusted.key"), "-out", str(cls.other_ca), *ca_extensions])
+        cls.encrypted_key = cls.root / "encrypted.key"
+        cls.openssl_run(["pkey", "-in", str(cls.key), "-aes-256-cbc", "-passout", "stdin",
+                         "-out", str(cls.encrypted_key)], b"synthetic-fixture-passphrase\n")
+
+    @classmethod
+    def openssl_run(cls, arguments, input_bytes=None):
+        result = subprocess.run([cls.openssl, *arguments], input=input_bytes,
+                                capture_output=True, timeout=30, check=False)
+        if result.returncode:
+            # Never expose process output, private key data or synthetic passwords.
+            raise lifecycle.DeploymentError("openssl " + arguments[0] + " failed")
+        return result.stdout
+
+    def inputs(self, **changes):
+        values = dict(lan_bind_address="192.0.2.11", lan_port=18443,
+                      lan_allowed_cidrs="192.0.2.12/32", tls_name="files.cf.test",
+                      tls_cert_file=self.cert, tls_key_file=self.key, tls_ca_file=self.ca)
+        values.update(changes)
+        return SimpleNamespace(**values)
+
+    def check_inputs(self, **changes):
+        def actual_command(command, input_bytes=None):
+            self.assertEqual(command[0], "openssl")
+            # /dev/null is an existing empty stream on Linux. Map that exact
+            # pre-fix input to an existing empty file for the Windows regression.
+            arguments = ["file:" + str(self.empty) if value == "file:/dev/null" else value
+                         for value in command[1:]]
+            return self.openssl_run(arguments, input_bytes)
+        with mock.patch.object(lifecycle, "run", side_effect=actual_command), \
+             mock.patch.object(lifecycle, "assert_safe_path"), \
+             mock.patch.object(lifecycle.stat, "S_IMODE", return_value=0o600):
+            return lifecycle.tls_inputs(self.inputs(**changes))
+
+    def test_valid_unencrypted_private_key_and_matching_dns_are_accepted(self):
+        result = self.check_inputs()
+        self.assertTrue(result["server.crt"] == self.cert.read_bytes(), "accepted certificate bytes changed")
+        self.assertTrue(result["server.key"] == self.key.read_bytes(), "accepted private key bytes changed")
+        self.assertTrue(result["ca.crt"] == self.ca.read_bytes(), "accepted CA bytes changed")
+
+    def test_ca_missing_key_usage_is_rejected(self):
+        with self.assertRaisesRegex(lifecycle.DeploymentError, "openssl verify failed"):
+            self.check_inputs(tls_ca_file=self.missing_usage_ca, tls_cert_file=self.missing_usage_cert)
+
+    def test_client_only_certificate_is_rejected_for_the_server(self):
+        with self.assertRaisesRegex(lifecycle.DeploymentError, "openssl verify failed"):
+            self.check_inputs(tls_cert_file=self.wrong_purpose_cert)
+
+    def test_runtime_validator_uses_the_same_strict_server_certificate_policy(self):
+        source = (MODULE_PATH.parent / "validate.sh").read_text(encoding="utf-8")
+        # Execute the validator's actual crypto argv on protected synthetic
+        # inputs; full POSIX path/owner/Docker validation remains the VM's job.
+        line = re.search(r"(?m)^  openssl verify [^\n]+", source).group(0)
+        arguments = shlex.split(line.split(" >/dev/null", 1)[0])[1:]
+        for label, ca, cert, name, allowed in (
+                ("valid", self.ca, self.cert, "files.cf.test", True),
+                ("missing CA usage", self.missing_usage_ca, self.missing_usage_cert, "files.cf.test", False),
+                ("wrong purpose", self.ca, self.wrong_purpose_cert, "files.cf.test", False),
+                ("wrong CA", self.other_ca, self.cert, "files.cf.test", False),
+                ("wrong hostname", self.ca, self.cert, "wrong.cf.test", False)):
+            with self.subTest(label=label):
+                substitutions = {"$CONFIG_ROOT/tls/ca.crt": str(ca), "$CONFIG_ROOT/tls/server.crt": str(cert), "$LAN_TLS_SERVER_NAME": name}
+                command = [substitutions.get(value, value) for value in arguments]
+                if allowed:
+                    self.openssl_run(command)
+                else:
+                    with self.assertRaisesRegex(lifecycle.DeploymentError, "openssl verify failed"):
+                        self.openssl_run(command)
+
+    def test_wrong_dns_is_rejected_by_chain_and_name_verification(self):
+        with self.assertRaisesRegex(lifecycle.DeploymentError, "openssl verify failed"):
+            self.check_inputs(tls_name="wrong.cf.test")
+
+    def test_ip_subject_alternative_name_is_checked(self):
+        self.check_inputs(tls_name="192.0.2.11")
+        with self.assertRaisesRegex(lifecycle.DeploymentError, "openssl verify failed"):
+            self.check_inputs(tls_name="192.0.2.99")
+
+    def test_untrusted_ca_is_rejected(self):
+        with self.assertRaisesRegex(lifecycle.DeploymentError, "openssl verify failed"):
+            self.check_inputs(tls_ca_file=self.other_ca)
+
+    def test_certificate_with_less_than_one_day_remaining_is_rejected(self):
+        with self.assertRaisesRegex(lifecycle.DeploymentError, "openssl x509 failed"):
+            self.check_inputs(tls_cert_file=self.short_cert)
+
+    def test_encrypted_private_key_is_rejected_without_prompting(self):
+        with self.assertRaisesRegex(lifecycle.DeploymentError, "openssl pkey failed"):
+            self.check_inputs(tls_key_file=self.encrypted_key)
+
+    def test_mismatched_private_key_is_rejected(self):
+        with self.assertRaisesRegex(lifecycle.DeploymentError, "do not match"):
+            self.check_inputs(tls_key_file=self.ca_key)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,168 @@
+name: shared-host-delivery
+
+on:
+  pull_request:
+    branches: [feat/v1-integration]
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Verification scope (full remains the default)
+        type: choice
+        options: [full, reboot, storage, lifecycle]
+        default: full
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shared-host-delivery-${{ github.head_ref || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  source-regression:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+          cache-dependency-path: backend/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install repository dependencies
+        run: cd frontend && npm ci --no-audit --no-fund
+      - name: Frontend types, lint, unit tests and build
+        run: |
+          cd frontend && npm run typecheck
+          cd ..
+          make lint-frontend test-frontend build-frontend
+      - name: Independent FileBridge security tests
+        run: cd tools/filebrowser-agentctl && go test -race ./...
+      - name: Existing Playwright entry point
+        run: make test-playwright
+      - name: No unexpected tracked changes
+        run: git diff --exit-code
+
+  backend-regression:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+          cache-dependency-path: backend/go.sum
+      - name: Backend tests and lint
+        run: make test-backend lint-backend
+      - name: No unexpected tracked changes
+        run: git diff --exit-code
+
+  deployment-validation:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install existing validation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends gettext-base nginx python3-yaml ripgrep shellcheck systemd
+      - name: Existing deployment validation including shared-host regression
+        run: make validate-deployment
+      - name: Check every tracked shell file separately
+        run: |
+          while IFS= read -r -d '' file; do bash -n "$file"; done < <(git ls-files -z '*.sh')
+      - name: No unexpected tracked changes
+        run: git diff --exit-code
+
+  fixed-image:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'storage'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - uses: docker/setup-buildx-action@v3
+      - name: Install disposable VM test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssl
+      - name: Build real frontend and backend from fixed source
+        run: |
+          revision=$(git rev-parse HEAD)
+          bash deploy/shared-host/image.sh build --source-sha "$revision" \
+            --version "verification-$revision" --image "cf-filebrowser:verification-$revision" \
+            --evidence "$RUNNER_TEMP/cf-image-evidence"
+          docker image inspect "cf-filebrowser:verification-$revision" --format '{{.Id}}'
+      - name: Real Debian 13 verification for the selected scope
+        env:
+          VERIFICATION_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope || 'full' }}
+        run: |
+          revision=$(git rev-parse HEAD)
+          accelerator=tcg
+          if [[ -r /dev/kvm && -w /dev/kvm ]]; then accelerator=kvm; fi
+          bash scripts/tests/shared-host-vm.sh --source-sha "$revision" \
+            --image-ref "cf-filebrowser:verification-$revision" \
+            --evidence "$RUNNER_TEMP/cf-vm-evidence" --accelerator "$accelerator" --scope "$VERIFICATION_SCOPE"
+      - name: Save sanitized VM acceptance results only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-host-vm-results
+          path: ${{ runner.temp }}/cf-vm-evidence/vm-result.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Save non-secret build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-host-image-inputs
+          path: ${{ runner.temp }}/cf-image-evidence
+          if-no-files-found: error
+          retention-days: 14
+      - name: No unexpected tracked changes
+        run: git diff --exit-code
+
+  storage-control:
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'storage'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Install existing VM dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssl
+      - name: Same-guest storage device-budget control without a product image
+        run: |
+          revision=$(git rev-parse HEAD)
+          accelerator=tcg
+          if [[ -r /dev/kvm && -w /dev/kvm ]]; then accelerator=kvm; fi
+          bash scripts/tests/shared-host-vm.sh --source-sha "$revision" \
+            --evidence "$RUNNER_TEMP/cf-storage-evidence" --accelerator "$accelerator" --scope storage
+      - name: Save sanitized storage results only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-host-storage-results
+          path: ${{ runner.temp }}/cf-storage-evidence/vm-result.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: No unexpected tracked changes
+        run: git diff --exit-code

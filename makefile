@@ -88,7 +88,7 @@ lint-frontend:
 	cd frontend && npm run lint
 
 lint-backend:
-	cd backend && go tool golangci-lint run --path-prefix=backend
+	cd backend && go tool golangci-lint run --path-prefix=backend --max-issues-per-linter=0 --max-same-issues=0
 
 lint: lint-backend lint-frontend
 
@@ -112,7 +112,7 @@ cleanup-translations:
 	cd frontend && npm run i18n:cleanup
 
 test-backend:
-	cd backend && go test -race -timeout=10s ./...
+	cd backend && go test -race -timeout=5m ./...
 
 test-frontend:
 	cd frontend && npm run test

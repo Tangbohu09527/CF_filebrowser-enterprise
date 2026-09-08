@@ -9,3 +9,7 @@ services:
       args:
         VERSION: ${BUILD_VERSION:?BUILD_VERSION is required}
         REVISION: ${BUILD_REVISION:?BUILD_REVISION is required}
+        FFMPEG_IMAGE: ${FFMPEG_IMAGE:-gtstef/ffmpeg:8.1-decode}
+        GO_IMAGE: ${GO_IMAGE:-golang:alpine}
+        NODE_IMAGE: ${NODE_IMAGE:-node:jod-slim}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-alpine:latest}

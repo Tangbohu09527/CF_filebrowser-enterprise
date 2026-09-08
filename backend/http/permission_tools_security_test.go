@@ -1,14 +1,18 @@
 package http
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -465,6 +469,210 @@ func TestPermissionReadSecurity_DuplicateCacheHitDoesNotWaitForSearchLock(t *tes
 	}
 	if !strings.Contains(recorder.Body.String(), fmt.Sprintf("%d", markerSize)) {
 		t.Errorf("cached duplicate response was not served while search lock was held: %s", recorder.Body.String())
+	}
+}
+
+func TestPermissionReadSecurity_DuplicatesFromRealIndexSizeModes(t *testing.T) {
+	for _, logical := range []bool{false, true} {
+		t.Run(fmt.Sprintf("useLogicalSize=%t", logical), func(t *testing.T) {
+			sourcePath := setupResourcePutTestEnv(t)
+			resetPermissionDuplicateResultsCache(t)
+			idx := indexing.GetIndex("source1")
+			if idx == nil {
+				t.Fatal("test source index is unavailable")
+			}
+			// Enable only the synchronous real-directory refresh; the test helper
+			// initialized this source without starting background scanners.
+			idx.Config.ResolvedRules.IndexingDisabled = false
+			idx.Config.UseLogicalSize = false
+			content := bytes.Repeat([]byte{0}, 1126*1024)
+			if len(content)%4096 == 0 {
+				t.Fatal("duplicate fixture must not be aligned to a 4 KiB block")
+			}
+			names := []string{"duplicate-size-a.bin", "duplicate-size-b.bin"}
+			var allocatedSize int64
+			for _, name := range names {
+				realPath := filepath.Join(sourcePath, "public", name)
+				if writeErr := os.WriteFile(realPath, content, 0o644); writeErr != nil {
+					t.Fatal(writeErr)
+				}
+				info, statErr := os.Stat(realPath)
+				if statErr != nil {
+					t.Fatal(statErr)
+				}
+				// Read the actual platform scanner size, rather than rounding the
+				// fixture length or constructing synthetic index metadata.
+				physical, physicalErr := idx.GetFsInfoCore("/public/"+name, indexing.Options{})
+				if physicalErr != nil {
+					t.Fatal(physicalErr)
+				}
+				t.Logf("fixture=%s logical_bytes=%d scanner_allocated_bytes=%d", name, info.Size(), physical.Size)
+				if info.Size() != int64(len(content)) || physical.Size == info.Size() {
+					t.Fatal("fixture must expose distinct actual logical and scanner allocated sizes")
+				}
+				if allocatedSize != 0 && allocatedSize != physical.Size {
+					t.Fatal("identical duplicate fixtures have different allocated sizes")
+				}
+				allocatedSize = physical.Size
+			}
+			idx.Config.UseLogicalSize = logical
+			if refreshErr := idx.RefreshDirectory("/public/", true); refreshErr != nil {
+				t.Fatal(refreshErr)
+			}
+			wantSize := allocatedSize
+			if logical {
+				wantSize = int64(len(content))
+			}
+			indexed, indexErr := indexing.GetIndexDB().GetFilesForMultipleSizes("source1", []int64{wantSize}, "/")
+			if indexErr != nil {
+				t.Fatal(indexErr)
+			}
+			if len(indexed[wantSize]) != len(names) {
+				t.Fatalf("real index has %d duplicate candidates at size %d, want %d", len(indexed[wantSize]), wantSize, len(names))
+			}
+			user := &users.User{
+				Username:    "duplicate-real-index-user",
+				Permissions: users.Permissions{Browse: true, Download: true},
+				Scopes:      []users.SourceScope{{Name: sourcePath, Scope: "/"}},
+			}
+			savePermissionReadUser(t, user)
+			query := url.Values{"source": {"source1"}, "scope": {"/"}, "minSizeMb": {"1"}}
+			request := httptest.NewRequest(http.MethodGet, "/api/tools/duplicateFinder?"+query.Encode(), nil)
+			recorder := httptest.NewRecorder()
+			returned, handlerErr := duplicatesHandler(recorder, request, &requestContext{user: user})
+			if got := permissionHandlerStatus(returned, recorder); got != http.StatusOK || handlerErr != nil {
+				t.Fatalf("real-index duplicate status=%d, want 200 (err: %v)", got, handlerErr)
+			}
+			var response duplicateResponse
+			if decodeErr := json.Unmarshal(recorder.Body.Bytes(), &response); decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			if response.Incomplete || len(response.Groups) != 1 {
+				t.Fatalf("real-index duplicate groups=%d incomplete=%t, want one complete group", len(response.Groups), response.Incomplete)
+			}
+			group := response.Groups[0]
+			if group.Size != wantSize || group.Count != len(names) || len(group.Files) != len(names) {
+				t.Fatalf("duplicate group size=%d count=%d files=%d, want size=%d count=2 files=2", group.Size, group.Count, len(group.Files), wantSize)
+			}
+			wantPaths := map[string]bool{"/public/duplicate-size-a.bin": true, "/public/duplicate-size-b.bin": true}
+			for _, file := range group.Files {
+				if file == nil || file.Source != "source1" || file.Size != wantSize || !wantPaths[file.Path] {
+					t.Fatal("duplicate response changed source, indexed size, or expected file identity")
+				}
+				delete(wantPaths, file.Path)
+			}
+			if len(wantPaths) != 0 {
+				t.Fatal("duplicate response omitted an indexed fixture")
+			}
+
+			// A different logical length can occupy the same physical bucket and
+			// have the same sampled zero bytes. It must not be called a duplicate.
+			if writeErr := os.WriteFile(filepath.Join(sourcePath, "public", names[1]), append(content, 0), 0o644); writeErr != nil {
+				t.Fatal(writeErr)
+			}
+			if refreshErr := idx.RefreshDirectory("/public/", true); refreshErr != nil {
+				t.Fatal(refreshErr)
+			}
+			changed, changedErr := idx.GetFsInfoCore("/public/"+names[1], indexing.Options{})
+			if changedErr != nil {
+				t.Fatal(changedErr)
+			}
+			changedSize := wantSize
+			if logical {
+				changedSize++
+			}
+			if changed.Size != changedSize {
+				t.Fatalf("changed fixture scanner size=%d, want %d", changed.Size, changedSize)
+			}
+			if !logical {
+				// Prove the persisted scanner bucket still contains both candidates;
+				// SQL separating their sizes must not make this rejection pass.
+				reindexed, reindexErr := indexing.GetIndexDB().GetFilesForMultipleSizes("source1", []int64{wantSize}, "/")
+				if reindexErr != nil {
+					t.Fatal(reindexErr)
+				}
+				if len(reindexed[wantSize]) != len(names) {
+					t.Fatalf("different-length real index has %d candidates in allocation bucket %d, want 2", len(reindexed[wantSize]), wantSize)
+				}
+				for _, candidate := range reindexed[wantSize] {
+					if candidate == nil || candidate.Size != wantSize {
+						t.Fatal("different-length candidate left the original allocation bucket")
+					}
+				}
+			}
+			resetPermissionDuplicateResultsCache(t)
+			recorder = httptest.NewRecorder()
+			returned, handlerErr = duplicatesHandler(recorder, request, &requestContext{user: user})
+			if got := permissionHandlerStatus(returned, recorder); got != http.StatusOK || handlerErr != nil {
+				t.Fatalf("different-length duplicate status=%d, want 200 (err: %v)", got, handlerErr)
+			}
+			response = duplicateResponse{}
+			if decodeErr := json.Unmarshal(recorder.Body.Bytes(), &response); decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			if response.Incomplete || len(response.Groups) != 0 {
+				t.Fatalf("different logical lengths returned groups=%d incomplete=%t, want no duplicate groups", len(response.Groups), response.Incomplete)
+			}
+		})
+	}
+}
+
+type permissionDuplicateSizeInfo struct {
+	os.FileInfo
+	logicalSize int64
+	stat        any
+}
+
+func (info permissionDuplicateSizeInfo) Size() int64 { return info.logicalSize }
+func (info permissionDuplicateSizeInfo) Sys() any    { return info.stat }
+
+func TestPermissionReadSecurity_DuplicateSizeRejectsInvalidStat(t *testing.T) {
+	realPath := filepath.Join(t.TempDir(), "duplicate-size.bin")
+	if writeErr := os.WriteFile(realPath, []byte("duplicate-size"), 0o644); writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	info, statErr := os.Stat(realPath)
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	negative := permissionDuplicateSizeInfo{FileInfo: info, logicalSize: -1, stat: info.Sys()}
+	for _, logical := range []bool{false, true} {
+		if _, ok := duplicateIndexedFileSize(negative, logical); ok {
+			t.Fatalf("negative logical size was accepted in logical=%t mode", logical)
+		}
+		if _, ok := duplicateIndexedFileSize(nil, logical); ok {
+			t.Fatalf("missing file info was accepted in logical=%t mode", logical)
+		}
+	}
+	if runtime.GOOS == "windows" {
+		overflow := permissionDuplicateSizeInfo{FileInfo: info, logicalSize: math.MaxInt64, stat: info.Sys()}
+		if _, ok := duplicateIndexedFileSize(overflow, false); ok {
+			t.Fatal("overflowing Windows allocation rounding was accepted")
+		}
+		return
+	}
+	unknown := permissionDuplicateSizeInfo{FileInfo: info, logicalSize: info.Size(), stat: struct{}{}}
+	if _, ok := duplicateIndexedFileSize(unknown, false); ok {
+		t.Fatal("unknown Unix allocation metadata was accepted")
+	}
+	// Clone the real platform stat type without importing a Unix-only type
+	// into this existing cross-platform test file.
+	original := reflect.ValueOf(info.Sys())
+	if original.Kind() != reflect.Pointer || original.IsNil() || original.Elem().Kind() != reflect.Struct {
+		t.Fatal("Unix fixture did not expose a stat structure")
+	}
+	for _, blocks := range []int64{-1, math.MaxInt64/512 + 1} {
+		copied := reflect.New(original.Elem().Type())
+		copied.Elem().Set(original.Elem())
+		blockField := copied.Elem().FieldByName("Blocks")
+		if !blockField.IsValid() || blockField.Kind() != reflect.Int64 || !blockField.CanSet() {
+			t.Fatal("Unix fixture did not expose a signed allocation block count")
+		}
+		blockField.SetInt(blocks)
+		invalid := permissionDuplicateSizeInfo{FileInfo: info, logicalSize: info.Size(), stat: copied.Interface()}
+		if _, ok := duplicateIndexedFileSize(invalid, false); ok {
+			t.Fatalf("invalid Unix allocation block count %d was accepted", blocks)
+		}
 	}
 }
 

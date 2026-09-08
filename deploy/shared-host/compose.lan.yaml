@@ -1,0 +1,22 @@
+# Optional native HTTPS exposure. Inputs have no wildcard or plaintext fallback.
+services:
+  filebrowser-enterprise:
+    ports:
+      - target: 8080
+        published: "${LAN_PORT:?LAN_PORT is required}"
+        host_ip: "${LAN_BIND_IP:?LAN_BIND_IP is required}"
+        protocol: tcp
+    environment:
+      FILEBROWSER_TLS_SERVER_NAME: "${LAN_TLS_SERVER_NAME:?LAN_TLS_SERVER_NAME is required}"
+    volumes:
+      - type: bind
+        source: "${CONFIG_ROOT:?CONFIG_ROOT is required}/tls"
+        target: /etc/filebrowser-enterprise/tls
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          app_health=$$(curl --fail --silent --show-error --noproxy '*' --cacert /etc/filebrowser-enterprise/tls/ca.crt --resolve "$$FILEBROWSER_TLS_SERVER_NAME:8080:127.0.0.1" "https://$$FILEBROWSER_TLS_SERVER_NAME:8080/health") && [ "$$app_health" = '{"message":"ok"}' ]

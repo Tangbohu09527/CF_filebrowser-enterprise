@@ -44,9 +44,9 @@ func (f *fileInfoWrapper) Sys() interface{}   { return nil }
 
 func (f *fileInfoWrapper) mode() os.FileMode {
 	if f.IsDir() {
-		return os.ModeDir | fileutils.PermDir
+		return os.ModeDir | fileutils.EffectiveDirPerm()
 	}
-	return fileutils.PermFile
+	return fileutils.EffectiveFilePerm()
 }
 
 // filteredFileSystem wraps a webdav.FileSystem and filters directory listings using FileInfoFaster

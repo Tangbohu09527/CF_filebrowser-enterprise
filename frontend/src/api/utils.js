@@ -1,6 +1,7 @@
 import i18n from "@/i18n";
 import { state } from "@/store";
 import { renew } from "@/utils/auth";
+import { joinPath } from "@/utils/url";
 
 export async function fetchURL(url, opts, auth = true) {
   opts = opts || {};
@@ -61,18 +62,9 @@ export function adjustedData(data) {
         item.isShared = false;
       }
       item.pinned = pinnedNames.has(item.name);
-      if (data.path === "/") {
-        if (item.type === "directory") {
-        item.path = `/${item.name}/`
-        } else {
-          item.path = `/${item.name}`
-        }
-      } else {
-        if (item.type === "directory") {
-          item.path = `${data.path}${item.name}/`
-        } else {
-          item.path = `${data.path}${item.name}`
-        }
+      item.path = joinPath(data.path, item.name);
+      if (item.type === "directory") {
+        item.path += "/";
       }
       return item;
     });
