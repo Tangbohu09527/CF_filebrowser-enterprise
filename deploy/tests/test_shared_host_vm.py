@@ -1253,6 +1253,9 @@ class TargetedRebootTests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(harness, 'record_stage'))
             observe = stack.enter_context(mock.patch.object(harness, 'reboot_observation', side_effect=[self.state(), after or self.state()]))
+            stack.enter_context(mock.patch.object(harness, 'storage_evidence', return_value={}))
+            stack.enter_context(mock.patch.object(harness, 'verify_storage_evidence'))
+            evidence['stage'] = 'real-host-reboot-and-api/container-health'
             api = stack.enter_context(mock.patch.object(harness, 'api', return_value={'passed': True}))
             healthy = stack.enter_context(mock.patch.object(harness, 'healthy', side_effect=health_error))
             lan = stack.enter_context(mock.patch.object(harness, 'lan_boundary', return_value={'passed': True}))

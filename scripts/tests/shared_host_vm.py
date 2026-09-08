@@ -1682,6 +1682,36 @@ def recovery_probe(vm, args, evidence, name, arguments):
 
 
 
+def storage_evidence(vm, args, evidence, phase):
+    if phase not in ('before','after','failure','mount-diagnostic'):
+        raise VerificationError('unknown storage evidence phase')
+    response = vm.command_on_guest(f"python3 -B {SOURCE}/scripts/tests/shared_host_storage_probe.py {phase}", check=False, timeout=180)
+    try:
+        if len(response.stdout) > 1024 * 1024:
+            raise ValueError('storage evidence bound')
+        report = json.loads(response.stdout)
+        if not isinstance(report, dict) or response.returncode or report.get('collection_failed'):
+            raise ValueError('storage evidence unavailable')
+    except (ValueError, UnicodeError) as error:
+        evidence['storage_' + phase] = {'collection_failed': True, 'exit_code': response.returncode}
+        record_stage(args, evidence, 'storage-evidence/' + phase)
+        raise VerificationError('bounded storage evidence unavailable: ' + phase) from error
+    evidence['storage_' + phase] = report
+    record_stage(args, evidence, 'storage-evidence/' + phase)
+    return report
+
+
+def verify_storage_evidence(before, after):
+    # Import only the pure comparisons; the destructive guest CLI has its own guard.
+    from shared_host_storage_probe import same_disk, unchanged_underlay
+    if not same_disk(before, after):
+        raise VerificationError('storage test disk identity changed or is unavailable')
+    if not unchanged_underlay(before, after):
+        raise VerificationError('root filesystem storage underlay changed or was not fully observed')
+    if before['root_underlay']['entry_count'] != 0:
+        raise VerificationError('root filesystem storage underlay was not empty before reboot')
+
+
 def targeted_reboot(args, evidence, server, client, image_id, baseline):
     """Reuse formal setup; finish before the independent full acceptance suites."""
     evidence['scope'] = 'reboot-blocker-only'
@@ -1690,8 +1720,25 @@ def targeted_reboot(args, evidence, server, client, image_id, baseline):
     before = reboot_observation(server)
     evidence['reboot_before_state'] = before
     verify_reboot_state(before, image_id)
-    evidence['host_reboot'] = reboot_operation(args, evidence, server, 'boot-id-change', server.reboot)
-    reboot_operation(args, evidence, server, 'container-health', lambda: healthy(server))
+    storage_before = storage_evidence(server, args, evidence, 'before')
+    verify_storage_evidence(storage_before, storage_before)
+    try:
+        evidence['host_reboot'] = reboot_operation(args, evidence, server, 'boot-id-change', server.reboot)
+        reboot_operation(args, evidence, server, 'container-health', lambda: healthy(server))
+    except REBOOT_ERRORS:
+        failed_stage = evidence['stage']
+        try:
+            storage_evidence(server, args, evidence, 'failure')
+            # Failure evidence is persisted above BEFORE the single optional
+            # diagnostic mount. No manual FileBrowser start or API success claim.
+            storage_evidence(server, args, evidence, 'mount-diagnostic')
+        except REBOOT_ERRORS as error:
+            evidence['storage_collection_failure'] = reboot_error_class(error)
+        record_stage(args, evidence, failed_stage)
+        raise
+    storage_after = storage_evidence(server, args, evidence, 'after')
+    verify_storage_evidence(storage_before, storage_after)
+    evidence['root_storage_underlay_unchanged'] = True
     after = reboot_observation(server)
     evidence['reboot_after_state'] = after
     verify_reboot_state(after, image_id)
