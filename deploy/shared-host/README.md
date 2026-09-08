@@ -365,7 +365,9 @@ preview/editor works.
 ## 6. Normal operation and restarts
 
 Use `manage.sh status`, `stop`, `validate` and `start`, each with the confirmed
-hostname. Start performs no implicit build or pull. The shared lock prevents
+hostname. Status reports `storage.ready` and a fixed `storage.reason` (including
+`not-mounted`, `root-filesystem`, and identity failures), without printing identity
+values or changing the mount. Start performs no implicit build or pull. The shared lock prevents
 management and backup/restore from running concurrently. Data and files are
 bind-mounted; cache may be regenerated.
 
@@ -373,7 +375,10 @@ The installation writes a protected expected storage identity in configuration
 and a matching marker on the independently mounted storage. All Compose binds
 use `create_host_path: false`. Missing mounts/markers prevent startup; mismatched
 markers fail before secrets or database initialization. If the disk arrives
-late, verify the real mount and rerun the normal start. Do not copy the marker
+late, an operator must restore the correct mount using the host storage procedure,
+then run `manage.sh status`, `manage.sh validate`, and `manage.sh start` with the
+confirmed `--hostname`. This is operator recovery, not a promise of automatic
+recovery. Do not copy the marker
 onto the root filesystem or loosen checks. Test container recreation and a real
 host reboot; a successful health check is not persistence evidence.
 

@@ -194,6 +194,40 @@ def deployment_lock():
         os.close(fd)
 
 
+def storage_status(paths: Paths) -> dict:
+    """Read-only operator status; never initialize a missing mount or print markers."""
+    result = {"path": paths.storage.as_posix(), "ready": False, "reason": "unsafe-or-unreadable"}
+    try:
+        assert_safe_path(paths.storage, owner=0, directory=True)
+        target = run(["findmnt", "-n", "-o", "TARGET", "--target", str(paths.storage)]).decode().strip()
+        if target != paths.storage.as_posix():
+            result["reason"] = "not-mounted"
+        elif paths.storage.stat().st_dev == os.stat("/").st_dev:
+            result["reason"] = "root-filesystem"
+        else:
+            markers = (paths.config / "storage.identity", paths.storage_project / ".storage-identity")
+            values = []
+            for marker in markers:
+                assert_safe_path(marker, owner=0, group=GID, mode=0o440)
+                if marker.stat().st_size != 65:
+                    result["reason"] = "identity-invalid"
+                    return result
+                value = marker.read_bytes()
+                if not re.fullmatch(rb"[0-9a-f]{64}\n", value):
+                    result["reason"] = "identity-invalid"
+                    return result
+                values.append(value)
+            if values[0] != values[1]:
+                result["reason"] = "identity-mismatch"
+            elif paths.files.stat().st_dev != paths.storage.stat().st_dev or markers[1].stat().st_dev != paths.storage.stat().st_dev:
+                result["reason"] = "files-device-mismatch"
+            else:
+                result.update(ready=True, reason="ready")
+    except (DeploymentError, OSError, ValueError):
+        pass
+    return result
+
+
 def host_checks(hostname: str, paths: Paths | None = None, *, require_storage: bool = True) -> None:
     paths = paths or Paths()
     if sys.platform != "linux" or os.geteuid() != 0:
@@ -621,7 +655,7 @@ def main() -> int:
                 assert_stopped(paths, metadata["exposure"])
             elif args.action == "status":
                 containers = project_containers()
-                print(json.dumps({"project": PROJECT, "source_sha": metadata["source_sha"], "image_id": metadata["image_id"], "bootstrap_complete": metadata["bootstrap_complete"], "containers": [{"id": value["Id"], "image_id": value["Image"], "status": value.get("State", {}).get("Status"), "health": value.get("State", {}).get("Health", {}).get("Status")} for value in containers]}, sort_keys=True))
+                print(json.dumps({"project": PROJECT, "source_sha": metadata["source_sha"], "image_id": metadata["image_id"], "bootstrap_complete": metadata["bootstrap_complete"], "storage": storage_status(paths), "containers": [{"id": value["Id"], "image_id": value["Image"], "status": value.get("State", {}).get("Status"), "health": value.get("State", {}).get("Health", {}).get("Status")} for value in containers]}, sort_keys=True))
             print(f"[shared-host {args.action}] completed")
         return 0
     except (DeploymentError, OSError, ValueError, KeyError) as error:

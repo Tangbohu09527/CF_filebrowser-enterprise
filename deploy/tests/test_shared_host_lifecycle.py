@@ -21,6 +21,43 @@ lifecycle = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(lifecycle)
 
 
+class StorageStatusTests(unittest.TestCase):
+    def test_unmounted_status_is_explicit_and_does_not_read_identity(self):
+        with mock.patch.object(lifecycle, "assert_safe_path"), \
+             mock.patch.object(lifecycle, "run", return_value=b"/\n"), \
+             mock.patch.object(Path, "read_bytes") as read:
+            result = lifecycle.storage_status(lifecycle.Paths())
+        self.assertEqual(result, {"path": "/srv/storage", "ready": False, "reason": "not-mounted"})
+        read.assert_not_called()
+
+    def test_identity_match_is_required_and_values_are_not_reported(self):
+        for actual, expected_reason in ((b"a" * 64 + b"\n", "ready"), (b"b" * 64 + b"\n", "identity-mismatch"), (b"sensitive-invalid", "identity-invalid")):
+            with self.subTest(reason=expected_reason), \
+                 mock.patch.object(lifecycle, "assert_safe_path"), \
+                 mock.patch.object(lifecycle, "run", return_value=b"/srv/storage\n"), \
+                 mock.patch.object(Path, "stat", side_effect=lambda p=None: SimpleNamespace(st_dev=2, st_size=65)), \
+                 mock.patch.object(lifecycle.os, "stat", return_value=SimpleNamespace(st_dev=1)), \
+                 mock.patch.object(Path, "read_bytes", side_effect=[b"a" * 64 + b"\n", actual]):
+                result = lifecycle.storage_status(lifecycle.Paths())
+            self.assertEqual(result["reason"], expected_reason)
+            self.assertIs(result["ready"], expected_reason == "ready")
+            self.assertNotIn("sensitive", json.dumps(result))
+            self.assertNotIn("a" * 64, json.dumps(result))
+
+    def test_root_filesystem_and_unsafe_identity_are_not_ready(self):
+        with mock.patch.object(lifecycle, "assert_safe_path"), \
+             mock.patch.object(lifecycle, "run", return_value=b"/srv/storage\n"), \
+             mock.patch.object(Path, "stat", return_value=SimpleNamespace(st_dev=1)), \
+             mock.patch.object(lifecycle.os, "stat", return_value=SimpleNamespace(st_dev=1)), \
+             mock.patch.object(Path, "read_bytes") as read:
+            self.assertEqual(lifecycle.storage_status(lifecycle.Paths())["reason"], "root-filesystem")
+            read.assert_not_called()
+        with mock.patch.object(lifecycle, "assert_safe_path", side_effect=lifecycle.DeploymentError("private-value")):
+            result = lifecycle.storage_status(lifecycle.Paths())
+        self.assertEqual(result["reason"], "unsafe-or-unreadable")
+        self.assertNotIn("private-value", json.dumps(result))
+
+
 class LifecycleTests(unittest.TestCase):
     def test_validator_diagnostic_reports_only_machine_safe_location(self):
         raw = b"PASSWORD-MUST-NOT-LEAK\n[shared-host-validate-diag] phase=compose-contract kind=contract line=248 exit=1\nTOKEN-MUST-NOT-LEAK\n"

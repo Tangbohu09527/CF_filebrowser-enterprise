@@ -150,6 +150,42 @@ def root_underlay():
     return underlay_tree(target)
 
 
+def lifecycle_snapshot(absent=False):
+    """Disposable guest only: bounded digests, never credentials or file bodies."""
+    if not Path('/etc/cf-shared-host-disposable').is_file():
+        raise RuntimeError('disposable guest marker required')
+    storage = Path('/srv/storage/cf-filebrowser-enterprise')
+    if absent:
+        if run(['mountpoint', '-q', '/srv/storage'])[0].returncode == 0:
+            raise RuntimeError('missing-mount snapshot requires an absent mount')
+        rows = fstab_entries(Path(GUEST, 'fstab.saved').read_text())
+        if len(rows) != 1 or rows[0]['fstype'] != 'ext4' or not rows[0]['what'].startswith('UUID='):
+            raise RuntimeError('verified ext4 test fstab required')
+        alias = '/dev/disk/by-uuid/' + rows[0]['what'][5:]
+        info, _ = json_command(['lsblk', '--json', '--nodeps', '--output', 'SERIAL,FSTYPE,UUID', alias])
+        devices = (info or {}).get('blockdevices', [])
+        if len(devices) != 1 or devices[0].get('serial') != 'cf-test-data' or devices[0].get('uuid') != rows[0]['what'][5:] or devices[0].get('fstype') != 'ext4':
+            raise RuntimeError('test disk identity mismatch')
+        view = Path(tempfile.mkdtemp(prefix='disk-readonly-', dir=GUEST))
+        # Private namespace, no journal replay and no writes to the original disk.
+        if run(['mount', '-o', 'ro,noload', alias, str(view)])[0].returncode:
+            raise RuntimeError('readonly test disk snapshot unavailable')
+        storage = view / 'cf-filebrowser-enterprise'
+    result = {}
+    for name, path in (('disk', storage), ('config', Path('/etc/cf-filebrowser-enterprise')), ('data', Path('/var/lib/cf-filebrowser-enterprise'))):
+        if not path.is_dir():
+            raise RuntimeError('required persistence directory missing')
+        tree = underlay_tree(path)
+        if not tree.get('complete'):
+            raise RuntimeError('persistence snapshot limit exceeded')
+        result[name] = {key: tree[key] for key in ('tree_sha256', 'entry_count')}
+    root = root_underlay()
+    if not root.get('complete') or root.get('business_path_exists'):
+        raise RuntimeError('root underlay is incomplete or contains business data')
+    result['root_underlay'] = {key: root[key] for key in ('tree_sha256', 'entry_count', 'business_path_exists')}
+    return result
+
+
 def block_state():
     data, timing = json_command(['lsblk','--json','--bytes','--output','NAME,PATH,TYPE,SERIAL,FSTYPE,UUID,MAJ:MIN,SIZE'])
     found = []

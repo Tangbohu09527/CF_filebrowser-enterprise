@@ -14,6 +14,35 @@ SPEC=importlib.util.spec_from_file_location('shared_host_storage_probe',PATH)
 probe=importlib.util.module_from_spec(SPEC);sys.modules[SPEC.name]=probe;SPEC.loader.exec_module(probe)
 
 
+class LifecycleSnapshotTests(unittest.TestCase):
+    def test_absent_disk_snapshot_requires_verified_identity_and_readonly_no_replay(self):
+        uuid = '6332c534-3906-4231-8f96-699533ec7835'
+        commands = []
+        def command(argv):
+            commands.append(argv)
+            return subprocess.CompletedProcess(argv, 32 if argv[0] == 'mountpoint' else 0), {}
+        tree = {'complete': True, 'tree_sha256': 'a'*64, 'entry_count': 1, 'entries': ['PRIVATE'], 'business_path_exists': False}
+        for serial in ('cf-test-data', 'wrong-disk'):
+            with self.subTest(serial=serial), mock.patch.object(Path, 'is_file', return_value=True), \
+                 mock.patch.object(Path, 'is_dir', return_value=True), \
+                 mock.patch.object(Path, 'read_text', return_value='UUID='+uuid+' /srv/storage ext4 defaults 0 2'), \
+                 mock.patch.object(probe, 'json_command', return_value=({'blockdevices':[{'serial':serial,'uuid':uuid,'fstype':'ext4'}]}, {})), \
+                 mock.patch.object(probe, 'run', side_effect=command), \
+                 mock.patch.object(probe.tempfile, 'mkdtemp', return_value='/private-view'), \
+                 mock.patch.object(probe, 'underlay_tree', return_value=tree), \
+                 mock.patch.object(probe, 'root_underlay', return_value=tree):
+                if serial == 'wrong-disk':
+                    count = len(commands)
+                    with self.assertRaisesRegex(RuntimeError, 'identity mismatch'):
+                        probe.lifecycle_snapshot(absent=True)
+                    self.assertFalse(any(c[0] == 'mount' for c in commands[count:]))
+                else:
+                    result = probe.lifecycle_snapshot(absent=True)
+                    self.assertIn(['mount', '-o', 'ro,noload', '/dev/disk/by-uuid/'+uuid, str(Path('/private-view'))], commands)
+                    self.assertNotIn('PRIVATE', json.dumps(result))
+                    self.assertEqual(set(result), {'disk','config','data','root_underlay'})
+
+
 class StorageEvidenceTests(unittest.TestCase):
     UUID='6332c534-3906-4231-8f96-699533ec7835'
 

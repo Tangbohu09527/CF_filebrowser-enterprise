@@ -1828,6 +1828,114 @@ def verify_reboot_state(state, image_id):
         if not state.get(field):
             raise VerificationError('reboot runtime identity absent: ' + field)
 
+def lifecycle_status(vm):
+    response = vm.command_on_guest(f"bash {SOURCE}/deploy/shared-host/manage.sh status --hostname {vm.name}")
+    return json.loads(response.stdout.splitlines()[0])
+
+
+def lifecycle_snapshot(vm, *, absent=False):
+    # The private namespace disappears on exit; no business mount is repaired.
+    script = f"""unshare --mount --propagation private python3 -B - <<'SNAPSHOT'
+import importlib.util,json
+spec=importlib.util.spec_from_file_location('storage_probe','{SOURCE}/scripts/tests/shared_host_storage_probe.py')
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+print(json.dumps(module.lifecycle_snapshot(absent={absent!r}),sort_keys=True))
+SNAPSHOT
+"""
+    return json.loads(vm.command_on_guest(script, timeout=120).stdout)
+
+
+def verify_lifecycle_snapshot(before, after, *, include_data):
+    keys = ('disk', 'config', 'root_underlay') + (('data',) if include_data else ())
+    if any(key not in before or key not in after or before[key] != after[key] for key in keys):
+        raise VerificationError("persistent data/configuration or root underlay changed")
+    if after['root_underlay'].get('business_path_exists') is not False:
+        raise VerificationError("unexpected business data in root underlay")
+
+
+def storage_lifecycle(args, evidence, server, client, image_id, baseline, *, verify_phase="verify-restored"):
+    manage = f"bash {SOURCE}/deploy/shared-host/manage.sh"
+    before = lifecycle_snapshot(server)
+    evidence["lifecycle_before"] = before
+    # Do not manually stop the app before reboot: unless-stopped must attempt
+    # normal daemon recovery against the deliberately absent business mount.
+    record_stage(args, evidence, "capture-original-container-before-missing-storage-reboot")
+    missing_container_id = server.command_on_guest("docker ps --no-trunc -q --filter label=com.docker.compose.project=cf-filebrowser").stdout.decode().strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", missing_container_id):
+        raise VerificationError("missing-storage test requires exactly one running original service")
+    evidence["missing_storage"] = {"original_container_id": missing_container_id, "original_sentinel_id": baseline[server.name]["id"]}
+    record_stage(args, evidence, "missing-business-mount-real-reboot")
+    server.command_on_guest("cp --preserve=mode /etc/fstab /root/cf-verification/fstab.saved\nsed -i '\\| /srv/storage |s/^/# missing-disk-test /' /etc/fstab")
+    evidence["missing_disk_reboot"] = server.reboot()
+    record_stage(args, evidence, "missing-storage-docker-and-original-sentinel-readiness")
+    missing = evidence["missing_storage"]
+    wait_missing_storage_ready(server, missing_container_id, baseline[server.name]["id"], missing)
+    record_stage(args, evidence, "verify-missing-storage-before-explicit-start")
+    verify_missing_storage_state(missing["before_explicit_start"], missing_container_id, baseline[server.name]["id"])
+    missing["status"] = lifecycle_status(server)
+    if missing["status"]["storage"] != {"path": "/srv/storage", "ready": False, "reason": "not-mounted"}:
+        raise VerificationError("formal status did not identify the absent storage mount")
+    missing["snapshot_before_refusal"] = lifecycle_snapshot(server, absent=True)
+    verify_lifecycle_snapshot(before, missing["snapshot_before_refusal"], include_data=False)
+    missing["formal_start_exit"] = server.command_on_guest(f"{manage} start --hostname {server.name}", check=False).returncode
+    if missing["formal_start_exit"] == 0:
+        raise VerificationError("formal start accepted absent storage")
+    record_stage(args, evidence, "explicit-original-container-start-with-missing-storage")
+    rejected = server.command_on_guest("docker start " + missing_container_id, check=False)
+    missing["explicit_start"] = missing_storage_rejection(rejected)
+    missing["after_explicit_start"] = missing_storage_state(server, missing_container_id, baseline[server.name]["id"])
+    record_stage(args, evidence, "verify-real-missing-storage-refusal-and-no-system-disk-writes")
+    if rejected.returncode == 0:
+        raise VerificationError("original container unexpectedly started while business storage was absent")
+    verify_missing_storage_state(missing["after_explicit_start"], missing_container_id, baseline[server.name]["id"])
+    missing["snapshot_after_refusal"] = lifecycle_snapshot(server, absent=True)
+    verify_lifecycle_snapshot(missing["snapshot_before_refusal"], missing["snapshot_after_refusal"], include_data=True)
+    missing["original_data_unchanged_during_refusal"] = True
+    missing["sentinels_unchanged"] = all(sentinel_state(vm) == baseline[vm.name] for vm in (server, client))
+    if not missing["sentinels_unchanged"]:
+        raise VerificationError("unrelated project changed during storage refusal")
+    server.command_on_guest("""
+    ! mountpoint -q /srv/storage
+    test ! -e /srv/storage/cf-filebrowser-enterprise
+    id=$(docker ps -aq --filter label=com.docker.compose.project=cf-filebrowser)
+    test -n "$id"
+    test "$(docker inspect --format '{{.State.Running}}' "$id")" != true
+    cp --preserve=mode /root/cf-verification/fstab.saved /etc/fstab
+    systemctl daemon-reload
+    mount /srv/storage
+    """)
+    record_stage(args, evidence, "late-mount-formal-start-and-api")
+    evidence["late_mount"] = {"recovery": "operator-restored-fstab-and-mount-then-formal-validate-start", "automatic_recovery_claimed": False,
+                             "before_start_status": lifecycle_status(server), "snapshot": lifecycle_snapshot(server)}
+    verify_lifecycle_snapshot(missing["snapshot_after_refusal"], evidence["late_mount"]["snapshot"], include_data=True)
+    if evidence["late_mount"]["before_start_status"]["storage"]["ready"] is not True:
+        raise VerificationError("correct late storage identity not ready")
+    server.command_on_guest(f"{manage} validate --hostname {server.name}\n{manage} start --hostname {server.name}")
+    healthy(server)
+    evidence["late_mount_api"] = api(client, verify_phase, "api-late-mount.json")
+    evidence["checks"].append("missing business mount blocks automatic boot without creating system-disk paths; late mount plus formal start recovers")
+    for vm in (server, client):
+        if sentinel_state(vm) != baseline[vm.name]:
+            raise VerificationError("unrelated project's container/network/port/data changed during lifecycle tests")
+    record_stage(args, evidence, "container-recreation-and-persistence")
+    # Recreate only this project's stopped service; no prune, down or volume removal.
+    old_container = lifecycle_status(server)["containers"]
+    if len(old_container) != 1 or not re.fullmatch(r"[0-9a-f]{64}", old_container[0]["id"]) or old_container[0]["image_id"] != image_id:
+        raise VerificationError("recreation requires one service with the pinned image")
+    server.command_on_guest(f"{manage} stop --hostname {server.name}")
+    evidence["recreation"] = {"before": old_container[0], "stopped_snapshot": lifecycle_snapshot(server)}
+    server.command_on_guest(f"docker rm {old_container[0]['id']} >/dev/null\n{manage} start --hostname {server.name}")
+    recreated = lifecycle_status(server)
+    if len(recreated["containers"]) != 1 or recreated["containers"][0]["id"] == old_container[0]["id"] or recreated["containers"][0]["image_id"] != image_id or recreated["storage"]["ready"] is not True:
+        raise VerificationError("recreation failed new-container/same-image/storage contract")
+    evidence["recreation"].update(after=recreated["containers"][0], snapshot=lifecycle_snapshot(server))
+    verify_lifecycle_snapshot(evidence["recreation"]["stopped_snapshot"], evidence["recreation"]["snapshot"], include_data=False)
+    evidence["recreated_api"] = api(client, verify_phase, "api-recreated.json")
+    evidence["recreation"]["sentinels_unchanged"] = all(sentinel_state(vm) == baseline[vm.name] for vm in (server, client))
+    if not evidence["recreation"]["sentinels_unchanged"]:
+        raise VerificationError("unrelated project changed during recreation")
+
+
 def scenario(args, work, evidence):
     record_stage(args, evidence, "official-debian-image-download-and-sha512")
     base, cloud_record = cloud_image(work)
@@ -1942,6 +2050,13 @@ test ! -e /srv/storage/cf-filebrowser-enterprise
         record_stage(args, evidence, "second-vm-real-lan-and-https-boundaries")
         evidence["initial_lan_boundary"] = lan_boundary(client)
         evidence["checks"].append("second-VM HTTPS UI/API controls before/after, curl certificate rejection, connected denied TCP peer refused before TLS, forwarded headers ignored on allowed HTTPS")
+        if args.scope == "lifecycle":
+            record_stage(args, evidence, "lifecycle-small-api-seed")
+            evidence["lifecycle_seed"] = api(client, "lifecycle-seed", "api-lifecycle-seed.json")
+            storage_lifecycle(args, evidence, server, client, image_id, baseline, verify_phase="lifecycle-verify")
+            evidence.update(result="passed", scope="lifecycle", boundaries={"recovery": "operator", "full_A_B": "not claimed", "PDF_UI_OnlyOffice_blank_restore": "not run in this scope"})
+            record_stage(args, evidence, "targeted-storage-lifecycle-complete")
+            return
         if args.scope == "reboot":
             targeted_reboot(args, evidence, server, client, image_id, baseline)
             return
@@ -1976,51 +2091,7 @@ test ! -e /srv/storage/cf-filebrowser-enterprise
         evidence["host_restart_lan_boundary"] = reboot_operation(args, evidence, client, "https-lan", lambda: lan_boundary(client), diagnostic_vm=server)
         evidence["host_restart_api"] = reboot_operation(args, evidence, client, "file-api", lambda: api(client, "verify-restored", "api-host-restart.json"), diagnostic_vm=server)
         evidence["checks"].append("controlled stop/start, Docker container restart, Docker daemon restart, real systemd host reboot and retained permissions/data")
-        # Do not manually stop the app before reboot: unless-stopped must attempt
-        # normal daemon recovery against the deliberately absent business mount.
-        record_stage(args, evidence, "capture-original-container-before-missing-storage-reboot")
-        missing_container_id = server.command_on_guest("docker ps --no-trunc -q --filter label=com.docker.compose.project=cf-filebrowser").stdout.decode().strip()
-        if not re.fullmatch(r"[0-9a-f]{64}", missing_container_id):
-            raise VerificationError("missing-storage test requires exactly one running original service")
-        evidence["missing_storage"] = {"original_container_id": missing_container_id, "original_sentinel_id": baseline[server.name]["id"]}
-        record_stage(args, evidence, "missing-business-mount-real-reboot")
-        server.command_on_guest("cp --preserve=mode /etc/fstab /root/cf-verification/fstab.saved\nsed -i '\\| /srv/storage |s/^/# missing-disk-test /' /etc/fstab")
-        evidence["missing_disk_reboot"] = server.reboot()
-        record_stage(args, evidence, "missing-storage-docker-and-original-sentinel-readiness")
-        missing = evidence["missing_storage"]
-        wait_missing_storage_ready(server, missing_container_id, baseline[server.name]["id"], missing)
-        record_stage(args, evidence, "verify-missing-storage-before-explicit-start")
-        verify_missing_storage_state(missing["before_explicit_start"], missing_container_id, baseline[server.name]["id"])
-        record_stage(args, evidence, "explicit-original-container-start-with-missing-storage")
-        rejected = server.command_on_guest("docker start " + missing_container_id, check=False)
-        missing["explicit_start"] = missing_storage_rejection(rejected)
-        missing["after_explicit_start"] = missing_storage_state(server, missing_container_id, baseline[server.name]["id"])
-        record_stage(args, evidence, "verify-real-missing-storage-refusal-and-no-system-disk-writes")
-        if rejected.returncode == 0:
-            raise VerificationError("original container unexpectedly started while business storage was absent")
-        verify_missing_storage_state(missing["after_explicit_start"], missing_container_id, baseline[server.name]["id"])
-        server.command_on_guest("""
-! mountpoint -q /srv/storage
-test ! -e /srv/storage/cf-filebrowser-enterprise
-id=$(docker ps -aq --filter label=com.docker.compose.project=cf-filebrowser)
-test -n "$id"
-test "$(docker inspect --format '{{.State.Running}}' "$id")" != true
-cp --preserve=mode /root/cf-verification/fstab.saved /etc/fstab
-systemctl daemon-reload
-mount /srv/storage
-""")
-        record_stage(args, evidence, "late-mount-formal-start-and-api")
-        server.command_on_guest(f"{manage} start --hostname {server.name}")
-        healthy(server)
-        evidence["late_mount_api"] = api(client, "verify-restored", "api-late-mount.json")
-        evidence["checks"].append("missing business mount blocks automatic boot without creating system-disk paths; late mount plus formal start recovers")
-        for vm in vms:
-            if sentinel_state(vm) != baseline[vm.name]:
-                raise VerificationError("unrelated project's container/network/port/data changed during lifecycle tests")
-        record_stage(args, evidence, "container-recreation-and-persistence")
-        # Recreate only this project's stopped service; no prune, down or volume removal.
-        server.command_on_guest(f"{manage} stop --hostname {server.name}\nid=$(docker ps -aq --filter label=com.docker.compose.project=cf-filebrowser)\ndocker rm \"$id\" >/dev/null\n{manage} start --hostname {server.name}")
-        evidence["recreated_api"] = api(client, "verify-restored", "api-recreated.json")
+        storage_lifecycle(args, evidence, server, client, image_id, baseline)
         backup = "/srv/storage/cf-filebrowser-enterprise/backups/verification.tar"
         flags = f"--source-sha {args.source_sha} --image-ref {shlex.quote(pinned)} --image-id {image_id}"
         record_stage(args, evidence, "formal-controlled-stop-backup")
@@ -2093,7 +2164,7 @@ if bash {SOURCE}/deploy/shared-host/backup.sh restore {GUEST}/verification.tar -
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-sha", required=True)
-    parser.add_argument("--scope", choices=("full", "reboot", "storage"), default="full", help="reboot runs only formal setup and the host reboot blocker checks")
+    parser.add_argument("--scope", choices=("full", "reboot", "storage", "lifecycle"), default="full", help="reboot runs only formal setup and the host reboot blocker checks")
     parser.add_argument("--image-ref", help="local image already built by the formal image.sh entry point")
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--accelerator", choices=("kvm", "tcg"), default="kvm")
@@ -2119,6 +2190,7 @@ def main():
     try:
         scenario(args, work, evidence)
         message = "reboot blocker targeted verification passed; full A/B remains separate" if args.scope == "reboot" else "real Debian/systemd/LAN/restore verification passed"
+        if args.scope == "lifecycle": message = "missing/late storage and recreation targeted verification passed; full A/B remains separate"
         if args.scope == "storage": message = "storage device-budget control completed; product verification remains separate"
         print("[shared-host-vm] " + message + "; publish only the evidence directory")
         return 0

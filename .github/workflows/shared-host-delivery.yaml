@@ -8,7 +8,7 @@ on:
       scope:
         description: Verification scope (full remains the default)
         type: choice
-        options: [full, reboot, storage]
+        options: [full, reboot, storage, lifecycle]
         default: full
 
 permissions:

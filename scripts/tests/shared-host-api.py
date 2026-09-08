@@ -592,6 +592,42 @@ class Acceptance:
         self.check('reboot_actual_read', self.download('reboot_actual_download', fresh, reader).body == b'modify')
         self.resource('reboot_actual_delete', 'DELETE', fresh, writer)
 
+    def lifecycle_seed(self):
+        """Seed only file/permission/Token/Share/audit persistence using existing helpers."""
+        self.login_admin()
+        self.resource("fixture_directory_create", "POST", self.state["root"], self.admin, isDir="true", body=b"")
+        worker = self.create_user("worker", permissions())
+        reader = self.create_user("reader", permissions(create=False, modify=False, delete=False))
+        stranger = self.create_user("stranger", permissions(create=False, modify=False, delete=False))
+        self.create_user("ui", permissions(api=False, share=False))
+        self.state["ui"] = {key: self.state["users"]["ui"][key] for key in ("username", "password")}
+        self.checkpoint()
+        source_info = self.request("source_configuration", "GET", "/api/settings", token=self.admin, query={"property": "sources"}).json()
+        sources = [source for source in source_info if source.get("name") == SOURCE]
+        self.check("dedicated_source_present", len(sources) == 1)
+        share_enabled = sources[0].get("config", {}).get("private") is False
+        self.state["share_enabled"] = share_enabled
+        self.checkpoint()
+        self.check("lifecycle_share_source_required", share_enabled)
+        content = "persistent storage lifecycle\n".encode()
+        self.resource("lifecycle_seed_file", "POST", "/中文 空格.txt", worker, body=content)
+        self.remember_file("中文 空格.txt", content)
+        self.resource("lifecycle_audit_create", "POST", "/audit-cycle.txt", worker, body=b"before")
+        self.resource("lifecycle_audit_modify", "PUT", "/audit-cycle.txt", worker, body=b"after")
+        self.resource("lifecycle_audit_delete", "DELETE", "/audit-cycle.txt", worker)
+        self.token_tests(worker, reader)
+        self.share_tests(worker, reader, stranger)
+        self.set_permissions("worker", permissions(download=False))
+        self.check_audit(worker)
+        self.state["seed_completed"] = True
+        self.state["lifecycle_seed_completed"] = True
+        self.checkpoint()
+        self.lifecycle_verify()
+
+    def lifecycle_verify(self):
+        self.check("lifecycle_completed_seed_required", self.state.get("lifecycle_seed_completed") is True)
+        self.verify_persistence()
+
     def exercise(self):
         self.login_admin()
         self.resource("fixture_directory_create", "POST", self.state["root"], self.admin, isDir="true", body=b"")
@@ -1154,7 +1190,7 @@ class Acceptance:
         self.dav("restored_webdav_denied_output_absent", "GET", "/webdav/restore-denied.txt", tokens["dav_live"], statuses=(404,))
         self.protocol_audit()
 
-    def verify_restored(self):
+    def verify_persistence(self):
         self.check("completed_seed_required", self.state.get("seed_completed") is True)
         self.login_admin()
         sessions = {}
@@ -1185,13 +1221,17 @@ class Acceptance:
         self.resource("restored_actual_modify", "PUT", fresh, sessions["ui"], body=b"restored modify")
         self.check("restored_actual_read", self.download("restored_actual_download", fresh, sessions["ui"]).body == b"restored modify")
         self.resource("restored_actual_delete", "DELETE", fresh, sessions["ui"])
+        return sessions
+
+    def verify_restored(self):
+        sessions = self.verify_persistence()
         preview = self.preview_request("restored_actual_preview", "/picture.png", sessions["ui"])
         self.check("restored_preview_has_bytes", bool(preview.body) and preview.headers.get("content-type", "").startswith("image/"))
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("exercise", "protocols", "verify-restored", "audit-pending-prepare", "audit-pending-hold", "audit-pending-verify", "reboot-seed", "reboot-verify"))
+    parser.add_argument("phase", choices=("exercise", "protocols", "verify-restored", "audit-pending-prepare", "audit-pending-hold", "audit-pending-verify", "reboot-seed", "reboot-verify", "lifecycle-seed", "lifecycle-verify"))
     parser.add_argument("--url", "--base-url", dest="url", required=True)
     parser.add_argument("--ca-file", required=True)
     parser.add_argument("--admin-password-file", required=True)
@@ -1207,7 +1247,7 @@ def main(argv=None):
     ca = protected_path(args.ca_file)
     evidence_path = protected_path(args.evidence, existing=False)
     state_path = Path(args.state_file)
-    if args.phase in ("exercise", "audit-pending-prepare", "reboot-seed"):
+    if args.phase in ("exercise", "audit-pending-prepare", "reboot-seed", "lifecycle-seed"):
         protected_path(state_path, existing=False)
         identifier = secrets.token_hex(6)
         prefix = "/cf-audit-pending-" if args.phase == "audit-pending-prepare" else "/cf-acceptance-"
@@ -1227,7 +1267,7 @@ def main(argv=None):
             test.exercise()
         elif args.phase == "protocols":
             test.protocols()
-        elif args.phase in ("reboot-seed", "reboot-verify"):
+        elif args.phase in ("reboot-seed", "reboot-verify", "lifecycle-seed", "lifecycle-verify"):
             getattr(test, args.phase.replace("-", "_"))()
         elif args.phase.startswith("audit-pending-"):
             getattr(test, args.phase.replace("-", "_"))()

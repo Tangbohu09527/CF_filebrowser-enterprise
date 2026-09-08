@@ -1137,6 +1137,11 @@ class InitialUIContinuationTests(unittest.TestCase):
     def test_scenario_preserves_full_remaining_sequence_and_uses_sticky_completion(self):
         import inspect
         source = inspect.getsource(harness.scenario)
+        full_call = '        storage_lifecycle(args, evidence, server, client, image_id, baseline)'
+        self.assertEqual(source.count(full_call + '\n'), 1)
+        self.assertLess(source.index('"real-host-reboot-and-api"'), source.index(full_call + '\n'))
+        self.assertLess(source.index(full_call + '\n'), source.index('"formal-controlled-stop-backup"'))
+        source += inspect.getsource(harness.storage_lifecycle)
         self.assertLess(source.index('initial_ui_with_preservation('), source.index('"formal-stop-start-and-container-restart"'))
         for phase in ('"docker-daemon-restart-and-api"', '"real-host-reboot-and-api"',
                       '"missing-business-mount-real-reboot"', '"container-recreation-and-persistence"',
@@ -1146,6 +1151,45 @@ class InitialUIContinuationTests(unittest.TestCase):
         self.assertIn('evidence["restored_ui"] = real_ui(server)', source)
         self.assertIn('complete_scenario(args, evidence)', source)
         self.assertNotIn('evidence["result"] = "passed"', source)
+
+
+class StorageLifecycleTests(unittest.TestCase):
+    def test_data_config_root_and_disk_changes_fail_closed(self):
+        before = {name: {"tree_sha256": "a" * 64, "entry_count": 1} for name in ("disk", "config", "data", "root_underlay")}
+        before["root_underlay"]["business_path_exists"] = False
+        harness.verify_lifecycle_snapshot(before, copy.deepcopy(before), include_data=True)
+        for name in before:
+            after = copy.deepcopy(before); after[name]["tree_sha256"] = "b" * 64
+            with self.subTest(name=name), self.assertRaises(harness.VerificationError):
+                harness.verify_lifecycle_snapshot(before, after, include_data=True)
+        after = copy.deepcopy(before); after['root_underlay']['business_path_exists'] = True
+        with self.assertRaises(harness.VerificationError):
+            harness.verify_lifecycle_snapshot(after, after, include_data=False)
+
+    def test_lifecycle_route_keeps_full_defaults_and_excludes_other_suites(self):
+        import inspect
+        source = inspect.getsource(harness.scenario)
+        route = source.split('if args.scope == "lifecycle":', 1)[1].split('if args.scope == "reboot":', 1)[0]
+        self.assertIn('"lifecycle-seed"', route)
+        self.assertIn('verify_phase="lifecycle-verify"', route)
+        self.assertIn('return', route)
+        for call in ('real_ui(', 'audit_pending_interrupt(', 'audit_store_fault(', 'backup.sh', 'storage_control('):
+            self.assertNotIn(call, route)
+        self.assertIn('default="full"', inspect.getsource(harness.main))
+
+    def test_only_lifecycle_api_omits_preview_and_full_verifier_retains_it(self):
+        import inspect
+        spec = importlib.util.spec_from_file_location('lifecycle_api', MODULE_PATH.with_name('shared-host-api.py'))
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        self.assertIn('self.verify_persistence()', inspect.getsource(module.Acceptance.lifecycle_verify))
+        full = inspect.getsource(module.Acceptance.verify_restored)
+        self.assertIn('self.verify_persistence()', full)
+        self.assertIn('restored_actual_preview', full)
+        self.assertIn('restored_preview_has_bytes', full)
+        seed = inspect.getsource(module.Acceptance.lifecycle_seed)
+        for call in ('self.token_tests(', 'self.share_tests(', 'self.check_audit('):
+            self.assertIn(call, seed)
+        self.assertNotIn('fixtures()', seed)
 
 
 class RebootDiagnosticTests(unittest.TestCase):
