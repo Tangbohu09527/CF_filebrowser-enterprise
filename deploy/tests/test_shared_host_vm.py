@@ -1334,6 +1334,15 @@ class StorageControlScopeTests(unittest.TestCase):
                 self.exercise(mounted,budget)
             self.assertEqual(self.vm.reboot.call_count,1);self.vm.close.assert_called_once()
 
+    def test_normal_guest_uses_finite_budget_and_control_retains_original_failure_input(self):
+        for storage_only,seconds in ((False,90),(True,5)):
+            vm=mock.Mock();vm.name='cf-verification-1'
+            harness.prerequisites(vm,'a'*40,storage_only=storage_only)
+            script=vm.command_on_guest.call_args.args[0]
+            self.assertIn(f'defaults,nofail,x-systemd.device-timeout={seconds}s 0 2',script)
+            self.assertNotIn('systemctl edit docker',script)
+            self.assertNotIn('chmod -R',script)
+
     def test_storage_scope_does_not_prepare_product_or_disable_pr_gates(self):
         vm=mock.Mock();harness.prerequisites(vm,'a'*40,storage_only=True)
         script=vm.command_on_guest.call_args.args[0]

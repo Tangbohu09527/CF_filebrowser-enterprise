@@ -274,6 +274,9 @@ ethernets:
 
 
 def prerequisites(vm, revision, *, storage_only=False):
+    # The UUID device arrives after the old 5s job budget under TCG. Keep the
+    # normal guest wait finite; the controlled experiment retains its 5s input.
+    device_wait_seconds = 5 if storage_only else 90
     source_setup = "" if storage_only else f"""
 test ! -e {SOURCE}
 git clone {PRODUCT} {SOURCE}
@@ -310,7 +313,7 @@ test -z "$(blkid -o value -s TYPE /dev/vdb || true)"
 mkfs.ext4 -q -L cf-test-storage /dev/vdb
 install -d -o root -g root -m 0755 /srv/storage
 uuid=$(blkid -o value -s UUID /dev/vdb)
-printf 'UUID=%s /srv/storage ext4 defaults,nofail,x-systemd.device-timeout=5s 0 2\\n' "$uuid" >> /etc/fstab
+printf 'UUID=%s /srv/storage ext4 defaults,nofail,x-systemd.device-timeout={device_wait_seconds}s 0 2\\n' "$uuid" >> /etc/fstab
 mount /srv/storage
 install -d -o root -g root -m 0700 {GUEST}
 printf '{SERVER_IP} {TLS_NAME}\\n' >> /etc/hosts
