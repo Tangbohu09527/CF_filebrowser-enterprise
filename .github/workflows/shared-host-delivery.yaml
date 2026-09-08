@@ -4,6 +4,12 @@ on:
   pull_request:
     branches: [feat/v1-integration]
   workflow_dispatch:
+    inputs:
+      scope:
+        description: Verification scope (full remains the default)
+        type: choice
+        options: [full, reboot]
+        default: full
 
 permissions:
   contents: read
@@ -14,6 +20,7 @@ concurrency:
 
 jobs:
   source-regression:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'reboot'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -44,6 +51,7 @@ jobs:
         run: git diff --exit-code
 
   backend-regression:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'reboot'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -60,6 +68,7 @@ jobs:
         run: git diff --exit-code
 
   deployment-validation:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'reboot'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -98,14 +107,16 @@ jobs:
             --version "verification-$revision" --image "cf-filebrowser:verification-$revision" \
             --evidence "$RUNNER_TEMP/cf-image-evidence"
           docker image inspect "cf-filebrowser:verification-$revision" --format '{{.Id}}'
-      - name: Real Debian 13 install, HTTPS clients, reboot and blank recovery
+      - name: Real Debian 13 verification for the selected scope
+        env:
+          VERIFICATION_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope || 'full' }}
         run: |
           revision=$(git rev-parse HEAD)
           accelerator=tcg
           if [[ -r /dev/kvm && -w /dev/kvm ]]; then accelerator=kvm; fi
           bash scripts/tests/shared-host-vm.sh --source-sha "$revision" \
             --image-ref "cf-filebrowser:verification-$revision" \
-            --evidence "$RUNNER_TEMP/cf-vm-evidence" --accelerator "$accelerator"
+            --evidence "$RUNNER_TEMP/cf-vm-evidence" --accelerator "$accelerator" --scope "$VERIFICATION_SCOPE"
       - name: Save sanitized VM acceptance results only
         if: always()
         uses: actions/upload-artifact@v4

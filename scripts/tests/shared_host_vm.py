@@ -219,7 +219,9 @@ ethernets:
             safe = re.findall(rb"^\[shared-host (?:check|prepare|validate|start|bootstrap-finish|stop|status)\] ERROR: [ -~]{1,500}$", result.stderr, re.MULTILINE)
             if safe:
                 detail += "; " + safe[-1].decode("ascii")
-            raise VerificationError(f"{self.name}: SSH guest action failed (exit {result.returncode})" + detail)
+            error = VerificationError(f"{self.name}: SSH guest action failed (exit {result.returncode})" + detail)
+            error.guest_exit_code = result.returncode
+            raise error
         return result
 
     def wait_ready(self):
@@ -496,6 +498,130 @@ done
 exit 1
 """, timeout=210)
 
+
+
+REBOOT_ERRORS = (VerificationError, OSError, ValueError, KeyError, subprocess.TimeoutExpired)
+
+
+def reboot_error_class(error):
+    if isinstance(error, subprocess.TimeoutExpired):
+        return "subprocess-timeout"
+    if isinstance(error, VerificationError):
+        return "verification-failed"
+    if isinstance(error, OSError):
+        return "os-error"
+    if isinstance(error, KeyError):
+        return "missing-result-field"
+    return "invalid-result"
+
+
+def reboot_observation(vm):
+    # Read-only, bounded diagnostics. Never print docker inspect/logs, environment,
+    # configuration, marker values, authentication material or exception text.
+    script = r"""python3 -B - <<'REBOOT_OBSERVATION'
+import hashlib,json,os,re,subprocess
+from pathlib import Path
+
+def run(*args):
+    return subprocess.run(args,capture_output=True,text=True,check=False,timeout=5)
+
+def safe(value, allowed, fallback='unknown'):
+    return value if value in allowed else fallback
+
+report={'available':True,'docker':safe(run('systemctl','is-active','docker').stdout.strip(),
+    ('active','inactive','activating','deactivating','failed','unknown'))}
+root=Path('/srv/storage')
+report['storage_mounted']=run('mountpoint','--quiet',str(root)).returncode==0
+report['storage_on_root_device']=root.exists() and root.stat().st_dev==Path('/').stat().st_dev
+uuid=run('findmnt','-n','-o','UUID','--mountpoint',str(root)).stdout.strip()
+report['storage_uuid']=uuid if re.fullmatch(r'[0-9a-f-]{36}',uuid) else None
+left=Path('/etc/cf-filebrowser-enterprise/storage.identity')
+right=root/'cf-filebrowser-enterprise/.storage-identity'
+report['storage_identity_matches']=(left.is_file() and right.is_file() and not left.is_symlink()
+    and not right.is_symlink() and left.stat().st_size==65 and right.stat().st_size==65
+    and left.read_bytes()==right.read_bytes())
+report['bootstrap_absent']=not os.path.lexists('/etc/cf-filebrowser-enterprise/secrets/bootstrap_admin_password')
+config=Path('/etc/cf-filebrowser-enterprise/config.yaml')
+report['config_sha256']=hashlib.sha256(config.read_bytes()).hexdigest() if config.is_file() and config.stat().st_size<=1048576 else None
+# Do not cause Docker socket activation while observing its autostart state.
+if report['docker']=='active':
+    ids=run('docker','ps','-aq','--no-trunc','--filter','label=com.docker.compose.project=cf-filebrowser').stdout.split()
+    report['container_count']=len(ids)
+    if len(ids)==1 and re.fullmatch(r'[0-9a-f]{64}',ids[0]):
+        result=run('docker','inspect',ids[0])
+        if result.returncode==0:
+            info=json.loads(result.stdout)[0];state=info.get('State',{})
+            report.update(container_id=ids[0],image_id=info.get('Image'),
+                running=state.get('Running') is True,
+                status=safe(state.get('Status'),('created','running','paused','restarting','removing','exited','dead')),
+                health=safe(state.get('Health',{}).get('Status'),('starting','healthy','unhealthy'),'absent'),
+                exit_code=state.get('ExitCode'),restart_count=info.get('RestartCount'))
+            error=state.get('Error','').lower()
+            report['container_error']=next((label for marker,label in (
+                ('bind source path does not exist','missing-bind-source'),
+                ('no such file or directory','missing-path'),('permission denied','permission-denied'))
+                if marker in error),'unclassified' if error else 'none')
+print(json.dumps(report,sort_keys=True))
+REBOOT_OBSERVATION
+"""
+    process = vm.command_on_guest(script, check=False, timeout=45)
+    if process.returncode or len(process.stdout) > 65536:
+        raise VerificationError("bounded reboot observation unavailable")
+    try:
+        value = json.loads(process.stdout)
+    except (ValueError, UnicodeError) as error:
+        raise VerificationError("invalid reboot observation") from error
+    bools = {'available', 'storage_mounted', 'storage_on_root_device', 'storage_identity_matches', 'bootstrap_absent', 'running'}
+    ints = {'container_count', 'exit_code', 'restart_count'}
+    enums = {'docker': {'active','inactive','activating','deactivating','failed','unknown'},
+             'status': {'created','running','paused','restarting','removing','exited','dead','unknown'},
+             'health': {'starting','healthy','unhealthy','absent'},
+             'container_error': {'missing-bind-source','missing-path','permission-denied','unclassified','none'}}
+    patterns = {'storage_uuid': r'[0-9a-f-]{36}', 'container_id': r'[0-9a-f]{64}', 'image_id': r'sha256:[0-9a-f]{64}', 'config_sha256': r'[0-9a-f]{64}'}
+    required = {'available','docker','storage_mounted','storage_on_root_device','storage_uuid','storage_identity_matches','bootstrap_absent'}
+    if not isinstance(value, dict) or not required <= value.keys() or value.keys() - (bools | ints | enums.keys() | patterns.keys()):
+        raise VerificationError("invalid reboot observation schema")
+    for key, item in value.items():
+        valid = ((key in bools and type(item) is bool)
+                 or (key in ints and type(item) is int and 0 <= item <= 1000000)
+                 or (key in enums and isinstance(item, str) and item in enums[key])
+                 or (key in patterns and ((key in ('storage_uuid', 'config_sha256') and item is None)
+                     or (isinstance(item, str) and re.fullmatch(patterns[key], item) is not None))))
+        if not valid:
+            raise VerificationError("invalid reboot observation value")
+    return value
+
+
+def reboot_operation(args, evidence, vm, name, operation, *, diagnostic_vm=None):
+    if name not in ('boot-id-change', 'container-health', 'https-lan', 'file-api'):
+        raise VerificationError("unknown reboot operation")
+    record = {'operation': name, 'vm': vm.name, 'result': 'failed', 'exit_code': None}
+    diagnostic_vm = diagnostic_vm or vm
+    evidence.setdefault('reboot_operations', []).append(record)
+    record_stage(args, evidence, 'real-host-reboot-and-api/' + name)
+    started = time.monotonic()
+    try:
+        value = operation()
+        record['result'] = 'passed'
+        record['exit_code'] = 0
+        return value
+    except REBOOT_ERRORS as error:
+        record['elapsed_seconds'] = round(time.monotonic() - started, 3)
+        record['classification'] = reboot_error_class(error)
+        if isinstance(error, subprocess.TimeoutExpired):
+            record['timeout_seconds'] = error.timeout
+        if type(getattr(error, 'guest_exit_code', None)) is int:
+            record['exit_code'] = error.guest_exit_code
+        # Preserve the original failure even if this independent probe fails.
+        try:
+            evidence['reboot_failure_state_vm'] = diagnostic_vm.name
+            evidence['reboot_failure_state'] = reboot_observation(diagnostic_vm)
+        except REBOOT_ERRORS as diagnostic_error:
+            evidence['reboot_failure_state'] = {'available': False, 'classification': reboot_error_class(diagnostic_error)}
+        raise
+    finally:
+        record.setdefault('elapsed_seconds', round(time.monotonic() - started, 3))
+        record_stage(args, evidence, 'real-host-reboot-and-api/' + name)
 
 
 def runtime_readiness_script():
@@ -1555,6 +1681,46 @@ def recovery_probe(vm, args, evidence, name, arguments):
     return report
 
 
+
+def targeted_reboot(args, evidence, server, client, image_id, baseline):
+    """Reuse formal setup; finish before the independent full acceptance suites."""
+    evidence['scope'] = 'reboot-blocker-only'
+    record_stage(args, evidence, 'reboot-target/seed-file-and-permission-state')
+    evidence['reboot_initial_api'] = api(client, 'reboot-seed', 'api-reboot-seed.json')
+    before = reboot_observation(server)
+    evidence['reboot_before_state'] = before
+    verify_reboot_state(before, image_id)
+    evidence['host_reboot'] = reboot_operation(args, evidence, server, 'boot-id-change', server.reboot)
+    reboot_operation(args, evidence, server, 'container-health', lambda: healthy(server))
+    after = reboot_observation(server)
+    evidence['reboot_after_state'] = after
+    verify_reboot_state(after, image_id)
+    for field in ('container_id', 'image_id', 'storage_uuid', 'config_sha256'):
+        if before[field] != after[field]:
+            raise VerificationError('reboot changed protected state: ' + field)
+    evidence['host_restart_lan_boundary'] = reboot_operation(args, evidence, client, 'https-lan', lambda: lan_boundary(client), diagnostic_vm=server)
+    evidence['host_restart_api'] = reboot_operation(args, evidence, client, 'file-api', lambda: api(client, 'reboot-verify', 'api-reboot-verify.json'), diagnostic_vm=server)
+    for vm in (server, client):
+        if sentinel_state(vm) != baseline[vm.name]:
+            raise VerificationError('reboot changed unrelated project identity/network/port/data')
+    evidence['boundaries'] = {'B': 'reboot blocker targeted verification only; full A/B acceptance remains separate',
+                              'UI_PDF_OnlyOffice_restore': 'not executed by this scope',
+                              'C': 'not executed; no target device or production client accessed'}
+    evidence['result'] = 'passed'
+    record_stage(args, evidence, 'reboot-target/complete')
+
+
+def verify_reboot_state(state, image_id):
+    expected = {'available': True, 'docker': 'active', 'storage_mounted': True, 'storage_on_root_device': False,
+                'storage_identity_matches': True, 'bootstrap_absent': True, 'container_count': 1,
+                'running': True, 'status': 'running', 'health': 'healthy', 'image_id': image_id}
+    for field, value in expected.items():
+        if state.get(field) != value:
+            raise VerificationError('reboot runtime state rejected: ' + field)
+    for field in ('container_id', 'storage_uuid', 'config_sha256'):
+        if not state.get(field):
+            raise VerificationError('reboot runtime identity absent: ' + field)
+
 def scenario(args, work, evidence):
     record_stage(args, evidence, "official-debian-image-download-and-sha512")
     base, cloud_record = cloud_image(work)
@@ -1666,6 +1832,9 @@ test ! -e /srv/storage/cf-filebrowser-enterprise
         record_stage(args, evidence, "second-vm-real-lan-and-https-boundaries")
         evidence["initial_lan_boundary"] = lan_boundary(client)
         evidence["checks"].append("second-VM HTTPS UI/API controls before/after, curl certificate rejection, connected denied TCP peer refused before TLS, forwarded headers ignored on allowed HTTPS")
+        if args.scope == "reboot":
+            targeted_reboot(args, evidence, server, client, image_id, baseline)
+            return
         record_stage(args, evidence, "audit-pending-process-interruption")
         audit_pending_interrupt(server, client, args, evidence, image_id, baseline)
         record_stage(args, evidence, "audit-store-real-write-failure")
@@ -1692,10 +1861,10 @@ test ! -e /srv/storage/cf-filebrowser-enterprise
         healthy(server)
         evidence["docker_restart_api"] = api(client, "verify-restored", "api-docker-restart.json")
         record_stage(args, evidence, "real-host-reboot-and-api")
-        evidence["host_reboot"] = server.reboot()
-        healthy(server)
-        evidence["host_restart_lan_boundary"] = lan_boundary(client)
-        evidence["host_restart_api"] = api(client, "verify-restored", "api-host-restart.json")
+        evidence["host_reboot"] = reboot_operation(args, evidence, server, "boot-id-change", server.reboot)
+        reboot_operation(args, evidence, server, "container-health", lambda: healthy(server))
+        evidence["host_restart_lan_boundary"] = reboot_operation(args, evidence, client, "https-lan", lambda: lan_boundary(client), diagnostic_vm=server)
+        evidence["host_restart_api"] = reboot_operation(args, evidence, client, "file-api", lambda: api(client, "verify-restored", "api-host-restart.json"), diagnostic_vm=server)
         evidence["checks"].append("controlled stop/start, Docker container restart, Docker daemon restart, real systemd host reboot and retained permissions/data")
         # Do not manually stop the app before reboot: unless-stopped must attempt
         # normal daemon recovery against the deliberately absent business mount.
@@ -1814,6 +1983,7 @@ if bash {SOURCE}/deploy/shared-host/backup.sh restore {GUEST}/verification.tar -
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-sha", required=True)
+    parser.add_argument("--scope", choices=("full", "reboot"), default="full", help="reboot runs only formal setup and the host reboot blocker checks")
     parser.add_argument("--image-ref", required=True, help="local image already built by the formal image.sh entry point")
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--accelerator", choices=("kvm", "tcg"), default="kvm")
@@ -1836,7 +2006,8 @@ def main():
     evidence = {"schema": "cf-shared-host-vm/v1", "source_sha": args.source_sha, "result": "failed", "checks": [], "accelerator": args.accelerator}
     try:
         scenario(args, work, evidence)
-        print("[shared-host-vm] real Debian/systemd/LAN/restore verification passed; publish only the evidence directory")
+        message = "reboot blocker targeted verification passed; full A/B remains separate" if args.scope == "reboot" else "real Debian/systemd/LAN/restore verification passed"
+        print("[shared-host-vm] " + message + "; publish only the evidence directory")
         return 0
     except (VerificationError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
         message = str(error) if isinstance(error, VerificationError) else "environment or operation failure; inspect private CI state"

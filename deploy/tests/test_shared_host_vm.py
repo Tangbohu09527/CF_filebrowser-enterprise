@@ -1148,5 +1148,182 @@ class InitialUIContinuationTests(unittest.TestCase):
         self.assertNotIn('evidence["result"] = "passed"', source)
 
 
+class RebootDiagnosticTests(unittest.TestCase):
+    def test_timeout_names_exact_operation_and_keeps_raw_output_private(self):
+        args = SimpleNamespace()
+        evidence = {'source_sha': 'a' * 40, 'result': 'failed'}
+        vm = SimpleNamespace(name='cf-verification-1')
+        failure = subprocess.TimeoutExpired(['ssh', 'PRIVATE-ARG'], 210,
+                                            output=b'PRIVATE-TOKEN', stderr=b'PRIVATE-SECRET')
+        with mock.patch.object(harness, 'record_stage'), mock.patch.object(harness, 'reboot_observation', return_value={'docker': 'active'}):
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                harness.reboot_operation(args, evidence, vm, 'container-health', mock.Mock(side_effect=failure))
+        self.assertIs(raised.exception, failure)
+        record = evidence['reboot_operations'][0]
+        self.assertEqual(record['operation'], 'container-health')
+        self.assertEqual(record['vm'], 'cf-verification-1')
+        self.assertEqual(record['classification'], 'subprocess-timeout')
+        self.assertEqual(record['timeout_seconds'], 210)
+        self.assertGreaterEqual(record['elapsed_seconds'], 0)
+        self.assertNotIn('PRIVATE', json.dumps(evidence))
+        self.assertEqual(evidence['result'], 'failed')
+
+    def test_diagnostic_failure_cannot_replace_original_exception(self):
+        evidence = {}
+        original = ValueError('PRIVATE-JSON')
+        with mock.patch.object(harness, 'record_stage'), mock.patch.object(harness, 'reboot_observation', side_effect=OSError('PRIVATE-PATH')):
+            with self.assertRaises(ValueError) as raised:
+                harness.reboot_operation(SimpleNamespace(), evidence, SimpleNamespace(name='cf-verification-1'), 'container-health', mock.Mock(side_effect=original))
+        self.assertIs(raised.exception, original)
+        self.assertEqual(evidence['reboot_failure_state'], {'available': False, 'classification': 'os-error'})
+        self.assertNotIn('PRIVATE', json.dumps(evidence))
+
+    def test_success_records_result_and_elapsed_without_failure_probe(self):
+        evidence = {}
+        with mock.patch.object(harness, 'record_stage'), mock.patch.object(harness, 'reboot_observation') as diagnostic:
+            value = harness.reboot_operation(SimpleNamespace(), evidence, SimpleNamespace(name='cf-verification-2'), 'https-lan', lambda: {'passed': True})
+        self.assertEqual(value, {'passed': True})
+        self.assertEqual(evidence['reboot_operations'][0]['result'], 'passed')
+        diagnostic.assert_not_called()
+
+    def test_guest_failure_exit_code_is_retained_without_error_text(self):
+        failure = harness.VerificationError('PRIVATE-DETAIL')
+        failure.guest_exit_code = 255
+        evidence = {}
+        with mock.patch.object(harness, 'record_stage'), mock.patch.object(harness, 'reboot_observation', return_value={}):
+            with self.assertRaises(harness.VerificationError):
+                harness.reboot_operation(SimpleNamespace(), evidence, SimpleNamespace(name='cf-verification-1'), 'boot-id-change', mock.Mock(side_effect=failure))
+        self.assertEqual(evidence['reboot_operations'][0]['exit_code'], 255)
+        self.assertNotIn('PRIVATE', json.dumps(evidence))
+
+    def test_observation_rejects_unknown_keys_and_raw_data(self):
+        vm = mock.Mock()
+        for raw in (b'{"password":"PRIVATE"}', b'PRIVATE', b'x' * 65537):
+            vm.command_on_guest.return_value = subprocess.CompletedProcess([], 0, raw, b'PRIVATE-STDERR')
+            with self.subTest(size=len(raw)), self.assertRaises(harness.VerificationError) as error:
+                harness.reboot_observation(vm)
+            self.assertNotIn('PRIVATE', str(error.exception))
+        self.assertEqual(vm.command_on_guest.call_args.kwargs['timeout'], 45)
+
+    def test_health_budget_and_existing_checks_are_unchanged(self):
+        import inspect
+        self.assertIn('timeout=210', inspect.getsource(harness.healthy))
+        self.assertIn('seq 1 90', inspect.getsource(harness.healthy))
+        source = inspect.getsource(harness.scenario)
+        for operation in ('boot-id-change', 'container-health', 'https-lan', 'file-api'):
+            self.assertIn(operation, source)
+        self.assertIn('lan_boundary(client)', source)
+        self.assertIn('api(client, "verify-restored", "api-host-restart.json")', source)
+
+
+class TargetedRebootTests(unittest.TestCase):
+    IMAGE = 'sha256:' + 'a' * 64
+
+    def state(self):
+        return {'available': True, 'docker': 'active', 'storage_mounted': True, 'storage_on_root_device': False,
+                'storage_uuid': '12345678-1234-1234-1234-123456789abc', 'storage_identity_matches': True,
+                'bootstrap_absent': True, 'container_count': 1, 'container_id': 'b' * 64, 'image_id': self.IMAGE,
+                'running': True, 'status': 'running', 'health': 'healthy', 'exit_code': 0, 'restart_count': 0,
+                'config_sha256': 'c' * 64, 'container_error': 'none'}
+
+    def test_positive_observation_and_strict_sanitized_values(self):
+        vm = mock.Mock()
+        vm.command_on_guest.return_value = subprocess.CompletedProcess([], 0, json.dumps(self.state()).encode(), b'PRIVATE')
+        self.assertEqual(harness.reboot_observation(vm), self.state())
+        for key, value in (('docker', 'PRIVATE'), ('exit_code', 'PRIVATE'), ('config_sha256', 'PRIVATE'), ('running', 1)):
+            invalid = self.state(); invalid[key] = value
+            vm.command_on_guest.return_value.stdout = json.dumps(invalid).encode()
+            with self.subTest(key=key), self.assertRaises(harness.VerificationError):
+                harness.reboot_observation(vm)
+
+    def test_mounted_wrong_device_identity_bootstrap_and_unhealthy_are_rejected(self):
+        harness.verify_reboot_state(self.state(), self.IMAGE)
+        for key, value in (('storage_mounted', False), ('storage_on_root_device', True), ('storage_identity_matches', False),
+                           ('bootstrap_absent', False), ('health', 'unhealthy'), ('image_id', 'sha256:' + 'd' * 64),
+                           ('storage_uuid', None), ('config_sha256', None), ('container_count', 2)):
+            invalid = self.state(); invalid[key] = value
+            with self.subTest(key=key), self.assertRaises(harness.VerificationError):
+                harness.verify_reboot_state(invalid, self.IMAGE)
+
+    def invoke(self, *, health_error=None, after=None):
+        evidence = {'result': 'failed'}
+        self.server = mock.Mock(name='server'); self.server.name = 'cf-verification-1'
+        self.client = mock.Mock(name='client'); self.client.name = 'cf-verification-2'
+        self.server.reboot.return_value = {'before': 'old-boot', 'after': 'new-boot'}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(harness, 'record_stage'))
+            observe = stack.enter_context(mock.patch.object(harness, 'reboot_observation', side_effect=[self.state(), after or self.state()]))
+            api = stack.enter_context(mock.patch.object(harness, 'api', return_value={'passed': True}))
+            healthy = stack.enter_context(mock.patch.object(harness, 'healthy', side_effect=health_error))
+            lan = stack.enter_context(mock.patch.object(harness, 'lan_boundary', return_value={'passed': True}))
+            stack.enter_context(mock.patch.object(harness, 'sentinel_state', return_value={'stable': True}))
+            try:
+                harness.targeted_reboot(SimpleNamespace(), evidence, self.server, self.client, self.IMAGE,
+                                        {self.server.name: {'stable': True}, self.client.name: {'stable': True}})
+            finally:
+                self.observed = evidence; self.api_calls = api.call_args_list; self.lan_count = lan.call_count
+        return evidence
+
+    def test_target_pass_is_separate_and_uses_only_reboot_api_phases(self):
+        evidence = self.invoke()
+        self.assertEqual(evidence['scope'], 'reboot-blocker-only')
+        self.assertEqual(evidence['result'], 'passed')
+        self.assertEqual([call.args[1] for call in self.api_calls], ['reboot-seed', 'reboot-verify'])
+        self.assertEqual(evidence['boundaries']['UI_PDF_OnlyOffice_restore'], 'not executed by this scope')
+        self.server.reboot.assert_called_once_with()
+        self.assertEqual([r['operation'] for r in evidence['reboot_operations']], ['boot-id-change','container-health','https-lan','file-api'])
+
+    def test_original_health_timeout_stops_api_and_preserves_failure(self):
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.invoke(health_error=subprocess.TimeoutExpired(['ssh', 'PRIVATE'], 210))
+        self.assertEqual(self.observed['result'], 'failed')
+        self.assertEqual(self.observed['reboot_operations'][-1]['timeout_seconds'], 210)
+        self.assertEqual(self.lan_count, 0)
+        self.assertEqual(len(self.api_calls), 1)
+        self.assertNotIn('PRIVATE', json.dumps(self.observed))
+
+    def test_changed_config_or_mount_uuid_cannot_pass(self):
+        for field, value in (('storage_uuid', '87654321-1234-1234-1234-123456789abc'), ('config_sha256', 'd' * 64)):
+            state = self.state(); state[field] = value
+            with self.subTest(field=field), self.assertRaises(harness.VerificationError):
+                self.invoke(after=state)
+            self.assertEqual(self.observed['result'], 'failed')
+            self.assertEqual(self.lan_count, 0)
+
+    def test_manual_scope_does_not_disable_ordinary_pr_ci(self):
+        source = (MODULE_PATH.parents[2] / '.github/workflows/shared-host-delivery.yaml').read_text()
+        self.assertEqual(source.count("if: github.event_name != 'workflow_dispatch' || inputs.scope != 'reboot'"), 3)
+        self.assertIn("github.event_name == 'workflow_dispatch' && inputs.scope || 'full'", source)
+        self.assertIn('default: full', source)
+        import inspect
+        scenario = inspect.getsource(harness.scenario)
+        self.assertLess(scenario.index('bootstrap-finish'), scenario.index('if args.scope == "reboot":'))
+        self.assertLess(scenario.index('if args.scope == "reboot":'), scenario.index('audit-pending-process-interruption'))
+
+
+class RebootAPIAssertionTests(unittest.TestCase):
+    def test_permission_or_byte_changes_are_rejected_by_existing_api_assertions(self):
+        path = MODULE_PATH.with_name('shared-host-api.py')
+        spec = importlib.util.spec_from_file_location('reboot_api_assertions', path)
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        original = b'file contents'
+        expected = {'size': len(original), 'sha256': hashlib.sha256(original).hexdigest()}
+        for corrupt_permissions, corrupt_bytes in ((True, False), (False, True)):
+            test = module.Acceptance.__new__(module.Acceptance)
+            test.state = {'reboot_seed_completed': True, 'users': {role: {'username': role, 'password': 'private', 'permissions': module.permissions(create=role=='worker', modify=role=='worker')}
+                          for role in ('worker', 'reader')}, 'files': {'original.txt': expected}}
+            test.checks = []; test.admin = 'private'; test.login_admin = mock.Mock()
+            test.login = lambda username, password, label: username
+            def request(label, method, endpoint, **kwargs):
+                granted = test.state['users'][kwargs['token']]['permissions'].copy()
+                if corrupt_permissions: granted['modify'] = not granted['modify']
+                return SimpleNamespace(json=lambda: {'permissions': granted})
+            test.request = request; test.resource = mock.Mock()
+            test.download = lambda *a, **k: SimpleNamespace(body=b'wrong' if corrupt_bytes else original)
+            with self.subTest(permissions=corrupt_permissions), self.assertRaises(module.AcceptanceError):
+                test.reboot_verify()
+            self.assertTrue(any(not item['passed'] for item in test.checks))
+
+
 if __name__ == "__main__":
     unittest.main()

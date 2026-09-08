@@ -553,6 +553,45 @@ class Acceptance:
         pending["verified"] = True
         self.checkpoint()
 
+
+    def reboot_seed(self):
+        """Small persistent API state for reboot isolation; no preview/UI/protocol suite."""
+        self.login_admin()
+        self.resource('reboot_directory_create', 'POST', self.state['root'], self.admin, isDir='true', body=b'')
+        writer = self.create_user('worker', permissions(share=False))
+        self.create_user('reader', permissions(create=False, modify=False, delete=False, share=False))
+        for name, content in {'中文 空格.txt': '真实重启前的文件内容\n'.encode(), 'empty.txt': b'',
+                              'binary.bin': bytes(range(256)) * 4096}.items():
+            self.resource('reboot_file_create', 'POST', '/' + name, writer, body=content)
+            self.remember_file(name, content)
+        self.state['reboot_seed_completed'] = True
+        self.checkpoint()
+        self.reboot_verify()
+
+    def reboot_verify(self):
+        self.check('reboot_completed_seed_required', self.state.get('reboot_seed_completed') is True)
+        self.login_admin()
+        sessions = {}
+        for role, account in self.state['users'].items():
+            sessions[role] = self.login(account['username'], account['password'], 'reboot_' + role + '_login')
+            who = self.request('reboot_' + role + '_identity', 'GET', '/api/users', token=sessions[role], query={'id': 'self'}).json()
+            self.check('reboot_' + role + '_permissions_unchanged', who.get('permissions') == account['permissions'])
+            self.check('reboot_' + role + '_ordinary', who.get('permissions', {}).get('admin') is False)
+        reader, writer = sessions['reader'], sessions['worker']
+        self.resource('reboot_reader_browse', 'GET', '/', reader)
+        for name, expected in self.state['files'].items():
+            self.check_bytes('reboot_existing_bytes_unchanged', self.download('reboot_existing_download', '/' + name, reader).body, expected)
+        for method in ('POST', 'PUT'):
+            self.resource('reboot_reader_new_denied_' + method, method, '/denied-new.txt', reader, body=b'blocked', statuses=(403,))
+            self.resource('reboot_reader_overwrite_denied_' + method, method, '/中文 空格.txt', reader, body=b'blocked', statuses=(403,))
+        self.resource('reboot_denied_new_absent', 'GET', '/denied-new.txt', writer, statuses=(404,))
+        self.check_bytes('reboot_denied_overwrite_preserved', self.download('reboot_after_denied_download', '/中文 空格.txt', reader).body, self.state['files']['中文 空格.txt'])
+        fresh = '/reboot-readwrite-' + secrets.token_hex(8) + '.txt'
+        self.resource('reboot_actual_create', 'POST', fresh, writer, body=b'create')
+        self.resource('reboot_actual_modify', 'PUT', fresh, writer, body=b'modify')
+        self.check('reboot_actual_read', self.download('reboot_actual_download', fresh, reader).body == b'modify')
+        self.resource('reboot_actual_delete', 'DELETE', fresh, writer)
+
     def exercise(self):
         self.login_admin()
         self.resource("fixture_directory_create", "POST", self.state["root"], self.admin, isDir="true", body=b"")
@@ -1152,7 +1191,7 @@ class Acceptance:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("exercise", "protocols", "verify-restored", "audit-pending-prepare", "audit-pending-hold", "audit-pending-verify"))
+    parser.add_argument("phase", choices=("exercise", "protocols", "verify-restored", "audit-pending-prepare", "audit-pending-hold", "audit-pending-verify", "reboot-seed", "reboot-verify"))
     parser.add_argument("--url", "--base-url", dest="url", required=True)
     parser.add_argument("--ca-file", required=True)
     parser.add_argument("--admin-password-file", required=True)
@@ -1168,7 +1207,7 @@ def main(argv=None):
     ca = protected_path(args.ca_file)
     evidence_path = protected_path(args.evidence, existing=False)
     state_path = Path(args.state_file)
-    if args.phase in ("exercise", "audit-pending-prepare"):
+    if args.phase in ("exercise", "audit-pending-prepare", "reboot-seed"):
         protected_path(state_path, existing=False)
         identifier = secrets.token_hex(6)
         prefix = "/cf-audit-pending-" if args.phase == "audit-pending-prepare" else "/cf-acceptance-"
@@ -1188,6 +1227,8 @@ def main(argv=None):
             test.exercise()
         elif args.phase == "protocols":
             test.protocols()
+        elif args.phase in ("reboot-seed", "reboot-verify"):
+            getattr(test, args.phase.replace("-", "_"))()
         elif args.phase.startswith("audit-pending-"):
             getattr(test, args.phase.replace("-", "_"))()
         else:
