@@ -35,7 +35,7 @@ PROPS = ('Id','LoadState','ActiveState','SubState','Result','What','Where','Requ
  'After','Before','BindsTo','TriggeredBy','JobTimeoutUSec','JobRunningTimeoutUSec',
  'ActiveEnterTimestampMonotonic','ActiveExitTimestampMonotonic',
  'InactiveEnterTimestampMonotonic','InactiveExitTimestampMonotonic',
- 'ExecMainCode','ExecMainStatus','ExecMainStartTimestampMonotonic','ExecMainExitTimestampMonotonic','ExecMount')
+ 'ExecMainCode','ExecMainStatus','ExecMainStartTimestampMonotonic','ExecMainExitTimestampMonotonic','ExecMount','FragmentPath','SourcePath','DropInPaths')
 
 
 def digest(data):
@@ -203,7 +203,45 @@ def related_units(mount):
                    if n.endswith('.device') or (n.startswith('systemd-fsck') and n.endswith('.service'))})[:8]
 
 
-def journal_records(raw, units, container_id):
+def storage_units(record, before):
+    """Recover only the verified test disk's names, even after job unloading."""
+    names=set(related_units(record.get('mount',{}))) | set(related_units(before.get('mount',{})))
+    names.update(n for n in before.get('related_units',{}) if re.fullmatch(UNIT,n))
+    identifiers=[]
+    entries=record.get('fstab',[])
+    disks=[d for d in record.get('disk',{}).get('devices',[]) if d.get('serial')==SERIAL]
+    if len(entries)==1 and len(disks)==1:
+        d=disks[0];uuid=d.get('blkid_uuid','');path=d.get('path','')
+        if isinstance(uuid,str) and isinstance(path,str) and re.fullmatch(UUID,uuid) and entries[0].get('what')=='UUID='+uuid and d.get('blkid_type')=='ext4' and re.fullmatch(r'/dev/[a-z0-9]+',path):
+            identifiers=[uuid,path]
+            for value in (path,'/dev/disk/by-uuid/'+uuid):
+                for option in ('--suffix=device','--template=systemd-fsck@.service'):
+                    p,_=run(['systemd-escape','--path',option,value])
+                    name=p.stdout.decode('ascii','replace').strip()
+                    if p.returncode or not re.fullmatch(UNIT,name):raise ValueError('test disk unit escaping failed')
+                    names.add(name)
+    return sorted(names)[:16],identifiers
+
+
+def unit_configuration(name):
+    """Selected directives and source filenames, never a raw unit/config dump."""
+    if not re.fullmatch(UNIT,name):raise ValueError('invalid unit configuration name')
+    p,timing=run(['systemctl','cat','--no-pager',name])
+    value={'query':timing,'files':[],'directives':[],'complete':p.returncode==0 and len(p.stdout)<=65536}
+    if not value['complete']:return value
+    allowed={'After','Before','Requires','Wants','BindsTo','DefaultDependencies','What','Where','Type','Options',
+             'JobTimeoutSec','JobRunningTimeoutSec','TimeoutSec','TimeoutStartSec','TimeoutStopSec'}
+    for line in p.stdout.decode('utf8','replace').splitlines():
+        if line.startswith('# /') and re.fullmatch(r'# /(?:run|etc|usr/lib|lib)/systemd/[A-Za-z0-9_./@\\-]+',line):
+            value['files'].append(line[2:])
+        key,sep,content=line.partition('=')
+        if sep and key in allowed and len(line)<=1000 and not re.search(r'(?i)password|token|secret|authorization',content):
+            value['directives'].append(line)
+    value['files']=value['files'][:16];value['directives']=value['directives'][:80]
+    return value
+
+
+def journal_records(raw, units, container_id, identifiers=()):
     records = []
     for line in raw.splitlines():
         try: item=json.loads(line)
@@ -212,11 +250,13 @@ def journal_records(raw, units, container_id):
         if not isinstance(msg,str): continue
         unit=item.get('UNIT') or item.get('_SYSTEMD_UNIT') or ''
         related=unit in units or any(n in msg for n in units)
+        related=related or any(re.search(re.escape(n)+r'(?=$|[^a-zA-Z0-9])',msg) for n in identifiers)
         docker=unit=='docker.service' and (container_id in msg or container_id[:12] in msg) if container_id else False
         if not related and not docker: continue
         mono=str(item.get('__MONOTONIC_TIMESTAMP',''))
         if not mono.isdigit(): continue
         record={'monotonic_us':int(mono),'unit':unit[:240],**error_evidence(msg)}
+        if re.fullmatch(UNIT,str(item.get('UNIT',''))):record['UNIT']=item['UNIT']
         if unit != 'docker.service' and item.get('_SYSTEMD_UNIT') != 'docker.service':
             # Only selected mount/device/fsck or PID1 messages; no general system
             # journal or Docker message bodies. Known fixture UUID/unit paths are
@@ -235,7 +275,9 @@ def collect(phase):
             'sample_monotonic_us':time.monotonic_ns()//1000,'disk':block_state()}
     record['fstab']=fstab_entries(Path('/etc/fstab').read_text())
     record['mount']=unit_state('srv-storage.mount')
-    deps=related_units(record['mount'])
+    saved=GUEST/'storage-before.json'
+    before=json.loads(saved.read_bytes()) if saved.exists() else {}
+    deps,identifiers=storage_units(record,before)
     record['related_units']={name:unit_state(name) for name in deps}
     record['docker_unit']=unit_state('docker.service')
     record['mounted']=run(['mountpoint','--quiet',str(STORAGE)])[0].returncode==0
@@ -251,16 +293,23 @@ def collect(phase):
                 'finished_at':state.get('FinishedAt'),'error':error_evidence(state.get('Error','')),
                 'binds':[{'source':v.get('Source'),'destination':v.get('Destination'),'source_state':path_state(v['Source'])}
                          for v in value.get('Mounts',[]) if v.get('Type')=='bind' and v.get('Source') in FIXED]}
-    # Device unit names come from real mount dependencies, not synthesized escapes.
+    # Include preboot dependencies and systemd-escaped verified disk candidates.
+    record['unit_candidates']=deps
+    record['unit_configurations']={name:unit_configuration(name) for name in ['srv-storage.mount',*deps]}
     units=['srv-storage.mount',*deps,'docker.service']
     argv=['journalctl','--boot','--no-pager','--output=json','--lines=350']
     for name in units: argv += ['--unit',name]
     p,timing=run(argv,15)
     record['journal']={'query':timing,'private_bytes':len(p.stdout),'private_sha256':digest(p.stdout),
-                       'events':journal_records(p.stdout,units,container_id) if len(p.stdout)<=2*1024*1024 else [],
+                       'events':journal_records(p.stdout,units,container_id,identifiers) if len(p.stdout)<=2*1024*1024 else [],
                        'within_byte_limit':len(p.stdout)<=2*1024*1024}
     p,_=run(['journalctl','--boot','--no-pager','--output=json','--lines=1000','_PID=1'],15)
-    record['pid1_events']=journal_records(p.stdout,units,container_id) if len(p.stdout)<=2*1024*1024 else []
+    record['pid1_events']=journal_records(p.stdout,units,container_id,identifiers) if len(p.stdout)<=2*1024*1024 else []
+    discovered={e['unit'] for e in record['journal']['events']+record['pid1_events']
+                if re.fullmatch(UNIT,e['unit']) and (e['unit'].endswith('.device') or e['unit'].startswith('systemd-fsck@'))}
+    for name in sorted(discovered-set(deps))[:8]:
+        record['related_units'][name]=unit_state(name)
+        record['unit_configurations'][name]=unit_configuration(name)
     names=[v['name'] for v in record['disk']['devices'] if v.get('serial')==SERIAL and re.fullmatch(r'[a-z0-9]+',str(v.get('name','')))]
     p,_=run(['journalctl','--boot','--dmesg','--no-pager','--output=json','--lines=600'],15)
     record['test_disk_kernel_events']=journal_records(p.stdout,names,'') if len(p.stdout)<=2*1024*1024 else []
@@ -303,7 +352,7 @@ def mount_diagnostic():
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('phase',choices=('before','after','failure','underlay','mount-diagnostic'))
+    parser.add_argument('phase',choices=('before','after','failure','underlay','mount-diagnostic','control-5s','control-90s-before','control-90s'))
     phase=parser.parse_args().phase
     if sys.platform!='linux' or os.geteuid()!=0 or Path('/etc/cf-shared-host-disposable').read_text().strip()!='cf-verification-1':
         parser.error('requires the marked disposable service guest')

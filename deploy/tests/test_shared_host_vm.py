@@ -1295,13 +1295,54 @@ class TargetedRebootTests(unittest.TestCase):
 
     def test_manual_scope_does_not_disable_ordinary_pr_ci(self):
         source = (MODULE_PATH.parents[2] / '.github/workflows/shared-host-delivery.yaml').read_text()
-        self.assertEqual(source.count("if: github.event_name != 'workflow_dispatch' || inputs.scope != 'reboot'"), 3)
+        self.assertEqual(source.count("if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'"), 3)
         self.assertIn("github.event_name == 'workflow_dispatch' && inputs.scope || 'full'", source)
         self.assertIn('default: full', source)
         import inspect
         scenario = inspect.getsource(harness.scenario)
         self.assertLess(scenario.index('bootstrap-finish'), scenario.index('if args.scope == "reboot":'))
         self.assertLess(scenario.index('if args.scope == "reboot":'), scenario.index('audit-pending-process-interruption'))
+
+
+class StorageControlScopeTests(unittest.TestCase):
+    def exercise(self, mounted=False, budget='5s'):
+        vm=mock.Mock();vm.reboot.side_effect=[{'before':'old','after':'five'},{'before':'five','after':'ninety'}]
+        before={'mounted':True}
+        failed={'boot_id':'five','mounted':mounted,'journal':{'events':[{'unit':'dev-test.device','JOB_RESULT':'timeout'}]},
+                'pid1_events':[],'related_units':{'dev-test.device':{'JobRunningTimeoutUSec':budget}}}
+        evidence={};args=SimpleNamespace(source_sha='a'*40,accelerator='tcg')
+        with mock.patch.object(harness,'VM',return_value=vm), mock.patch.object(harness,'port',return_value=12345), \
+             mock.patch.object(harness,'prerequisites') as prepare, mock.patch.object(harness,'record_stage'), \
+             mock.patch.object(harness,'verify_storage_evidence'), \
+             mock.patch.object(harness,'storage_evidence',side_effect=[before,failed,{}, {'boot_id':'ninety','mounted':True}]) as probe:
+            try:harness.storage_control(args,Path('.'),evidence,Path('base'),Path('key'))
+            finally:self.vm=vm;self.evidence=evidence;self.probe=probe;self.prepare=prepare
+
+    def test_only_observed_five_second_device_failure_allows_one_variable_change(self):
+        self.exercise()
+        self.assertEqual(self.vm.reboot.call_count,2)
+        self.assertEqual([c.args[3] for c in self.probe.call_args_list],['before','control-5s','control-90s-before','control-90s'])
+        script=self.vm.command_on_guest.call_args_list[-1].args[0]
+        self.assertIn("old.replace('x-systemd.device-timeout=5s','x-systemd.device-timeout=90s')",script)
+        self.assertNotIn('mount /srv/storage',script);self.assertNotIn('docker start',script)
+        self.prepare.assert_called_once_with(self.vm,'a'*40,storage_only=True)
+        self.assertEqual(self.evidence['result'],'passed');self.vm.close.assert_called_once()
+
+    def test_unreproduced_or_unverified_failure_stops_before_second_reboot(self):
+        for mounted,budget in ((True,'5s'),(False,'unknown')):
+            with self.subTest(mounted=mounted,budget=budget),self.assertRaises(harness.VerificationError):
+                self.exercise(mounted,budget)
+            self.assertEqual(self.vm.reboot.call_count,1);self.vm.close.assert_called_once()
+
+    def test_storage_scope_does_not_prepare_product_or_disable_pr_gates(self):
+        vm=mock.Mock();harness.prerequisites(vm,'a'*40,storage_only=True)
+        script=vm.command_on_guest.call_args.args[0]
+        self.assertIn('serial',script.lower());self.assertIn('x-systemd.device-timeout=5s',script)
+        self.assertNotIn('git clone',script);self.assertNotIn('manage.sh',script)
+        source=(MODULE_PATH.parents[2]/'.github/workflows/shared-host-delivery.yaml').read_text()
+        self.assertIn("if: github.event_name != 'workflow_dispatch' || inputs.scope != 'storage'",source)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.scope == 'storage'",source)
+        self.assertEqual(source.count("if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'"),3)
 
 
 class RebootAPIAssertionTests(unittest.TestCase):

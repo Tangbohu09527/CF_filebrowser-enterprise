@@ -8,7 +8,7 @@ on:
       scope:
         description: Verification scope (full remains the default)
         type: choice
-        options: [full, reboot]
+        options: [full, reboot, storage]
         default: full
 
 permissions:
@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   source-regression:
-    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'reboot'
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -51,7 +51,7 @@ jobs:
         run: git diff --exit-code
 
   backend-regression:
-    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'reboot'
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -68,7 +68,7 @@ jobs:
         run: git diff --exit-code
 
   deployment-validation:
-    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'reboot'
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -88,6 +88,7 @@ jobs:
         run: git diff --exit-code
 
   fixed-image:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'storage'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -131,6 +132,36 @@ jobs:
         with:
           name: shared-host-image-inputs
           path: ${{ runner.temp }}/cf-image-evidence
+          if-no-files-found: error
+          retention-days: 14
+      - name: No unexpected tracked changes
+        run: git diff --exit-code
+
+  storage-control:
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'storage'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Install existing VM dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssl
+      - name: Same-guest storage device-budget control without a product image
+        run: |
+          revision=$(git rev-parse HEAD)
+          accelerator=tcg
+          if [[ -r /dev/kvm && -w /dev/kvm ]]; then accelerator=kvm; fi
+          bash scripts/tests/shared-host-vm.sh --source-sha "$revision" \
+            --evidence "$RUNNER_TEMP/cf-storage-evidence" --accelerator "$accelerator" --scope storage
+      - name: Save sanitized storage results only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-host-storage-results
+          path: ${{ runner.temp }}/cf-storage-evidence/vm-result.json
           if-no-files-found: error
           retention-days: 14
       - name: No unexpected tracked changes

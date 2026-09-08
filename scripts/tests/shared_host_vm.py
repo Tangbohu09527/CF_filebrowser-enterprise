@@ -273,7 +273,16 @@ ethernets:
                     process.wait(timeout=10)
 
 
-def prerequisites(vm, revision):
+def prerequisites(vm, revision, *, storage_only=False):
+    source_setup = "" if storage_only else f"""
+test ! -e {SOURCE}
+git clone {PRODUCT} {SOURCE}
+git -C {SOURCE} fetch origin {revision}
+git -C {SOURCE} checkout --detach {revision}
+test "$(git -C {SOURCE} rev-parse HEAD)" = {revision}
+test -z "$(git -C {SOURCE} status --porcelain=v1)"
+bash {SOURCE}/deploy/shared-host/manage.sh check --hostname {vm.name}
+"""
     vm.command_on_guest(f"""
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -303,15 +312,9 @@ install -d -o root -g root -m 0755 /srv/storage
 uuid=$(blkid -o value -s UUID /dev/vdb)
 printf 'UUID=%s /srv/storage ext4 defaults,nofail,x-systemd.device-timeout=5s 0 2\\n' "$uuid" >> /etc/fstab
 mount /srv/storage
-test ! -e {SOURCE}
-git clone {PRODUCT} {SOURCE}
-git -C {SOURCE} fetch origin {revision}
-git -C {SOURCE} checkout --detach {revision}
-test "$(git -C {SOURCE} rev-parse HEAD)" = {revision}
-test -z "$(git -C {SOURCE} status --porcelain=v1)"
 install -d -o root -g root -m 0700 {GUEST}
 printf '{SERVER_IP} {TLS_NAME}\\n' >> /etc/hosts
-bash {SOURCE}/deploy/shared-host/manage.sh check --hostname {vm.name}
+{source_setup}
 """, timeout=1800)
 
 
@@ -1682,10 +1685,11 @@ def recovery_probe(vm, args, evidence, name, arguments):
 
 
 
-def storage_evidence(vm, args, evidence, phase):
-    if phase not in ('before','after','failure','mount-diagnostic'):
+def storage_evidence(vm, args, evidence, phase, probe_path=None):
+    if phase not in ('before','after','failure','mount-diagnostic','control-5s','control-90s-before','control-90s'):
         raise VerificationError('unknown storage evidence phase')
-    response = vm.command_on_guest(f"python3 -B {SOURCE}/scripts/tests/shared_host_storage_probe.py {phase}", check=False, timeout=180)
+    path = probe_path or SOURCE + "/scripts/tests/shared_host_storage_probe.py"
+    response = vm.command_on_guest(f"python3 -B {shlex.quote(path)} {phase}", check=False, timeout=180)
     try:
         if len(response.stdout) > 1024 * 1024:
             raise ValueError('storage evidence bound')
@@ -1757,6 +1761,59 @@ def targeted_reboot(args, evidence, server, client, image_id, baseline):
     record_stage(args, evidence, 'reboot-target/complete')
 
 
+def storage_control(args, work, evidence, base, key):
+    """One same-disk, same-guest 5s/90s device-budget experiment; no app image."""
+    vm=VM(1,work,base,key,port(),args.accelerator)
+    evidence.update(scope='storage-control-only',actual_vm_count=1)
+    try:
+        record_stage(args,evidence,'storage-control/guest-prepare')
+        vm.launch();vm.wait_ready()
+        # Retain the same guest OS/Docker packages and boot load as product runs,
+        # but acquire no FileBrowser source, image, registry or business assets.
+        prerequisites(vm,args.source_sha,storage_only=True)
+        vm.write_file(GUEST+'/storage-probe.py',(ROOT/'scripts/tests/shared_host_storage_probe.py').read_bytes())
+        vm.command_on_guest('systemctl daemon-reload')
+        probe=lambda phase: storage_evidence(vm,args,evidence,phase,GUEST+'/storage-probe.py')
+        before=probe('before');verify_storage_evidence(before,before)
+        record_stage(args,evidence,'storage-control/original-5s-reboot')
+        evidence['control_5s_boot']=vm.reboot()
+        after=probe('control-5s');verify_storage_evidence(before,after)
+        if after['boot_id']!=evidence['control_5s_boot']['after']:
+            raise VerificationError('storage control boot evidence mismatch')
+        events=after['journal']['events']+after['pid1_events']
+        failed={e['unit'] for e in events if e['unit'].endswith('.device') and e.get('JOB_RESULT')=='timeout'}
+        budgets={n:after['related_units'].get(n,{}).get('JobRunningTimeoutUSec') for n in failed}
+        evidence['control_failed_device_budgets']=budgets
+        if after['mounted'] or not failed or any(v!='5s' for v in budgets.values()):
+            raise VerificationError('original storage control lacks a failed device job with observed 5s budget; no variable change attempted')
+        # Exactly one variable; preserve UUID, nofail, fsck pass and all other rows.
+        record_stage(args,evidence,'storage-control/change-only-device-budget')
+        vm.command_on_guest("""
+python3 - <<'CONTROL_FSTAB'
+from pathlib import Path
+p=Path('/etc/fstab');text=p.read_text();rows=text.splitlines(keepends=True)
+hits=[i for i,line in enumerate(rows) if not line.lstrip().startswith('#') and len(line.split())==6 and line.split()[1]=='/srv/storage']
+assert len(hits)==1
+old=rows[hits[0]];assert old.split()[3]=='defaults,nofail,x-systemd.device-timeout=5s'
+rows[hits[0]]=old.replace('x-systemd.device-timeout=5s','x-systemd.device-timeout=90s')
+Path('/root/cf-verification/fstab-control-5s').write_text(text)
+p.write_text(''.join(rows))
+CONTROL_FSTAB
+systemctl daemon-reload
+""")
+        probe('control-90s-before')
+        record_stage(args,evidence,'storage-control/finite-90s-reboot')
+        evidence['control_90s_boot']=vm.reboot()
+        after=probe('control-90s');verify_storage_evidence(before,after)
+        if after['boot_id']!=evidence['control_90s_boot']['after'] or not after['mounted']:
+            raise VerificationError('finite device-budget control did not mount automatically')
+        evidence.update(result='passed',automatic_storage_mount=True,
+                        boundaries='storage hypothesis experiment only; no FileBrowser/API, manual mount or product recovery claim')
+        record_stage(args,evidence,'storage-control/complete')
+    finally:
+        vm.close()
+
+
 def verify_reboot_state(state, image_id):
     expected = {'available': True, 'docker': 'active', 'storage_mounted': True, 'storage_on_root_device': False,
                 'storage_identity_matches': True, 'bootstrap_absent': True, 'container_count': 1,
@@ -1782,6 +1839,9 @@ def scenario(args, work, evidence):
         raise VerificationError("runner has less than 12 GiB free disk or the configured 4 GiB RAM available; no VM or disk expansion attempted")
     key = work / "client-key"
     execute(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)])
+    if args.scope == "storage":
+        storage_control(args, work, evidence, base, key)
+        return
     tls = certificates(work)
     registry_id = None
     vms = []
@@ -2030,11 +2090,13 @@ if bash {SOURCE}/deploy/shared-host/backup.sh restore {GUEST}/verification.tar -
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-sha", required=True)
-    parser.add_argument("--scope", choices=("full", "reboot"), default="full", help="reboot runs only formal setup and the host reboot blocker checks")
-    parser.add_argument("--image-ref", required=True, help="local image already built by the formal image.sh entry point")
+    parser.add_argument("--scope", choices=("full", "reboot", "storage"), default="full", help="reboot runs only formal setup and the host reboot blocker checks")
+    parser.add_argument("--image-ref", help="local image already built by the formal image.sh entry point")
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--accelerator", choices=("kvm", "tcg"), default="kvm")
     args = parser.parse_args()
+    if args.scope != "storage" and not args.image_ref:
+        parser.error("--image-ref is required for product verification")
     if sys.platform != "linux" or os.environ.get("GITHUB_ACTIONS") != "true":
         parser.error("this destructive VM-fixture harness runs only on a disposable Linux GitHub Actions runner")
     if not re.fullmatch(r"[0-9a-f]{40}", args.source_sha):
@@ -2054,6 +2116,7 @@ def main():
     try:
         scenario(args, work, evidence)
         message = "reboot blocker targeted verification passed; full A/B remains separate" if args.scope == "reboot" else "real Debian/systemd/LAN/restore verification passed"
+        if args.scope == "storage": message = "storage device-budget control completed; product verification remains separate"
         print("[shared-host-vm] " + message + "; publish only the evidence directory")
         return 0
     except (VerificationError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:

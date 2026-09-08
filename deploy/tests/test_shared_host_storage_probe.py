@@ -95,4 +95,43 @@ class StorageEvidenceTests(unittest.TestCase):
             self.assertTrue(result['attempted']);self.assertTrue(result['diagnostic_only']);self.assertFalse(result['automatic_reboot_recovery'])
 
 
+class StorageDiscoveryTests(unittest.TestCase):
+    UUID='6332c534-3906-4231-8f96-699533ec7835'
+    DEVICE=r'dev-disk-by\x2duuid-6332c534\x2d3906\x2d4231\x2d8f96\x2d699533ec7835.device'
+    FSCK=r'systemd-fsck@dev-disk-by\x2duuid-6332c534\x2d3906\x2d4231\x2d8f96\x2d699533ec7835.service'
+
+    def test_empty_post_failure_dependencies_keep_uuid_timeout_and_fsck_failure(self):
+        record={'mount':{},'fstab':[{'what':'UUID='+self.UUID,'fstype':'ext4'}],
+                'disk':{'devices':[{'serial':'cf-test-data','path':'/dev/vdb','blkid_uuid':self.UUID,'blkid_type':'ext4'}]}}
+        before={'mount':{'Requires':['dev-vdb.device']},'related_units':{'dev-vdb.device':{}}}
+        def escape(argv,timeout=10):
+            self.assertEqual(argv[0],'systemd-escape')
+            if argv[-1]=='/dev/vdb':name='systemd-fsck@dev-vdb.service' if '--template=systemd-fsck@.service' in argv else 'dev-vdb.device'
+            else:name=self.FSCK if '--template=systemd-fsck@.service' in argv else self.DEVICE
+            return subprocess.CompletedProcess(argv,0,(name+'\n').encode(),b''),{}
+        with mock.patch.object(probe,'run',side_effect=escape):
+            names,identifiers=probe.storage_units(record,before)
+        self.assertIn('dev-vdb.device',names);self.assertIn(self.DEVICE,names);self.assertIn(self.FSCK,names)
+        rows=[{'__MONOTONIC_TIMESTAMP':'21000000','UNIT':self.DEVICE,'MESSAGE':'Device start timed out','JOB_RESULT':'timeout'},
+              {'__MONOTONIC_TIMESTAMP':'22000000','UNIT':self.FSCK,'MESSAGE':'File system check failed','JOB_RESULT':'failed'},
+              {'__MONOTONIC_TIMESTAMP':'23000000','UNIT':'systemd-fsck@observed-alias.service','MESSAGE':'Check failed for /dev/vdb','JOB_RESULT':'failed'},
+              {'__MONOTONIC_TIMESTAMP':'23000000','UNIT':'dev-unrelated.device','MESSAGE':'Timed out /dev/vdz','JOB_RESULT':'timeout'}]
+        events=probe.journal_records('\n'.join(json.dumps(x) for x in rows),names,'',identifiers)
+        self.assertEqual([e['JOB_RESULT'] for e in events],['timeout','failed','failed'])
+        self.assertEqual(events[0]['UNIT'],self.DEVICE)
+        self.assertNotIn('unrelated',json.dumps(events))
+
+    def test_unverified_uuid_does_not_generate_candidates(self):
+        with mock.patch.object(probe,'run') as command:
+            names,identifiers=probe.storage_units({'fstab':[{'what':'UUID='+self.UUID}],'disk':{'devices':[]}}, {})
+        command.assert_not_called();self.assertEqual(names,[]);self.assertEqual(identifiers,[])
+
+    def test_generated_unit_configuration_is_allowlisted_and_bounded(self):
+        raw=b'# /run/systemd/generator/srv-storage.mount\n[Unit]\nAfter=dev-vdb.device\n[Mount]\nWhat=/dev/vdb\nWhere=/srv/storage\nOptions=defaults,nofail,x-systemd.device-timeout=5s\n[Service]\nEnvironment=TOKEN=PRIVATE\nExecStart=/bin/echo PRIVATE\n[Unit]\nJobRunningTimeoutSec=5s\n'
+        with mock.patch.object(probe,'run',return_value=(subprocess.CompletedProcess([],0,raw,b''),{})):
+            value=probe.unit_configuration('srv-storage.mount')
+        self.assertIn('JobRunningTimeoutSec=5s',value['directives']);self.assertNotIn('PRIVATE',json.dumps(value))
+        self.assertIn('/run/systemd/generator/srv-storage.mount',value['files'])
+
+
 if __name__=='__main__':unittest.main()
