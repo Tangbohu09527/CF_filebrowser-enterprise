@@ -1223,6 +1223,34 @@ class Acceptance:
         self.resource("restored_actual_delete", "DELETE", fresh, sessions["ui"])
         return sessions
 
+    def restore_verify(self):
+        sessions = self.verify_persistence()
+        reader, worker = sessions["reader"], sessions["worker"]
+        fresh = "/restore-audited-" + secrets.token_hex(8) + ".txt"
+        self.resource("restore_reader_create_denied", "POST", fresh, reader, body=b"blocked", statuses=(403,))
+        self.resource("restore_denied_create_absent", "GET", fresh, reader, statuses=(404,))
+        self.resource("restore_reader_overwrite_denied", "PUT", "/中文 空格.txt", reader, body=b"blocked", statuses=(403,))
+        self.check_bytes("restore_denied_overwrite_unchanged", self.download("restore_reader_download", "/中文 空格.txt", reader).body, self.state["files"]["中文 空格.txt"])
+        self.resource("restore_audited_create", "POST", fresh, worker, body=b"before")
+        self.resource("restore_audited_modify", "PUT", fresh, worker, body=b"after")
+        self.check("restore_audited_download_bytes", self.download("restore_audited_download", fresh, reader).body == b"after")
+        self.resource("restore_audited_delete", "DELETE", fresh, worker)
+        events = self.request("restore_new_audit_query", "GET", "/api/audit", token=self.admin,
+                              query={"actor": self.state["users"]["worker"]["username"], "source": SOURCE,
+                                     "path": self.state["root"] + fresh, "limit": "100"}).json().get("items", [])
+        self.verify_new_restore_audit(events, fresh)
+        active = self.state["shares"]["active"]
+        self.public("restore_wrong_share_password_denied", "/中文 空格.txt", active, password="wrong-restore-test-password", statuses=(401,))
+        self.public("restore_share_write_still_denied", fresh, active, password=active["password"], endpoint="resources", method="POST", body=b"blocked", statuses=(403,))
+        self.resource("restore_share_denied_write_absent", "GET", fresh, reader, statuses=(404,))
+
+    def verify_new_restore_audit(self, events, fresh):
+        relevant = [e for e in events if e.get("path") == self.state["root"] + fresh
+                    and e.get("username") == self.state["users"]["worker"]["username"]
+                    and e.get("result") == "success" and e.get("requestId")
+                    and e["requestId"] not in self.state["audit_ids"]]
+        self.check("restore_new_operations_finalized", {"file.upload", "file.modify", "file.delete"}.issubset({e.get("action") for e in relevant}), record_count=len(relevant))
+
     def verify_restored(self):
         sessions = self.verify_persistence()
         preview = self.preview_request("restored_actual_preview", "/picture.png", sessions["ui"])
@@ -1231,7 +1259,7 @@ class Acceptance:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("exercise", "protocols", "verify-restored", "audit-pending-prepare", "audit-pending-hold", "audit-pending-verify", "reboot-seed", "reboot-verify", "lifecycle-seed", "lifecycle-verify"))
+    parser.add_argument("phase", choices=("exercise", "protocols", "verify-restored", "audit-pending-prepare", "audit-pending-hold", "audit-pending-verify", "reboot-seed", "reboot-verify", "lifecycle-seed", "lifecycle-verify", "restore-verify"))
     parser.add_argument("--url", "--base-url", dest="url", required=True)
     parser.add_argument("--ca-file", required=True)
     parser.add_argument("--admin-password-file", required=True)
@@ -1267,7 +1295,7 @@ def main(argv=None):
             test.exercise()
         elif args.phase == "protocols":
             test.protocols()
-        elif args.phase in ("reboot-seed", "reboot-verify", "lifecycle-seed", "lifecycle-verify"):
+        elif args.phase in ("reboot-seed", "reboot-verify", "lifecycle-seed", "lifecycle-verify", "restore-verify"):
             getattr(test, args.phase.replace("-", "_"))()
         elif args.phase.startswith("audit-pending-"):
             getattr(test, args.phase.replace("-", "_"))()

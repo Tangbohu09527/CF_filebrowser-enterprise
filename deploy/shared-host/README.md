@@ -459,6 +459,23 @@ operation, not performed by restore. Verify file hashes, administrator login,
 ordinary-user permissions, active and revoked Tokens/Shares, audit and real
 read/write after recovery. Merely listing archive members is not recovery proof.
 
+For a scoped CI recovery acceptance, dispatch the existing `shared-host-delivery`
+workflow with `scope=restore` on the fixed branch commit. It uses the formal
+installation, `backup.sh create/verify/restore` and `manage.sh validate/start`
+entry points on two independent Debian test disks. The source stays stopped;
+the operator transfers only the reserved test address to the replacement.
+The protected archive travels over pinned SSH; only its external digest and
+sanitized checks are published. No backup, API state or keys are artifacts.
+
+The scope compares archive members, stopped database bytes and ownership before
+the recovered application starts, allowing only the verified storage identity
+rotation. After startup it checks persistent accounts, permissions, Tokens,
+Shares, historical and new audit records, file bytes and real allowed/denied
+writes, then repeats API checks after a formal stop/start. Corrupt input,
+external checksum mismatch and occupied-target refusals include before/after
+root inventories. This scope does not certify UI, protocols, host reboot or
+full A/B acceptance; those existing gates remain separate.
+
 Code/image rollback and database restoration are separate. Restore requires an
 exact source/image match. A database already migrated by newer code must not be
 opened with an arbitrary older image; use the matching pre-upgrade backup in an

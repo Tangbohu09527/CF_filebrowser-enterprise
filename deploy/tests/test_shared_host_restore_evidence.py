@@ -197,5 +197,91 @@ class ProbeDriverTests(unittest.TestCase):
 
 
 
+
+class PayloadComparisonTests(unittest.TestCase):
+    def test_stopped_database_must_match_and_only_identity_bytes_may_rotate(self):
+        old = [{"path": name, "kind": "file", "mode": 0o640, "uid": 10001, "gid": 10001,
+                "size": 65, "sha256": "a" * 64} for name in
+               ("data/database.db", "config/storage.identity", "config/config.yaml", "files/example.txt")]
+        import copy
+        self.assertTrue(probe.compare_payload(old, copy.deepcopy(old), rotated=False)["database_bytes_match"])
+        new = copy.deepcopy(old); new[1]["sha256"] = "b" * 64
+        self.assertTrue(probe.compare_payload(old, new, rotated=True)["database_bytes_match"])
+        with self.assertRaises(probe.ProbeError): probe.compare_payload(old, new, rotated=False)
+        for index, field, value in ((0,"sha256","c"*64), (2,"sha256","c"*64), (3,"mode",0o777), (1,"uid",0)):
+            changed = copy.deepcopy(new); changed[index][field] = value
+            with self.subTest(index=index,field=field), self.assertRaises(probe.ProbeError):
+                probe.compare_payload(old, changed, rotated=True)
+        for changed in (new[:-1], new + [{**new[0], "path":"files/extra"}]):
+            with self.assertRaises(probe.ProbeError): probe.compare_payload(old, changed, rotated=True)
+        with self.assertRaises(probe.ProbeError): probe.compare_payload(old, old, rotated=True)
+
+
+
+class RestoreAcceptanceTests(unittest.TestCase):
+    @staticmethod
+    def module(filename):
+        spec = importlib.util.spec_from_file_location("restore_acceptance_" + filename.replace("-", "_"), MODULE_PATH.with_name(filename))
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        return module
+
+    def test_old_audit_or_missing_terminal_operation_cannot_prove_new_writes(self):
+        api = self.module("shared-host-api.py")
+        test = object.__new__(api.Acceptance)
+        test.state = {"root":"/fixture", "users":{"worker":{"username":"worker"}}, "audit_ids":["old"]}
+        def check(label, value, **kwargs):
+            if not value: raise AssertionError(label)
+        test.check = check
+        events = [{"path":"/fixture/new", "username":"worker", "result":"success", "requestId":str(i), "action":action}
+                  for i,action in enumerate(("file.upload","file.modify","file.delete"))]
+        test.verify_new_restore_audit(events, "/new")
+        import copy
+        for changed in (events[:-1], [{**e,"requestId":"old"} for e in events], [{**e,"result":"pending"} for e in events],
+                        [{**e,"path":"/fixture/old"} for e in events], [{**e,"username":"someone-else"} for e in events]):
+            with self.assertRaises(AssertionError): test.verify_new_restore_audit(changed, "/new")
+
+    def test_command_refusal_requires_exact_category_and_preserves_sanitized_failure(self):
+        harness = self.module("shared_host_vm.py")
+        vm = mock.Mock(name="guest"); vm.name = "isolated-target"
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(evidence=Path(directory))
+            for rc, stderr, accepted in ((1,b'[shared-host-backup] ERROR: archive does not match the externally recorded checksum',True),
+                                        (1,b'PRIVATE-KEY unexpected error',False),(0,b'',False),(255,b'SSH failure',False)):
+                vm.command_on_guest.return_value = subprocess.CompletedProcess([],rc,b'PRIVATE-TOKEN',stderr)
+                evidence = {}
+                with contextlib.redirect_stdout(io.StringIO()):
+                    if accepted:
+                        harness.restore_command(vm,args,evidence,"external-sha-rejection","backup restore",refusal=("archive does not match the externally recorded checksum",))
+                    else:
+                        with self.assertRaises(harness.VerificationError):
+                            harness.restore_command(vm,args,evidence,"external-sha-rejection","backup restore",refusal=("archive does not match the externally recorded checksum",))
+                stored = (args.evidence/'vm-result.json').read_text(encoding='utf8')
+                self.assertNotIn('PRIVATE',stored)
+                record = json.loads(stored)['restore_operations'][0]
+                self.assertEqual(record['exit_code'],rc); self.assertIn('elapsed_seconds',record)
+
+    def test_blank_target_rejects_product_roots_and_unclean_source(self):
+        harness = self.module("shared_host_vm.py")
+        empty = {"containers":[], "roots":{"config":{"root":{"exists":False}}}}
+        harness.require_restore_stopped(empty,blank=True)
+        for altered in ({"containers":[], "roots":{"config":{"root":{"exists":True}}}},
+                        {"containers":[{"Running":False,"Restarting":False,"OOMKilled":False,"ExitCode":127}],"roots":{}}):
+            with self.assertRaises(harness.VerificationError): harness.require_restore_stopped(altered,blank=True)
+
+    def test_target_route_reuses_formal_chain_without_other_suites(self):
+        import inspect
+        harness = self.module("shared_host_vm.py")
+        route = inspect.getsource(harness.scenario).split('if args.scope == "restore":',1)[1].split('if args.scope == "lifecycle":',1)[0]
+        self.assertIn('targeted_restore(',route); self.assertIn('return',route)
+        source = inspect.getsource(harness.targeted_restore)
+        for required in ('backup.sh create','backup.sh verify','backup.sh restore','formal-validate','formal-start',
+                         'restore_payload_before_start','restore_occupied_target_unchanged','restore_source_still_stopped','restored_restart_api'):
+            self.assertIn(required,source)
+        for forbidden in ('real_ui(', 'storage_lifecycle(', 'storage_control(', 'audit_store_fault(', 'bootstrap-finish'):
+            self.assertNotIn(forbidden,source)
+        self.assertLess(source.index('restore_payload_before_start'),source.index('"formal-start"'))
+        self.assertNotIn('server.read_file(',source.split('"formal-restore"',1)[1])
+
+
 if __name__ == "__main__":
     unittest.main()

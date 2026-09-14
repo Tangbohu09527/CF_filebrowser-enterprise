@@ -1670,7 +1670,9 @@ def record_stage(args, evidence, name):
 
 
 def recovery_probe(vm, args, evidence, name, arguments):
-    command = "python3 " + SOURCE + "/scripts/tests/shared_host_restore_evidence.py " + shlex.join(arguments)
+    command = "python3 -B " + SOURCE + "/scripts/tests/shared_host_restore_evidence.py " + shlex.join(arguments)
+    if arguments == ["inventory"]:
+        command = "unshare --mount --propagation private " + command
     process = vm.command_on_guest(command, check=False)
     try:
         report = json.loads(process.stdout)
@@ -1936,6 +1938,130 @@ def storage_lifecycle(args, evidence, server, client, image_id, baseline, *, ver
         raise VerificationError("unrelated project changed during recreation")
 
 
+
+def restore_command(vm, args, evidence, stage, command, *, refusal=None):
+    record_stage(args, evidence, "restore/" + stage)
+    started = time.monotonic()
+    record = {"vm": vm.name, "command_class": stage}
+    evidence.setdefault("restore_operations", []).append(record)
+    try:
+        response = vm.command_on_guest(command, check=False, timeout=900)
+        record["exit_code"] = response.returncode
+        # Only reviewed, fixed backup errors may cross the evidence boundary.
+        known = ("backup content checksum failed", "backup is corrupt or truncated",
+                 "backup is truncated or missing its end marker", "archive inventory is incomplete", "invalid backup manifest JSON",
+                 "archive does not match the externally recorded checksum", "restore requires empty config, data and files roots")
+        errors = [message for message in known if message.encode() in response.stderr]
+        record["error_class"] = errors[0] if errors else "none" if not response.returncode else "guest-command-failed"
+        if refusal:
+            if response.returncode != 1 or record["error_class"] not in refusal:
+                raise VerificationError("restore/" + stage + ": expected specific refusal was not observed")
+            record["expected_refusal"] = True
+        elif response.returncode:
+            raise VerificationError("restore/" + stage + ": guest exit " + str(response.returncode) + "; " + record["error_class"])
+        return response
+    except subprocess.TimeoutExpired as error:
+        record.update(error_class="bounded-command-timeout", timeout_seconds=900)
+        raise VerificationError("restore/" + stage + ": bounded guest command timed out") from error
+    finally:
+        record["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        record_stage(args, evidence, "restore/" + stage)
+
+
+def require_restore_stopped(inventory, *, blank=False):
+    containers = inventory["containers"]
+    if any(c["Running"] or c["Restarting"] or c["OOMKilled"] or c["ExitCode"] != 0 for c in containers):
+        raise VerificationError("restore requires a cleanly stopped source/target")
+    if blank and (containers or any(r["root"]["exists"] for r in inventory["roots"].values())):
+        raise VerificationError("restore target has existing product state")
+
+
+def targeted_restore(args, evidence, server, client, image_id, pinned, baseline):
+    """One independent recovery chain using the existing production entry points."""
+    evidence.update(scope="restore", framework_sha=args.source_sha)
+    manage = f"bash {SOURCE}/deploy/shared-host/manage.sh"
+    backup = "/srv/storage/cf-filebrowser-enterprise/backups/verification.tar"
+    destination = GUEST + "/verification.tar"
+    flags = f"--source-sha {args.source_sha} --image-ref {shlex.quote(pinned)} --image-id {image_id}"
+    def run(vm, stage, command, **kwargs):
+        return restore_command(vm, args, evidence, stage, command, **kwargs)
+    def inventory(vm, name):
+        return recovery_probe(vm, args, evidence, name, ["inventory"])
+    def payload(vm, name, path, checksum, rotated=False):
+        return recovery_probe(vm, args, evidence, name, ["payload", "--archive", path, "--archive-sha256", checksum,
+            "--source-sha", args.source_sha, "--image-ref", pinned, "--image-id", image_id] + (["--rotated"] if rotated else []))
+
+    blank = inventory(client, "restore_target_blank")
+    require_restore_stopped(blank, blank=True)
+    evidence["restore_seed"] = api(client, "lifecycle-seed", "api-restore-seed.json")
+    run(server, "formal-create", f"bash {SOURCE}/deploy/shared-host/backup.sh create {backup} --hostname {server.name} {flags}")
+    source_stopped = inventory(server, "restore_source_stopped")
+    require_restore_stopped(source_stopped)
+    if source_stopped["storage_uuid"] == blank["storage_uuid"]:
+        raise VerificationError("restore target must use an independent disk UUID")
+    checksum = run(server, "external-archive-sha256", "sha256sum " + backup).stdout.decode().split()[0]
+    evidence["external_backup_sha256"] = checksum
+    run(server, "formal-verify", f"bash {SOURCE}/deploy/shared-host/backup.sh verify {backup} --hostname {server.name} {flags} --sha256 {checksum}")
+    payload(server, "restore_archive_source_stopped_integrity", backup, checksum)
+    old = recovery_probe(server, args, evidence, "restore_original_identity", ["snapshot"])["storage_identity_sha256"]
+    record_stage(args, evidence, "restore/pinned-ssh-private-transfer")
+    client.write_file(destination, server.read_file(backup))
+    # Protected test-client expectations are not product state and are not restoration inputs.
+    server.write_file(GUEST + "/api-state.json", client.read_file(GUEST + "/api-state.json"))
+    received = run(client, "received-archive-sha256", "sha256sum " + destination).stdout.decode().split()[0]
+    if received != checksum:
+        raise VerificationError("restore transfer external checksum differs")
+    run(client, "protected-input-metadata", f'test "$(stat -c %a:%u:%g {destination})" = 600:0:0')
+    run(client, "make-damaged-copy", f"head -c 1024 {destination} > {GUEST}/incomplete.tar; chmod 600 {GUEST}/incomplete.tar")
+    damaged = run(client, "damaged-copy-sha256", "sha256sum " + GUEST + "/incomplete.tar").stdout.decode().split()[0]
+    prefix = f"bash {SOURCE}/deploy/shared-host/backup.sh restore"
+    for name, path, sha, expected in (
+        ("corrupt-rejection", GUEST + "/incomplete.tar", damaged, ("backup is corrupt or truncated", "archive inventory is incomplete", "backup is truncated or missing its end marker", "invalid backup manifest JSON")),
+        ("external-sha-rejection", destination, "0" * 64, ("archive does not match the externally recorded checksum",))):
+        run(client, name, f"{prefix} {path} --hostname {client.name} {flags} --sha256 {sha}", refusal=expected)
+        after = inventory(client, "restore_" + name + "_untouched")
+        if after != blank:
+            raise VerificationError("rejected restore wrote into blank target")
+    run(client, "formal-restore", f"{prefix} {destination} --hostname {client.name} {flags} --sha256 {checksum}")
+    restored = inventory(client, "restore_target_before_start")
+    require_restore_stopped(restored)
+    payload(client, "restore_payload_before_start", destination, checksum, rotated=True)
+    recovery_probe(client, args, evidence, "restored_storage_identity", ["restore", "--archive-name", "verification.tar",
+        "--archive-sha256", checksum, "--source-sha", args.source_sha, "--image-ref", pinned, "--image-id", image_id,
+        "--previous-identity-sha256", old])
+    run(client, "occupied-target-rejection", f"{prefix} {destination} --hostname {client.name} {flags} --sha256 {checksum}",
+        refusal=("restore requires empty config, data and files roots",))
+    if inventory(client, "restore_occupied_target_unchanged") != restored:
+        raise VerificationError("occupied target was modified by refused restore")
+    # Documented operator address takeover; source stays stopped, same DNS/cert/CA.
+    run(server, "source-address-release", f"ip address del {SERVER_IP}/24 dev cflan\nip address add {CLIENT_IP}/24 dev cflan")
+    run(client, "target-address-takeover", f"ip address del {CLIENT_IP}/24 dev cflan\nip address add {SERVER_IP}/24 dev cflan")
+    run(client, "formal-validate", f"{manage} validate --hostname {client.name}")
+    run(client, "formal-start", f"{manage} start --hostname {client.name}")
+    record_stage(args, evidence, "restore/target-https-api")
+    healthy(client)
+    evidence["restored_lan_boundary"] = lan_boundary(server)
+    evidence["restored_api"] = api(server, "restore-verify", "api-restored-target.json")
+    run(client, "formal-stop-for-restart", f"{manage} stop --hostname {client.name}")
+    run(client, "formal-start-after-stop", f"{manage} start --hostname {client.name}")
+    healthy(client)
+    record_stage(args, evidence, "restore/target-restart-api")
+    evidence["restored_restart_api"] = api(server, "restore-verify", "api-restored-restart.json")
+    source_final = inventory(server, "restore_source_still_stopped")
+    require_restore_stopped(source_final)
+    if source_final != source_stopped:
+        raise VerificationError("stopped source product state changed during recovery")
+    inventory(client, "restore_target_final")
+    evidence["restore_sentinels_unchanged"] = {vm.name: sentinel_state(vm) == baseline[vm.name] for vm in (server, client)}
+    if not all(evidence["restore_sentinels_unchanged"].values()):
+        raise VerificationError("restore changed unrelated Docker sentinel")
+    evidence.update(result="passed", boundaries={"scope": "formal second-VM restore only", "full_A_B": "not claimed",
+        "address_change": "operator transfers original service address; DNS and TLS material unchanged",
+        "database_hash": "compared while stopped before startup; live API semantics after startup",
+        "UI_PDF_protocols_reboot_matrix": "not run"})
+    record_stage(args, evidence, "targeted-blank-restore-complete")
+
+
 def scenario(args, work, evidence):
     record_stage(args, evidence, "official-debian-image-download-and-sha512")
     base, cloud_record = cloud_image(work)
@@ -2050,6 +2176,9 @@ test ! -e /srv/storage/cf-filebrowser-enterprise
         record_stage(args, evidence, "second-vm-real-lan-and-https-boundaries")
         evidence["initial_lan_boundary"] = lan_boundary(client)
         evidence["checks"].append("second-VM HTTPS UI/API controls before/after, curl certificate rejection, connected denied TCP peer refused before TLS, forwarded headers ignored on allowed HTTPS")
+        if args.scope == "restore":
+            targeted_restore(args, evidence, server, client, image_id, pinned, baseline)
+            return
         if args.scope == "lifecycle":
             record_stage(args, evidence, "lifecycle-small-api-seed")
             evidence["lifecycle_seed"] = api(client, "lifecycle-seed", "api-lifecycle-seed.json")
@@ -2164,7 +2293,7 @@ if bash {SOURCE}/deploy/shared-host/backup.sh restore {GUEST}/verification.tar -
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-sha", required=True)
-    parser.add_argument("--scope", choices=("full", "reboot", "storage", "lifecycle"), default="full", help="reboot runs only formal setup and the host reboot blocker checks")
+    parser.add_argument("--scope", choices=("full", "reboot", "storage", "lifecycle", "restore"), default="full", help="reboot runs only formal setup and the host reboot blocker checks")
     parser.add_argument("--image-ref", help="local image already built by the formal image.sh entry point")
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--accelerator", choices=("kvm", "tcg"), default="kvm")
@@ -2191,6 +2320,7 @@ def main():
         scenario(args, work, evidence)
         message = "reboot blocker targeted verification passed; full A/B remains separate" if args.scope == "reboot" else "real Debian/systemd/LAN/restore verification passed"
         if args.scope == "lifecycle": message = "missing/late storage and recreation targeted verification passed; full A/B remains separate"
+        if args.scope == "restore": message = "formal blank second-VM restore targeted verification passed; full A/B remains separate"
         if args.scope == "storage": message = "storage device-budget control completed; product verification remains separate"
         print("[shared-host-vm] " + message + "; publish only the evidence directory")
         return 0
