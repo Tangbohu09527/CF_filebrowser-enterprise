@@ -483,6 +483,15 @@ class QemuLaunchTests(unittest.TestCase):
             vm = harness.VM(1, root, root / "base.qcow2", ssh_key, 22223, "tcg")
         return vm, calls
 
+    def test_normal_seed_preserves_non_localhost_entries_across_cloud_init_boots(self):
+        # cloud-init's per-boot template mode erases the prepared service name.
+        # Keep localhost management enabled while retaining other hosts entries.
+        with tempfile.TemporaryDirectory() as directory:
+            vm, _ = self.make_vm(directory)
+            seed = (vm.directory / "user-data").read_text()
+            self.assertIn("manage_etc_hosts: localhost\n", seed)
+            self.assertNotIn("manage_etc_hosts: false", seed)
+
     def test_disk_serial_is_a_device_property_and_disk_order_is_explicit(self):
         with tempfile.TemporaryDirectory() as directory:
             vm, _ = self.make_vm(directory)
@@ -1453,6 +1462,56 @@ class NamePersistenceTests(unittest.TestCase):
         self.assertIn("'manage_etc_hosts':config.get('manage_etc_hosts')",script)
         self.assertIn("'hosts_module_events':events[-20:]",script)
         self.assertNotIn("'config':config",script)
+
+    def test_real_reboot_waits_for_cloud_init_and_never_repairs_lost_name(self):
+        for lost in (False,True):
+            vm=mock.Mock();vm.reboot.return_value={'before':'old','after':'new'}; evidence={}
+            with self.subTest(lost=lost), mock.patch.object(harness,'name_resolution',side_effect=[
+                    self.state('localhost','old'),self.state('localhost','new',not lost)]), \
+                 mock.patch.object(harness,'record_stage'):
+                if lost:
+                    with self.assertRaises(harness.VerificationError):
+                        harness.reboot_with_test_name(None,evidence,vm)
+                else:
+                    self.assertEqual(harness.reboot_with_test_name(None,evidence,vm),vm.reboot.return_value)
+                vm.reboot.assert_called_once();vm.wait_ready.assert_called_once()
+                vm.command_on_guest.assert_not_called()
+                self.assertIn('source_client_name_after_reboot',evidence)
+
+    def test_takeover_requires_stopped_services_and_no_duplicate_addresses(self):
+        for running in (False,True):
+            server=SimpleNamespace(name='source');client=SimpleNamespace(name='target')
+            owned={'source':{harness.SERVER_IP},'target':{harness.CLIENT_IP}};commands=[]
+            def run(vm,args,evidence,stage,command):
+                words=command.split();action,address=words[2],words[3].split('/')[0]
+                if action=='del': owned[vm.name].remove(address)
+                else:
+                    self.assertNotIn(address,set.union(*owned.values()))
+                    owned[vm.name].add(address)
+                commands.append(stage)
+            inventory={'containers':[{'Running':running,'Restarting':False,'OOMKilled':False,'ExitCode':0}]}
+            with self.subTest(running=running),mock.patch.object(harness,'recovery_probe',return_value=inventory), \
+                 mock.patch.object(harness,'restore_command',side_effect=run),mock.patch.object(harness,'record_stage'), \
+                 mock.patch.object(harness,'name_resolution',return_value=self.state('localhost','boot')):
+                if running:
+                    with self.assertRaises(harness.VerificationError):
+                        harness.restored_address_transfer(None,{},server,client)
+                    self.assertEqual(commands,[])
+                else:
+                    harness.restored_address_transfer(None,{},server,client)
+                    self.assertEqual(owned,{'source':{harness.CLIENT_IP},'target':{harness.SERVER_IP}})
+                    self.assertEqual(commands,['source-address-release','target-address-release','target-address-takeover','source-client-address'])
+
+    def test_full_and_restore_share_reboot_and_takeover_without_recovery_shortcut(self):
+        import inspect
+        full=inspect.getsource(harness.scenario);target=inspect.getsource(harness.targeted_restore)
+        for source in (full,target):
+            self.assertIn('reboot_with_test_name(args, evidence, server)',source)
+            self.assertIn('restored_address_transfer(args, evidence, server, client)',source)
+            self.assertLess(source.index('reboot_with_test_name('),source.index('backup.sh create'))
+        self.assertLess(target.index('"lifecycle-seed"'),target.index('reboot_with_test_name('))
+        self.assertIn('lan_boundary(server)',target);self.assertIn('api(server, "restore-verify"',target)
+        self.assertIn('api(server, "verify-restored"',full)
 
     def test_dns_scope_returns_before_product_setup_and_keeps_pr_gates(self):
         import inspect

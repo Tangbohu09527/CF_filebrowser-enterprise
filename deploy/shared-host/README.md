@@ -462,7 +462,9 @@ read/write after recovery. Merely listing archive members is not recovery proof.
 For a scoped CI recovery acceptance, dispatch the existing `shared-host-delivery`
 workflow with `scope=restore` on the fixed branch commit. It uses the formal
 installation, `backup.sh create/verify/restore` and `manage.sh validate/start`
-entry points on two independent Debian test disks. The source stays stopped;
+entry points on two independent Debian test disks. The source VM first undergoes
+a real reboot using the same name-resolution checks as the full path. After
+backup the source stays stopped;
 the operator transfers only the reserved test address to the replacement.
 The protected archive travels over pinned SSH; only its external digest and
 sanitized checks are published. No backup, API state or keys are artifacts.
@@ -473,8 +475,24 @@ rotation. After startup it checks persistent accounts, permissions, Tokens,
 Shares, historical and new audit records, file bytes and real allowed/denied
 writes, then repeats API checks after a formal stop/start. Corrupt input,
 external checksum mismatch and occupied-target refusals include before/after
-root inventories. This scope does not certify UI, protocols, host reboot or
-full A/B acceptance; those existing gates remain separate.
+root inventories. This scope does not certify UI, protocols or the complete
+reboot/A/B matrix; those existing gates remain separate.
+
+The disposable VM seed uses cloud-init `manage_etc_hosts: localhost`: cloud-init
+still maintains its localhost mapping while retaining the test service entry
+prepared once by `prerequisites()`. Full and scoped recovery share the same
+source reboot/name checks and stopped-source address transfer. Both old addresses
+are released before reassignment; the original VM then resolves `files.cf.test`
+through normal NSS and validates HTTPS using the existing CA and certificate.
+There is no post-reboot hosts repair or TLS/name-resolution bypass.
+
+For the bounded hosts-only old/new comparison, dispatch `scope=dns`. It uses
+the same verified Debian image and QEMU framework without a FileBrowser image,
+Docker preparation, UI or restore. It records only the test name, expected
+address, selected cloud-init configuration/version, Boot IDs, getent results and
+bounded hosts-module timestamps. A successful comparison requires the old
+`true` mode to lose the entry after reboot and `localhost` to retain it; an
+unreproduced old failure stops the comparison instead of claiming a root cause.
 
 Code/image rollback and database restoration are separate. Restore requires an
 exact source/image match. A database already migrated by newer code must not be

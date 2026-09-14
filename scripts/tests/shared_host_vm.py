@@ -106,7 +106,7 @@ def resource_budget(base_virtual_bytes, seed_bytes=2 * 16 * 1024 ** 2):
 
 
 class VM:
-    def __init__(self, number, work, base, ssh_key, peer_port, accelerator, *, hosts_mode="true"):
+    def __init__(self, number, work, base, ssh_key, peer_port, accelerator, *, hosts_mode="localhost"):
         if hosts_mode not in ("true", "localhost"):
             raise VerificationError("unsupported test hosts mode")
         self.number = number
@@ -323,6 +323,21 @@ def require_test_name(state, *, present=True):
         raise VerificationError('test name resolution differs from expected ' + ('address' if present else 'absence'))
     if state['hosts_entries'] != ([SERVER_IP + ' ' + TLS_NAME] if present else []):
         raise VerificationError('test hosts entry differs from expected presence')
+
+
+def reboot_with_test_name(args, evidence, vm):
+    """Shared full/restore path: observe normal NSS resolution across real boot."""
+    before = evidence['source_client_name_before_reboot'] = name_resolution(vm)
+    record_stage(args, evidence, 'source-client-name/before-reboot')
+    require_test_name(before)
+    boot = vm.reboot()
+    vm.wait_ready()  # Observe after cloud-init, without repairing hosts or services.
+    after = evidence['source_client_name_after_reboot'] = name_resolution(vm)
+    record_stage(args, evidence, 'source-client-name/after-reboot')
+    if before['boot_id'] != boot['before'] or after['boot_id'] != boot['after'] or boot['before'] == boot['after']:
+        raise VerificationError('source client name evidence requires matching changed boot IDs')
+    require_test_name(after)
+    return boot
 
 
 def name_control(args, work, evidence, base, key):
@@ -2061,6 +2076,24 @@ def require_restore_stopped(inventory, *, blank=False):
         raise VerificationError("restore target has existing product state")
 
 
+def restored_address_transfer(args, evidence, server, client):
+    """Same stopped-source takeover and NSS check in full and scoped recovery."""
+    for vm in (server, client):
+        stopped = recovery_probe(vm, args, evidence, 'address_transfer_stopped_' + vm.name, ['inventory'])
+        require_restore_stopped(stopped)
+    # Release both old addresses before assigning either one to its new owner.
+    # Management remains on the separate pinned SSH/NAT interface throughout.
+    for vm, stage, command in (
+        (server, 'source-address-release', f'ip address del {SERVER_IP}/24 dev cflan'),
+        (client, 'target-address-release', f'ip address del {CLIENT_IP}/24 dev cflan'),
+        (client, 'target-address-takeover', f'ip address add {SERVER_IP}/24 dev cflan'),
+        (server, 'source-client-address', f'ip address add {CLIENT_IP}/24 dev cflan')):
+        restore_command(vm, args, evidence, stage, command)
+    evidence['restored_client_name'] = name_resolution(server)
+    record_stage(args, evidence, 'restore/original-vm-client-name')
+    require_test_name(evidence['restored_client_name'])
+
+
 def targeted_restore(args, evidence, server, client, image_id, pinned, baseline):
     """One independent recovery chain using the existing production entry points."""
     evidence.update(scope="restore", framework_sha=args.source_sha)
@@ -2079,6 +2112,9 @@ def targeted_restore(args, evidence, server, client, image_id, pinned, baseline)
     blank = inventory(client, "restore_target_blank")
     require_restore_stopped(blank, blank=True)
     evidence["restore_seed"] = api(client, "lifecycle-seed", "api-restore-seed.json")
+    evidence["host_reboot"] = reboot_operation(args, evidence, server, "boot-id-change",
+        lambda: reboot_with_test_name(args, evidence, server))
+    reboot_operation(args, evidence, server, "container-health", lambda: healthy(server))
     run(server, "formal-create", f"bash {SOURCE}/deploy/shared-host/backup.sh create {backup} --hostname {server.name} {flags}")
     source_stopped = inventory(server, "restore_source_stopped")
     require_restore_stopped(source_stopped)
@@ -2119,8 +2155,7 @@ def targeted_restore(args, evidence, server, client, image_id, pinned, baseline)
     if inventory(client, "restore_occupied_target_unchanged") != restored:
         raise VerificationError("occupied target was modified by refused restore")
     # Documented operator address takeover; source stays stopped, same DNS/cert/CA.
-    run(server, "source-address-release", f"ip address del {SERVER_IP}/24 dev cflan\nip address add {CLIENT_IP}/24 dev cflan")
-    run(client, "target-address-takeover", f"ip address del {CLIENT_IP}/24 dev cflan\nip address add {SERVER_IP}/24 dev cflan")
+    restored_address_transfer(args, evidence, server, client)
     run(client, "formal-validate", f"{manage} validate --hostname {client.name}")
     run(client, "formal-start", f"{manage} start --hostname {client.name}")
     record_stage(args, evidence, "restore/target-https-api")
@@ -2143,7 +2178,8 @@ def targeted_restore(args, evidence, server, client, image_id, pinned, baseline)
     evidence.update(result="passed", boundaries={"scope": "formal second-VM restore only", "full_A_B": "not claimed",
         "address_change": "operator transfers original service address; DNS and TLS material unchanged",
         "database_hash": "compared while stopped before startup; live API semantics after startup",
-        "UI_PDF_protocols_reboot_matrix": "not run"})
+        "source_reboot": "real guest reboot before stopped backup; normal name resolution retained",
+        "UI_PDF_protocols_full_reboot_matrix": "not run"})
     record_stage(args, evidence, "targeted-blank-restore-complete")
 
 
@@ -2303,7 +2339,7 @@ test ! -e /srv/storage/cf-filebrowser-enterprise
         healthy(server)
         evidence["docker_restart_api"] = api(client, "verify-restored", "api-docker-restart.json")
         record_stage(args, evidence, "real-host-reboot-and-api")
-        evidence["host_reboot"] = reboot_operation(args, evidence, server, "boot-id-change", server.reboot)
+        evidence["host_reboot"] = reboot_operation(args, evidence, server, "boot-id-change", lambda: reboot_with_test_name(args, evidence, server))
         reboot_operation(args, evidence, server, "container-health", lambda: healthy(server))
         evidence["host_restart_lan_boundary"] = reboot_operation(args, evidence, client, "https-lan", lambda: lan_boundary(client), diagnostic_vm=server)
         evidence["host_restart_api"] = reboot_operation(args, evidence, client, "file-api", lambda: api(client, "verify-restored", "api-host-restart.json"), diagnostic_vm=server)
@@ -2354,10 +2390,10 @@ if bash {SOURCE}/deploy/shared-host/backup.sh restore {GUEST}/verification.tar -
         record_stage(args, evidence, "restored-address-transfer-and-formal-start")
         # A restored fixed LAN config assumes the same address. Transfer that
         # address after stopping the original, instead of editing restored data.
-        server.command_on_guest(f"ip address del {SERVER_IP}/24 dev cflan\nip address add {CLIENT_IP}/24 dev cflan")
-        client.command_on_guest(f"ip address del {CLIENT_IP}/24 dev cflan\nip address add {SERVER_IP}/24 dev cflan\n{manage} start --hostname {client.name}")
+        restored_address_transfer(args, evidence, server, client)
+        client.command_on_guest(f"{manage} start --hostname {client.name}")
         healthy(client)
-        lan_boundary(server)
+        evidence["restored_lan_boundary"] = lan_boundary(server)
         record_stage(args, evidence, "restored-real-api-verification")
         evidence["restored_api"] = api(server, "verify-restored", "api-restored.json")
         record_stage(args, evidence, "restored-existing-playwright-ui")
