@@ -8,7 +8,7 @@ on:
       scope:
         description: Verification scope (full remains the default)
         type: choice
-        options: [full, reboot, storage, lifecycle, restore]
+        options: [full, reboot, storage, lifecycle, restore, dns]
         default: full
 
 permissions:
@@ -88,7 +88,7 @@ jobs:
         run: git diff --exit-code
 
   fixed-image:
-    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'storage'
+    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'storage' && inputs.scope != 'dns')
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -162,6 +162,36 @@ jobs:
         with:
           name: shared-host-storage-results
           path: ${{ runner.temp }}/cf-storage-evidence/vm-result.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: No unexpected tracked changes
+        run: git diff --exit-code
+
+  name-resolution-control:
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'dns'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Install existing VM dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssl
+      - name: Hosts-only real reboot comparison without a product image
+        run: |
+          revision=$(git rev-parse HEAD)
+          accelerator=tcg
+          if [[ -r /dev/kvm && -w /dev/kvm ]]; then accelerator=kvm; fi
+          bash scripts/tests/shared-host-vm.sh --source-sha "$revision" \
+            --evidence "$RUNNER_TEMP/cf-name-evidence" --accelerator "$accelerator" --scope dns
+      - name: Save sanitized test-name evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-host-name-results
+          path: ${{ runner.temp }}/cf-name-evidence/vm-result.json
           if-no-files-found: error
           retention-days: 14
       - name: No unexpected tracked changes

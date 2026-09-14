@@ -1393,10 +1393,78 @@ class StorageControlScopeTests(unittest.TestCase):
         self.assertIn('serial',script.lower());self.assertIn('x-systemd.device-timeout=5s',script)
         self.assertNotIn('git clone',script);self.assertNotIn('manage.sh',script)
         source=(MODULE_PATH.parents[2]/'.github/workflows/shared-host-delivery.yaml').read_text()
-        self.assertIn("if: github.event_name != 'workflow_dispatch' || inputs.scope != 'storage'",source)
+        self.assertIn("if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'storage' && inputs.scope != 'dns')",source)
         self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.scope == 'storage'",source)
         self.assertEqual(source.count("if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'"),3)
 
+
+
+class NamePersistenceTests(unittest.TestCase):
+    def state(self, mode, boot, present=True):
+        return {'boot_id': boot, 'manage_etc_hosts': mode,
+                'addresses': [harness.SERVER_IP] if present else [],
+                'hosts_entries': [harness.SERVER_IP + ' ' + harness.TLS_NAME] if present else [],
+                'getent_exit_code': 0 if present else 2}
+
+    def control(self, old_lost=True):
+        vm=mock.Mock();vm.reboot.return_value={'before':'old','after':'new'}
+        evidence={}
+        states=[self.state(True,'old'), self.state(True,'new',not old_lost),
+                self.state('localhost','old'),self.state('localhost','new')]
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(harness,'VM',return_value=vm) as constructor, \
+             mock.patch.object(harness,'prepare_test_name') as prepare, \
+             mock.patch.object(harness,'name_resolution',side_effect=states), \
+             mock.patch.object(harness,'record_stage'), mock.patch.object(harness,'port',return_value=12345):
+            try:
+                harness.name_control(SimpleNamespace(accelerator='tcg'),Path(directory),evidence,Path('base'),Path('key'))
+            finally:
+                self.vm,self.constructor,self.prepare,self.evidence=vm,constructor,prepare,evidence
+
+    def test_control_requires_old_failure_then_fixed_persistence_and_real_reboots(self):
+        self.control()
+        self.assertEqual(self.evidence['result'],'passed')
+        self.assertEqual([c.kwargs['hosts_mode'] for c in self.constructor.call_args_list],['true','localhost'])
+        self.assertEqual(self.vm.reboot.call_count,2)
+        self.assertEqual(self.prepare.call_count,2)  # preparation only, no post-reboot repair
+        self.assertEqual(self.vm.close.call_count,2)
+        self.vm.command_on_guest.assert_not_called()  # no product/dependency/disk setup
+
+    def test_old_config_not_reproduced_stops_without_more_vm_attempts(self):
+        with self.assertRaises(harness.VerificationError): self.control(old_lost=False)
+        self.assertEqual(self.vm.reboot.call_count,1)
+        self.assertEqual(self.constructor.call_count,1)
+        self.vm.close.assert_called_once()
+        self.assertNotIn('result',self.evidence)
+
+    def test_missing_wrong_or_unresolvable_name_cannot_pass(self):
+        for delta in ({'addresses':[]},{'addresses':['192.0.2.99']},{'getent_exit_code':2},{'hosts_entries':[]}):
+            state=self.state('localhost','boot');state.update(delta)
+            with self.subTest(delta=delta),self.assertRaises(harness.VerificationError):
+                harness.require_test_name(state)
+
+    def test_probe_is_bounded_and_does_not_publish_cloud_config(self):
+        vm=mock.Mock();vm.command_on_guest.return_value.stdout=b'{}'
+        harness.name_resolution(vm)
+        call=vm.command_on_guest.call_args; script=call.args[0]
+        compile(script.split("<<'NAME_PROBE'\n",1)[1].rsplit('\nNAME_PROBE',1)[0],'<guest-name-probe>','exec')
+        self.assertEqual(call.kwargs['timeout'],60)
+        self.assertIn("'getent','ahostsv4',name",script)
+        self.assertIn("'manage_etc_hosts':config.get('manage_etc_hosts')",script)
+        self.assertIn("'hosts_module_events':events[-20:]",script)
+        self.assertNotIn("'config':config",script)
+
+    def test_dns_scope_returns_before_product_setup_and_keeps_pr_gates(self):
+        import inspect
+        source=inspect.getsource(harness.scenario)
+        route=source.split('if args.scope == "dns":',1)[1].split('if args.scope == "storage":',1)[0]
+        self.assertIn('name_control(',route);self.assertIn('return',route)
+        self.assertLess(source.index('name_control('),source.index('certificates('))
+        workflow=(MODULE_PATH.parents[2]/'.github/workflows/shared-host-delivery.yaml').read_text()
+        self.assertEqual(workflow.count("if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'"),3)
+        self.assertIn("inputs.scope != 'storage' && inputs.scope != 'dns'",workflow)
+        job=workflow.split('  name-resolution-control:',1)[1]
+        self.assertNotIn('image.sh build',job);self.assertIn('--scope dns',job)
 
 class RebootAPIAssertionTests(unittest.TestCase):
     def test_permission_or_byte_changes_are_rejected_by_existing_api_assertions(self):

@@ -106,7 +106,9 @@ def resource_budget(base_virtual_bytes, seed_bytes=2 * 16 * 1024 ** 2):
 
 
 class VM:
-    def __init__(self, number, work, base, ssh_key, peer_port, accelerator):
+    def __init__(self, number, work, base, ssh_key, peer_port, accelerator, *, hosts_mode="true"):
+        if hosts_mode not in ("true", "localhost"):
+            raise VerificationError("unsupported test hosts mode")
         self.number = number
         self.name = f"cf-verification-{number}"
         self.directory = work / self.name
@@ -126,7 +128,7 @@ class VM:
         private = "\n".join("    " + line for line in host_key.read_text().splitlines())
         user_data = f"""#cloud-config
 hostname: {self.name}
-manage_etc_hosts: true
+manage_etc_hosts: {hosts_mode}
 disable_root: true
 ssh_pwauth: false
 users:
@@ -273,7 +275,91 @@ ethernets:
                     process.wait(timeout=10)
 
 
+def prepare_test_name(vm):
+    # Called once during preparation, never as a post-reboot repair.
+    vm.command_on_guest(f"printf '{SERVER_IP} {TLS_NAME}\\n' >> /etc/hosts")
+
+
+def name_resolution(vm):
+    """Only the public fixture name/config and bounded hosts-module events."""
+    result = vm.command_on_guest(rf"""python3 - <<'NAME_PROBE'
+import datetime,json,re,subprocess,time,yaml
+from pathlib import Path
+name={TLS_NAME!r}
+def command(*args):
+    return subprocess.run(args,capture_output=True,text=True,timeout=15)
+config=yaml.safe_load(Path('/var/lib/cloud/instance/cloud-config.txt').read_text())
+entries=[]
+for line in Path('/etc/hosts').read_text().splitlines():
+    fields=line.split('#',1)[0].split()
+    if len(fields)>1 and name in fields[1:]: entries.append(fields[0]+' '+name)
+lookup=command('getent','ahostsv4',name)
+# Do not publish arbitrary cloud-config, log messages or any other hostname.
+log=Path('/var/log/cloud-init.log')
+events=[]
+for line in log.read_text(errors='replace').splitlines()[-4000:]:
+    if 'cc_update_etc_hosts.py' not in line and 'Running module update_etc_hosts' not in line: continue
+    kind=('update-module' if 'Running module update_etc_hosts' in line else
+          'hosts-template-write' if 'Updating /etc/hosts' in line else
+          'hosts-mode' if 'manage_etc_hosts' in line else 'hosts-module-event')
+    stamp=re.match(r'^(\d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}},\d+)',line)
+    events.append({{'timestamp':stamp.group(1) if stamp else None,'event':kind}})
+print(json.dumps({{'schema':'cf-test-name/v1','vm':Path('/etc/hostname').read_text().strip(),
+    'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+    'utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'monotonic_seconds':time.monotonic(),
+    'cloud_init_version':command('dpkg-query','-W','-f=${{Version}}','cloud-init').stdout.strip(),
+    'manage_etc_hosts':config.get('manage_etc_hosts'),
+    'domain':name,'expected_address':{SERVER_IP!r},'hosts_entries':entries,
+    'getent_exit_code':lookup.returncode,'addresses':sorted(set(row.split()[0] for row in lookup.stdout.splitlines() if row.split())),
+    'hosts_module_events':events[-20:]}},sort_keys=True))
+NAME_PROBE
+""", timeout=60)
+    return json.loads(result.stdout)
+
+
+def require_test_name(state, *, present=True):
+    expected = [SERVER_IP] if present else []
+    if state['addresses'] != expected or state['getent_exit_code'] != (0 if present else 2):
+        raise VerificationError('test name resolution differs from expected ' + ('address' if present else 'absence'))
+    if state['hosts_entries'] != ([SERVER_IP + ' ' + TLS_NAME] if present else []):
+        raise VerificationError('test hosts entry differs from expected presence')
+
+
+def name_control(args, work, evidence, base, key):
+    """One old/proposed cloud-init mode comparison; no product or disk setup."""
+    evidence.update(scope='name-control-only', actual_vm_count=2, name_control={})
+    for mode in ('true', 'localhost'):
+        directory = work / ('hosts-' + mode)
+        directory.mkdir(mode=0o700)
+        vm = VM(1, directory, base, key, port(), args.accelerator, hosts_mode=mode)
+        state = evidence['name_control'][mode] = {}
+        try:
+            record_stage(args, evidence, 'name-control/' + mode + '/prepare')
+            vm.launch(); vm.wait_ready()
+            prepare_test_name(vm)
+            state['before'] = name_resolution(vm)
+            require_test_name(state['before'])
+            record_stage(args, evidence, 'name-control/' + mode + '/real-reboot')
+            state['reboot'] = vm.reboot()
+            vm.wait_ready()
+            state['after'] = name_resolution(vm)
+            record_stage(args, evidence, 'name-control/' + mode + '/observed')
+            if state['before']['boot_id'] != state['reboot']['before'] or state['after']['boot_id'] != state['reboot']['after']:
+                raise VerificationError('name control boot evidence mismatch')
+            if state['before']['boot_id'] == state['after']['boot_id']:
+                raise VerificationError('name control requires a real reboot')
+            expected_mode = True if mode == 'true' else 'localhost'
+            if any(state[phase]['manage_etc_hosts'] != expected_mode for phase in ('before','after')):
+                raise VerificationError('name control cloud-init mode mismatch')
+            require_test_name(state['after'], present=mode == 'localhost')
+        finally:
+            vm.close()
+    evidence.update(result='passed', boundaries='hosts-only old/fixed control; no FileBrowser, Docker, registry, UI or recovery executed')
+    record_stage(args, evidence, 'name-control/complete')
+
+
 def prerequisites(vm, revision, *, storage_only=False):
+    prepare_test_name(vm)
     # The UUID device arrives after the old 5s job budget under TCG. Keep the
     # normal guest wait finite; the controlled experiment retains its 5s input.
     device_wait_seconds = 5 if storage_only else 90
@@ -316,7 +402,6 @@ uuid=$(blkid -o value -s UUID /dev/vdb)
 printf 'UUID=%s /srv/storage ext4 defaults,nofail,x-systemd.device-timeout={device_wait_seconds}s 0 2\\n' "$uuid" >> /etc/fstab
 mount /srv/storage
 install -d -o root -g root -m 0700 {GUEST}
-printf '{SERVER_IP} {TLS_NAME}\\n' >> /etc/hosts
 {source_setup}
 """, timeout=1800)
 
@@ -2076,6 +2161,9 @@ def scenario(args, work, evidence):
         raise VerificationError("runner has less than 12 GiB free disk or the configured 4 GiB RAM available; no VM or disk expansion attempted")
     key = work / "client-key"
     execute(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)])
+    if args.scope == "dns":
+        name_control(args, work, evidence, base, key)
+        return
     if args.scope == "storage":
         storage_control(args, work, evidence, base, key)
         return
@@ -2293,12 +2381,12 @@ if bash {SOURCE}/deploy/shared-host/backup.sh restore {GUEST}/verification.tar -
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-sha", required=True)
-    parser.add_argument("--scope", choices=("full", "reboot", "storage", "lifecycle", "restore"), default="full", help="reboot runs only formal setup and the host reboot blocker checks")
+    parser.add_argument("--scope", choices=("full", "reboot", "storage", "lifecycle", "restore", "dns"), default="full", help="reboot runs only formal setup and the host reboot blocker checks")
     parser.add_argument("--image-ref", help="local image already built by the formal image.sh entry point")
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--accelerator", choices=("kvm", "tcg"), default="kvm")
     args = parser.parse_args()
-    if args.scope != "storage" and not args.image_ref:
+    if args.scope not in ("storage", "dns") and not args.image_ref:
         parser.error("--image-ref is required for product verification")
     if sys.platform != "linux" or os.environ.get("GITHUB_ACTIONS") != "true":
         parser.error("this destructive VM-fixture harness runs only on a disposable Linux GitHub Actions runner")
@@ -2321,6 +2409,7 @@ def main():
         message = "reboot blocker targeted verification passed; full A/B remains separate" if args.scope == "reboot" else "real Debian/systemd/LAN/restore verification passed"
         if args.scope == "lifecycle": message = "missing/late storage and recreation targeted verification passed; full A/B remains separate"
         if args.scope == "restore": message = "formal blank second-VM restore targeted verification passed; full A/B remains separate"
+        if args.scope == "dns": message = "name resolution control completed; product verification remains separate"
         if args.scope == "storage": message = "storage device-budget control completed; product verification remains separate"
         print("[shared-host-vm] " + message + "; publish only the evidence directory")
         return 0
