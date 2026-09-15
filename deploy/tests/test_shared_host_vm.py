@@ -149,6 +149,94 @@ class DebianAcquisitionTests(unittest.TestCase):
         self.assertIn('prepared_cloud_image(args.base_dir)',inspect.getsource(harness.scenario))
 
 
+class InitialLANConnectionTests(unittest.TestCase):
+    def test_curl_transport_keeps_numeric_fields_and_no_private_strings(self):
+        fields=harness.lan_safe_fields({'remote_ip':'192.0.2.11','local_ip':'192.0.2.12','remote_port':18443,'local_port':41234,'time_connect':0.005,'time_total':0.006,'time_appconnect':0,'time_namelookup':0.001,'headers':'PRIVATE','remote_url':'PRIVATE'})
+        self.assertEqual(fields['remote_ip'],harness.SERVER_IP)
+        self.assertEqual(fields['time_total'],0.006)
+        self.assertNotIn('PRIVATE',json.dumps(fields))
+        self.assertEqual(harness.lan_curl_fields({'remote_ip':'PRIVATE','remote_port':True,'time_total':float('nan'),'local_port':999999}),{})
+
+    def test_failure_is_saved_before_read_only_snapshots_and_one_tcp_attempt(self):
+        server=SimpleNamespace(name='server');client=SimpleNamespace(name='client');events=[];evidence={}
+        failure=harness.VerificationError('original LAN failure');failure.lan_evidence={'passed':False,'stage':'allowed-health-before'}
+        def saved(*args):events.append(('save',bool(evidence.get('lan_failure'))))
+        def snapshot(vm,role,tcp=False):events.append((vm.name,role,tcp));return {'recorded':True}
+        with mock.patch.object(harness,'lan_boundary',side_effect=failure),mock.patch.object(harness,'record_stage',side_effect=saved),mock.patch.object(harness,'lan_snapshot',side_effect=snapshot):
+            with self.assertRaises(harness.VerificationError) as caught:harness.initial_lan_boundary(None,evidence,server,client)
+        self.assertIs(caught.exception,failure)
+        self.assertEqual(events[0],('save',True))
+        self.assertEqual([e for e in events if e[0]!='save'],[('client','client',False),('server','server',False),('client','client',True)])
+        self.assertEqual(evidence['lan_failure'],failure.lan_evidence)
+
+    def test_diagnostic_failure_cannot_replace_original_or_trigger_restart(self):
+        failure=harness.VerificationError('original');failure.lan_evidence={}
+        evidence={}
+        with mock.patch.object(harness,'lan_boundary',side_effect=failure),mock.patch.object(harness,'record_stage'),mock.patch.object(harness,'lan_snapshot',side_effect=OSError(5,'PRIVATE')) as snapshots:
+            with self.assertRaises(harness.VerificationError) as caught:harness.initial_lan_boundary(None,evidence,mock.Mock(),mock.Mock())
+        self.assertIs(caught.exception,failure);self.assertEqual(snapshots.call_count,3)
+        self.assertNotIn('PRIVATE',json.dumps(evidence))
+
+    def test_success_keeps_existing_result_and_does_not_probe_tcp(self):
+        with mock.patch.object(harness,'lan_boundary',return_value={'passed':True}),mock.patch.object(harness,'lan_snapshot') as snapshot:
+            self.assertEqual(harness.initial_lan_boundary(None,{},None,None),{'passed':True})
+            snapshot.assert_not_called()
+
+    def test_packet_rules_keep_project_nat_and_global_filter_without_comments(self):
+        rules='''*nat
+[2:120] -A DOCKER -d 192.0.2.11/32 ! -i br-123 -p tcp -m tcp --dport 18443 -m comment --comment PRIVATE-TOKEN -j DNAT --to-destination 172.18.0.2:8080
+[3:180] -A DOCKER -d 192.0.2.90/32 -p tcp --dport 9999 -j DNAT --to-destination 172.19.0.2:9999
+[5:300] -A FORWARD -j DOCKER-USER
+'''
+        records=harness.lan_packet_rules(rules,[harness.SERVER_IP,'172.18.0.2'],'br-123')
+        self.assertEqual(len(records),2);self.assertEqual(records[0]['dnat'],'172.18.0.2:8080');self.assertEqual(records[0]['packets'],2);self.assertEqual(records[0]['negated_flags'],['-i'])
+        self.assertNotIn('PRIVATE',json.dumps(records));self.assertNotIn('172.19',json.dumps(records))
+        self.assertEqual(harness.lan_packet_rules(rules,[''],''),[{'chain':'FORWARD','target':'DOCKER-USER','negated_flags':[],'packets':5,'bytes':300}])
+
+    def test_server_snapshot_keeps_real_published_nat_and_listener_state(self):
+        state={'Running':True,'Status':'running','Health':{'Status':'healthy'},'Pid':123,'ExitCode':0}
+        ports=[{'HostIp':'192.0.2.11','HostPort':'18443'}]
+        def command(argv,**kwargs):
+            if argv[:2]==['docker','ps']:value='a'*12
+            elif argv[:2]==['docker','inspect']:value=json.dumps([{'State':state,'RestartCount':0,'HostConfig':{'PortBindings':{'8080/tcp':ports}},'NetworkSettings':{'Ports':{'8080/tcp':ports},'Networks':{'cf-filebrowser_private':{'IPAddress':'172.18.0.2','NetworkID':'b'*64}}},'Config':{'Env':['SECRET=PRIVATE']}}])
+            elif argv[:3]==['docker','network','inspect']:value=json.dumps([{'Options':{}}])
+            elif argv[0]=='getent':value='192.0.2.11 STREAM files.cf.test\n'
+            elif argv[0]=='iptables-save':value=':FORWARD DROP [0:0]\n[1:60] -A DOCKER -d 192.0.2.11/32 -p tcp --dport 18443 -j DNAT --to-destination 172.18.0.2:8080\n'
+            elif argv[:2]==['docker','logs']:value='PRIVATE-TOKEN'
+            else:value='[]'
+            return subprocess.CompletedProcess(argv,0,value,'')
+        def read(path,*args,**kwargs):
+            name=str(path).replace('\\','/')
+            if name.endswith('/tcp'):return 'header\n0: 00000000:1F90 00000000:0000 0A\n'
+            if name.endswith('/tcp6'):return 'header\n'
+            if name.endswith('config.yaml'):return 'server:\n  listen: 0.0.0.0\n  port: 8080\n  token: PRIVATE\n'
+            if name.endswith('.env'):return 'LAN_BIND_IP=192.0.2.11\nLAN_PORT=18443\nSECRET=PRIVATE\n'
+            return '12345678-1234-1234-1234-123456789abc'
+        with mock.patch.object(harness.subprocess,'run',side_effect=command) as calls,mock.patch.object(Path,'read_text',read):result=harness.lan_guest_snapshot('server')
+        self.assertTrue(result['container']['running']);self.assertEqual(result['published_ports'],ports)
+        self.assertEqual(result['namespace_listeners'],[{'address':'0.0.0.0','port':8080}])
+        self.assertEqual(result['nat_rules'][0]['dnat'],'172.18.0.2:8080');self.assertEqual(result['forward_policy'],'DROP')
+        self.assertNotIn('PRIVATE',json.dumps(result))
+        self.assertTrue(all(call.kwargs['timeout']==8 for call in calls.call_args_list))
+        commands=[call.args[0] for call in calls.call_args_list]
+        self.assertFalse(any(any(word in command for word in ('start','restart','stop','up','-F','-D')) for command in commands))
+
+    def test_client_snapshot_records_route_neighbor_and_single_connection_errno(self):
+        import errno
+        def command(argv,**kwargs):
+            if argv[0]=='getent':output='192.0.2.11 STREAM files.cf.test\n'
+            elif 'address' in argv:output=json.dumps([{'ifindex':3,'ifname':'cflan','flags':['UP','LOWER_UP'],'operstate':'UP','addr_info':[{'family':'inet','local':'192.0.2.12','prefixlen':24,'scope':'global'}]}])
+            elif 'route' in argv:output=json.dumps([{'dst':'192.0.2.11','from':'192.0.2.12','dev':'cflan'}])
+            else:output=json.dumps([{'dst':'192.0.2.11','dev':'cflan','state':['FAILED']}])
+            return subprocess.CompletedProcess(argv,0,output,'PRIVATE')
+        sock=mock.Mock();sock.getsockname.return_value=('192.0.2.12',43210);sock.connect.side_effect=OSError(errno.EHOSTUNREACH,'PRIVATE')
+        with mock.patch.object(harness.subprocess,'run',side_effect=command),mock.patch.object(Path,'read_text',return_value='12345678-1234-1234-1234-123456789abc'),mock.patch.object(harness.socket,'socket',return_value=sock):
+            result=harness.lan_guest_snapshot('client',tcp=True)
+        self.assertEqual(result['resolved_ipv4'],['192.0.2.11']);self.assertEqual(result['routes'][0]['dev'],'cflan')
+        self.assertEqual(result['tcp_diagnostic']['errno'],errno.EHOSTUNREACH);sock.connect.assert_called_once_with(('192.0.2.11',18443))
+        self.assertNotIn('PRIVATE',json.dumps(result))
+
+
 class CertificateTrustTests(unittest.TestCase):
     """Real disposable certificates/TLS; this does not boot a VM or application."""
 
@@ -410,6 +498,15 @@ class LANBoundaryTests(unittest.TestCase):
 
     def probe(self):
         return harness.probe_lan_boundary('/protected/ca.crt', '/protected/wrong-ca.crt', '/protected/empty-trust')
+
+    def test_failed_curl7_preserves_actual_connection_timing_without_response_body(self):
+        meta=json.dumps({'remote_ip':'192.0.2.11','local_ip':'192.0.2.12','remote_port':18443,'local_port':43210,'time_namelookup':0.001,'time_connect':0,'time_appconnect':0,'time_total':0.002}).encode()
+        self.curl.side_effect=[subprocess.CompletedProcess([],7,b'PRIVATE-BODY\nCF_CONNECT '+meta+b'\n000',b'PRIVATE-ERROR')]
+        report=harness.lan_probe_report('/protected/ca','/protected/wrong','/protected/empty')
+        self.assertFalse(report['passed']);self.assertEqual(report['stage'],'allowed-health-before')
+        fields=report['observations']['allowed-health-before']
+        self.assertEqual(fields['remote_port'],18443);self.assertEqual(fields['curl_exit_code'],7);self.assertEqual(fields['time_total'],0.002)
+        self.assertNotIn('PRIVATE',json.dumps(report))
 
     def test_report_retains_failed_substage_without_private_transport_output(self):
         self.curl.side_effect = [subprocess.CompletedProcess([], 22, b'PRIVATE-BODY\n503', b'PRIVATE-TOKEN')]

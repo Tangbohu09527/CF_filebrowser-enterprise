@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -1658,7 +1659,27 @@ def lan_safe_fields(value):
         safe['category'] = value['category']
     if value.get('rejection') in ('tls-eof', 'tcp-reset'):
         safe['rejection'] = value['rejection']
+    safe.update(lan_curl_fields(value))
     return safe
+
+
+def lan_curl_fields(payload):
+    # Only the explicitly requested write-out fields, never curl stderr/body.
+    fields = {}
+    for name in ('remote_ip', 'local_ip'):
+        try:
+            fields[name] = str(ipaddress.ip_address(payload.get(name, '')))
+        except ValueError:
+            pass
+    for name in ('remote_port', 'local_port'):
+        value = payload.get(name)
+        if type(value) is int and 0 <= value <= 65535:
+            fields[name] = value
+    for name in ('time_namelookup', 'time_connect', 'time_appconnect', 'time_total'):
+        value = payload.get(name)
+        if type(value) in (int, float) and 0 <= value <= 600:
+            fields[name] = value
+    return fields
 
 
 def lan_error_fields(error):
@@ -1740,7 +1761,11 @@ def probe_lan_boundary(ca_file, untrusted_ca_file, empty_trust, *, report=None):
 
     base = f"https://{TLS_NAME}:{TLS_PORT}"
     common = ["curl", "--fail", "--silent", "--show-error", "--noproxy", "*",
-              "--interface", CLIENT_IP, "--max-time", "5", "--write-out", "\n%{http_code}"]
+              "--interface", CLIENT_IP, "--max-time", "5", "--write-out",
+              '\nCF_CONNECT {"remote_ip":"%{remote_ip}","local_ip":"%{local_ip}",'
+              '"remote_port":%{remote_port},"local_port":%{local_port},'
+              '"time_namelookup":%{time_namelookup},"time_connect":%{time_connect},'
+              '"time_appconnect":%{time_appconnect},"time_total":%{time_total}}\n%{http_code}']
 
     def curl(path, ca, *extra):
         try:
@@ -1752,6 +1777,13 @@ def probe_lan_boundary(ca_file, untrusted_ca_file, empty_trust, *, report=None):
     def allowed(path, *headers):
         response = curl(path, ca_file, *headers)
         body, _, status = response.stdout.rpartition(b"\n")
+        content, marker, connection = body.rpartition(b"\nCF_CONNECT ")
+        if marker:
+            body = content
+            try:
+                observed(**lan_curl_fields(json.loads(connection)))
+            except (ValueError, AttributeError):
+                pass  # Original HTTP/body assertions still decide success.
         expected = b'<html' in body if path == '/' else body.strip() == b'{"message":"ok"}'
         observed(curl_exit_code=response.returncode, http_status=int(status) if re.fullmatch(rb'[1-5][0-9]{2}', status) else None, body_expected=expected)
         if response.returncode != 0 or status != b'200' or not expected:
@@ -1828,6 +1860,164 @@ def probe_lan_boundary(ca_file, untrusted_ca_file, empty_trust, *, report=None):
             'denied_source': {'tcp_connected': True, 'socket_source': source, 'socket_peer': peer,
                               'tls_handshake_completed': False, 'rejection': rejection,
                               'application_bytes_received': 0, 'elapsed_ms': round(elapsed * 1000)}}
+
+
+def lan_packet_rules(text, addresses, bridge):
+    """Retain only numeric project endpoints and reviewed packet-rule fields."""
+    result = []
+    for line in text.splitlines():
+        tokens = shlex.split(line)
+        if '-A' not in tokens:
+            continue
+        def value(flag):
+            return tokens[tokens.index(flag)+1] if flag in tokens and tokens.index(flag)+1 < len(tokens) else ''
+        chain = value('-A')
+        if not re.fullmatch(r'DOCKER(?:-[A-Z0-9-]+)?|FORWARD|PREROUTING|OUTPUT|POSTROUTING', chain):
+            continue
+        relevant = any(ip in line for ip in addresses if ip) or (bridge and bridge in tokens)
+        if not relevant and chain not in ('FORWARD', 'DOCKER-USER'):
+            continue
+        record = {'chain': chain}
+        for flag, name in (('-j','target'),('-i','in'),('-o','out'),('-p','protocol'),('--dport','dport'),('--sport','sport'),('--to-destination','dnat'),('-s','source'),('-d','destination')):
+            item = value(flag)
+            if name=='target' and re.fullmatch(r'ACCEPT|DROP|REJECT|RETURN|DNAT|MASQUERADE|DOCKER(?:-[A-Z0-9-]+)?',item):record[name]=item
+            elif name in ('in','out') and item and (item in ('cflan','cfnat','docker0') or item==bridge):record[name]=item
+            elif name=='protocol' and item in ('tcp','all'):record[name]=item
+            elif name in ('sport','dport') and item.isdigit() and 0<int(item)<65536:record[name]=int(item)
+            elif name=='dnat' and re.fullmatch(r'[0-9.]+:[0-9]+',item):record[name]=item
+            elif name in ('source','destination'):
+                try:record[name]=str(ipaddress.ip_network(item,strict=False))
+                except ValueError:pass
+        record['negated_flags']=[tokens[i+1] for i,token in enumerate(tokens[:-1]) if token=='!' and tokens[i+1] in ('-s','-d','-i','-o')]
+        states=value('--ctstate').split(',')
+        if states and all(v in ('NEW','ESTABLISHED','RELATED','INVALID','UNTRACKED') for v in states):record['connection_states']=states
+        counter = re.match(r'^\[(\d+):(\d+)\]',line)
+        if counter:record['packets'],record['bytes']=map(int,counter.groups())
+        result.append(record)
+        if len(result)>=48:break
+    return result
+
+
+def lan_guest_snapshot(role, tcp=False):
+    """Run only in the already guarded disposable guest; no repair operations."""
+    record={'role':role,'utc_ns':time.time_ns(),'monotonic_ns':time.monotonic_ns(),'commands':{}}
+    def run(label, argv, include_stderr=False):
+        try:
+            result=subprocess.run(argv,capture_output=True,text=True,check=False,timeout=8)
+            record['commands'][label]={'exit_code':result.returncode}
+            return (result.stdout + (result.stderr if include_stderr else ""))[:262144]
+        except (OSError,subprocess.TimeoutExpired) as error:
+            record['commands'][label]=lan_error_fields(error)
+            return ''
+    def document(label,argv,default):
+        try:return json.loads(run(label,argv))
+        except ValueError:return default
+    record['boot_id']=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    record['expected_target']={'name':TLS_NAME,'ip':SERVER_IP,'port':TLS_PORT,'source':CLIENT_IP}
+    resolved=[]
+    for row in run('getent',['getent','ahostsv4',TLS_NAME]).splitlines():
+        try:address=str(ipaddress.IPv4Address(row.split()[0]))
+        except (ValueError,IndexError):continue
+        if address not in resolved:resolved.append(address)
+    resolved=resolved[:4]
+    record['resolved_ipv4']=resolved
+    record['interfaces']=[]
+    for row in document('addresses',['ip','-j','-4','address','show','dev','cflan'],[]):
+        record['interfaces'].append({k:row.get(k) for k in ('ifindex','ifname','flags','mtu','operstate')})
+        record['interfaces'][-1]['addresses']=[{k:a.get(k) for k in ('local','prefixlen','scope')} for a in row.get('addr_info',[]) if a.get('family')=='inet'][:4]
+    source=CLIENT_IP if role=='client' else SERVER_IP
+    target=SERVER_IP if role=='client' else CLIENT_IP
+    record['routes']=[]
+    for address in dict.fromkeys([target]+(resolved if role=='client' else [])):
+        for row in document('route-'+address,['ip','-j','-4','route','get',address,'from',source],[]):
+            record['routes'].append({k:row.get(k) for k in ('dst','from','dev','gateway','prefsrc','flags')})
+    record['neighbors']=[{k:row.get(k) for k in ('dst','dev','lladdr','state')} for row in document('neighbors',['ip','-j','-4','neigh','show','dev','cflan'],[]) if row.get('dst') in (SERVER_IP,CLIENT_IP,*resolved)][:8]
+    record['kernel_forwarding']={}
+    for name,path in {'ip_forward':'/proc/sys/net/ipv4/ip_forward','cflan_rp_filter':'/proc/sys/net/ipv4/conf/cflan/rp_filter','all_rp_filter':'/proc/sys/net/ipv4/conf/all/rp_filter'}.items():
+        try:
+            value=Path(path).read_text().strip()
+            record['kernel_forwarding'][name]=int(value) if value in ('0','1','2') else None
+        except OSError:record['kernel_forwarding'][name]=None
+    if role=='server':
+        ids=run('containers',['docker','ps','-aq','--filter','label=com.docker.compose.project=cf-filebrowser','--filter','label=com.docker.compose.service=filebrowser-enterprise']).split()
+        record['container_count']=len(ids)
+        if len(ids)==1 and re.fullmatch('[0-9a-f]{12,64}',ids[0]):
+            items=document('inspect',['docker','inspect',ids[0]],[])
+            if items:
+                info=items[0];state=info.get('State',{});record['container']={'id':ids[0], 'running':state.get('Running'),'status':state.get('Status'),'health':state.get('Health',{}).get('Status'),'restarting':state.get('Restarting'),'restart_count':info.get('RestartCount'),'exit_code':state.get('ExitCode'),'started_at':state.get('StartedAt'),'finished_at':state.get('FinishedAt')}
+                record['host_config_ports']=info.get('HostConfig',{}).get('PortBindings',{}).get('8080/tcp')
+                record['published_ports']=info.get('NetworkSettings',{}).get('Ports',{}).get('8080/tcp')
+                network=info.get('NetworkSettings',{}).get('Networks',{}).get('cf-filebrowser_private',{})
+                record['project_network']={k:network.get(k) for k in ('IPAddress','Gateway','NetworkID','EndpointID')}
+                network_id=network.get('NetworkID','');bridge=''
+                if re.fullmatch('[0-9a-f]{64}',network_id):
+                    nets=document('network',['docker','network','inspect',network_id],[])
+                    if nets:bridge=nets[0].get('Options',{}).get('com.docker.network.bridge.name','br-'+network_id[:12])
+                record['project_bridge']=bridge
+                record['namespace_listeners']=[]
+                pid=state.get('Pid',0)
+                if type(pid)==int and pid>0:
+                    for family in ('tcp','tcp6'):
+                        try:
+                            for row in Path(f'/proc/{pid}/net/{family}').read_text().splitlines()[1:]:
+                                parts=row.split();address,port=parts[1].split(':')
+                                if int(port,16)!=8080 or parts[3]!='0A':continue
+                                raw=bytes.fromhex(address);raw=b''.join(raw[i:i+4][::-1] for i in range(0,len(raw),4))
+                                record['namespace_listeners'].append({'address':socket.inet_ntop(socket.AF_INET if family=='tcp' else socket.AF_INET6,raw),'port':8080})
+                        except OSError as error:record['listener_error']=lan_error_fields(error)
+                import yaml
+                try:
+                    config=yaml.safe_load(Path('/etc/cf-filebrowser-enterprise/config.yaml').read_text())['server']
+                    record['configured_listener']={k:config.get(k) for k in ('listen','port')}
+                    values=dict(line.split('=',1) for line in Path('/etc/cf-filebrowser-enterprise/.env').read_text().splitlines() if '=' in line and not line.startswith('#'))
+                    record['configured_publish']={k:values.get(k) for k in ('LAN_BIND_IP','LAN_PORT')}
+                except (OSError,ValueError,KeyError) as error:record['configuration_error']=lan_error_fields(error)
+                for table in ('nat','filter'):
+                    rules=run('iptables-'+table,['iptables-save','-c','-t',table])
+                    record[table+'_rules']=lan_packet_rules(rules,[SERVER_IP,CLIENT_IP,network.get('IPAddress','')],bridge)
+                    if table=='filter':record['forward_policy']=next((m.group(1) for line in rules.splitlines() if (m:=re.match(r'^:FORWARD (ACCEPT|DROP) ',line))),None)
+                logs=run('startup-errors',['docker','logs','--tail','60',ids[0]],include_stderr=True)
+                record['startup_error_categories']=[kind for marker,kind in (('address already in use','bind-address-in-use'),('cannot assign requested address','bind-address-unavailable'),('permission denied','permission-denied'),('storage identity','storage-identity')) if marker in (logs+state.get('Error','')).lower()]
+    if tcp:
+        # Exactly one TCP attempt AFTER the original failure and both snapshots.
+        started=time.monotonic();sock=socket.socket(socket.AF_INET,socket.SOCK_STREAM);sock.settimeout(5)
+        attempt={'target_ip':resolved[0] if resolved else None,'target_port':TLS_PORT,'connected':False}
+        try:
+            sock.bind((CLIENT_IP,0))
+            if not resolved:raise socket.gaierror(-2,'test name has no IPv4 result')
+            sock.connect((resolved[0],TLS_PORT));attempt['connected']=True
+        except OSError as error:attempt.update(lan_error_fields(error))
+        finally:
+            attempt['source_ip'],attempt['source_port']=sock.getsockname();sock.close()
+        attempt['elapsed_ms']=int((time.monotonic()-started)*1000);record['tcp_diagnostic']=attempt
+    record['finished_utc_ns']=time.time_ns()
+    return record
+
+
+def lan_snapshot(vm, role, tcp=False):
+    script=f"""python3 -B - <<'CF_LAN_STATE'
+import importlib.util,json
+spec=importlib.util.spec_from_file_location('cf_lan_state','{SOURCE}/scripts/tests/shared_host_vm.py')
+module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+print(json.dumps(module.lan_guest_snapshot({role!r},tcp={tcp!r}),sort_keys=True))
+CF_LAN_STATE
+"""
+    return json.loads(vm.command_on_guest(script,timeout=120).stdout)
+
+
+def initial_lan_boundary(args, evidence, server, client):
+    try:
+        return lan_boundary(client)
+    except VerificationError as error:
+        evidence['lan_failure']=getattr(error,'lan_evidence',{})
+        evidence['failure']=str(error)
+        record_stage(args,evidence,'second-vm-real-lan-and-https-boundaries')  # Save BEFORE diagnostic operations.
+        snapshots=evidence.setdefault('lan_connection_failure',{})
+        for label,vm,role,tcp in (('client',client,'client',False),('server',server,'server',False),('tcp',client,'client',True)):
+            try:snapshots[label]=lan_snapshot(vm,role,tcp)
+            except REBOOT_ERRORS as diagnostic_error:snapshots[label]={'available':False,**lan_error_fields(diagnostic_error)}
+            record_stage(args,evidence,'second-vm-real-lan-and-https-boundaries')
+        raise
 
 
 def lan_boundary(vm):
@@ -2389,11 +2579,13 @@ test ! -e /srv/storage/cf-filebrowser-enterprise
         record_stage(args, evidence, "verify-actual-service-runtime-contract")
         verify_runtime_readiness(evidence["runtime_readiness"], image_id, args.source_sha)
         evidence["checks"].append("actual service and PID1 UID/GID 10001, dependency versions, writable files/data/cache and denied root/config writes, readable protected inputs without reading their values")
+        evidence["lan_before_prepare"] = lan_snapshot(server, "server")
         record_stage(args, evidence, "idempotent-prepare-after-bootstrap")
         server.command_on_guest(f"{manage} prepare --hostname {server.name} --source-sha {args.source_sha} --image-ref {shlex.quote(pinned)} --mode staging --exposure lan --test-disk --enable-share-source --enable-webdav --bootstrap-password-file {GUEST}/admin-password", timeout=900)
         evidence["checks"].append("formal empty-root install, admin verification, bootstrap removal, same-image login, idempotent prepare")
         record_stage(args, evidence, "second-vm-real-lan-and-https-boundaries")
-        evidence["initial_lan_boundary"] = lan_boundary(client)
+        evidence["lan_after_prepare"] = lan_snapshot(server, "server")
+        evidence["initial_lan_boundary"] = initial_lan_boundary(args, evidence, server, client)
         evidence["checks"].append("second-VM HTTPS UI/API controls before/after, curl certificate rejection, connected denied TCP peer refused before TLS, forwarded headers ignored on allowed HTTPS")
         if args.scope == "restore":
             targeted_restore(args, evidence, server, client, image_id, pinned, baseline)
