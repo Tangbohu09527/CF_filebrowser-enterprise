@@ -23,6 +23,8 @@ import tempfile
 import threading
 import time
 import urllib.request
+import urllib.error
+import urllib.parse
 
 ROOT = Path(__file__).resolve().parents[2]
 PRODUCT = "https://github.com/Tangbohu09527/CF_filebrowser-enterprise.git"
@@ -66,32 +68,102 @@ def port():
         return listener.getsockname()[1]
 
 
-def download(url, destination):
+def download(url, destination, observations=None):
+    """One bounded attempt; retain only public source and numeric failure facts."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != 'https' or parsed.hostname != 'cloud.debian.org' or parsed.username or parsed.password or parsed.query:
+        raise VerificationError('test image download requires the official public HTTPS source')
+    record = {'host': parsed.hostname, 'path': parsed.path, 'stage': 'request',
+              'destination_exists': destination.exists(), 'directory_exists': destination.parent.is_dir(),
+              'directory_writable': os.access(destination.parent, os.W_OK),
+              'free_disk_bytes': shutil.disk_usage(destination.parent).free, 'received_bytes': 0, 'written_bytes': 0}
+    if observations is not None:
+        observations.append(record)
+    started = time.monotonic()
     request = urllib.request.Request(url, headers={"User-Agent": "CF-isolated-delivery-verification/1"})
     try:
-        with urllib.request.urlopen(request, timeout=120) as response, destination.open("xb") as output:
-            shutil.copyfileobj(response, output)
+        with urllib.request.urlopen(request, timeout=120) as response:
+            record['http_status'] = response.status
+            record['stage'] = 'create-file'
+            with destination.open('xb') as output:
+                while True:
+                    record['stage'] = 'read'
+                    block = response.read(1024 * 1024)
+                    if not block:
+                        break
+                    record['received_bytes'] += len(block)
+                    record['stage'] = 'write'
+                    record['written_bytes'] += output.write(block)
+                record['stage'] = 'flush'
+                output.flush()
+                record['stage'] = 'close-file'
+            record['stage'] = 'close-response'
+        record.update(stage='complete', result='passed')
     except OSError as error:
-        raise VerificationError("official Debian download failed for " + url.rsplit("/", 1)[-1] + "; partial download retained") from error
+        reason = getattr(error, 'reason', None)
+        record.update(result='failed', exception_type=type(error).__name__, errno=error.errno,
+                      http_status=getattr(error, 'code', record.get('http_status')),
+                      reason_type=type(reason).__name__ if reason is not None else None,
+                      reason_errno=getattr(reason, 'errno', None), tls_verify_code=getattr(reason, 'verify_code', None))
+        symbolic = getattr(reason, 'reason', None)
+        if isinstance(symbolic, str) and re.fullmatch('[A-Z0-9_]{1,80}', symbolic):
+            record['reason_code'] = symbolic
+        # Never reflect exception strings: proxy auth, headers or body may appear.
+        failure = {k: record.get(k) for k in ('host','path','stage','exception_type','errno','http_status','reason_type','reason_errno','tls_verify_code')}
+        raise VerificationError('official Debian acquisition failed: ' + json.dumps(failure, sort_keys=True)) from error
+    finally:
+        record['elapsed_seconds'] = round(time.monotonic() - started, 3)
 
 
-def cloud_image(work):
-    manifest = work / "SHA512SUMS"
-    download(CLOUD + "SHA512SUMS", manifest)
-    expected = None
-    for line in manifest.read_text().splitlines():
-        fields = line.split()
-        if len(fields) == 2 and fields[1].lstrip("*") == CLOUD_IMAGE and re.fullmatch(r"[0-9a-f]{128}", fields[0]):
-            expected = fields[0]
-    if expected is None:
-        raise VerificationError("official Debian manifest does not identify the requested cloud image")
+def manifest_digest(manifest):
+    matches = [fields[0] for line in manifest.read_text().splitlines()
+               if len(fields := line.split()) == 2 and fields[1].lstrip('*') == CLOUD_IMAGE
+               and re.fullmatch(r'[0-9a-f]{128}', fields[0])]
+    if len(matches) != 1:
+        raise VerificationError('official Debian manifest does not uniquely identify the requested cloud image')
+    return matches[0]
+
+
+def cloud_image(work, evidence=None):
+    evidence = evidence if evidence is not None else {}
+    acquisition = evidence.setdefault('image_acquisition', {'downloads': []})
+    manifest = work / 'SHA512SUMS'
+    download(CLOUD + 'SHA512SUMS', manifest, acquisition['downloads'])
+    acquisition['manifest_downloaded'] = True
+    expected = manifest_digest(manifest)
+    acquisition.update(manifest_lists_image=True, expected_sha512=expected)
+    # A partial download cannot be mistaken for a verified QEMU backing image.
     path = work / CLOUD_IMAGE
-    download(CLOUD + CLOUD_IMAGE, path)
-    with path.open("rb") as stream:
-        actual = hashlib.file_digest(stream, "sha512").hexdigest()
+    partial = work / (CLOUD_IMAGE + '.partial')
+    if path.exists():
+        raise VerificationError('refusing to replace an existing test base image')
+    download(CLOUD + CLOUD_IMAGE, partial, acquisition['downloads'])
+    with partial.open('rb') as stream:
+        actual = hashlib.file_digest(stream, 'sha512').hexdigest()
+    acquisition['actual_sha512'] = actual
     if actual != expected:
-        raise VerificationError("Debian image does not match the official SHA512 manifest")
-    return path, {"url": CLOUD + CLOUD_IMAGE, "sha512": actual, "checksum_url": CLOUD + "SHA512SUMS"}
+        raise VerificationError('Debian image does not match the official SHA512 manifest')
+    partial.rename(path)
+    record = {'url': CLOUD + CLOUD_IMAGE, 'sha512': actual, 'checksum_url': CLOUD + 'SHA512SUMS'}
+    private_write(work / 'verified.json', json.dumps(record, sort_keys=True))
+    acquisition['verified'] = True
+    return path, record
+
+
+def prepared_cloud_image(directory):
+    # Rehash the same pure base image; do not fetch latest a second time.
+    record = json.loads((directory / 'verified.json').read_text())
+    expected = manifest_digest(directory / 'SHA512SUMS')
+    if record != {'url': CLOUD + CLOUD_IMAGE, 'sha512': expected, 'checksum_url': CLOUD + 'SHA512SUMS'}:
+        raise VerificationError('prepared Debian input source or manifest differs')
+    path = directory / CLOUD_IMAGE
+    if path.is_symlink() or not path.is_file():
+        raise VerificationError('prepared Debian image must be a regular file')
+    with path.open('rb') as stream:
+        actual = hashlib.file_digest(stream, 'sha512').hexdigest()
+    if actual != expected:
+        raise VerificationError('prepared Debian image checksum differs')
+    return path, record
 
 
 def resource_budget(base_virtual_bytes, seed_bytes=2 * 16 * 1024 ** 2):
@@ -2185,7 +2257,7 @@ def targeted_restore(args, evidence, server, client, image_id, pinned, baseline)
 
 def scenario(args, work, evidence):
     record_stage(args, evidence, "official-debian-image-download-and-sha512")
-    base, cloud_record = cloud_image(work)
+    base, cloud_record = prepared_cloud_image(args.base_dir) if getattr(args, "base_dir", None) else cloud_image(work, evidence)
     evidence.update(cloud_image=cloud_record)
     record_stage(args, evidence, "two-vm-resource-preflight")
     base_info = json.loads(execute(["qemu-img", "info", "--output=json", str(base)]).stdout)
@@ -2417,20 +2489,23 @@ if bash {SOURCE}/deploy/shared-host/backup.sh restore {GUEST}/verification.tar -
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-sha", required=True)
-    parser.add_argument("--scope", choices=("full", "reboot", "storage", "lifecycle", "restore", "dns"), default="full", help="reboot runs only formal setup and the host reboot blocker checks")
+    parser.add_argument("--scope", choices=("full", "reboot", "storage", "lifecycle", "restore", "dns", "image"), default="full", help="reboot runs only formal setup and the host reboot blocker checks")
+    parser.add_argument("--base-dir", type=Path, help="same verified pure Debian input directory from scope=image")
     parser.add_argument("--image-ref", help="local image already built by the formal image.sh entry point")
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--accelerator", choices=("kvm", "tcg"), default="kvm")
     args = parser.parse_args()
-    if args.scope not in ("storage", "dns") and not args.image_ref:
+    if args.scope not in ("storage", "dns", "image") and not args.image_ref:
         parser.error("--image-ref is required for product verification")
     if sys.platform != "linux" or os.environ.get("GITHUB_ACTIONS") != "true":
         parser.error("this destructive VM-fixture harness runs only on a disposable Linux GitHub Actions runner")
     if not re.fullmatch(r"[0-9a-f]{40}", args.source_sha):
         parser.error("source SHA must be a full immutable lowercase commit")
-    if args.accelerator == "kvm" and not os.access("/dev/kvm", os.R_OK | os.W_OK):
+    if args.scope == "image" and not args.base_dir:
+        parser.error("image scope requires a new --base-dir")
+    if args.scope != "image" and args.accelerator == "kvm" and not os.access("/dev/kvm", os.R_OK | os.W_OK):
         parser.error("KVM is unavailable to this runner; grant CI access explicitly or select --accelerator tcg with a larger timeout")
-    for name in ("qemu-system-x86_64", "qemu-img", "cloud-localds", "ssh", "ssh-keygen", "openssl", "docker", "curl", "sudo"):
+    for name in (() if args.scope == "image" else ("qemu-system-x86_64", "qemu-img", "cloud-localds", "ssh", "ssh-keygen", "openssl", "docker", "curl", "sudo")):
         if not shutil.which(name):
             parser.error("required CI dependency is missing: " + name)
     os.umask(0o077)
@@ -2441,6 +2516,13 @@ def main():
     work = Path(tempfile.mkdtemp(prefix="cf-private-vm-", dir=os.environ.get("RUNNER_TEMP")))
     evidence = {"schema": "cf-shared-host-vm/v1", "source_sha": args.source_sha, "result": "failed", "checks": [], "accelerator": args.accelerator}
     try:
+        if args.scope == "image":
+            record_stage(args, evidence, 'official-debian-image-download-and-sha512')
+            args.base_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+            _, record = cloud_image(args.base_dir, evidence)
+            evidence.update(result='passed', scope='image', cloud_image=record)
+            record_stage(args, evidence, 'debian-input-verified-without-product-or-vm')
+            return 0
         scenario(args, work, evidence)
         message = "reboot blocker targeted verification passed; full A/B remains separate" if args.scope == "reboot" else "real Debian/systemd/LAN/restore verification passed"
         if args.scope == "lifecycle": message = "missing/late storage and recreation targeted verification passed; full A/B remains separate"

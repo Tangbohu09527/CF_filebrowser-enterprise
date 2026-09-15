@@ -24,6 +24,98 @@ harness = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(harness)
 
 
+
+class DebianAcquisitionTests(unittest.TestCase):
+    def response(self, data):
+        import io
+        response = io.BytesIO(data); response.status = 200
+        return response
+
+    def test_http_error_keeps_status_stage_and_no_private_reason(self):
+        error = harness.urllib.error.HTTPError(harness.CLOUD + harness.CLOUD_IMAGE, 404, 'private-proxy-credential', {}, None)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(harness.urllib.request,'urlopen',side_effect=error) as request:
+            records=[]
+            with self.assertRaises(harness.VerificationError) as caught:
+                harness.download(harness.CLOUD+harness.CLOUD_IMAGE,Path(tmp)/'image',records)
+            self.assertEqual(request.call_count,1)
+            self.assertEqual(records[0]['stage'],'request')
+            self.assertEqual(records[0]['http_status'],404)
+            self.assertEqual(records[0]['received_bytes'],0)
+            self.assertFalse(records[0]['destination_exists'])
+            self.assertGreater(records[0]['free_disk_bytes'],0)
+            self.assertNotIn('private-proxy-credential',str(caught.exception)+json.dumps(records))
+
+    def test_create_read_and_write_failures_remain_distinguishable(self):
+        import errno,io
+        class Interrupted(io.BytesIO):
+            status=200
+            def read(self,*args): raise OSError(errno.ECONNRESET,'private-read-error')
+        for phase in ('create-file','read','write'):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp:
+                dest=Path(tmp)/'image'; records=[]
+                if phase=='create-file': dest.write_bytes(b'existing')
+                response=Interrupted() if phase=='read' else self.response(b'payload')
+                with mock.patch.object(harness.urllib.request,'urlopen',return_value=response):
+                    if phase=='write':
+                        writer=mock.MagicMock();writer.__enter__.return_value=writer
+                        writer.write.side_effect=OSError(errno.ENOSPC,'private-disk-error')
+                        with mock.patch.object(Path,'open',return_value=writer),self.assertRaises(harness.VerificationError):
+                            harness.download(harness.CLOUD+harness.CLOUD_IMAGE,dest,records)
+                    else:
+                        with self.assertRaises(harness.VerificationError):
+                            harness.download(harness.CLOUD+harness.CLOUD_IMAGE,dest,records)
+                self.assertEqual(records[0]['stage'],phase)
+                self.assertEqual(records[0]['errno'],{'create-file':errno.EEXIST,'read':errno.ECONNRESET,'write':errno.ENOSPC}[phase])
+                self.assertNotIn('private-',json.dumps(records))
+                if phase=='create-file': self.assertEqual(dest.read_bytes(),b'existing')
+
+    def test_url_error_preserves_numeric_underlying_errno(self):
+        import errno
+        error=harness.urllib.error.URLError(OSError(errno.ECONNREFUSED,'private-auth'))
+        with tempfile.TemporaryDirectory() as tmp,mock.patch.object(harness.urllib.request,'urlopen',side_effect=error):
+            records=[]
+            with self.assertRaises(harness.VerificationError):harness.download(harness.CLOUD+'SHA512SUMS',Path(tmp)/'sum',records)
+            self.assertEqual(records[0]['reason_errno'],errno.ECONNREFUSED)
+            self.assertEqual(records[0]['exception_type'],'URLError')
+
+    def acquire(self,directory,*,corrupt=False,listed=True):
+        content=b'pure synthetic base'; digest=hashlib.sha512(content).hexdigest()
+        manifest=(digest+'  '+(harness.CLOUD_IMAGE if listed else 'other.qcow2')+'\n').encode()
+        evidence={}
+        with mock.patch.object(harness.urllib.request,'urlopen',side_effect=[self.response(manifest),self.response(b'corrupt' if corrupt else content)]) as request:
+            try:return harness.cloud_image(directory,evidence),evidence
+            finally:self.request_count=request.call_count
+
+    def test_manifest_and_complete_digest_required_before_reusable_file(self):
+        for corrupt,listed in ((True,True),(False,False)):
+            with self.subTest(corrupt=corrupt,listed=listed),tempfile.TemporaryDirectory() as tmp:
+                directory=Path(tmp)
+                with self.assertRaises(harness.VerificationError):self.acquire(directory,corrupt=corrupt,listed=listed)
+                self.assertFalse((directory/harness.CLOUD_IMAGE).exists())
+                self.assertFalse((directory/'verified.json').exists())
+                self.assertEqual(self.request_count,2 if listed else 1)
+
+    def test_reuse_rehashes_same_input_without_network_and_rejects_tampering(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory=Path(tmp);(path,record),evidence=self.acquire(directory)
+            self.assertTrue(evidence['image_acquisition']['verified'])
+            self.assertFalse((directory/(harness.CLOUD_IMAGE+'.partial')).exists())
+            with mock.patch.object(harness.urllib.request,'urlopen') as network:
+                self.assertEqual(harness.prepared_cloud_image(directory),(path,record))
+                path.write_bytes(b'tampered')
+                with self.assertRaises(harness.VerificationError):harness.prepared_cloud_image(directory)
+                network.assert_not_called()
+
+    def test_preflight_precedes_build_and_actual_vm_reuses_its_input(self):
+        import inspect
+        workflow=(MODULE_PATH.parents[2]/'.github/workflows/shared-host-delivery.yaml').read_text()
+        self.assertLess(workflow.index('Acquire and verify Debian input'),workflow.index('Build real frontend and backend'))
+        self.assertEqual(workflow.count('--base-dir "$RUNNER_TEMP/cf-debian-base"'),2)
+        self.assertIn('--scope image',workflow)
+        self.assertEqual(workflow.count("if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'"),3)
+        self.assertIn('prepared_cloud_image(args.base_dir)',inspect.getsource(harness.scenario))
+
+
 class CertificateTrustTests(unittest.TestCase):
     """Real disposable certificates/TLS; this does not boot a VM or application."""
 

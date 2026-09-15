@@ -8,7 +8,7 @@ on:
       scope:
         description: Verification scope (full remains the default)
         type: choice
-        options: [full, reboot, storage, lifecycle, restore, dns]
+        options: [full, reboot, storage, lifecycle, restore, dns, image]
         default: full
 
 permissions:
@@ -96,12 +96,27 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
+      - name: Acquire and verify Debian input before product build
+        run: |
+          bash scripts/tests/shared-host-vm.sh --source-sha "$(git rev-parse HEAD)" \
+            --scope image --base-dir "$RUNNER_TEMP/cf-debian-base" --evidence "$RUNNER_TEMP/cf-debian-evidence"
+      - name: Save sanitized Debian acquisition evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-host-debian-input
+          path: ${{ runner.temp }}/cf-debian-evidence/vm-result.json
+          if-no-files-found: error
+          retention-days: 14
       - uses: docker/setup-buildx-action@v3
+        if: github.event_name != 'workflow_dispatch' || inputs.scope != 'image'
       - name: Install disposable VM test dependencies
+        if: github.event_name != 'workflow_dispatch' || inputs.scope != 'image'
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssl
       - name: Build real frontend and backend from fixed source
+        if: github.event_name != 'workflow_dispatch' || inputs.scope != 'image'
         run: |
           revision=$(git rev-parse HEAD)
           bash deploy/shared-host/image.sh build --source-sha "$revision" \
@@ -109,6 +124,7 @@ jobs:
             --evidence "$RUNNER_TEMP/cf-image-evidence"
           docker image inspect "cf-filebrowser:verification-$revision" --format '{{.Id}}'
       - name: Real Debian 13 verification for the selected scope
+        if: github.event_name != 'workflow_dispatch' || inputs.scope != 'image'
         env:
           VERIFICATION_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope || 'full' }}
         run: |
@@ -116,10 +132,11 @@ jobs:
           accelerator=tcg
           if [[ -r /dev/kvm && -w /dev/kvm ]]; then accelerator=kvm; fi
           bash scripts/tests/shared-host-vm.sh --source-sha "$revision" \
+            --base-dir "$RUNNER_TEMP/cf-debian-base" \
             --image-ref "cf-filebrowser:verification-$revision" \
             --evidence "$RUNNER_TEMP/cf-vm-evidence" --accelerator "$accelerator" --scope "$VERIFICATION_SCOPE"
       - name: Save sanitized VM acceptance results only
-        if: always()
+        if: always() && (github.event_name != 'workflow_dispatch' || inputs.scope != 'image')
         uses: actions/upload-artifact@v4
         with:
           name: shared-host-vm-results
@@ -127,7 +144,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Save non-secret build evidence
-        if: always()
+        if: always() && (github.event_name != 'workflow_dispatch' || inputs.scope != 'image')
         uses: actions/upload-artifact@v4
         with:
           name: shared-host-image-inputs
