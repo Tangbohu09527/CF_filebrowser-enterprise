@@ -1,4 +1,4 @@
-import type { Page } from "@playwright/test";
+import type { Page, Request } from "@playwright/test";
 import { test as base, expect } from "@playwright/test";
 
 /**
@@ -60,8 +60,12 @@ export const test = base.extend<{
   checkForNotification: (message: string | RegExp) => Promise<import('@playwright/test').Locator>;
 }>({
   checkForErrors: async ({ page }, use) => {
-    const { checkForErrors } = setupErrorTracking(page);
-    await use(checkForErrors);
+    const { checkForErrors, dispose } = setupErrorTracking(page);
+    try {
+      await use(checkForErrors);
+    } finally {
+      dispose();
+    }
   },
   openContextMenu: async ({ page }, use) => {
     await use(async () => {
@@ -83,6 +87,55 @@ export const test = base.extend<{
 export function setupErrorTracking(page: Page) {
   const consoleErrors: string[] = [];
   const failedResponses: { url: string; status: number }[] = [];
+  // Keep only fixed categories: failed fetches may have no HTTP response.
+  // Request URLs, credentials, failure text and payloads are never retained here.
+  const requestFailures: { endpoint: string; method: string; resourceType: string; category: string; navigation: boolean }[] = [];
+  let requestFailuresTruncated = false;
+  const onRequestFailed = (request: Request) => {
+    if (requestFailures.length >= 16) {
+      requestFailuresTruncated = true;
+      return;
+    }
+    try {
+      const navigation = request.isNavigationRequest() === true;
+      let pathname = "";
+      try {
+        // Backend bases: noauth/screenshots=/files/, proxy=/subpath, others=/.
+        // Strip only their exact API prefixes; UI and public paths stay unknown.
+        pathname = new URL(request.url()).pathname.replace(/^\/(?:files|subpath)(?=\/api(?:\/|$))/, "");
+      } catch {
+        // An unparseable address is reported only as an unknown endpoint.
+      }
+      const endpoint = navigation ? "other" : pathname === "/api/resources/preview" ? "preview" :
+        pathname === "/api/resources" ? "resources" :
+        pathname === "/api/events" ? "events" :
+        /^\/api\/tools\/fileWatcher(?:\/sse)?$/.test(pathname) ? "file-watcher" :
+        /^\/api\/auth(?:\/|$)/.test(pathname) ? "auth" :
+        /^\/api\/media(?:\/|$)/.test(pathname) ? "media" :
+        /^\/api\/tools(?:\/|$)/.test(pathname) ? "tools" :
+        /^\/api\/users(?:\/|$)/.test(pathname) ? "users" :
+        /^\/api\/share(?:\/|$)/.test(pathname) ? "share" :
+        /^\/api\/settings(?:\/|$)/.test(pathname) ? "settings" :
+        /^\/api(?:\/|$)/.test(pathname) ? "api-other" : "other";
+      const requestMethod = request.method();
+      const method = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"].includes(requestMethod) ? requestMethod : "OTHER";
+      const requestResourceType = request.resourceType();
+      const resourceType = ["document", "stylesheet", "image", "media", "font", "script", "texttrack", "xhr", "fetch", "eventsource", "websocket", "manifest", "other"].includes(requestResourceType) ? requestResourceType : "other";
+      const failure = request.failure()?.errorText || "";
+      const category = /abort|cancel/i.test(failure) ? "aborted" :
+        /timeout|timed_out/i.test(failure) ? "timeout" :
+        /unknown_host|name_not_resolved/i.test(failure) ? "dns" :
+        /connection_refused/i.test(failure) ? "refused" :
+        /net_reset|connection_reset/i.test(failure) ? "reset" :
+        /ssl|tls|cert|sec_error/i.test(failure) ? "tls" :
+        /network|fetch|net_error|connection/i.test(failure) ? "network" : "other";
+      requestFailures.push({ endpoint, method, resourceType, category, navigation });
+    } catch {
+      // A diagnostic getter failure must not alter the original error checks.
+      requestFailures.push({ endpoint: "other", method: "OTHER", resourceType: "other", category: "unavailable", navigation: false });
+    }
+  };
+  page.on("requestfailed", onRequestFailed);
 
   // Track console errors
   page.on("console", async (message) => {
@@ -154,6 +207,11 @@ export function setupErrorTracking(page: Page) {
 
   return {
     checkForErrors: (expectedConsoleErrors = 0, expectedApiErrors = 0) => {
+      if (consoleErrors.length !== expectedConsoleErrors || failedResponses.length !== expectedApiErrors) {
+        console.error("Playwright request failure diagnostics", JSON.stringify({
+          schema: 1, failures: requestFailures, truncated: requestFailuresTruncated,
+        }));
+      }
       if (consoleErrors.length !== expectedConsoleErrors) {
         console.error(`\n=== Unexpected Console Errors (Expected: ${expectedConsoleErrors}, Got: ${consoleErrors.length}) ===`);
         consoleErrors.forEach((error, index) => {
@@ -175,6 +233,7 @@ export function setupErrorTracking(page: Page) {
       expect(consoleErrors).toHaveLength(expectedConsoleErrors);
       expect(failedResponses).toHaveLength(expectedApiErrors);
     },
+    dispose: () => page.off("requestfailed", onRequestFailed),
   };
 }
 

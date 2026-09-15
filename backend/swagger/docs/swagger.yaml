@@ -16,11 +16,19 @@ definitions:
         $ref: '#/definitions/users.Permissions'
       expiresAt:
         type: integer
+      fingerprint:
+        type: string
+      id:
+        type: string
       issuedAt:
         type: integer
       name:
         type: string
-      token:
+      permissionsVersion:
+        type: integer
+      tokenPrefix:
+        type: string
+      type:
         type: string
     type: object
   http.BulkDeleteItem:
@@ -70,6 +78,27 @@ definitions:
       token:
         type: string
     type: object
+  http.ManagementShareCapabilities:
+    properties:
+      browse:
+        type: boolean
+      create:
+        type: boolean
+      delete:
+        type: boolean
+      download:
+        type: boolean
+      modify:
+        type: boolean
+      preview:
+        type: boolean
+      replace:
+        type: boolean
+      thumbnail:
+        type: boolean
+      viewer:
+        type: boolean
+    type: object
   http.MoveCopyItem:
     properties:
       fromPath:
@@ -113,15 +142,12 @@ definitions:
   http.ShareResponse:
     properties:
       allowCreate:
-        description: allow creating files
         type: boolean
       allowDelete:
         type: boolean
       allowModify:
-        description: allow modifying files
         type: boolean
       allowReplacements:
-        description: allow replacements of files
         type: boolean
       allowedUsernames:
         items:
@@ -133,18 +159,17 @@ definitions:
         type: string
       canEditShare:
         type: boolean
+      configuredCapabilities:
+        $ref: '#/definitions/http.ManagementShareCapabilities'
       description:
         type: string
       disableAnonymous:
         type: boolean
       disableDownload:
-        description: don't allow downloading files
         type: boolean
       disableFileViewer:
-        description: don't allow viewing files
         type: boolean
       disableLoginOption:
-        description: disable login option in share (true = hide, false = show)
         type: boolean
       disableShareCard:
         type: boolean
@@ -158,15 +183,15 @@ definitions:
         type: integer
       downloadsLimit:
         type: integer
+      effectiveCapabilities:
+        $ref: '#/definitions/http.ManagementShareCapabilities'
       enableOnlyOffice:
         type: boolean
       enforceDarkLightMode:
-        description: '"dark" or "light"'
         type: string
       expire:
         type: integer
       extractEmbeddedSubtitles:
-        description: can be io intensive for large files and take 10-30 seconds.
         type: boolean
       favicon:
         type: string
@@ -177,7 +202,6 @@ definitions:
       hash:
         type: string
       hideFileExt:
-        description: show hidden files based on extensions in shares
         type: string
       hideNavButtons:
         type: boolean
@@ -185,8 +209,6 @@ definitions:
         type: boolean
       maxBandwidth:
         type: integer
-      password_hash:
-        type: string
       path:
         type: string
       pathExists:
@@ -198,47 +220,28 @@ definitions:
       shareTheme:
         type: string
       shareType:
-        description: 'type of share: normal, upload, max'
         type: string
       shareURL:
         type: string
       showHidden:
-        description: show hidden files in share (true = show, false = hide)
         type: boolean
       sidebarLinks:
-        description: customizable sidebar links
         items:
           $ref: '#/definitions/users.SidebarLink'
         type: array
       source:
-        description: Override embedded field to show source name
         type: string
       sourceURL:
+        type: string
+      status:
         type: string
       themeColor:
         type: string
       title:
         type: string
-      token:
-        description: |-
-          Token is a random value that will only be set when PasswordHash is set. It is
-          URL-Safe and is used to download links in password-protected shares via a
-          query arg.
-        type: string
-      userDownloads:
-        additionalProperties:
-          type: integer
-        description: Track downloads per username
-        type: object
-      userID:
-        type: integer
       username:
         type: string
-      version:
-        type: integer
       viewMode:
-        description: 'default view mode for anonymous users: "list", "compact", "normal",
-          "gallery"'
         type: string
     type: object
   http.archiveCreateRequest:
@@ -1137,6 +1140,12 @@ definitions:
     type: object
   settings.Server:
     properties:
+      allowedClientCIDRs:
+        description: optional canonical TCP peer CIDRs; ignores forwarding headers
+          and rejects other peers before TLS/HTTP
+        items:
+          type: string
+        type: array
       baseURL:
         description: base URL for the server, the subpath that the server is running
           on.
@@ -1465,6 +1474,9 @@ definitions:
       api:
         description: allow api access
         type: boolean
+      browse:
+        description: allow browsing files and directories
+        type: boolean
       create:
         description: allow creating or uploading files
         type: boolean
@@ -1476,6 +1488,9 @@ definitions:
         type: boolean
       modify:
         description: allow modifying files
+        type: boolean
+      preview:
+        description: allow previewing file contents
         type: boolean
       realtime:
         description: allow realtime updates
@@ -1693,6 +1708,8 @@ definitions:
         type: string
       canEditShare:
         type: boolean
+      capabilities:
+        $ref: '#/definitions/share.PublicCapabilities'
       description:
         type: string
       disableAnonymous:
@@ -1797,6 +1814,8 @@ definitions:
         type: string
       canEditShare:
         type: boolean
+      capabilities:
+        $ref: '#/definitions/share.PublicCapabilities'
       description:
         type: string
       disableAnonymous:
@@ -1886,132 +1905,18 @@ definitions:
           "gallery"'
         type: string
     type: object
-  share.Link:
+  share.PublicCapabilities:
     properties:
-      allowCreate:
-        description: allow creating files
+      browse:
         type: boolean
-      allowDelete:
+      download:
         type: boolean
-      allowModify:
-        description: allow modifying files
+      preview:
         type: boolean
-      allowReplacements:
-        description: allow replacements of files
+      thumbnail:
         type: boolean
-      allowedUsernames:
-        items:
-          type: string
-        type: array
-      banner:
-        type: string
-      bannerUrl:
-        type: string
-      canEditShare:
+      viewer:
         type: boolean
-      description:
-        type: string
-      disableAnonymous:
-        type: boolean
-      disableDownload:
-        description: don't allow downloading files
-        type: boolean
-      disableFileViewer:
-        description: don't allow viewing files
-        type: boolean
-      disableLoginOption:
-        description: disable login option in share (true = hide, false = show)
-        type: boolean
-      disableShareCard:
-        type: boolean
-      disableSidebar:
-        type: boolean
-      disableThumbnails:
-        type: boolean
-      downloadURL:
-        type: string
-      downloads:
-        type: integer
-      downloadsLimit:
-        type: integer
-      enableOnlyOffice:
-        type: boolean
-      enforceDarkLightMode:
-        description: '"dark" or "light"'
-        type: string
-      expire:
-        type: integer
-      extractEmbeddedSubtitles:
-        description: can be io intensive for large files and take 10-30 seconds.
-        type: boolean
-      favicon:
-        type: string
-      faviconUrl:
-        type: string
-      hasPassword:
-        type: boolean
-      hash:
-        type: string
-      hideFileExt:
-        description: show hidden files based on extensions in shares
-        type: string
-      hideNavButtons:
-        type: boolean
-      keepAfterExpiration:
-        type: boolean
-      maxBandwidth:
-        type: integer
-      password_hash:
-        type: string
-      path:
-        type: string
-      perUserDownloadLimit:
-        type: boolean
-      quickDownload:
-        type: boolean
-      shareTheme:
-        type: string
-      shareType:
-        description: 'type of share: normal, upload, max'
-        type: string
-      shareURL:
-        type: string
-      showHidden:
-        description: show hidden files in share (true = show, false = hide)
-        type: boolean
-      sidebarLinks:
-        description: customizable sidebar links
-        items:
-          $ref: '#/definitions/users.SidebarLink'
-        type: array
-      source:
-        description: backend source is path to maintain between name changes
-        type: string
-      sourceURL:
-        type: string
-      themeColor:
-        type: string
-      title:
-        type: string
-      token:
-        description: |-
-          Token is a random value that will only be set when PasswordHash is set. It is
-          URL-Safe and is used to download links in password-protected shares via a
-          query arg.
-        type: string
-      userDownloads:
-        additionalProperties:
-          type: integer
-        description: Track downloads per username
-        type: object
-      userID:
-        type: integer
-      version:
-        type: integer
-      viewMode:
-        description: 'default view mode for anonymous users: "list", "compact", "normal",
-          "gallery"'
-        type: string
     type: object
   users.AuthToken:
     properties:
@@ -2024,11 +1929,18 @@ definitions:
       issuedAt:
         type: integer
       key:
-        description: for backward compatibility
+        description: legacy database field
         type: string
       name:
         type: string
+      permissionsVersion:
+        type: integer
       token:
+        description: legacy database field
+        type: string
+      tokenHash:
+        type: string
+      tokenPrefix:
         type: string
     type: object
   users.FileLoading:
@@ -2064,6 +1976,9 @@ definitions:
       api:
         description: allow api access
         type: boolean
+      browse:
+        description: allow browsing files and directories
+        type: boolean
       create:
         description: allow creating or uploading files
         type: boolean
@@ -2075,6 +1990,9 @@ definitions:
         type: boolean
       modify:
         description: allow modifying files
+        type: boolean
+      preview:
+        description: allow previewing file contents
         type: boolean
       realtime:
         description: allow realtime updates
@@ -3059,6 +2977,10 @@ paths:
         name: permissions
         required: true
         type: string
+      - description: Create a stateful token that uses current user permissions
+        in: query
+        name: minimal
+        type: boolean
       produces:
       - application/json
       responses:
@@ -3410,49 +3332,6 @@ paths:
       tags:
       - Resources
   /api/office/callback:
-    get:
-      consumes:
-      - application/json
-      description: Receives callbacks from OnlyOffice document server for document
-        status changes and saves
-      parameters:
-      - description: Source name
-        in: query
-        name: source
-        type: string
-      - description: File path
-        in: query
-        name: path
-        type: string
-      - description: Share hash (for public shares)
-        in: query
-        name: hash
-        type: string
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: Callback processed successfully
-          schema:
-            additionalProperties: true
-            type: object
-        "400":
-          description: Invalid callback data
-          schema:
-            additionalProperties:
-              type: string
-            type: object
-        "500":
-          description: Server error
-          schema:
-            additionalProperties:
-              type: string
-            type: object
-      security:
-      - ApiKeyAuth: []
-      summary: Handle OnlyOffice document server callback
-      tags:
-      - Office
     post:
       consumes:
       - application/json
@@ -4098,6 +3977,12 @@ paths:
             additionalProperties:
               type: string
             type: object
+        "403":
+          description: Browse, preview, or download permission required
+          schema:
+            additionalProperties:
+              type: string
+            type: object
         "404":
           description: File not found
           schema:
@@ -4291,7 +4176,7 @@ paths:
           description: List of share links for the specified path
           schema:
             items:
-              $ref: '#/definitions/share.Link'
+              $ref: '#/definitions/http.ShareResponse'
             type: array
         "500":
           description: Internal server error
@@ -4356,9 +4241,9 @@ paths:
       - application/json
       responses:
         "200":
-          description: Created share link
+          description: Created or updated share link
           schema:
-            $ref: '#/definitions/share.Link'
+            $ref: '#/definitions/http.ShareResponse'
         "400":
           description: Bad request - failed to decode body
           schema:
@@ -4445,7 +4330,7 @@ paths:
           description: List of share links
           schema:
             items:
-              $ref: '#/definitions/share.Link'
+              $ref: '#/definitions/http.ShareResponse'
             type: array
         "500":
           description: Internal server error
@@ -4992,6 +4877,55 @@ paths:
           schema:
             $ref: '#/definitions/iteminfo.ExtendedFileInfo'
       summary: Directory with media metadata (public share)
+      tags:
+      - Shares
+  /public/api/media/subtitles:
+    get:
+      parameters:
+      - description: Share hash
+        in: query
+        name: hash
+        required: true
+        type: string
+      - description: Path within the share
+        in: query
+        name: path
+        type: string
+      - description: Subtitle track name
+        in: query
+        name: name
+        required: true
+        type: string
+      - description: Whether this is an embedded subtitle stream
+        in: query
+        name: embedded
+        type: boolean
+      produces:
+      - text/plain
+      responses:
+        "200":
+          description: Raw subtitle content
+          schema:
+            type: string
+        "400":
+          description: Bad request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Get subtitle content from a public share
       tags:
       - Shares
   /public/api/resources:

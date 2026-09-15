@@ -515,7 +515,7 @@ func previewHelperFunc(w http.ResponseWriter, r *http.Request, d *requestContext
 			return http.StatusForbidden, commonerrors.ErrAccessDenied
 		}
 		if !d.fileInfo.HasPreview && !strings.HasPrefix(d.fileInfo.Type, "audio") {
-			return http.StatusBadRequest, fmt.Errorf("this item does not have a preview")
+			return http.StatusBadRequest, fmt.Errorf("this item does not have a preview: %w", commonerrors.ErrInvalidRequestParams)
 		}
 		currentTarget, err := resolveAuthenticatedReadTarget(currentUser, d.fileInfo.Source, d.fileInfo.Path)
 		if err != nil {
@@ -567,7 +567,7 @@ func previewHelperFunc(w http.ResponseWriter, r *http.Request, d *requestContext
 		defer cleanup()
 		d.fileInfo = prepared
 		if !d.fileInfo.HasPreview {
-			return http.StatusBadRequest, fmt.Errorf("this item does not have a preview")
+			return http.StatusBadRequest, fmt.Errorf("this item does not have a preview: %w", commonerrors.ErrInvalidRequestParams)
 		}
 		authenticatedTarget = &currentTarget
 		snapshotPath = d.fileInfo.PreviewSourcePath

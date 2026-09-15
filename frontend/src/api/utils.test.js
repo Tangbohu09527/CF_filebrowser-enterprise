@@ -35,6 +35,33 @@ vi.mock('@/utils/constants', () => {
 import { adjustedData } from './utils.js';
 
 describe('adjustedData', () => {
+  it.each([
+    { path: "/", folderPath: "/testdata/", fileName: "IMG_2578.JPG", filePath: "/IMG_2578.JPG" },
+    { path: "/myfolder", folderPath: "/myfolder/testdata/", fileName: "IMG_2578.JPG", filePath: "/myfolder/IMG_2578.JPG" },
+    { path: "/myfolder/", folderPath: "/myfolder/testdata/", fileName: "IMG_2578.JPG", filePath: "/myfolder/IMG_2578.JPG" },
+    { path: "/myfolder/testdata", folderPath: "/myfolder/testdata/testdata/", fileName: "IMG_2578.JPG", filePath: "/myfolder/testdata/IMG_2578.JPG" },
+    { path: "/folder#hash", folderPath: "/folder#hash/testdata/", fileName: "file#.sh", filePath: "/folder#hash/file#.sh" },
+    { path: "/中文 空格", folderPath: "/中文 空格/testdata/", fileName: "中文#.txt", filePath: "/中文 空格/中文#.txt" },
+  ])('joins listing children of $path without relying on a trailing slash', ({ path, folderPath, fileName, filePath }) => {
+    const result = adjustedData({
+      type: "directory",
+      path,
+      source: "exclude",
+      pinnedItems: [fileName],
+      folders: [{ name: "testdata", type: "directory" }],
+      files: [{ name: fileName, type: "file", isShared: true }],
+    });
+
+    expect(result.path).toBe(path);
+    expect(result.items).toEqual([
+      { name: "testdata", type: "directory", path: folderPath, source: "exclude", isShared: false, pinned: false },
+      { name: fileName, type: "file", path: filePath, source: "exclude", isShared: true, pinned: true },
+    ]);
+    expect(result.folders).toEqual([]);
+    expect(result.files).toEqual([]);
+    expect(result.pinnedItems).toBeUndefined();
+  });
+
   it('should append the URL and process directory data correctly', () => {
     const input = {
       type: "directory",

@@ -53,6 +53,7 @@ type Server struct {
 	Socket                       string         `json:"socket"`                                 // socket to listen on - eg. /var/run/filebrowser.sock
 	TLSKey                       string         `json:"tlsKey"`                                 // path to TLS key
 	TLSCert                      string         `json:"tlsCert"`                                // path to TLS cert
+	AllowedClientCIDRs           []string       `json:"allowedClientCIDRs"`                     // optional canonical TCP peer CIDRs; ignores forwarding headers and rejects other peers before TLS/HTTP
 	DisablePreviews              bool           `json:"disablePreviews"`                        // disable all previews thumbnails, simple icons will be used
 	DisableResize                bool           `json:"disablePreviewResize"`                   // disable resizing of previews for faster loading over slow connections
 	DisableTypeDetectionByHeader bool           `json:"disableTypeDetectionByHeader"`           // disable type detection by header, useful if filesystem is slow.

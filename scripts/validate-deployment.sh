@@ -54,7 +54,7 @@ validate_shell_syntax() {
   local root=$1 path
   while IFS= read -r -d '' path; do
     bash -n "$path"
-  done < <(find "$root/scripts" -type f -name '*.sh' -print0)
+  done < <(find "$root/scripts" "$root/deploy/shared-host" -type f -name '*.sh' -print0)
 }
 
 if [[ "$MODE" == repository ]]; then
@@ -68,8 +68,7 @@ if [[ "$MODE" == repository ]]; then
   validate_shell_syntax "$REPO_ROOT"
   "$PYTHON_BIN" "$REPO_ROOT/scripts/lib/deployment_validation.py" --repository "$REPO_ROOT"
   "$PYTHON_BIN" "$REPO_ROOT/deploy/tests/test_deployment_assets.py"
-  bash -n "$REPO_ROOT/deploy/shared-host/validate.sh"
-  "$PYTHON_BIN" "$REPO_ROOT/deploy/tests/test_shared_host_assets.py"
+  "$PYTHON_BIN" -m unittest discover -s "$REPO_ROOT/deploy/tests" -p 'test_shared_host_*.py' -v
   bash "$REPO_ROOT/scripts/tests/failure-drills.sh"
 
   repository_docker_config=$(mktemp -d)

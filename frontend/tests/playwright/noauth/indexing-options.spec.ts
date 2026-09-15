@@ -5,9 +5,25 @@ test("navigate folder -- item should not be visible", async ({ page, checkForErr
     await expect(page).toHaveTitle("Graham's Filebrowser - Files - playwright-files");
     // excluded folder should not be visible in the file list
     await expect(page.locator('a[aria-label="excluded"]')).toHaveCount(0);
+    const rejectedRead = page.waitForResponse(response => {
+        const url = new URL(response.url());
+        return response.request().method() === "GET" &&
+            url.pathname === "/files/api/resources" &&
+            url.searchParams.get("source") === "exclude" &&
+            url.searchParams.get("path") === "/excluded";
+    });
     await page.goto("/files/exclude/excluded");
-    const msg = "500: directory or item is not viewable"
-    await checkForNotification(page, msg);
+    const response = await rejectedRead;
+    expect([...new URL(response.url()).searchParams]).toEqual([
+        ["path", "/excluded"], ["source", "exclude"],
+    ]);
+    expect(response.status()).toBe(500);
+    expect(await response.json()).toEqual({
+        status: 500, message: "authenticated read target is unavailable",
+    });
+    const msg = "500: authenticated read target is unavailable";
+    const notification = await checkForNotification(page, msg);
+    await expect(notification).toHaveText(msg);
     checkForErrors(1,1); // expect error not indexed
 });
 

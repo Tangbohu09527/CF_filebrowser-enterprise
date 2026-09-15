@@ -104,7 +104,7 @@ test("2x copy from listing to new folder", async({ page, checkForErrors }) => {
   await page.locator('.selected-count-header').waitFor({ state: 'visible' });
   await expect(page.locator('.selected-count-header')).toHaveText('1');
   await page.locator('button[aria-label="Copy file"]').click();
-  await expect(copyDestLabel(page)).toHaveText(`/myfolder/ (${GENERAL_COPY_SOURCE})`);
+  await expect(copyDestLabel(page)).toHaveText(`/myfolder (${GENERAL_COPY_SOURCE})`);
   await page.locator('div[aria-label="copy-prompt"] .listing-item[aria-label="newfolder"]').click();
   await page.locator('button[aria-label="Copy"]').click();
   await checkForNotification(page, "Files copied successfully!");

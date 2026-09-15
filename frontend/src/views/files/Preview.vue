@@ -184,16 +184,17 @@ export default {
       const getRawPreview = isRawImageMimeType(state.req.type) && globalVars.exiftoolAvailable;
       const getHeicPreview = isHeicOrHeif && ((globalVars.mediaAvailable && globalVars.enableHeicConversion) || globalVars.exiftoolAvailable);
       if (this.pdfConvertable || getRawPreview || getHeicPreview) {
+        const previewSize = this.pdfConvertable ? "xlarge" : "original";
         if (getters.isShare()) {
           const previewPath = url.removeTrailingSlash(state.req.path);
-          return resourcesApi.getPreviewURLPublic(previewPath, "original");
+          return resourcesApi.getPreviewURLPublic(previewPath, previewSize);
         }
         return (
           `${resourcesApi.getPreviewURL(
             state.req.source,
             state.req.path,
             state.req.modified,
-          )}&size=original`
+          )}&size=${previewSize}`
         );
       }
       if (getters.isShare()) {

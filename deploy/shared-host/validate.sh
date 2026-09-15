@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Machine-safe failure locations contain no command, path, configuration value
+# or stderr payload. lifecycle.py accepts only this fixed diagnostic grammar.
+DIAG_PHASE=arguments
+diagnostic() {
+  printf '[shared-host-validate-diag] phase=%s kind=%s line=%s exit=%s\n' "$DIAG_PHASE" "$3" "$1" "$2" >&2
+}
+trap 'diagnostic "$LINENO" "$?" shell' ERR
+
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 MODE=staging
 DEBUG=false
+LAN=false
+TEST_DISK=false
 ASSETS_ONLY=false
 ENV_FILE=
 EXPECTED_HOSTNAME=${DEPLOY_HOSTNAME:-}
@@ -15,6 +25,7 @@ log() {
 }
 
 die() {
+  diagnostic "${BASH_LINENO[0]}" 1 shell
   printf '[shared-host-validate] ERROR: %s\n' "$*" >&2
   exit 1
 }
@@ -25,7 +36,8 @@ usage() {
     '' \
     'Options:' \
     '  --mode staging|candidate|production' \
-    '  --debug' \
+    '  --debug | --lan' \
+    '  --test-disk (staging only; independent mount, not RAID verification)' \
     '  --hostname NAME' \
     '  --raid-check-command ABSOLUTE_PATH' \
     '  --raid-confirmed' \
@@ -44,6 +56,14 @@ while (($# > 0)); do
       (($# >= 2)) || die '--mode requires a value'
       MODE=$2
       shift 2
+      ;;
+    --lan)
+      LAN=true
+      shift
+      ;;
+    --test-disk)
+      TEST_DISK=true
+      shift
       ;;
     --debug)
       DEBUG=true
@@ -82,6 +102,8 @@ case "$MODE" in
   *) die "unsupported mode: $MODE" ;;
 esac
 
+[[ "$DEBUG" != true || "$LAN" != true ]] || die '--debug and --lan are mutually exclusive'
+[[ "$TEST_DISK" != true || "$MODE" == staging ]] || die '--test-disk is allowed only in staging'
 [[ -n "$ENV_FILE" ]] || die '--env-file is required'
 [[ -f "$ENV_FILE" && ! -L "$ENV_FILE" ]] || die "env file must be a regular non-symlink: $ENV_FILE"
 
@@ -106,6 +128,7 @@ assert_env_value() {
   [[ "$actual" == "$expected" ]] || die "$key must be $expected"
 }
 
+DIAG_PHASE=dependencies
 require_command docker
 require_command env
 require_command grep
@@ -176,6 +199,7 @@ fi
 ((compose_major > 2 || (compose_major == 2 && compose_minor >= 20))) ||
   die "Docker Compose 2.20 or newer is required; found $compose_version"
 
+DIAG_PHASE=env
 if grep -Eiq '^[[:space:]]*(export[[:space:]]+)?[A-Z0-9_]*(PASSWORD|SECRET|TOKEN|COOKIE)[A-Z0-9_]*[[:space:]]*=' "$ENV_FILE"; then
   die 'the env file must not contain password, Secret, Token, or Cookie values'
 fi
@@ -210,6 +234,38 @@ if [[ "$MODE" == candidate || "$MODE" == production ]]; then
     die "$MODE mode rejects an unapproved placeholder immutable digest"
 fi
 
+DIAG_PHASE=lan-inputs
+LAN_BIND_IP=
+LAN_PORT=
+LAN_TLS_SERVER_NAME=
+LAN_ALLOW_CIDRS=
+if [[ "$LAN" == true ]]; then
+  LAN_BIND_IP=$(env_value LAN_BIND_IP)
+  LAN_PORT=$(env_value LAN_PORT)
+  LAN_TLS_SERVER_NAME=$(env_value LAN_TLS_SERVER_NAME)
+  LAN_ALLOW_CIDRS=$(env_value LAN_ALLOW_CIDRS)
+  "$PYTHON_BIN" - "$LAN_BIND_IP" "$LAN_PORT" "$LAN_TLS_SERVER_NAME" "$LAN_ALLOW_CIDRS" <<'PYLAN'
+import ipaddress
+import re
+import sys
+try:
+    address = ipaddress.IPv4Address(sys.argv[1])
+    assert not (address.is_unspecified or address.is_loopback or address.is_multicast or address.is_link_local)
+    assert str(int(sys.argv[2])) == sys.argv[2] and 1024 <= int(sys.argv[2]) <= 65535
+    name = sys.argv[3]
+    assert len(name) <= 253 and all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label) for label in name.split("."))
+    cidrs = sys.argv[4].split(",")
+    assert cidrs and len(cidrs) == len(set(cidrs))
+    for cidr in cidrs:
+        network = ipaddress.IPv4Network(cidr, strict=True)
+        assert str(network) == cidr and network.prefixlen > 0
+        assert not (network.network_address.is_unspecified or network.is_loopback or network.is_multicast or network.is_link_local)
+except (ValueError, AssertionError):
+    print("[shared-host-validate] ERROR: LAN requires a unicast IPv4 bind, port 1024..65535, TLS DNS name, and explicit canonical source CIDRs", file=sys.stderr)
+    raise SystemExit(1)
+PYLAN
+fi
+
 compose_config() {
   env \
     -u COMPOSE_FILE \
@@ -228,13 +284,29 @@ compose_config() {
     -u CACHE_ROOT \
     -u FILES_ROOT \
     -u BACKUP_ROOT \
+    -u LAN_BIND_IP \
+    -u LAN_PORT \
+    -u LAN_TLS_SERVER_NAME \
+    -u LAN_ALLOW_CIDRS \
     docker compose --env-file "$ENV_FILE" "$@" --profile approved config --format json
 }
 
+DIAG_PHASE=compose-render
 base_json=$(compose_config -f "$SCRIPT_DIR/compose.yaml") || die 'base Compose configuration is invalid'
 debug_json=$(compose_config -f "$SCRIPT_DIR/compose.yaml" -f "$SCRIPT_DIR/compose.debug.yaml") ||
   die 'debug Compose configuration is invalid'
 
+lan_json=
+if [[ "$LAN" == true ]]; then
+  lan_json=$(compose_config -f "$SCRIPT_DIR/compose.yaml" -f "$SCRIPT_DIR/compose.lan.yaml") ||
+    die 'LAN Compose configuration is invalid'
+fi
+
+DIAG_PHASE=compose-contract
+SHARED_HOST_LAN_JSON=$lan_json \
+SHARED_HOST_LAN_BIND_IP=$LAN_BIND_IP \
+SHARED_HOST_LAN_PORT=$LAN_PORT \
+SHARED_HOST_LAN_TLS_SERVER_NAME=$LAN_TLS_SERVER_NAME \
 SHARED_HOST_BASE_JSON=$base_json \
 SHARED_HOST_DEBUG_JSON=$debug_json \
 SHARED_HOST_IMAGE=$FILEBROWSER_IMAGE \
@@ -250,14 +322,24 @@ from pathlib import Path
 import yaml
 
 
-def fail(message: str) -> None:
+def fail(message: str, *, line: int | None = None) -> None:
+    if line is None:
+        line = sys._getframe(1).f_lineno
+    # contract line is relative to this embedded Python block, not shell YAML.
+    print(f"[shared-host-validate-diag] phase=compose-contract kind=contract line={line} exit=1", file=sys.stderr)
     print(f"[shared-host-validate] ERROR: {message}", file=sys.stderr)
     raise SystemExit(1)
 
 
 def expect(condition: bool, message: str) -> None:
     if not condition:
-        fail(message)
+        fail(message, line=sys._getframe(1).f_lineno)
+
+
+def bind_refuses_host_creation(volume: dict) -> bool:
+    # Older compose-go serializes false with omitempty. Raw YAML is checked
+    # independently and must explicitly contain create_host_path: false.
+    return volume.get("type") == "bind" and volume.get("bind", {}).get("create_host_path", False) is False
 
 
 def load_yaml(path: Path) -> dict:
@@ -294,6 +376,8 @@ def reject_plaintext_secrets(value: object, location: str) -> None:
 assets = Path(sys.argv[1])
 base_raw = load_yaml(assets / "compose.yaml")
 debug_raw = load_yaml(assets / "compose.debug.yaml")
+lan_raw = load_yaml(assets / "compose.lan.yaml")
+lan_config_raw = load_yaml(assets / "config.lan.yaml.example")
 build_raw = load_yaml(assets / "compose.build.yaml")
 config_raw = load_yaml(assets / "config.yaml.example")
 
@@ -341,17 +425,22 @@ expect(
         "FILEBROWSER_JWT_TOKEN_SECRET_FILE": "/run/filebrowser-secrets/jwt_token_secret",
         "FILEBROWSER_TOTP_SECRET_FILE": "/run/filebrowser-secrets/totp_secret",
         "FILEBROWSER_BOOTSTRAP_PASSWORD_FILE": "/run/filebrowser-secrets/bootstrap_admin_password",
+        "FILEBROWSER_STORAGE_EXPECTED_FILE": "/etc/filebrowser-enterprise/storage.identity",
+        "FILEBROWSER_STORAGE_IDENTITY_FILE": "/run/filebrowser-storage-identity",
+        "FILEBROWSER_STORAGE_FILES_ROOT": "/srv/filebrowser/files",
     },
     "raw container environment is invalid",
 )
 expect(
     raw_service.get("volumes") == [
-        {"type": "bind", "source": "${CONFIG_ROOT:?CONFIG_ROOT is required}/config.yaml", "target": "/etc/filebrowser-enterprise/config.yaml", "read_only": True},
-        {"type": "bind", "source": "${CONFIG_ROOT:?CONFIG_ROOT is required}/secrets", "target": "/run/filebrowser-secrets", "read_only": True},
-        {"type": "bind", "source": "${DATA_ROOT:?DATA_ROOT is required}", "target": "/var/lib/filebrowser-enterprise"},
-        {"type": "bind", "source": "${CACHE_ROOT:?CACHE_ROOT is required}", "target": "/var/cache/filebrowser-enterprise"},
-        {"type": "bind", "source": "${FILES_ROOT:?FILES_ROOT is required}", "target": "/srv/filebrowser/files"},
-        {"type": "bind", "source": "${SOURCE_ROOT:?SOURCE_ROOT is required}/scripts/container-entrypoint.sh", "target": "/opt/filebrowser-enterprise/scripts/container-entrypoint.sh", "read_only": True},
+        {"type": "bind", "source": "${CONFIG_ROOT:?CONFIG_ROOT is required}/config.yaml", "target": "/etc/filebrowser-enterprise/config.yaml", "read_only": True, "bind": {"create_host_path": False}},
+        {"type": "bind", "source": "${CONFIG_ROOT:?CONFIG_ROOT is required}/secrets", "target": "/run/filebrowser-secrets", "read_only": True, "bind": {"create_host_path": False}},
+        {"type": "bind", "source": "${DATA_ROOT:?DATA_ROOT is required}", "target": "/var/lib/filebrowser-enterprise", "bind": {"create_host_path": False}},
+        {"type": "bind", "source": "${CACHE_ROOT:?CACHE_ROOT is required}", "target": "/var/cache/filebrowser-enterprise", "bind": {"create_host_path": False}},
+        {"type": "bind", "source": "${FILES_ROOT:?FILES_ROOT is required}", "target": "/srv/filebrowser/files", "bind": {"create_host_path": False}},
+        {"type": "bind", "source": "${CONFIG_ROOT:?CONFIG_ROOT is required}/storage.identity", "target": "/etc/filebrowser-enterprise/storage.identity", "read_only": True, "bind": {"create_host_path": False}},
+        {"type": "bind", "source": "/srv/storage/cf-filebrowser-enterprise/.storage-identity", "target": "/run/filebrowser-storage-identity", "read_only": True, "bind": {"create_host_path": False}},
+        {"type": "bind", "source": "${SOURCE_ROOT:?SOURCE_ROOT is required}/scripts/container-entrypoint.sh", "target": "/opt/filebrowser-enterprise/scripts/container-entrypoint.sh", "read_only": True, "bind": {"create_host_path": False}},
     ],
     "raw bind mounts are invalid",
 )
@@ -394,10 +483,37 @@ expect(
         "args": {
             "VERSION": "${BUILD_VERSION:?BUILD_VERSION is required}",
             "REVISION": "${BUILD_REVISION:?BUILD_REVISION is required}",
+            "FFMPEG_IMAGE": "${FFMPEG_IMAGE:-gtstef/ffmpeg:8.1-decode}",
+            "GO_IMAGE": "${GO_IMAGE:-golang:alpine}",
+            "NODE_IMAGE": "${NODE_IMAGE:-node:jod-slim}",
+            "RUNTIME_IMAGE": "${RUNTIME_IMAGE:-alpine:latest}",
         },
     },
     "build context, Dockerfile, or revision arguments are invalid",
 )
+
+lan_health = "app_health=$$(curl --fail --silent --show-error --noproxy '*' --cacert /etc/filebrowser-enterprise/tls/ca.crt --resolve \"$$FILEBROWSER_TLS_SERVER_NAME:8080:127.0.0.1\" \"https://$$FILEBROWSER_TLS_SERVER_NAME:8080/health\") && [ \"$$app_health\" = '{\"message\":\"ok\"}' ]"
+expected_lan_volume = {
+    "type": "bind",
+    "source": "${CONFIG_ROOT:?CONFIG_ROOT is required}/tls",
+    "target": "/etc/filebrowser-enterprise/tls",
+    "read_only": True,
+    "bind": {"create_host_path": False},
+}
+expect(lan_raw == {"services": {"filebrowser-enterprise": {
+    "ports": [{"target": 8080, "published": "${LAN_PORT:?LAN_PORT is required}", "host_ip": "${LAN_BIND_IP:?LAN_BIND_IP is required}", "protocol": "tcp"}],
+    "environment": {"FILEBROWSER_TLS_SERVER_NAME": "${LAN_TLS_SERVER_NAME:?LAN_TLS_SERVER_NAME is required}"},
+    "volumes": [expected_lan_volume],
+    "healthcheck": {"test": ["CMD-SHELL", lan_health]},
+}}}, "LAN override may add only the explicit native HTTPS binding, trust files and strict healthcheck")
+expected_lan_config = copy.deepcopy(config_raw)
+expected_lan_config["server"].update({
+    "tlsCert": "/etc/filebrowser-enterprise/tls/server.crt",
+    "tlsKey": "/etc/filebrowser-enterprise/tls/server.key",
+    "allowedClientCIDRs": ["127.0.0.1/32"],
+})
+expect(lan_config_raw == expected_lan_config, "LAN template must preserve base configuration and enable native TLS with a closed source allowlist")
+reject_plaintext_secrets(lan_config_raw, "LAN config template")
 
 server = config_raw.get("server", {})
 expect(server.get("listen") == "0.0.0.0" and server.get("port") == 8080, "config template listen contract is invalid")
@@ -468,6 +584,9 @@ expected_environment = {
     "FILEBROWSER_JWT_TOKEN_SECRET_FILE": "/run/filebrowser-secrets/jwt_token_secret",
     "FILEBROWSER_TOTP_SECRET_FILE": "/run/filebrowser-secrets/totp_secret",
     "FILEBROWSER_BOOTSTRAP_PASSWORD_FILE": "/run/filebrowser-secrets/bootstrap_admin_password",
+    "FILEBROWSER_STORAGE_EXPECTED_FILE": "/etc/filebrowser-enterprise/storage.identity",
+    "FILEBROWSER_STORAGE_IDENTITY_FILE": "/run/filebrowser-storage-identity",
+    "FILEBROWSER_STORAGE_FILES_ROOT": "/srv/filebrowser/files",
 }
 expect(service.get("environment") == expected_environment, "container environment must contain only reviewed file paths")
 for forbidden_key in ("depends_on", "links", "external_links", "network_mode", "extra_hosts"):
@@ -491,6 +610,8 @@ expected_mounts = [
     ("/var/lib/cf-filebrowser-enterprise", "/var/lib/filebrowser-enterprise", False),
     ("/var/cache/cf-filebrowser-enterprise", "/var/cache/filebrowser-enterprise", False),
     ("/srv/storage/cf-filebrowser-enterprise/files", "/srv/filebrowser/files", False),
+    ("/etc/cf-filebrowser-enterprise/storage.identity", "/etc/filebrowser-enterprise/storage.identity", True),
+    ("/srv/storage/cf-filebrowser-enterprise/.storage-identity", "/run/filebrowser-storage-identity", True),
     ("/opt/cf-filebrowser-enterprise/scripts/container-entrypoint.sh", "/opt/filebrowser-enterprise/scripts/container-entrypoint.sh", True),
 ]
 actual_mounts = [
@@ -498,6 +619,7 @@ actual_mounts = [
     for item in service.get("volumes", [])
 ]
 expect(actual_mounts == expected_mounts, "bind mounts must match the approved FileBrowser-owned paths")
+expect(all(bind_refuses_host_creation(item) for item in service.get("volumes", [])), "all bind mounts must refuse automatic host path creation")
 expect("/srv/storage/cf-filebrowser-enterprise/backups" not in {item[0] for item in actual_mounts}, "BACKUP_ROOT must not be mounted")
 
 debug_service = debug.get("services", {}).get(expected_service, {})
@@ -510,6 +632,27 @@ expect(port.get("target") == 8080, "debug port must target container port 8080")
 debug_without_ports = copy.deepcopy(debug)
 debug_without_ports["services"][expected_service].pop("ports", None)
 expect(debug_without_ports == base, "debug override may only add the approved loopback port")
+
+if os.environ["SHARED_HOST_LAN_JSON"]:
+    lan = json.loads(os.environ["SHARED_HOST_LAN_JSON"])
+    lan_service = lan.get("services", {}).get(expected_service, {})
+    ports = lan_service.get("ports", [])
+    expect(len(ports) == 1, "LAN must publish exactly one port")
+    port = ports[0]
+    expect(port.get("host_ip") == os.environ["SHARED_HOST_LAN_BIND_IP"], "LAN must use the explicit bind IP")
+    expect(str(port.get("published")) == os.environ["SHARED_HOST_LAN_PORT"] and port.get("target") == 8080 and port.get("protocol") == "tcp", "LAN port mapping is invalid")
+    expect(lan_service["environment"].pop("FILEBROWSER_TLS_SERVER_NAME", None) == os.environ["SHARED_HOST_LAN_TLS_SERVER_NAME"], "LAN TLS name is invalid")
+    # Compose config re-escapes dollars in JSON; unlike container inspect,
+    # its reviewed healthcheck still contains the original $$ shell escapes.
+    expect(lan_service["healthcheck"].get("test") == ["CMD-SHELL", lan_health], "LAN healthcheck must verify CA and hostname")
+    lan_service["healthcheck"] = copy.deepcopy(service["healthcheck"])
+    tls_mounts = [item for item in lan_service.get("volumes", []) if item.get("target") == "/etc/filebrowser-enterprise/tls"]
+    expect(len(tls_mounts) == 1, "LAN must contain one TLS trust mount")
+    tls_mount = tls_mounts[0]
+    expect(tls_mount.get("source") == "/etc/cf-filebrowser-enterprise/tls" and tls_mount.get("read_only") is True and bind_refuses_host_creation(tls_mount), "LAN TLS mount must be protected and pre-existing")
+    lan_service["volumes"].remove(tls_mount)
+    lan_service.pop("ports")
+    expect(lan == base, "LAN override contains unapproved changes")
 PY
 
 if [[ "$ASSETS_ONLY" == true ]]; then
@@ -517,11 +660,13 @@ if [[ "$ASSETS_ONLY" == true ]]; then
   exit 0
 fi
 
+DIAG_PHASE=host
 case "$FILEBROWSER_IMAGE" in
   *'.invalid'*|*replace-with*) die 'FILEBROWSER_IMAGE still contains a non-deployable placeholder' ;;
 esac
 
 require_command awk
+require_command cmp
 require_command findmnt
 require_command getent
 require_command hostname
@@ -547,6 +692,7 @@ fqdn_hostname=$(hostname -f 2>/dev/null || true)
 [[ "$EXPECTED_HOSTNAME" == "$actual_hostname" || "$EXPECTED_HOSTNAME" == "$fqdn_hostname" ]] ||
   die "confirmed hostname does not match this host"
 
+DIAG_PHASE=mount
 mountpoint -q /srv/storage || die '/srv/storage must be an independent mount point'
 storage_target=$(findmnt -n -o TARGET --target /srv/storage 2>/dev/null) ||
   die '/srv/storage mount details could not be determined'
@@ -582,10 +728,13 @@ elif [[ -n "$RAID_CHECK_COMMAND" ]]; then
     [[ -n "$raid_check_parent" ]] || raid_check_parent=/
   done
   "$RAID_CHECK_COMMAND" /srv/storage >/dev/null 2>&1 || die 'external RAID check failed'
+elif [[ "$TEST_DISK" == true ]]; then
+  log 'independent test-disk mount verified; RAID was not verified'
 elif [[ "$raid_confirmation" != true ]]; then
   die 'RAID status requires --raid-check-command or --raid-confirmed'
 fi
 
+DIAG_PHASE=host-identity
 if getent passwd "$FILEBROWSER_UID" >/dev/null 2>&1; then
   die "FILEBROWSER_UID maps to an existing host account"
 else
@@ -599,9 +748,35 @@ else
   [[ "$getent_status" == 2 ]] || die 'host group lookup failed'
 fi
 
-if [[ "$DEBUG" == true ]]; then
-  debug_listeners=$(ss -H -ltn 'sport = :18081' 2>/dev/null) || die 'debug port availability could not be checked'
-  [[ -z "$debug_listeners" ]] || die '127.0.0.1:18081 is already in use'
+DIAG_PHASE=port
+if [[ "$DEBUG" == true || "$LAN" == true ]]; then
+  bind_ip=127.0.0.1
+  bind_port=18081
+  if [[ "$LAN" == true ]]; then bind_ip=$LAN_BIND_IP; bind_port=$LAN_PORT; fi
+  port_listeners=$(ss -H -ltn "sport = :$bind_port" 2>/dev/null) || die 'published port availability could not be checked'
+  if [[ -n "$port_listeners" ]]; then
+    # Repeated validation accepts only our uniquely identified running service.
+    project_containers=$(docker ps --filter label=com.docker.compose.project=cf-filebrowser --filter label=com.docker.compose.service=filebrowser-enterprise --format '{{.ID}}') ||
+      die 'running project service could not be located'
+    [[ "$project_containers" =~ ^[0-9a-f]{12,64}$ ]] ||
+      die 'requested published port is occupied and no unique running project service owns it'
+    project_inspect=$(docker inspect "$project_containers") || die 'running project service could not be inspected'
+    SHARED_HOST_INSPECT=$project_inspect "$PYTHON_BIN" - "$bind_ip" "$bind_port" <<'PYPORT'
+import json
+import os
+import sys
+containers = json.loads(os.environ["SHARED_HOST_INSPECT"])
+valid = len(containers) == 1
+if valid:
+    container = containers[0]
+    labels = container.get("Config", {}).get("Labels", {})
+    ports = container.get("NetworkSettings", {}).get("Ports", {}).get("8080/tcp", [])
+    valid = container.get("State", {}).get("Running") is True and labels.get("com.docker.compose.project") == "cf-filebrowser" and labels.get("com.docker.compose.service") == "filebrowser-enterprise" and ports == [{"HostIp": sys.argv[1], "HostPort": sys.argv[2]}]
+if not valid:
+    print("[shared-host-validate] ERROR: occupied port does not match this project's exact running service binding", file=sys.stderr)
+    raise SystemExit(1)
+PYPORT
+  fi
 fi
 
 require_directory() {
@@ -649,11 +824,13 @@ assert_secret_file() {
   ' "$path" >/dev/null || die "$label must be one non-empty line with the required length"
 }
 
+DIAG_PHASE=paths
 require_directory "$SOURCE_ROOT" 'source root'
 assert_canonical_path "$SOURCE_ROOT" 'source root'
 [[ -f "$SOURCE_ROOT/scripts/container-entrypoint.sh" && ! -L "$SOURCE_ROOT/scripts/container-entrypoint.sh" && -x "$SOURCE_ROOT/scripts/container-entrypoint.sh" ]] ||
   die 'the reviewed container entrypoint is missing, unsafe, or not executable'
 assert_canonical_path "$SOURCE_ROOT/scripts/container-entrypoint.sh" 'reviewed container entrypoint'
+DIAG_PHASE=config
 require_directory "$CONFIG_ROOT" 'configuration root'
 assert_canonical_path "$CONFIG_ROOT" 'configuration root'
 assert_owner_mode "$CONFIG_ROOT" 750 0 "$FILEBROWSER_GID" 'configuration root'
@@ -672,6 +849,7 @@ env_mode=$(stat -c '%a' -- "$ENV_FILE") || die 'env file mode could not be read'
 env_uid=$(stat -c '%u' -- "$ENV_FILE") || die 'env file owner could not be read'
 [[ "$env_uid" == 0 && "$env_mode" == 600 ]] || die 'the real env file must be root-owned with mode 0600'
 
+DIAG_PHASE=data
 assert_owned_directory "$DATA_ROOT" 'data root'
 assert_canonical_path "$DATA_ROOT" 'data root'
 assert_owned_directory "$CACHE_ROOT" 'cache root'
@@ -681,9 +859,63 @@ assert_canonical_path "$FILES_ROOT" 'files root'
 require_directory "$BACKUP_ROOT" 'future backup root'
 assert_canonical_path "$BACKUP_ROOT" 'future backup root'
 
+DIAG_PHASE=storage-identity
+storage_identity=/srv/storage/cf-filebrowser-enterprise/.storage-identity
+for identity_file in "$CONFIG_ROOT/storage.identity" "$storage_identity"; do
+  [[ -f "$identity_file" && ! -L "$identity_file" ]] || die 'storage identity is missing or unsafe'
+  assert_canonical_path "$identity_file" 'storage identity'
+  assert_owner_mode "$identity_file" 440 0 "$FILEBROWSER_GID" 'storage identity'
+  [[ $(stat -c '%s' -- "$identity_file") == 65 ]] || die 'storage identity must be 64 hexadecimal bytes and one newline'
+  awk 'NR == 1 && length($0) == 64 && $0 !~ /[^0-9a-f]/ { valid = 1; next } { valid = 0 } END { if (NR != 1 || !valid) exit 1 }' "$identity_file" ||
+    die 'storage identity has an invalid format'
+done
+cmp -s -- "$CONFIG_ROOT/storage.identity" "$storage_identity" || die 'storage identities do not match'
+[[ $(stat -c '%d' -- "$FILES_ROOT") == "$(stat -c '%d' -- "$storage_identity")" ]] ||
+  die 'files and storage identity are on different devices'
+[[ $(findmnt -n -o TARGET --target "$FILES_ROOT") == /srv/storage ]] ||
+  die 'files root must be on the confirmed /srv/storage mount'
+
+DIAG_PHASE=tls
+if [[ "$LAN" == true ]]; then
+  require_command openssl
+  require_directory "$CONFIG_ROOT/tls" 'TLS directory'
+  assert_canonical_path "$CONFIG_ROOT/tls" 'TLS directory'
+  assert_owner_mode "$CONFIG_ROOT/tls" 750 0 "$FILEBROWSER_GID" 'TLS directory'
+  for tls_name in server.crt server.key ca.crt; do
+    tls_file=$CONFIG_ROOT/tls/$tls_name
+    [[ -f "$tls_file" && ! -L "$tls_file" && -s "$tls_file" ]] || die "TLS $tls_name is missing or unsafe"
+    assert_canonical_path "$tls_file" "TLS $tls_name"
+    assert_owner_mode "$tls_file" 440 0 "$FILEBROWSER_GID" "TLS $tls_name"
+  done
+  openssl verify -x509_strict -purpose sslserver -CAfile "$CONFIG_ROOT/tls/ca.crt" -verify_hostname "$LAN_TLS_SERVER_NAME" "$CONFIG_ROOT/tls/server.crt" >/dev/null 2>&1 ||
+    die 'TLS certificate chain or DNS name is invalid'
+  cert_public=$(openssl x509 -in "$CONFIG_ROOT/tls/server.crt" -pubkey -noout 2>/dev/null) ||
+    die 'TLS certificate public key could not be read'
+  key_public=$(openssl pkey -in "$CONFIG_ROOT/tls/server.key" -pubout -passin pass: 2>/dev/null) ||
+    die 'TLS key must be valid and available without interactive passphrase'
+  [[ "$cert_public" == "$key_public" ]] || die 'TLS certificate and key do not match'
+fi
+DIAG_PHASE=runtime-config
+"$PYTHON_BIN" - "$CONFIG_ROOT/config.yaml" "$LAN" "$LAN_ALLOW_CIDRS" <<'PYCONFIG'
+import sys
+import yaml
+with open(sys.argv[1], encoding="utf-8") as config_file:
+    server = yaml.safe_load(config_file).get("server", {})
+if sys.argv[2] == "true":
+    expected = ["127.0.0.1/32"] + sys.argv[3].split(",")
+    valid = server.get("tlsCert") == "/etc/filebrowser-enterprise/tls/server.crt" and server.get("tlsKey") == "/etc/filebrowser-enterprise/tls/server.key" and server.get("allowedClientCIDRs") == expected
+else:
+    valid = not server.get("tlsCert") and not server.get("tlsKey") and not server.get("allowedClientCIDRs")
+if not valid:
+    print("[shared-host-validate] ERROR: native TLS/source allowlist configuration does not match the selected exposure", file=sys.stderr)
+    raise SystemExit(1)
+PYCONFIG
+
+DIAG_PHASE=secrets
 assert_secret_file "$CONFIG_ROOT/secrets/jwt_token_secret" 32 'JWT token Secret'
 assert_secret_file "$CONFIG_ROOT/secrets/totp_secret" 32 'TOTP Secret'
 
+DIAG_PHASE=bootstrap
 database_file=$DATA_ROOT/database.db
 bootstrap_file=$CONFIG_ROOT/secrets/bootstrap_admin_password
 [[ ! -L "$database_file" ]] || die 'database.db must not be a symbolic link'
