@@ -459,6 +459,26 @@ operation, not performed by restore. Verify file hashes, administrator login,
 ordinary-user permissions, active and revoked Tokens/Shares, audit and real
 read/write after recovery. Merely listing archive members is not recovery proof.
 
+The disposable VM input is pinned to Debian 13 genericcloud amd64
+[`20260831-2587`](https://cloud.debian.org/images/cloud/trixie/20260831-2587/),
+using `debian-13-genericcloud-amd64-20260831-2587.qcow2` and the SHA512 recorded
+in `scripts/tests/shared_host_vm.py` from the directory's official `SHA512SUMS`.
+CI downloads and checks that manifest and the complete image before product
+build or VM setup. It then rehashes and uses the same pure base file through
+`--base-dir`; it does not download `latest` again. A partial file is never a
+usable base. Neither base images nor VM disks are published as CI artifacts.
+
+For acquisition alone, dispatch this workflow with `scope=image`: it uses the
+same downloader without a product build or VM. The `shared-host-debian-input`
+artifact records public source/redirect paths, request/file/read/write phase,
+HTTP or TLS/errno classification, bytes and disk availability. Certificate,
+manifest and checksum failures stop immediately; no TLS bypass or automatic
+retry is used. The fixed input preserves the image used by the earlier accepted
+VM checks. During the September 15 investigation, mutable `latest` had changed
+to `20260914-2601`; its image request failed TLS verification (code 10) while
+its manifest succeeded. This input pin does not establish missing exception
+details from the two earlier runs, and acquisition success is not restore proof.
+
 For a scoped CI recovery acceptance, dispatch the existing `shared-host-delivery`
 workflow with `scope=restore` on the fixed branch commit. It uses the formal
 installation, `backup.sh create/verify/restore` and `manage.sh validate/start`

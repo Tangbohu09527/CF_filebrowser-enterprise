@@ -33,7 +33,7 @@ class DebianAcquisitionTests(unittest.TestCase):
 
     def test_http_error_keeps_status_stage_and_no_private_reason(self):
         error = harness.urllib.error.HTTPError(harness.CLOUD + harness.CLOUD_IMAGE, 404, 'private-proxy-credential', {}, None)
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(harness.urllib.request,'urlopen',side_effect=error) as request:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(harness.urllib.request.OpenerDirector,'open',side_effect=error) as request:
             records=[]
             with self.assertRaises(harness.VerificationError) as caught:
                 harness.download(harness.CLOUD+harness.CLOUD_IMAGE,Path(tmp)/'image',records)
@@ -55,7 +55,7 @@ class DebianAcquisitionTests(unittest.TestCase):
                 dest=Path(tmp)/'image'; records=[]
                 if phase=='create-file': dest.write_bytes(b'existing')
                 response=Interrupted() if phase=='read' else self.response(b'payload')
-                with mock.patch.object(harness.urllib.request,'urlopen',return_value=response):
+                with mock.patch.object(harness.urllib.request.OpenerDirector,'open',return_value=response):
                     if phase=='write':
                         writer=mock.MagicMock();writer.__enter__.return_value=writer
                         writer.write.side_effect=OSError(errno.ENOSPC,'private-disk-error')
@@ -72,7 +72,7 @@ class DebianAcquisitionTests(unittest.TestCase):
     def test_url_error_preserves_numeric_underlying_errno(self):
         import errno
         error=harness.urllib.error.URLError(OSError(errno.ECONNREFUSED,'private-auth'))
-        with tempfile.TemporaryDirectory() as tmp,mock.patch.object(harness.urllib.request,'urlopen',side_effect=error):
+        with tempfile.TemporaryDirectory() as tmp,mock.patch.object(harness.urllib.request.OpenerDirector,'open',side_effect=error):
             records=[]
             with self.assertRaises(harness.VerificationError):harness.download(harness.CLOUD+'SHA512SUMS',Path(tmp)/'sum',records)
             self.assertEqual(records[0]['reason_errno'],errno.ECONNREFUSED)
@@ -82,7 +82,7 @@ class DebianAcquisitionTests(unittest.TestCase):
         content=b'pure synthetic base'; digest=hashlib.sha512(content).hexdigest()
         manifest=(digest+'  '+(harness.CLOUD_IMAGE if listed else 'other.qcow2')+'\n').encode()
         evidence={}
-        with mock.patch.object(harness.urllib.request,'urlopen',side_effect=[self.response(manifest),self.response(b'corrupt' if corrupt else content)]) as request:
+        with mock.patch.object(harness,'CLOUD_SHA512',digest), mock.patch.object(harness.urllib.request.OpenerDirector,'open',side_effect=[self.response(manifest),self.response(b'corrupt' if corrupt else content)]) as request:
             try:return harness.cloud_image(directory,evidence),evidence
             finally:self.request_count=request.call_count
 
@@ -100,11 +100,44 @@ class DebianAcquisitionTests(unittest.TestCase):
             directory=Path(tmp);(path,record),evidence=self.acquire(directory)
             self.assertTrue(evidence['image_acquisition']['verified'])
             self.assertFalse((directory/(harness.CLOUD_IMAGE+'.partial')).exists())
-            with mock.patch.object(harness.urllib.request,'urlopen') as network:
+            with mock.patch.object(harness,'CLOUD_SHA512',record['sha512']), mock.patch.object(harness.urllib.request.OpenerDirector,'open') as network:
                 self.assertEqual(harness.prepared_cloud_image(directory),(path,record))
                 path.write_bytes(b'tampered')
                 with self.assertRaises(harness.VerificationError):harness.prepared_cloud_image(directory)
                 network.assert_not_called()
+
+    def test_fixed_manifest_mismatch_refuses_image_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory=Path(tmp)
+            manifest=('0'*128+'  '+harness.CLOUD_IMAGE+'\n').encode()
+            with mock.patch.object(harness.urllib.request.OpenerDirector,'open',return_value=self.response(manifest)) as request:
+                with self.assertRaisesRegex(harness.VerificationError,'pinned input SHA512'):
+                    harness.cloud_image(directory,{})
+                self.assertEqual(request.call_count,1)
+                self.assertFalse((directory/harness.CLOUD_IMAGE).exists())
+
+    def test_official_redirect_evidence_and_https_guard(self):
+        record={};handler=harness.DebianRedirects(record)
+        request=harness.urllib.request.Request(harness.CLOUD+harness.CLOUD_IMAGE)
+        target='https://laotzu.ftp.acc.umu.se/images/cloud/test.qcow2'
+        redirected=handler.redirect_request(request,None,302,'',{},target)
+        self.assertEqual(redirected.full_url,target)
+        self.assertEqual(record['redirects'],[{'http_status':302,'host':'laotzu.ftp.acc.umu.se','path':'/images/cloud/test.qcow2'}])
+        for target in ('http://example.test/image','https://user:password@example.test/image','https://example.test/image?secret=value'):
+            with self.subTest(target=target),self.assertRaises(harness.VerificationError):
+                handler.redirect_request(request,None,302,'',{},target)
+        self.assertEqual(len(record['redirects']),1)
+
+    def test_expired_certificate_remains_a_failure_without_retry(self):
+        reason=harness.ssl.SSLCertVerificationError(1,'private TLS details')
+        reason.verify_code=10
+        with tempfile.TemporaryDirectory() as tmp,mock.patch.object(harness.urllib.request.OpenerDirector,'open',side_effect=harness.urllib.error.URLError(reason)) as request:
+            records=[]
+            with self.assertRaises(harness.VerificationError):harness.download(harness.CLOUD+harness.CLOUD_IMAGE,Path(tmp)/'image.partial',records)
+            self.assertEqual(request.call_count,1)
+            self.assertEqual(records[0]['tls_verify_code'],10)
+            self.assertEqual(records[0]['received_bytes'],0)
+            self.assertNotIn('private TLS',json.dumps(records))
 
     def test_preflight_precedes_build_and_actual_vm_reuses_its_input(self):
         import inspect

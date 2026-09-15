@@ -3,7 +3,7 @@
 
 Never run this on a deployment host. Only the dedicated evidence directory is
 publishable: VM disks, SSH/TLS private keys, API state and backups are private.
-The caller builds the product first with deploy/shared-host/image.sh build.
+CI verifies the pure Debian input before building the product or creating VMs.
 """
 from __future__ import annotations
 
@@ -28,8 +28,11 @@ import urllib.parse
 
 ROOT = Path(__file__).resolve().parents[2]
 PRODUCT = "https://github.com/Tangbohu09527/CF_filebrowser-enterprise.git"
-CLOUD = "https://cloud.debian.org/images/cloud/trixie/latest/"
-CLOUD_IMAGE = "debian-13-genericcloud-amd64.qcow2"
+CLOUD_VERSION = "20260831-2587"
+CLOUD = "https://cloud.debian.org/images/cloud/trixie/" + CLOUD_VERSION + "/"
+CLOUD_IMAGE = "debian-13-genericcloud-amd64-" + CLOUD_VERSION + ".qcow2"
+# Expected value copied from this fixed official directory's SHA512SUMS.
+CLOUD_SHA512 = "8ea9faae810043a0b35b0149f05014f26705c2339ffb11ead308f33e844a87cc3ef46ec81d5262b38817b6a88af404874d48a5857ebe072ef6a31dfb6e371f50"
 VM_USER = "cf-manager"
 SERVER_IP = "192.0.2.11"
 CLIENT_IP = "192.0.2.12"
@@ -68,6 +71,24 @@ def port():
         return listener.getsockname()[1]
 
 
+class DebianRedirects(urllib.request.HTTPRedirectHandler):
+    max_redirections = 5
+
+    def __init__(self, record):
+        self.record = record
+
+    def redirect_request(self, request, fp, code, message, headers, newurl):
+        target = urllib.parse.urlsplit(newurl)
+        if target.scheme != 'https' or not target.hostname or target.username or target.password or target.query:
+            raise VerificationError('official Debian redirect must remain public HTTPS')
+        redirects = self.record.setdefault('redirects', [])
+        if len(redirects) >= self.max_redirections:
+            raise VerificationError('official Debian redirect limit exceeded')
+        redirects.append({'http_status': code, 'host': target.hostname, 'path': target.path})
+        # Follow only the official response; default HTTPS certificate validation remains enabled.
+        return super().redirect_request(request, fp, code, message, headers, newurl)
+
+
 def download(url, destination, observations=None):
     """One bounded attempt; retain only public source and numeric failure facts."""
     parsed = urllib.parse.urlsplit(url)
@@ -82,7 +103,7 @@ def download(url, destination, observations=None):
     started = time.monotonic()
     request = urllib.request.Request(url, headers={"User-Agent": "CF-isolated-delivery-verification/1"})
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with urllib.request.build_opener(DebianRedirects(record)).open(request, timeout=120) as response:
             record['http_status'] = response.status
             record['stage'] = 'create-file'
             with destination.open('xb') as output:
@@ -121,6 +142,8 @@ def manifest_digest(manifest):
                and re.fullmatch(r'[0-9a-f]{128}', fields[0])]
     if len(matches) != 1:
         raise VerificationError('official Debian manifest does not uniquely identify the requested cloud image')
+    if matches[0] != CLOUD_SHA512:
+        raise VerificationError('official Debian manifest differs from the pinned input SHA512')
     return matches[0]
 
 
@@ -144,7 +167,7 @@ def cloud_image(work, evidence=None):
     if actual != expected:
         raise VerificationError('Debian image does not match the official SHA512 manifest')
     partial.rename(path)
-    record = {'url': CLOUD + CLOUD_IMAGE, 'sha512': actual, 'checksum_url': CLOUD + 'SHA512SUMS'}
+    record = {'version': CLOUD_VERSION, 'url': CLOUD + CLOUD_IMAGE, 'sha512': actual, 'checksum_url': CLOUD + 'SHA512SUMS'}
     private_write(work / 'verified.json', json.dumps(record, sort_keys=True))
     acquisition['verified'] = True
     return path, record
@@ -154,7 +177,7 @@ def prepared_cloud_image(directory):
     # Rehash the same pure base image; do not fetch latest a second time.
     record = json.loads((directory / 'verified.json').read_text())
     expected = manifest_digest(directory / 'SHA512SUMS')
-    if record != {'url': CLOUD + CLOUD_IMAGE, 'sha512': expected, 'checksum_url': CLOUD + 'SHA512SUMS'}:
+    if record != {'version': CLOUD_VERSION, 'url': CLOUD + CLOUD_IMAGE, 'sha512': expected, 'checksum_url': CLOUD + 'SHA512SUMS'}:
         raise VerificationError('prepared Debian input source or manifest differs')
     path = directory / CLOUD_IMAGE
     if path.is_symlink() or not path.is_file():
@@ -2514,7 +2537,7 @@ def main():
         parser.error("evidence must be a new directory outside the source checkout")
     args.evidence.mkdir(mode=0o700, parents=True)
     work = Path(tempfile.mkdtemp(prefix="cf-private-vm-", dir=os.environ.get("RUNNER_TEMP")))
-    evidence = {"schema": "cf-shared-host-vm/v1", "source_sha": args.source_sha, "result": "failed", "checks": [], "accelerator": args.accelerator}
+    evidence = {"schema": "cf-shared-host-vm/v1", "source_sha": args.source_sha, "result": "failed", "checks": [], "accelerator": args.accelerator, "scope": args.scope}
     try:
         if args.scope == "image":
             record_stage(args, evidence, 'official-debian-image-download-and-sha512')
