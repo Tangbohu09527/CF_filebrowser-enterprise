@@ -1,0 +1,34 @@
+name: FileBridge Windows config
+
+on:
+  push:
+    branches: ['feat/filebridge-hermes-crud']
+    paths:
+      - 'integrations/hermes-filebridge/windows/**'
+      - 'integrations/hermes-filebridge/tests/Test-WindowsConfigReplace.ps1'
+      - '.github/workflows/filebridge-windows-config.yaml'
+  pull_request:
+    paths:
+      - 'integrations/hermes-filebridge/windows/**'
+      - 'integrations/hermes-filebridge/tests/Test-WindowsConfigReplace.ps1'
+      - '.github/workflows/filebridge-windows-config.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native Windows PowerShell (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Native replacement regression (dummy files only)
+        shell: powershell
+        run: ./integrations/hermes-filebridge/tests/Test-WindowsConfigReplace.ps1
