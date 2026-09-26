@@ -32,3 +32,6 @@ jobs:
       - name: Native replacement regression (dummy files only)
         shell: powershell
         run: ./integrations/hermes-filebridge/tests/Test-WindowsConfigReplace.ps1
+      - name: Side-by-side stage ACL and no-overwrite selftest (dummy files only)
+        shell: powershell
+        run: ./integrations/hermes-filebridge/windows/Stage-CreateClient.ps1 -Mode SelfTest
