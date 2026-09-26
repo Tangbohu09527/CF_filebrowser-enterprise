@@ -113,7 +113,20 @@ func filebridgeTransport(options TrustOptions) (http.RoundTripper, error) {
 func sameClientPath(a, b string) bool {
 	a, b = filepath.Clean(a), filepath.Clean(b)
 	if runtime.GOOS == "windows" {
-		return strings.EqualFold(a, b)
+		// EvalSymlinks also expands legitimate 8.3 aliases on Windows. Compare
+		// file identity, but independently reject every actual link component.
+		for current := a; ; current = filepath.Dir(current) {
+			info, err := os.Lstat(current)
+			if err != nil || info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+				return false
+			}
+			if filepath.Dir(current) == current {
+				break
+			}
+		}
+		left, leftErr := os.Lstat(a)
+		right, rightErr := os.Stat(b)
+		return leftErr == nil && rightErr == nil && os.SameFile(left, right)
 	}
 	return a == b
 }

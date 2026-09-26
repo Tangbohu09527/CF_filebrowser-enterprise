@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"io"
 	"log"
@@ -76,7 +77,7 @@ func saveTrust(t *testing.T, data []byte) TrustOptions {
 
 func TestTrustStrictBundle(t *testing.T) {
 	ca, _ := trustFixture(t, false)
-	for _, kind := range []string{"valid", "bad-hash", "missing-hash", "missing-file", "garbage", "private-block", "non-ca", "oversized", "symlink"} {
+	for _, kind := range []string{"valid", "bad-hash", "missing-hash", "missing-file", "garbage", "private-block", "non-ca", "oversized", "symlink", "parent-symlink"} {
 		t.Run(kind, func(t *testing.T) {
 			data := ca
 			if kind == "garbage" {
@@ -106,6 +107,12 @@ func TestTrustStrictBundle(t *testing.T) {
 					t.Skip("OS does not permit test symlink")
 				}
 				opts.CAFile = name
+			case "parent-symlink":
+				name := filepath.Join(t.TempDir(), "parent-link")
+				if err := os.Symlink(filepath.Dir(opts.CAFile), name); err != nil {
+					t.Skip("OS does not permit test symlink")
+				}
+				opts.CAFile = filepath.Join(name, filepath.Base(opts.CAFile))
 			}
 			pool, err := trustRoots(opts)
 			if kind == "valid" {
@@ -171,5 +178,40 @@ func TestTrustDoesNotModifyGlobalTransportOrProxy(t *testing.T) {
 	other, err := filebridgeTransport(TrustOptions{})
 	if err != nil || other.(*http.Transport).Proxy == nil {
 		t.Fatal("default proxy compatibility changed")
+	}
+}
+
+func TestTrustConfigRelativePathAndFailClosedReload(t *testing.T) {
+	ca, _ := trustFixture(t, false)
+	opts := saveTrust(t, ca)
+	directory := filepath.Dir(opts.CAFile)
+	filename := filepath.Join(directory, "config.json")
+	value := map[string]any{
+		"base_url":        "https://files.example.invalid/",
+		"allowed_sources": map[string]any{"files": map[string]any{"read_roots": []string{"/"}}},
+		"ca_file":         "ca.pem", "ca_sha256": opts.CASHA256, "direct_connection": true,
+	}
+	raw, _ := json.Marshal(value)
+	if err := os.WriteFile(filename, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := LoadConfig(filename, false)
+	if err != nil || config.CAFile != opts.CAFile || !config.DirectConnection {
+		t.Fatalf("relative CA config failed: %v", err)
+	}
+	if err := os.WriteFile(opts.CAFile, []byte("replaced"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	client := NewClient(config, "synthetic-token")
+	if client.initErr == nil {
+		t.Fatal("CA changed after config parsing but was accepted")
+	}
+	value["insecure_skip_verify"] = true
+	raw, _ = json.Marshal(value)
+	if err := os.WriteFile(filename, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(filename, false); err == nil {
+		t.Fatal("unknown insecure option accepted")
 	}
 }
