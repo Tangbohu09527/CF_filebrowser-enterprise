@@ -31,7 +31,9 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
-          python-version: '3.11.16'
+          # Official Windows binary; handles mkdir(0700), unlike Python 3.11.9.
+          # Production Hermes Python is not installed or upgraded by this workflow.
+          python-version: '3.12.10'
       - name: Native replacement regression (dummy files only)
         shell: powershell
         run: ./integrations/hermes-filebridge/tests/Test-WindowsConfigReplace.ps1
