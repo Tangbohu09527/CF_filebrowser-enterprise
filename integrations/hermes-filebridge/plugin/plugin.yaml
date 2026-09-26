@@ -1,0 +1,6 @@
+name: cf-filebridge
+version: "0.1.0"
+kind: standalone
+description: Read-only adapter for the independently configured FileBrowser client
+provides_tools:
+  - filebrowser_files

@@ -37,15 +37,22 @@ jobs:
         with:
           go-version-file: tools/filebrowser-agentctl/go.mod
           cache: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
       - name: Test and vet independent client
         working-directory: tools/filebrowser-agentctl
         shell: bash
         run: |
           set -euo pipefail
           go version
-          test -z "$(gofmt -l cmd internal)"
+          unformatted=$(gofmt -l cmd internal)
+          printf '%s\n' "$unformatted"
+          test -z "$unformatted"
           go test -count=1 ./...
           go vet ./...
+      - name: Test read-only Hermes adapter
+        run: python -B -m unittest discover -s integrations/hermes-filebridge/tests -v
       - name: Build client and retain fixed-source inventory
         shell: bash
         run: |
@@ -53,7 +60,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/filebridge-evidence"
           git rev-parse HEAD > "$RUNNER_TEMP/filebridge-evidence/source-sha.txt"
           go version > "$RUNNER_TEMP/filebridge-evidence/go-version.txt"
-          git archive --format=tar.gz --output="$RUNNER_TEMP/filebridge-evidence/filebridge-source.tar.gz" HEAD tools/filebrowser-agentctl
+          git archive --format=tar.gz --output="$RUNNER_TEMP/filebridge-evidence/filebridge-source.tar.gz" HEAD tools/filebrowser-agentctl integrations/hermes-filebridge
           cd tools/filebrowser-agentctl
           output="$RUNNER_TEMP/filebridge-evidence/filebrowser-agentctl"
           if [ "$RUNNER_OS" = Windows ]; then output="$output.exe"; fi

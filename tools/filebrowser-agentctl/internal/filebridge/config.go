@@ -33,6 +33,7 @@ const (
 )
 
 type Config struct {
+	TrustOptions
 	BaseURL              string                  `json:"base_url"`
 	TokenFile            string                  `json:"token_file,omitempty"`
 	AuditLog             string                  `json:"audit_log,omitempty"`
@@ -160,6 +161,10 @@ func (c *Config) applyDefaultsAndValidate(allowLocalhostHTTP bool) error {
 	base, err := validateBaseURL(c.BaseURL, allowLocalhostHTTP)
 	if err != nil {
 		return err
+	}
+	c.CAFile = resolveConfigRelative(c.configDir, c.CAFile)
+	if _, err := trustRoots(c.TrustOptions); err != nil {
+		return bridgeError("invalid_trust", "CA file and SHA-256 must identify a valid certificate bundle")
 	}
 	c.parsedBaseURL = base
 	c.requestTimeout = time.Duration(c.TimeoutSeconds) * time.Second
