@@ -91,13 +91,21 @@ function Set-CfConfigBytesExact {
     $moved = $false
     try {
         # Copy the original security onto a SAME-DIRECTORY staging file. Do not construct
-        # a new DACL or merge inherited grants with File.Replace. Only owner/group are aligned.
+        # a new grant policy or merge inherited grants with File.Replace. Reuse exact source security.
         [IO.File]::Copy($Destination, $candidate, $false)
         $acl = Get-Acl -LiteralPath $candidate -ErrorAction Stop
         $acl.SetOwner($originalAcl.GetOwner([Security.Principal.SecurityIdentifier]))
         $acl.SetGroup($originalAcl.GetGroup([Security.Principal.SecurityIdentifier]))
         [IO.File]::SetAccessControl($candidate, $acl)
-        if ((Get-CfConfigSddl $candidate) -cne $OriginalSddl) { throw 'CF_CONFIG_CANDIDATE_SECURITY_MISMATCH' }
+        if ((Get-CfConfigSddl $candidate) -cne $OriginalSddl) {
+            # CopyFile can re-inherit security, especially for a protected original.
+            # Apply the ORIGINAL descriptor to the staging file only; require exact readback.
+            $exact = [Security.AccessControl.FileSecurity]::new()
+            $parts = [Security.AccessControl.AccessControlSections]::Access -bor [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group
+            $exact.SetSecurityDescriptorSddlForm($OriginalSddl, $parts)
+            [IO.File]::SetAccessControl($candidate, $exact)
+            if ((Get-CfConfigSddl $candidate) -cne $OriginalSddl) { throw 'CF_CONFIG_CANDIDATE_SECURITY_MISMATCH' }
+        }
         Assert-CfConfigPath $candidate
         $identityCandidate = [CfFileBridge.ConfigNativeV1]::Identity($candidate)
         if ($identityCandidate.Split(':')[0] -cne $identityBefore.Split(':')[0]) { throw 'CF_CONFIG_DIFFERENT_VOLUME' }
