@@ -117,5 +117,73 @@ class PluginTests(unittest.TestCase):
                 run.assert_not_called()
 
 
+
+
+class CreateContext(Context):
+    def __init__(self, settings=None):
+        super().__init__(settings)
+        self.registrations = []
+
+    def register_tool(self, **kwargs):
+        self.registrations.append(kwargs)
+
+
+class CreatePluginTests(unittest.TestCase):
+    fixture = PluginTests.fixture
+
+    def create_fixture(self):
+        ctx = self.fixture()
+        ctx.settings.update(create_enabled=True, create_config_path=ctx.settings["config_path"])
+        return ctx
+
+    def test_optional_registration_only(self):
+        for settings, count in (({}, 1), ({"allow_writes": True}, 1),
+                                ({"create_enabled": "true", "create_config_path": "x"}, 1),
+                                ({"create_enabled": True}, 1),
+                                ({"create_enabled": True, "create_config_path": "x"}, 2)):
+            ctx = CreateContext(settings)
+            plugin.register(ctx)
+            self.assertEqual(len(ctx.registrations), count)
+            self.assertEqual(ctx.registrations[0]["name"], "filebrowser_files")
+            if count == 2:
+                self.assertEqual(ctx.registrations[1]["name"], "filebrowser_create_text")
+                self.assertEqual(ctx.registrations[1]["schema"]["parameters"]["properties"]["command"]["enum"], ["plan", "apply", "status"])
+
+    def test_no_self_approval_or_unknown_args(self):
+        for command, data in (("approve-create", {}), ("approve", {}), ("shell", {}),
+                              ("apply", {"approved": True}), ("apply", {"content": "override"}),
+                              ("plan", {"local_file": "secret"}), ("plan", {"url": "secret"}),
+                              ("plan", {"apply": True})):
+            with self.subTest(command=command, data=data), patch.object(plugin.subprocess, "run") as call:
+                reply = plugin.handler_for(self.create_fixture(), creation=True)({"command": command, "input": data})
+                self.assertFalse(json.loads(reply)["ok"])
+                call.assert_not_called()
+
+    def test_apply_uses_only_approved_command_and_second_config(self):
+        ctx = self.create_fixture()
+        for command, actual in (("plan", "create-text"), ("apply", "create-approved"), ("status", "create-status")):
+            result = subprocess.CompletedProcess([], 0, json.dumps({"schema_version": "filebrowser-agentctl/v1", "command": actual, "ok": True}).encode(), b"secret")
+            with patch.object(plugin.subprocess, "run", return_value=result) as call:
+                response = plugin.handler_for(ctx, creation=True)({"command": command, "input": {"operation_id": "op-proposed-01"}})
+                self.assertTrue(json.loads(response)["ok"])
+                self.assertEqual(call.call_args.args[0][-1], actual)
+                self.assertEqual("--apply" in call.call_args.args[0], command == "apply")
+                self.assertEqual(call.call_args.args[0][2], ctx.settings["create_config_path"])
+                self.assertNotIn("secret", response)
+
+    def test_apply_timeout_is_unknown_and_no_retry(self):
+        with patch.object(plugin.subprocess, "run", side_effect=subprocess.TimeoutExpired([], 180)) as call:
+            response = plugin.handler_for(self.create_fixture(), creation=True)({"command": "apply", "input": {}})
+            self.assertEqual(json.loads(response)["error"]["code"], "create_outcome_unknown_check_status")
+            self.assertEqual(call.call_count, 1)
+
+    def test_disable_after_registration_is_checked(self):
+        ctx = self.create_fixture()
+        handler = plugin.handler_for(ctx, creation=True)
+        ctx.settings["create_enabled"] = False
+        with patch.object(plugin.subprocess, "run") as call:
+            self.assertEqual(json.loads(handler({"command": "plan", "input": {}}))["error"]["code"], "create_disabled")
+            call.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,18 +5,20 @@ import "fmt"
 const SchemaVersion = "filebrowser-agentctl/v1"
 
 type Input struct {
-	SchemaVersion  string `json:"schema_version,omitempty"`
-	RequestID      string `json:"request_id,omitempty"`
-	OperationID    string `json:"operation_id,omitempty"`
-	Source         string `json:"source,omitempty"`
-	Path           string `json:"path,omitempty"`
-	Query          string `json:"query,omitempty"`
-	Limit          int    `json:"limit,omitempty"`
-	Algorithm      string `json:"algorithm,omitempty"`
-	OutputFile     string `json:"output_file,omitempty"`
-	LocalFile      string `json:"local_file,omitempty"`
-	ExpectedBytes  *int64 `json:"expected_bytes,omitempty"`
-	ExpectedSHA256 string `json:"expected_sha256,omitempty"`
+	Content        *string `json:"content,omitempty"`
+	PlanSHA256     string  `json:"plan_sha256,omitempty"`
+	SchemaVersion  string  `json:"schema_version,omitempty"`
+	RequestID      string  `json:"request_id,omitempty"`
+	OperationID    string  `json:"operation_id,omitempty"`
+	Source         string  `json:"source,omitempty"`
+	Path           string  `json:"path,omitempty"`
+	Query          string  `json:"query,omitempty"`
+	Limit          int     `json:"limit,omitempty"`
+	Algorithm      string  `json:"algorithm,omitempty"`
+	OutputFile     string  `json:"output_file,omitempty"`
+	LocalFile      string  `json:"local_file,omitempty"`
+	ExpectedBytes  *int64  `json:"expected_bytes,omitempty"`
+	ExpectedSHA256 string  `json:"expected_sha256,omitempty"`
 }
 
 type Response struct {

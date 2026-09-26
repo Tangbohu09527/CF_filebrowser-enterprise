@@ -33,6 +33,7 @@ const (
 )
 
 type Config struct {
+	CreateText *CreateTextPolicy `json:"create_text,omitempty"`
 	TrustOptions
 	BaseURL              string                  `json:"base_url"`
 	TokenFile            string                  `json:"token_file,omitempty"`
@@ -178,7 +179,7 @@ func (c *Config) applyDefaultsAndValidate(allowLocalhostHTTP bool) error {
 	for index, root := range c.LocalWriteRoots {
 		c.LocalWriteRoots[index] = resolveConfigRelative(c.configDir, root)
 	}
-	return nil
+	return c.initializeCreatePolicy()
 }
 
 func validateBaseURL(raw string, allowLocalhostHTTP bool) (*url.URL, error) {
