@@ -16,6 +16,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import ssl
 import subprocess
@@ -82,14 +83,20 @@ class QuietServer(ThreadingHTTPServer):
 
 
 def child_check(source, worker):
+    # Python 3.11 Windows obtains its OS version through `cmd /c ver`.
+    # Cache this real stdlib OS fact before guarding Hermes execution. No
+    # Hermes code is imported or replaced during this test bootstrap.
+    platform.system()
     # Installed before upstream imports. Profiles/config writes stay in the
     # freshly created sandbox; imports can read only explicit source/runtime
     # roots. Any unexpected attempted access fails the complete test even when
     # an optional upstream import catches the immediate exception.
     sandbox = Path(os.environ["HERMES_HOME"]).parent
     allowed_roots = (sandbox, source, HERE, Path(sys.prefix), Path(sys.base_prefix))
-    read_only_os_metadata = {"/proc/1/cgroup", "/proc/self/mountinfo", "/etc/os-release", "/usr/lib/os-release"}
+    read_only_os_metadata = {"/proc/1/cgroup", "/proc/self/mountinfo", "/proc/stat", "/proc/version",
+                             "/etc/os-release", "/usr/lib/os-release"}
     violations = []
+    system_reads = set()
 
     def within(path, roots):
         candidate = Path(os.path.abspath(os.fsdecode(path)))
@@ -102,10 +109,11 @@ def child_check(source, worker):
             write = bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
             roots = (sandbox,) if write else allowed_roots
             denied = not within(path, roots) and not (not write and Path(os.path.abspath(path)) == worker)
-            # Pinned upstream config probes these fixed OS/container metadata
-            # files on both platforms. No user profile/config path is allowed.
+            # Pinned upstream config and psutil's import-time CPU probes read
+            # these exact OS metadata paths. No user/config root is allowed.
             if not write and os.fsdecode(path) in read_only_os_metadata:
                 denied = False
+                system_reads.add(os.fsdecode(path))
             if os.path.normcase(os.fsdecode(path)) == os.path.normcase(os.devnull):
                 denied = False
         elif event in ("socket.bind", "socket.connect"):
@@ -131,8 +139,8 @@ def child_check(source, worker):
         elif event in ("os.system", "os.exec", "os.posix_spawn"):
             denied = True
         if denied:
-            violations.append(event)
             detail = " (" + os.fsdecode(args[0]) + ")" if event == "open" else ""
+            violations.append(event + detail)
             raise RuntimeError("isolated middleware test blocked unexpected " + event + detail)
 
     sys.addaudithook(guard)
@@ -440,7 +448,8 @@ def child_check(source, worker):
                           "real_plugin_context": True, "real_tool_execution_middleware": True,
                           "real_https_native_worker": True, "synthetic_host_bindings": True,
                           "authenticated_request_binding": False, "live_enabled": False,
-                          "isolation_audit_violations": len(violations), "ok": True}))
+                          "isolation_audit_violations": len(violations),
+                          "readonly_system_metadata": sorted(system_reads), "ok": True}))
     finally:
         manager.unload()
 

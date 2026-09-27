@@ -27,6 +27,8 @@ HTTP 请求探针使用另一个临时 Profile 和空 bundled 插件目录。额
 loader 加载的测试插件，只记录关联字段名称、合成 ID 和固定结果，不替换请求、agent、
 dispatcher 或生命周期。对外网络、DNS 和子进程执行由 audit guard 拒绝；模型 stub 仅监听
 loopback。middleware 组件测试另行允许固定 worker，使用公开测试证书及私有临时 NTFS 目录。
+测试引导先通过标准库查询真实 OS 版本（Python 3.11 Windows 会调用 `cmd /c ver`），
+随后安装严格执行审计，再导入 Hermes；没有替换平台探测结果或放行 Hermes 的任意子进程。
 
 ## 要求逐项对应
 
@@ -88,6 +90,13 @@ loopback。middleware 组件测试另行允许固定 worker，使用公开测试
 响应为 200、`hermes.failed=true`，但没有对应 `on_session_end`；SSE 断开则观察到
 `interrupted=true`，同一事件的 `completed` 仍为 true。因此不能只看 completed，
 也不能把该 hook 当作所有异常出口的撤销保证。后续探针明确记录这个缺口，不制造结束事件。
+
+首轮远端 CI（`d95c0d77`，[运行记录](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/36312116021)）
+暴露测试引导的跨平台差异：Windows Python 3.11 的标准库 OS 版本查询被误当成 Hermes
+子进程；Linux 的 6 项功能断言通过，但 psutil 导入的 CPU 统计读取被审计拒绝。
+修正仅在测试引导缓存真实 OS 信息、为固定只读 `/proc/stat` 与 `/proc/version` 增加精确许可，
+并记录所有被允许的系统元数据路径和被拒路径（不读出内容）。未放宽用户目录、凭据、
+网络或业务工具权限，保留全部功能与审计断言；最终结果需以修正提交的 Linux/Windows CI 为准。
 
 未重新执行本地后端/前端/E2E/产品构建：没有对应实现改动。未运行当前安装的 Hermes、
 真实 Gateway、微信或 CFserver：本轮明确禁止。没有为规避历史 backend Lint 红项修改

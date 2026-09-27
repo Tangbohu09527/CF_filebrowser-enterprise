@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import platform
 import secrets
 import shutil
 import subprocess
@@ -164,6 +165,10 @@ class ModelHandler(BaseHTTPRequestHandler):
 
 
 async def child_probe(source, lifecycle=False):
+    # Python 3.11 Windows caches its real OS version using `cmd /c ver`.
+    # Complete that stdlib bootstrap before guarding Hermes execution; keep
+    # actual request/agent/tool subprocess attempts forbidden below.
+    platform.system()
     model = ModelStub()
     threading.Thread(target=model.serve_forever, daemon=True).start()
     home = Path(os.environ["HERMES_HOME"])
