@@ -30,6 +30,14 @@ SOURCE_BLOBS = {
     "hermes_cli/config.py": "ad60058c4c6581cfe79910f93fe464cd05f2f10f",
     "tools/registry.py": "26257fccc25aaf04707b8f6d46ac83fd1e8704ab",
     "utils.py": "91c3a8399de3b13baf7b7c307e77d15f3b141beb",
+    "gateway/platforms/api_server.py": "5c4a2bf4ae7ac21191cdac72631aaf08509c2d88",
+    "gateway/platforms/api_server_openai_routes.py": "6da8690fa55716652134890d0371da4c1d78619a",
+    "model_tools.py": "924cd94413b18c3a069228950939c4c43fa43b3b",
+    "hermes_cli/middleware.py": "897e4afc07ba0d78ba928baf39a8573422b648be",
+    "agent/tool_executor.py": "fa73ec6b625b50005259dfd1614d55a9b93b096e",
+    "agent/turn_facade.py": "5eb2b500d8a2ac962c00f22f4e6f6854ac6565a8",
+    "agent/turn_finalizer.py": "67a4024de84ae5a9e303d499782631cdcd2dd4ba",
+    "tools/thread_context.py": "293a4e916756310b02afa3bb20e209ac7492fd35",
 }
 PLUGIN = Path(__file__).resolve().parents[1] / "plugin"
 TOOL = "filebrowser_download_inbound"

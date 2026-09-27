@@ -70,6 +70,7 @@ loopback。middleware 组件测试另行允许固定 worker，使用公开测试
 | `<venv-python> -I -B integrations/hermes-filebridge/tests/test_hermes_loader.py --hermes-source <source>` | 默认关闭/显式注册两场景通过，新增 8 个官方请求/执行边界文件的 Git blob 校验通过 |
 | `<venv-python> -I -B integrations/hermes-filebridge/tests/test_hermes_middleware.py --hermes-source <source> --worker <native-worker>` | Windows 6 项通过；真实 model_tools → 官方 middleware → 当前 worker → 下游读取。包括重复/并发、4 次耗尽不重置、身份/线程/目录及 handle 隔离、取消/结束和 ContextVar 恢复；合成 binding，认证请求交接仍为 false |
 | `<venv-python> -I -B integrations/hermes-filebridge/tests/test_hermes_request_probe.py --hermes-source <source>` | Windows 真实 HTTP 探针通过：两个并发会话、每会话连续两轮，共 4 次官方工具执行；缺绑定均拒绝；2 次正常结束 hook；无/错误 Bearer 两次 401 且无模型或工具事件 |
+| 同一请求探针加 `--lifecycle` | 正常断言全部保留并通过；额外复现真实模型异常出口缺少结束 hook、SSE 取消发出 interrupted 事件。输出 `lifecycle_complete=false`、`exception_end_hook_missing=true`，不是生命周期授权成功 |
 
 真实请求实测 `task_id == session_id`，middleware 收到 `api_request_id`、
 `middleware_schema_version`、`original_args`、`session_id`、`task_id`、

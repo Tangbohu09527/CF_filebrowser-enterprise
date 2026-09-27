@@ -62,7 +62,7 @@ jobs:
           echo "CF_FILEBRIDGE_INBOUND_TEST_EXE=$output" >> "$GITHUB_ENV"
       - name: Test existing Hermes tools and inbound HTTPS worker wiring
         run: python -B -m unittest discover -s integrations/hermes-filebridge/tests -v
-      - name: Verify actual pinned Hermes loader in an isolated environment
+      - name: Verify official Hermes loader, middleware and HTTP request boundary
         shell: bash
         run: |
           set -euo pipefail
@@ -75,9 +75,14 @@ jobs:
           python -m venv "$root/venv"
           runner="$root/venv/bin/python"
           if [ "$RUNNER_OS" = Windows ]; then runner="$root/venv/Scripts/python.exe"; fi
-          "$runner" -m pip install --disable-pip-version-check PyYAML==6.0.3
+          "$runner" -m pip install --disable-pip-version-check -r integrations/hermes-filebridge/tests/hermes-probe-requirements.txt
           "$runner" -I -B integrations/hermes-filebridge/tests/test_hermes_loader.py \
             --hermes-source "$root/source/hermes-agent-4d55ca91656ac5f83e1506679b7f81e0238e5e16"
+          "$runner" -I -B integrations/hermes-filebridge/tests/test_hermes_middleware.py \
+            --hermes-source "$root/source/hermes-agent-4d55ca91656ac5f83e1506679b7f81e0238e5e16" \
+            --worker "$CF_FILEBRIDGE_INBOUND_TEST_EXE"
+          "$runner" -I -B integrations/hermes-filebridge/tests/test_hermes_request_probe.py \
+            --hermes-source "$root/source/hermes-agent-4d55ca91656ac5f83e1506679b7f81e0238e5e16" --lifecycle
       - name: Build client and retain fixed-source inventory
         shell: bash
         run: |
