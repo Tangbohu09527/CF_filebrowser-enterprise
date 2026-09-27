@@ -2,7 +2,7 @@
 
 新增入站附件开发入口见 [INBOUND_DOWNLOAD.md](INBOUND_DOWNLOAD.md)。专用下载 worker
 将固定 Gateway 契约的字节验证后落到任务目录；模型不能传 URL、凭据或任务上下文。
-此能力默认关闭，公开 Hermes 接口缺少完整可信 Dispatch 桥接，具体证据与最小配套要求见
+此能力默认关闭。官方 tool_execution middleware 可承载桥接；尚缺 Gateway 的权威 Dispatch 交接与撤销契约，具体证据与配套要求见
 [INBOUND_CONTEXT.md](INBOUND_CONTEXT.md)。隔离 HTTPS / Windows 测试和真实插件加载测试
 分别记录；这些结果不代表实际 AI 主机已安装启用或真实 Dispatch 下载已经验收。
 
@@ -68,7 +68,7 @@ FileBrowser 用户的 Source Scope 是服务端授权根。假设账号 Scope �
 
 CI 使用独立 Go module 原来的 `go test ./...` / `go vet ./...`，在 Linux 和 Windows 上运行，不修改 module/依赖锁文件。额外 TLS 用例包含实际本地 HTTPS 握手：正确 CA 通过、错误 CA/名称失败、摘要/路径/PEM 拒绝，且不替换进程全局 Transport。Go 源文件固定 LF，避免 Windows checkout 自动换行导致格式化门禁误报；门禁保留。
 
-Python 插件测试只使用临时文件、模拟进程与模拟 PluginContext，不连接业务服务。测试不等同于真实 Hermes 发现、工具可见性、Profile 选择或微信调用验收。CI 产出固定提交的二进制、源码包和 SHA256SUMS；下载后必须对照成功的相应提交、平台和文件摘要。
+原只读/受控新建 Python 单元测试使用临时文件、模拟进程与模拟 PluginContext，不连接业务服务。下载组件另有真实 HTTPS/原生 worker、官方 loader 和请求边界探针，各层证据见 [宿主桥接验证记录](HOST_BRIDGE_VALIDATION.md)，不能扩大为微信现场验收。CI 产出固定提交的二进制、源码包和 SHA256SUMS；下载后必须对照成功的相应提交、平台和文件摘要。
 
 已安装的只读版本：受限 Token 交付、该安装目录的 NTFS ACL 检查、实际 Profile 插件启用、API 工具集合可见性和微信只读实收有带日期的现场证据。尚未完成：新建版本现场安装/验收、修改/删除、强隔离审批与写入恢复、新环境统一一条命令安装。不能把旧版只读验收扩大为新版写操作验收，也不能把 CI 通过写成现场上线。
 

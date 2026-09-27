@@ -2,7 +2,7 @@
 
 状态：本项目包含专用下载引擎、原生安全落盘、插件宿主 API、隔离测试和独立暂存检查入口。
 **真实 Hermes 的可信 Dispatch 适配器尚未接通，因此不应启用实际附件下载。**
-公开接口缺口及固定源码证据见 [INBOUND_CONTEXT.md](INBOUND_CONTEXT.md)。本轮未修改 Hermes
+官方 middleware 可承载工具执行范围；外部认证交接缺口及固定源码证据见 [INBOUND_CONTEXT.md](INBOUND_CONTEXT.md)。本轮未修改 Hermes
 核心、Gateway、运行中的 Profile、客户端或凭据，未连接 CFserver、发送微信或正式归档。
 
 ## 固定契约与调用入口
@@ -25,7 +25,9 @@
 
 真实宿主必须在认证后的任务创建位置调用 `HostBridge.start_dispatch(binding)`，在实际工具
 调用线程内进入 `bridge.activate(dispatch_id)`，并将结束、取消和租约撤销连接到
-`end_dispatch` / `close`。这些方法是新增的宿主 API，**不是现有 PluginContext 的能力**。
+`end_dispatch` / `close`。这些方法复用本项目现有 HostBridge；官方 `register_middleware("tool_execution", ...)`
+能够在真实工具分派范围调用 activate，不需要 Hermes 新增 current_dispatch。尚缺的权威交接
+契约见 [GATEWAY_HOST_BINDING_REQUIREMENTS.md](GATEWAY_HOST_BINDING_REQUIREMENTS.md)。
 插件不从正文、一般 kwargs、环境变量或未经认证的 `session_metadata` 推导授权。
 
 `Binding` 仅经过私有管道传入 worker：`dispatch_id`、`task_id`、`thread_id`、

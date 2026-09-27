@@ -1,8 +1,9 @@
 """Host-only Dispatch bridge to the isolated inbound download worker.
 
-Nothing in this module derives authority from model arguments, handler kwargs,
-prompt text or session metadata. The audited public Hermes PluginContext does
-not yet supply this bridge; an authenticated host lifecycle adapter is required.
+Nothing in this module derives authority from model arguments, handler kwargs
+or prompt text. Authenticated metadata can carry authority, but must first be
+verified and bound to the actual execution. Official tool_execution middleware
+can scope activate(); the missing Gateway handoff is documented separately.
 """
 from __future__ import annotations
 

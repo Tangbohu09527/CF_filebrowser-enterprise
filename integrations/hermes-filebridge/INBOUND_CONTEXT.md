@@ -1,52 +1,55 @@
-# 入站附件：真实 Hermes 接口与尚未接通的宿主上下文
+# 入站附件：官方 middleware 接线与外部认证契约
 
-本页核验的是公开 Hermes 源码，不是运行中的 Hermes、微信 Gateway 或已安装客户端。固定接口基线为 [`NousResearch/hermes-agent@4d55ca91656ac5f83e1506679b7f81e0238e5e16`](https://github.com/NousResearch/hermes-agent/tree/4d55ca91656ac5f83e1506679b7f81e0238e5e16)，与本目录 README 一致。
+核验基线：[官方 Hermes `4d55ca91656ac5f83e1506679b7f81e0238e5e16`](https://github.com/NousResearch/hermes-agent/tree/4d55ca91656ac5f83e1506679b7f81e0238e5e16)；[Gateway `a26f234fbe60f9a3212bf6bd3471bba3f5802997`](https://github.com/Tangbohu09527/CF_agent-gateway/tree/a26f234fbe60f9a3212bf6bd3471bba3f5802997)。本页不读取或描述用户正在运行的安装。
 
-`filebrowser_download_inbound` 默认关闭。开启 `inbound_enabled` 只注册工具；没有可信宿主绑定时返回 `trusted_context_unavailable`。模型只能传入正整数 `attachment_id`。文本中的附件描述、`session_metadata`、工具参数和 handler 的 `task_id` / `session_id` / `user_task` kwargs 都不能自行生成授权。
+**结论：官方 middleware 可以包住 `HostBridge.activate`，无需修改 Hermes 核心，也无需新增 current_dispatch API。还缺的是 Gateway 的权威 Dispatch 交接与撤销契约。** 具体字段、接口、调用时机和验收条件见 [GATEWAY_HOST_BINDING_REQUIREMENTS.md](GATEWAY_HOST_BINDING_REQUIREMENTS.md)。此前把问题归结为 PluginContext 没有完整 current-Dispatch API 的表述不准确，已更正。
 
-## 已核验的官方调用链
+`filebrowser_download_inbound` 仍默认关闭。开启只注册工具；没有经过认证的绑定仍返回 `trusted_context_unavailable`。模型仅能传入 `attachment_id`，不能签发任务、选择路径、origin 或凭据。
 
-| 能力 | 固定源码证据 | 适用边界 |
-| --- | --- | --- |
-| 真实插件发现与加载 | [`PluginManager.discover_and_load`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/hermes_cli/plugins.py#L1218-L1254)；[`_discover_and_load_inner`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/hermes_cli/plugins.py#L1324-L1351)；[`register_fn(PluginContext(manifest, self))`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/hermes_cli/plugins_loader.py#L264-L337) | loader 确实构造真实 `PluginContext`，然后调用插件 `register(ctx)`。仅此不能证明当前请求来自可信 Gateway。 |
-| 插件配置 | [`PluginContext.get_config`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/hermes_cli/plugins.py#L225-L267) | 读取当前 Profile 下的插件配置，不是当前任务授权或附件清单。 |
-| 工具分派关联信息 | [`_CallIds`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/model_tools.py#L632-L643)；[`_execute_tool`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/model_tools.py#L807-L830) | 一般 handler 收到 `task_id`、`session_id` 和 `user_task`；hooks / middleware 还可收到 `turn_id` / `tool_call_id`。这些关联字段没有附件授权、Gateway origin allowlist、租约或下载预算。 |
-| `ctx.dispatch_tool` | [`dispatch_tool`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/hermes_cli/plugins.py#L690-L699) | 只在可用时从 CLI 引用取得 `parent_agent`；源码明确 Gateway 中 `_cli_ref` 为 `None`。不能把该接口当作所有运行入口的当前可信 Dispatch。 |
-| 用户、线程、路由信息 | [`set_session_vars`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/gateway/session_context.py#L115-L144)；[`get_session_env`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/gateway/session_context.py#L173-L179) | 核心有任务局部 ContextVar；通用 getter 在未绑定时回退进程环境变量。它不携带身份认证证明，也不提供附件能力授权，插件不能据此接受伪造或陈旧环境值。 |
-| 工作目录 | [`runtime_cwd`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/agent/runtime_cwd.py#L38-L94) | 有 session cwd、`TERMINAL_CWD` 和启动目录回退。它是运行目录解析，不是“此附件可以写入这里”的授权；缺失绑定时不得回退使用这些目录。 |
-| Gateway 入站 hook | [`pre_gateway_dispatch` 定义](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/hermes_cli/plugins.py#L130-L137) | 在 auth / pairing 之前触发。收到 `event` / `gateway` 对象不等于认证已经通过，不能直接签发下载权限。 |
-| 停止通知 | [`_interrupt_and_clear_session`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/gateway/run_agent_cache.py#L460-L489) | `agent_loop_stopped` 有 session key 和原因，返回值被忽略；没有本插件的 Dispatch ID、可撤销句柄或自动关闭本插件 worker 的实现。 |
-| 结束与卸载 | [`on_session_end` 发出位置](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/agent/turn_finalizer.py#L626-L640)；[`on_unload` / `spawn_task`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/hermes_cli/plugins.py#L413-L431) | 结束 hook 是观察通知，且 `_persist_disabled` 路径不发出该通知；`spawn_task` 管理的是插件卸载时的任务。它们不构成覆盖所有结束/取消入口的租约契约。 |
-
-因此，核验的公开 `PluginContext` 没有本插件需要的完整 current-Dispatch API。不能编造 `ctx.current_task`、`ctx.allowed_origin` 或 `ctx.authorized_workdir`，也不能仅用模拟 Context 的单元测试宣称这些能力存在。
-
-## 待配套宿主接线的最小要求
-
-本项目 `plugin/inbound.py` 的 `HostBridge` 是本项目新增的进程内宿主 API，**不是上述 Hermes 公共接口**。真实接入仍需认证边界的宿主适配器，完成以下工作：
-
-1. 在入站认证、权限检查与实际任务创建完成后，取得不可由模型覆盖的任务 / 用户 / 线程关联、附件清单、允许的 Gateway origin、任务工作目录、有效期限与预算。一个普通的 `session_metadata.inbound_attachments` 字段不自动满足这些条件。
-2. 使用操作者固定的独立下载 worker 路径和 SHA-256 创建 `HostBridge`，调用 `start_dispatch(binding)`。该 worker 与已有 FileBrowser Token 客户端的配置、凭据和命令分离。不能从聊天正文、模型工具参数、一般 kwargs 或继承环境拼装 binding。
-3. 在实际工具执行范围内使用 `bridge.activate(dispatch_id)`，并确保 ContextVar 正确传到执行线程 / 异步任务。`register(ctx)` 发生在插件加载阶段，不能在此为后续所有请求绑定一个全局任务。
-4. 将真实任务结束、取消、超时、租约撤销和宿主退出连接到 `end_dispatch` / `close`。结束后拒绝后续下载和 handle 解析；不得通过重新创建 worker、替换 Dispatch ID 或自动重试刷新同一任务的预算。仅订阅一个结束 hook 不足以覆盖全部路径。
-5. 后续处理通过宿主的工作副本 handle 解析接口完成，并复核活动 Dispatch 与文件完整性。内部绝对路径、bearer URL 和凭据不能回传聊天。该 host-only API 与同 OS 身份的其他工具之间没有额外的操作系统安全边界。
-
-目前没有修改或部署外部 Hermes / Gateway 来实现这套适配器。启用插件不会补上这些缺口；无绑定拒绝是预期行为。
-
-## 真实 loader 验证
-
-[`tests/test_hermes_loader.py`](tests/test_hermes_loader.py) 是显式执行的集成检查，不会在普通 `unittest discover` 中自动下载或跳过上游验证。它要求调用者提供上述固定提交的官方源代码副本，并校验关键 loader / registry 文件的 Git blob ID。
-
-准备方式：从[固定提交源码包](https://codeload.github.com/NousResearch/hermes-agent/zip/4d55ca91656ac5f83e1506679b7f81e0238e5e16)提取到独立测试临时目录，使用 Python 3.11–3.13 的独立虚拟环境。此次在 Windows / Python 3.12 上仅需安装 `PyYAML==6.0.3`，版本来自该提交的 `pyproject.toml`。这不是完整 Hermes 运行环境的依赖清单，不安装、升级或替换实际 Hermes。
+## 真实请求和工具执行的公开接线
 
 ```text
-<test-venv-python> -I -B integrations/hermes-filebridge/tests/test_hermes_loader.py --hermes-source <fixed-commit-source-directory>
+Gateway HTTP client (Bearer + X-Hermes-Session-Id)
+  -> 官方 APIServerAdapter /v1/chat/completions
+  -> 官方 AIAgent.run_conversation（框架 session/task/turn 关联）
+  -> agent.tool_executor 的 tool_execution middleware
+     或 model_tools.handle_function_call -> _execute_tool 的同名 middleware
+  -> 插件 middleware 在当前工具执行线程内：
+       以框架关联查询并核验 Gateway 权威绑定 [当前缺少此外部契约]
+       with existing_bridge.activate(authoritative_dispatch_id):
+           return next_call(args)
+  -> 官方 registry -> 当前 filebrowser_download_inbound handler
+  -> 现有 NDJSON worker -> HTTPS -> NTFS 文件 -> 验证后的 handle
+  -> 同样授权范围内的下游工具 -> existing_bridge.open_workcopy(handle)
 ```
 
-检查使用临时 Profile、空 bundled 插件目录和复制的本项目插件；不读取真实 Profile、Token 或已安装客户端。实际 `PluginManager` 完成发现和加载，实际 `PluginContext` 注册处理器，实际工具 registry 接受分派。测试不替换这些核心对象，并通过 Python audit hook 拒绝发现/调用阶段的网络和子进程启动。
+| 扩展点与固定源码 | 已确认的作用及限制 |
+| --- | --- |
+| [`PluginContext.register_middleware`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/hermes_cli/plugins.py) | 插件公开注册 `tool_execution` 包装，无需私有成员或 monkey patch。`register(ctx)` 本身只负责注册，不激活全局任务。 |
+| [`run_tool_execution_middleware` / `_run_execution_chain`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/hermes_cli/middleware.py) | 同步调用 `next_call(args)`，可正确进入/恢复 ContextVar。**调用 next_call 前的 callback 异常会跳过该 middleware 并继续执行**，因此授权拒绝必须返回固定失败结果，不能依赖抛异常阻止执行；handler 的无绑定拒绝仍须保留。 |
+| [`model_tools._execute_tool`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/model_tools.py) | 真实 registry 分派经过该 middleware；框架传入 session/task/turn/tool_call 关联。模型参数不是这些框架参数的授权来源。 |
+| [`agent.tool_executor`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/agent/tool_executor.py) | agent 路径外层包住 middleware，内层跳过重复包装。应在实际工具执行线程激活，不应只在 HTTP 线程设置 ContextVar。 |
+| [`tools.thread_context`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/tools/thread_context.py) | 官方工具并发通过 copy_context 传播上下文。每次执行仍需用自己的框架关联核验绑定，不使用进程全局“当前任务”。 |
+| [`APIServerAdapter._run_agent`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/gateway/platforms/api_server.py) | executor 边界显式传播部分官方 ContextVar；HTTP 线程里设定的任意插件 ContextVar 不能假定自动传播。 |
+| [`OpenAICompatRoutesMixin._handle_chat_completions`](https://github.com/NousResearch/hermes-agent/blob/4d55ca91656ac5f83e1506679b7f81e0238e5e16/gateway/platforms/api_server_openai_routes.py) | 消费 `X-Hermes-Session-Id`，没有消费 Gateway 的 `session_metadata.inbound_attachments`；metadata 的真实性与字段是否到达插件是两个问题。 |
 
-2026-09-27 本地结果：默认配置不注册下载工具；显式 `inbound_enabled=true` 后注册；传入一般 handler 关联 kwargs 而不绑定宿主时，真实 registry 调用返回 `trusted_context_unavailable`。两个配置场景均通过，`host_bridge_connected=false`。
+这些链接用于审查固定版本，不是运行时代码按源码行号打补丁，也不要求用户降级或永久锁定 Hermes。
 
-该结果只证明固定上游 loader 的兼容性和无绑定拒绝。它没有运行 Hermes 会话、Gateway 认证、微信传输或真实任务取消，也没有验证实际 worker 下载。那些行为必须分别由下载引擎/桥接测试和后续真实宿主联调证明；模拟 binding 或模拟 PluginContext 的成功用例不能替代宿主联调。
+## 关联与授权分开
+
+- `session_id` / `task_id` / `turn_id` 可用于定位真实执行，但不能证明企业身份、附件权限或仍活动的 Gateway claim。工作目录只能取自操作者配置下分配的私有目录，不能从这些 ID、原文件名或模型输入直接拼接。
+- Gateway 的 DB 身份检查和 `grant_read` 是附件授权的权威来源；经认证 HTTP 或验签后取得的 metadata **可以可信**。当前问题是官方 API 没有将该字段交给插件，且当前内容没有 Dispatch claim/lease，不能靠放宽信任补齐。
+- `descriptor.expires_at` 是读能力期限，不是 Dispatch 租约期限。收到有效 read token 也不能据此让下游文件句柄跨任务存活。
+- 现有 Gateway 会把包含 Authorization 的完整附件描述放入用户消息正文；不能从该正文提取凭据作为桥接，也不能将它继续送给模型。本项目 worker 不泄密，并不证明上游消息没有泄密；配套契约必须提供无凭据的模型投影。
+- `on_session_end` 可辅助结束回收，但 `_persist_disabled` 和非正常退出路径不能仅依赖该通知。真实请求探针已复现：模型 HTTP 400 使 `hermes.failed=true`，却没有对应结束 hook；SSE 断开事件带 `interrupted=true`，同时 `completed=true`。API SSE 断线不等于 Gateway claim 取消；Gateway 当前续租失败也没有向 Hermes 发出撤销。需权威租约、结束信号及断线拒绝，详见外部契约。
+- plugin `on_unload` / 正常退出负责 close；意外进程退出使管道 EOF 撤销原 worker。重启必须由 Gateway 拒绝旧 claim 重放，不能重建旧下载预算。
+
+## 证据分层
+
+1. `tests/test_inbound_plugin.py`：合成可信 binding、实际 HTTPS 和当前原生 worker，验证下载、预算、句柄消费及回收。它不证明请求认证。
+2. `tests/test_hermes_loader.py`：隔离固定官方 loader、真实 PluginContext 和 registry；验证发现、默认关闭及无绑定拒绝。
+3. 本轮真实 middleware 组件探针与真实 HTTP 请求探针分别记录于 [HOST_BRIDGE_VALIDATION.md](HOST_BRIDGE_VALIDATION.md)。合成 binding 的组件成功不升级为 authenticated request 成功。
+4. 真实 AI 主机与 Gateway 联调仍未执行；下载工具保持默认关闭。不能将模型服务替身、测试 observer 或手动 start_dispatch 当作权威交接已经存在。
 
 ## 独立 Windows 暂存与检查
 
