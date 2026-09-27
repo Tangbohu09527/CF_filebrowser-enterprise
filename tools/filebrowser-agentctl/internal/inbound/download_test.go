@@ -213,6 +213,108 @@ func TestDownloadConcurrentAndRepeatedShareFourAttempts(t *testing.T) {
 	assertNoWorkFiles(t, b)
 }
 
+func TestDownloadThirtySecondBudgetShared(t *testing.T) {
+	var calls atomic.Int32
+	stopServer := make(chan struct{})
+	defer close(stopServer)
+	server, ca, hash := inboundTLS(t, false, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-stopServer:
+		}
+	}))
+	b := inboundBinding(t, server, ca, hash, make([]byte, 100))
+	// Exercise the real fixed 30-second budget, not an earlier credential or
+	// dispatch expiry. Both callers start while the one HTTP body is blocked.
+	b.ExpiresAt = time.Now().Add(90 * time.Second)
+	b.Attachments[0].ExpiresAt = b.ExpiresAt
+	e := inboundEngine(t, b)
+	startCalls := make(chan struct{})
+	results := make(chan Result, 2)
+	for range 2 {
+		go func() {
+			<-startCalls
+			results <- e.Download(context.Background(), 2)
+		}()
+	}
+	start := time.Now()
+	guard := time.NewTimer(40 * time.Second)
+	defer guard.Stop()
+	close(startCalls)
+	for range 2 {
+		select {
+		case result := <-results:
+			assertFailure(t, result, "deadline_exceeded")
+		case <-guard.C:
+			t.Fatal("fixed total budget exceeded the 40-second test guard")
+		}
+	}
+	if elapsed := time.Since(start); elapsed < 29*time.Second || elapsed > 35*time.Second {
+		t.Fatalf("real 30-second deadline completed after %s", elapsed)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("concurrent callers used %d wire attempts, want 1", got)
+	}
+	repeatedAt := time.Now()
+	assertFailure(t, e.Download(context.Background(), 2), "deadline_exceeded")
+	if time.Since(repeatedAt) > time.Second || calls.Load() != 1 {
+		t.Fatal("repeat restarted or extended an exhausted total budget")
+	}
+	e.Close()
+	assertNoWorkFiles(t, b)
+}
+
+func TestDownloadHTTPSCrossOriginRedirects(t *testing.T) {
+	for _, status := range []int{301, 302, 303, 307, 308} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			var sourceCalls, targetCalls, targetAuthorizations atomic.Int32
+			target, targetCA, _ := inboundTLS(t, false, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				targetCalls.Add(1)
+				if r.Header.Get("Authorization") != "" {
+					targetAuthorizations.Add(1)
+				}
+				_, _ = w.Write([]byte("target"))
+			}))
+			source, sourceCA, _ := inboundTLS(t, false, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				sourceCalls.Add(1)
+				if r.Header.Get("Authorization") != syntheticAuthorization {
+					t.Error("source did not receive the attachment authorization")
+				}
+				w.Header().Set("Location", target.URL+"/inbound-media/12/content")
+				w.WriteHeader(status)
+			}))
+			// Trust both test servers so a mistakenly followed redirect cannot
+			// hide behind an unknown-CA handshake failure at the target.
+			bundle, err := os.ReadFile(sourceCA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			targetCertificate, err := os.ReadFile(targetCA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bundle = append(bundle, targetCertificate...)
+			bundlePath := filepath.Join(t.TempDir(), "both-test-origins.pem")
+			if err := os.WriteFile(bundlePath, bundle, 0600); err != nil {
+				t.Fatal(err)
+			}
+			bundleHash := sha256.Sum256(bundle)
+			b := inboundBinding(t, source, bundlePath, hex.EncodeToString(bundleHash[:]), []byte("target"))
+			e := inboundEngine(t, b)
+			assertFailure(t, e.Download(context.Background(), 2), "response_rejected")
+			assertFailure(t, e.Download(context.Background(), 2), "response_rejected")
+			if sourceCalls.Load() != 1 || targetCalls.Load() != 0 || targetAuthorizations.Load() != 0 {
+				t.Fatalf("redirect sent requests or authorization: source=%d target=%d authorized=%d", sourceCalls.Load(), targetCalls.Load(), targetAuthorizations.Load())
+			}
+			assertNoWorkFiles(t, b)
+		})
+	}
+}
+
 func TestDownloadDeadlinesAndCancellation(t *testing.T) {
 	for _, kind := range []string{"read-timeout", "retry-after-budget", "dispatch-cancel", "credential-expired", "dispatch-expired"} {
 		t.Run(kind, func(t *testing.T) {

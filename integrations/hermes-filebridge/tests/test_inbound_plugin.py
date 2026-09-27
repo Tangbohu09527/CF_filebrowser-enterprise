@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 PLUGIN_PATH = Path(__file__).resolve().parents[1] / "plugin" / "__init__.py"
 spec = importlib.util.spec_from_file_location("cf_inbound_plugin_test", PLUGIN_PATH)
@@ -279,6 +280,29 @@ foreach($id in @($sid.Value,'S-1-5-18','S-1-5-32-544')) {
         with self.assertRaises(inbound.BridgeError):
             self.bridge.start_dispatch(binding)
         self.assertEqual(self.calls, 0)
+
+    def test_native_stderr_and_inherited_filebrowser_token_are_not_used(self):
+        secret = "synthetic-filebrowser-runtime-token-never-use-for-gateway"
+        keylog = self.root / "must-not-write-tls-secrets"
+        with patch.dict(os.environ, {"FILEBROWSER_AGENT_TOKEN": secret,
+                                   "HTTPS_PROXY": "http://127.0.0.1:1",
+                                   "SSLKEYLOGFILE": str(keylog)}):
+            self.bridge.start_dispatch(self.binding())
+            response = self.call()
+        self.assertTrue(response["ok"], response)
+        self.assertTrue(self.headers_correct)
+        self.assertNotIn(secret, json.dumps(response))
+        self.assertFalse(keylog.exists())
+        # Capture actual native stderr too: DEVNULL in the host is not evidence
+        # that the standalone worker itself avoids raw-input diagnostics.
+        invalid = json.dumps({"authorization": DUMMY_AUTH, "token": secret}).encode() + b"\n"
+        direct = subprocess.run([str(self.executable)], input=invalid, capture_output=True,
+                                timeout=3, shell=False)
+        combined = direct.stdout + direct.stderr
+        self.assertNotIn(DUMMY_AUTH.encode(), combined)
+        self.assertNotIn(secret.encode(), combined)
+        self.assertEqual(direct.stderr, b"")
+        self.assertFalse(json.loads(direct.stdout)["ok"])
 
 
 if __name__ == "__main__":
