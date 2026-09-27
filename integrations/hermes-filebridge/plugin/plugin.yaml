@@ -1,7 +1,8 @@
 name: cf-filebridge
-version: "0.2.0"
+version: "0.3.0"
 kind: standalone
-description: Read-only files and optional operator-approved text creation via independent client
+description: Scoped files, approved text creation and host-bound inbound working copies
 provides_tools:
   - filebrowser_files
   - filebrowser_create_text
+  - filebrowser_download_inbound

@@ -130,3 +130,7 @@ def register(ctx):
                 }}},
             handler=handler_for(ctx, creation=True), description="Operator-approved scoped text creation", override=False,
         )
+
+    if ctx.get_config("inbound_enabled", False) is True:
+        from .inbound import register_inbound
+        register_inbound(ctx)

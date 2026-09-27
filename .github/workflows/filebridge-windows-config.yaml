@@ -43,3 +43,6 @@ jobs:
       - name: Python700 reproduction, restricted recovery and cross-language stage
         shell: powershell
         run: ./integrations/hermes-filebridge/windows/Manage-CreateStage.ps1 -Mode SelfTest
+      - name: Inbound side-by-side staging and resumable inventory checks
+        shell: powershell
+        run: ./integrations/hermes-filebridge/tests/Test-InboundStage.ps1

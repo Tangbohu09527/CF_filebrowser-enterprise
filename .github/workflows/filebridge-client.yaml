@@ -51,8 +51,33 @@ jobs:
           test -z "$unformatted"
           go test -count=1 ./...
           go vet ./...
-      - name: Test read-only Hermes adapter
+      - name: Build isolated inbound worker for native plugin integration tests
+        working-directory: tools/filebrowser-agentctl
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/filebridge-inbound"
+          if [ "$RUNNER_OS" = Windows ]; then output="$output.exe"; fi
+          go build -trimpath -mod=readonly -o "$output" ./cmd/filebridge-inbound
+          echo "CF_FILEBRIDGE_INBOUND_TEST_EXE=$output" >> "$GITHUB_ENV"
+      - name: Test existing Hermes tools and inbound HTTPS worker wiring
         run: python -B -m unittest discover -s integrations/hermes-filebridge/tests -v
+      - name: Verify actual pinned Hermes loader in an isolated environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/filebridge-hermes-loader"
+          mkdir -p "$root/source"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            https://codeload.github.com/NousResearch/hermes-agent/zip/4d55ca91656ac5f83e1506679b7f81e0238e5e16 \
+            -o "$root/source.zip"
+          unzip -q "$root/source.zip" -d "$root/source"
+          python -m venv "$root/venv"
+          runner="$root/venv/bin/python"
+          if [ "$RUNNER_OS" = Windows ]; then runner="$root/venv/Scripts/python.exe"; fi
+          "$runner" -m pip install --disable-pip-version-check PyYAML==6.0.3
+          "$runner" -I -B integrations/hermes-filebridge/tests/test_hermes_loader.py \
+            --hermes-source "$root/source/hermes-agent-4d55ca91656ac5f83e1506679b7f81e0238e5e16"
       - name: Build client and retain fixed-source inventory
         shell: bash
         run: |
@@ -65,9 +90,16 @@ jobs:
           output="$RUNNER_TEMP/filebridge-evidence/filebrowser-agentctl"
           if [ "$RUNNER_OS" = Windows ]; then output="$output.exe"; fi
           CGO_ENABLED=0 go build -trimpath -mod=readonly -o "$output" ./cmd/filebrowser-agentctl
+          inbound="$RUNNER_TEMP/filebridge-evidence/inbound-bundle"
+          mkdir -p "$inbound/plugin"
+          binary="filebridge-inbound"
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          CGO_ENABLED=0 go build -trimpath -mod=readonly -o "$inbound/$binary" ./cmd/filebridge-inbound
+          cp ../../integrations/hermes-filebridge/plugin/{__init__.py,inbound.py,plugin.yaml} "$inbound/plugin/"
+          INBOUND_BUNDLE="$inbound" python -c 'import hashlib,json,os,pathlib,subprocess; p=pathlib.Path(os.environ["INBOUND_BUNDLE"]); files={f.relative_to(p).as_posix():hashlib.sha256(f.read_bytes()).hexdigest() for f in sorted(p.rglob("*")) if f.is_file()}; (p/"inventory.json").write_text(json.dumps({"schema":"cf-inbound-bundle/v1","source_commit":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),"files":files},indent=2)+"\n",encoding="utf-8")'
           git diff --exit-code
           cd "$RUNNER_TEMP/filebridge-evidence"
-          sha256sum filebrowser-agentctl* filebridge-source.tar.gz > SHA256SUMS
+          sha256sum filebrowser-agentctl* filebridge-source.tar.gz inbound-bundle/inventory.json > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: filebridge-client-${{ matrix.os }}-${{ github.sha }}
