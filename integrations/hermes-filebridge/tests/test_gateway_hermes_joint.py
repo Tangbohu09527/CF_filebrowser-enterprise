@@ -315,6 +315,19 @@ def isolated_guard(sandbox, sources, worker):
             detail = {"event": event}
             if event == "open":
                 detail["path"] = os.fsdecode(args[0])
+            # Code locations only: no frame locals, command arguments, request
+            # values or credentials. Optional upstream probes often swallow
+            # exceptions, so retain their bounded call sites for diagnosis.
+            callers = []
+            frame = sys._getframe(1)
+            for _ in range(5):
+                if frame is None:
+                    break
+                callers.append({"file": frame.f_code.co_filename,
+                                "function": frame.f_code.co_name, "line": frame.f_lineno})
+                frame = frame.f_back
+            del frame
+            detail["callers"] = callers
             violations.append(detail)
             # Paths only (never file contents, command arguments or headers)
             # make a swallowed optional import/SessionDB failure diagnosable.
@@ -755,7 +768,7 @@ async def child(gateway, hermes, worker):
         for secret in _test_secrets:
             assert all(secret.encode() not in material for material in materials), "credential leaked into model/profile/output"
         assert "Bearer " not in json.dumps(model.requests)
-        assert violations == [], "unexpected isolated-operation attempt"
+        assert violations == [], violations
         print(json.dumps({"ok": True, "gateway_commit": GATEWAY_COMMIT,
             "hermes_commit": verify_sources(gateway, hermes), "real_gateway_database_claim_prebinding": True,
             "real_gateway_https_auth_resolve_events_closed": True, "real_hermes_http_agent_loader": True,

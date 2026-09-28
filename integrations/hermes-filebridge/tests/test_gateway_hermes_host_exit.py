@@ -49,6 +49,10 @@ HERMES_ENV = "CF_EXIT_HERMES_KEY"
 KEY_ENV = "CF_EXIT_GRANT_KEY"
 
 
+class _AuditDetails(list):
+    """Only our guard's safe code/path diagnostics may enter failure JSON."""
+
+
 # This observer registers a real downstream tool. Inspecting the already-created
 # worker PID is test instrumentation only; it never issues authority or starts a
 # worker. Holding this real stream prevents a normal end hook before SIGKILL.
@@ -64,7 +68,8 @@ def consume(args, **_context):
         receipt = {"host_pid": os.getpid(), "worker_pid": dispatch.process.pid,
             "bytes_read": len(data), "sha256": hashlib.sha256(data).hexdigest(),
             "stream_open": not stream.closed, "worker_alive": dispatch.process.poll() is None,
-            "host_audit_violations_before_kill": len(sys.modules["__main__"]._host_guard_violations)}
+            "host_audit_violations_before_kill": len(sys.modules["__main__"]._host_guard_violations),
+            "host_audit_details": list(sys.modules["__main__"]._host_guard_violations)}
         path = pathlib.Path(os.environ["CF_EXIT_STREAM_RECEIPT"])
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(receipt), encoding="utf-8")
@@ -119,7 +124,7 @@ async def host_child(gateway, hermes, worker):
         port = adapter._site._server.sockets[0].getsockname()[1]
         ready = sandbox / "host-ready.json"
         temporary = ready.with_suffix(".tmp")
-        assert _host_guard_violations == []
+        assert _host_guard_violations == [], _AuditDetails(_host_guard_violations)
         temporary.write_text(json.dumps({"pid": os.getpid(), "origin": f"http://127.0.0.1:{port}"}))
         temporary.replace(ready)
         await asyncio.Event().wait()
@@ -287,7 +292,8 @@ async def orchestrate(gateway, hermes, worker):
         assert receipt_path.exists() and host.poll() is None and not pending.done(), "workcopy consumer was not held open"
         receipt = json.loads(receipt_path.read_text())
         assert receipt["host_pid"] == host.pid and receipt["stream_open"] and receipt["worker_alive"]
-        assert receipt["host_audit_violations_before_kill"] == 0
+        assert receipt["host_audit_violations_before_kill"] == 0, _AuditDetails(receipt["host_audit_details"])
+        assert receipt["host_audit_details"] == [], _AuditDetails(receipt["host_audit_details"])
         assert receipt["bytes_read"] == len(expected) and receipt["sha256"] == hashlib.sha256(expected).hexdigest()
         worker_pid = receipt["worker_pid"]
         assert type(worker_pid) is int and worker_pid > 1 and worker_pid != host.pid
@@ -339,13 +345,14 @@ async def orchestrate(gateway, hermes, worker):
         assert not any(path.endswith("/closed") for _method, path, _status in gateway_requests)
         assert dispatcher.claim_once() is None, "uncertain history was automatically requeued"
         log.flush()
-        materials = [json.dumps(model.requests).encode(), (sandbox / "host-output.log").read_bytes()]
+        materials = [json.dumps(model.requests).encode(), (sandbox / "host-output.log").read_bytes(),
+                     receipt_path.read_bytes()]
         materials += [path.read_bytes() for path in home.rglob("*") if path.is_file()]
         assert len(test_secrets) == 4, "actual short attachment authorization was not included in leak checks"
         for secret in test_secrets:
             assert all(secret.encode() not in data for data in materials), "credential leaked in the isolated probe"
         assert "Bearer " not in json.dumps(model.requests)
-        assert violations == []
+        assert violations == [], _AuditDetails(violations)
         print(json.dumps({"ok": True, "gateway_commit": joint.GATEWAY_COMMIT,
             "hermes_commit": joint.verify_sources(gateway, hermes),
             "actual_separate_hermes_process_killed": True, "verified_workcopy_stream_held_at_exit": True,
@@ -468,7 +475,7 @@ def verify_import_child(gateway, hermes):
     shared = acquire(sandbox / "profile" / "state.db")
     release_or_close(shared)
     asyncio.run(verify_public_model_lock())
-    assert violations == []
+    assert violations == [], _AuditDetails(violations)
     rejected_metadata = violations.platform_probes_denied
     assert not rejected_metadata or sys.platform == "win32"
     assert all(os.path.normcase(os.path.abspath(path)) ==
@@ -543,6 +550,8 @@ if __name__ == "__main__":
                 name = error.name or ""
                 if name and all(part.isidentifier() for part in name.split(".")):
                     report["missing_module"] = name
+            if isinstance(error, AssertionError) and error.args and isinstance(error.args[0], _AuditDetails):
+                report["isolation_violations"] = error.args[0]
             print(json.dumps(report))
             raise SystemExit(1) from None
     else:
@@ -560,5 +569,8 @@ if __name__ == "__main__":
             # Do not echo arbitrary upstream exception text or captured logs;
             # source locations are enough to diagnose this isolated CI gate.
             frames = [f"{Path(item.filename).name}:{item.lineno}" for item in traceback.extract_tb(error.__traceback__)]
-            print(json.dumps({"ok": False, "error_type": type(error).__name__, "locations": frames}))
+            report = {"ok": False, "error_type": type(error).__name__, "locations": frames}
+            if isinstance(error, AssertionError) and error.args and isinstance(error.args[0], _AuditDetails):
+                report["isolation_violations"] = error.args[0]
+            print(json.dumps(report))
             raise SystemExit(1) from None

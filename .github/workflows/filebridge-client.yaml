@@ -104,14 +104,19 @@ jobs:
           python -m venv "$root/venv"
           "$root/venv/bin/python" -m pip install --disable-pip-version-check \
             -r integrations/hermes-filebridge/tests/gateway-hermes-joint-requirements.txt
+          joint_status=0
           "$root/venv/bin/python" -I -B integrations/hermes-filebridge/tests/test_gateway_hermes_joint.py \
             --gateway-source "$root/source/CF_agent-gateway-0ec54bf0f25f421e37e16e11bd098a814beca258" \
             --gateway-archive "$root/source.zip" \
-            --hermes-source "$CF_HERMES_TEST_SOURCE" --worker "$CF_FILEBRIDGE_INBOUND_TEST_EXE"
+            --hermes-source "$CF_HERMES_TEST_SOURCE" --worker "$CF_FILEBRIDGE_INBOUND_TEST_EXE" || joint_status=$?
+          exit_status=0
           "$root/venv/bin/python" -I -B integrations/hermes-filebridge/tests/test_gateway_hermes_host_exit.py \
             --gateway-source "$root/source/CF_agent-gateway-0ec54bf0f25f421e37e16e11bd098a814beca258" \
             --gateway-archive "$root/source.zip" \
-            --hermes-source "$CF_HERMES_TEST_SOURCE" --worker "$CF_FILEBRIDGE_INBOUND_TEST_EXE"
+            --hermes-source "$CF_HERMES_TEST_SOURCE" --worker "$CF_FILEBRIDGE_INBOUND_TEST_EXE" || exit_status=$?
+          # Run both independent boundaries; either failure keeps the gate red.
+          test "$joint_status" -eq 0
+          test "$exit_status" -eq 0
       - name: Build client and retain fixed-source inventory
         shell: bash
         run: |
