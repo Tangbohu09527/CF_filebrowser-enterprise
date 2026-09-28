@@ -1,5 +1,8 @@
 # Gateway / Hermes 入站附件联合适配（2026-09-28）
 
+本文保留 `8faff6a0` 及之前的旧版参考事实。后续官方 Hermes `0f4a98f` / Python 3.14.7
+兼容验证、首个失败、最小适配及新旧 CI 结果见[当前版本兼容记录](CURRENT_HERMES_COMPATIBILITY.md)。
+
 起点 `2b3894c1ae3146a5f6c29084068345f70e6892d9`，分支 `feat/filebridge-hermes-crud`，
 PR #2 保持 Draft/Open。工作树 `C:\Users\Admin\.codex\worktrees\6330\CF_filebrowser-enterprise`。
 先核对路径、branch/status/remote/HEAD/log/diff 再 fetch，起点本地/远端一致且干净。

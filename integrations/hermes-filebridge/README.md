@@ -1,5 +1,9 @@
 # Hermes FileBridge：内部 CA、只读接入与受控新建
 
+当前官方 Hermes `0f4a98f` / 独立 Python 3.14.7 与旧版参考的兼容检查，见
+[当前版本兼容记录](CURRENT_HERMES_COMPATIBILITY.md)。固定源码用于复现，不要求修改已安装 Hermes；
+新旧结果、原候选与更新制品、隔离联合测试和现场验收分别记录。
+
 新增入站附件开发入口见 [INBOUND_DOWNLOAD.md](INBOUND_DOWNLOAD.md)。专用下载 worker
 将固定 Gateway 契约的字节验证后落到任务目录；模型不能传 URL、凭据或任务上下文。
 此能力默认关闭。宿主适配消费 Gateway `0ec54bf0` 的权威 resolve / events / closed 契约，
