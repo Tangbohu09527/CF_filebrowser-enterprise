@@ -94,6 +94,8 @@ def verify_sources(gateway, hermes, archive=None):
 # cannot issue bindings and has no Gateway credential or descriptor access.
 OBSERVER = '''import hashlib, importlib, json, os, threading
 _lock = threading.Lock()
+retained_streams = []
+native_processes = []
 def record(kind, data):
     with _lock, open(os.environ["CF_JOINT_EVENTS"], "a", encoding="utf-8") as stream:
         stream.write(json.dumps({"kind": kind, **data}) + "\\n")
@@ -102,8 +104,18 @@ def consume(args, **kwargs):
     module = get_plugin_manager()._plugins["cf-filebridge"].module
     host = importlib.import_module(module.__name__ + ".inbound_host")
     try:
-        with host.open_workcopy(args["handle"]) as stream:
+        if os.environ.get("CF_JOINT_RETAIN_STREAM") == "1":
+            context = host.open_workcopy(args["handle"])
+            stream = context.__enter__()
+            retained_streams.append((context, stream))
             data = stream.read()
+            # Read-only observation of the real native child for exit checks;
+            # the test never creates, changes or injects a dispatch binding.
+            adapter, scope = host._active_host.get()
+            native_processes.append(adapter.bridge._dispatches[scope.resolved.worker_binding["dispatch_id"]].process)
+        else:
+            with host.open_workcopy(args["handle"]) as stream:
+                data = stream.read()
         result = {"ok": True, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
                   "actual_stream_read": True}
     except Exception:
@@ -136,6 +148,7 @@ class ModelServer(ThreadingHTTPServer):
         self.requests = []
         self.lock = threading.Lock()
         self.barrier = threading.Barrier(2, timeout=15)
+        self.control_events = {name: (threading.Event(), threading.Event()) for name in ("control", "disconnect")}
 
     def handle_error(self, *_):
         pass
@@ -167,6 +180,11 @@ class ModelHandler(BaseHTTPRequestHandler):
         label = next((name for name in ("alice", "bob", "error") if "joint-" in text and name in text), "auxiliary")
         with self.server.lock:
             self.server.requests.append(body)
+        control_case = next((name for name in self.server.control_events if "joint-control-" + name in text), None)
+        if control_case is not None and tools:
+            entered, release = self.server.control_events[control_case]
+            entered.set()
+            assert release.wait(20), "independent control HTTP probe did not release model"
         if "joint-error" in text and results and tools:
             self.send_json({"error": {"type": "invalid_request_error", "message": "isolated model failure"}}, 400)
             return
@@ -353,9 +371,19 @@ async def child(gateway, hermes, worker):
         app = create_app(settings)
         gateway_requests = []
         paused_content = {}
+        delay_closed_requests = [False]
+        release_closed = asyncio.Event()
+        blocked_closed_count = [0]
         async def observe_gateway(scope, receive, send):
             # Passive ASGI observer: preserve the actual app/auth/routes/body
             # unchanged, and never retain headers, queries or capability values.
+            if scope.get("path", "").endswith("/closed") and delay_closed_requests[0]:
+                # Network fixture delays delivery *before* the unmodified app;
+                # the client times out and the real lease barrier must expire.
+                # Releasing later still delegates to the actual authenticated
+                # route rather than manufacturing an acknowledgement.
+                blocked_closed_count[0] += 1
+                await release_closed.wait()
             async def observed_send(message):
                 if scope["type"] == "http" and message["type"] == "http.response.start":
                     gateway_requests.append((scope["method"], scope["path"], message["status"]))
@@ -387,7 +415,7 @@ async def child(gateway, hermes, worker):
                 await asyncio.sleep(0.02)
         sessions = app.state.database_session_factory
         with sessions() as session:
-            for name in ("alice", "bob", "error", "retry", "exhaust", "lease", "cancel"):
+            for name in ("alice", "bob", "error", "retry", "exhaust", "lease", "cancel", "lostclosed", "control", "disconnect"):
                 identity_service = IdentityService(session)
                 identity = identity_service.create_identity(employee_id="joint-" + name)
                 identity_service.create_mapping(platform="wechat", account_id="wxid-joint-gateway",
@@ -582,6 +610,97 @@ async def child(gateway, hermes, worker):
         assert all(result.get("ok") is False for result in tool_events(lease_binding.session_id, CONSUME))
         assert lease_binding.closed_at is not None and lease_binding.grant_ciphertext is None
         assert sum(p == f"/inbound-media/{job_for(item).id}/content" for _method, p, _status in gateway_requests) == 1
+        # Lose delivery of a real /closed request. Local worker/stream shutdown
+        # must precede that acknowledgement, and Gateway's actual fixed lease
+        # must unblock completion without a reconnect or refreshed budget.
+        item = admit("lostclosed", "attachment", True)
+        assert await asyncio.to_thread(intake.run_once) == "ready"
+        closed_claim = dispatcher.claim_once()
+        observer = manager._plugins["cf-a-joint-observer"].module
+        os.environ["CF_JOINT_RETAIN_STREAM"] = "1"
+        delay_closed_requests[0] = True
+        began = time.monotonic()
+        try:
+            await asyncio.wait_for(asyncio.to_thread(dispatcher.process_claim, closed_claim), 42)
+            closed_elapsed = time.monotonic() - began
+            lost_binding = binding_for(closed_claim)
+            assert blocked_closed_count[0] == 1, "host retried an uncertain closed request"
+            assert lost_binding.closed_at is None and lost_binding.grant_ciphertext is None
+            assert 25 <= closed_elapsed < 42, closed_elapsed
+            assert observer.retained_streams and all(stream.closed for _context, stream in observer.retained_streams)
+            assert observer.native_processes and all(process.poll() is not None for process in observer.native_processes)
+        finally:
+            delay_closed_requests[0] = False
+            release_closed.set()
+            os.environ.pop("CF_JOINT_RETAIN_STREAM", None)
+            for context, _stream in observer.retained_streams:
+                context.__exit__(None, None, None)
+        # These are independent authenticated control-protocol negative probes,
+        # not successful downloads or fabricated plugin bindings. A genuine
+        # Gateway worker prebinds each child and waits inside the real model
+        # request while this explicit synthetic host exercises the HTTP fences.
+        tls = ssl.create_default_context(cafile=str(sandbox / "cert.pem"))
+        direct_control_cases = []
+        async with ClientSession(connector=TCPConnector(ssl=tls), timeout=ClientTimeout(total=8)) as client:
+            for scenario in ("control", "disconnect"):
+                item = admit(scenario, "control", True)
+                assert await asyncio.to_thread(intake.run_once) == "ready"
+                claim = dispatcher.claim_once()
+                pending = asyncio.create_task(asyncio.to_thread(dispatcher.process_claim, claim))
+                entered, release = model.control_events[scenario]
+                assert await asyncio.to_thread(entered.wait, 10), "real model did not receive prebound request"
+                binding = binding_for(claim)
+                body = {"schema": "cf-inbound-host-binding/v1", "session_id": binding.session_id,
+                    "task_id": binding.session_id, "host_instance_id": "joint-direct-" + scenario,
+                    "host_nonce": secrets.token_urlsafe(32)}
+                headers = {"Authorization": "Bearer " + service_token}
+                try:
+                    async with client.post(origin + "/internal/hermes/inbound-bindings/resolve", json=body, headers=headers) as response:
+                        assert response.status == 200
+                        resolved = await response.json()
+                    descriptor = resolved["attachments"][0]
+                    authorization = descriptor["authorization"]
+                    _test_secrets.extend((authorization, authorization.removeprefix("Bearer "), body["host_nonce"]))
+                    # Successful resolve alone cannot authorize byte delivery.
+                    async with client.get(descriptor["url"], headers={"Authorization": authorization}) as response:
+                        assert response.status == 403
+                    for changed in ({**body, "host_instance_id": "old-instance"},
+                                    {**body, "host_nonce": "old_nonce_" + "x" * 32}):
+                        async with client.post(origin + "/internal/hermes/inbound-bindings/resolve", json=changed, headers=headers) as response:
+                            assert response.status == 403
+                    owner = {**body, "claim_epoch": resolved["claim_epoch"]}
+                    event_headers = {**headers, "X-CF-Session-Id": body["session_id"], "X-CF-Task-Id": body["task_id"],
+                        "X-CF-Host-Instance-Id": body["host_instance_id"], "X-CF-Host-Nonce": body["host_nonce"],
+                        "X-CF-Claim-Epoch": resolved["claim_epoch"]}
+                    endpoint = origin + "/internal/hermes/inbound-bindings/" + resolved["binding_id"]
+                    async with client.get(endpoint + "/events", headers={**event_headers,
+                            "X-CF-Claim-Epoch": "00000000-0000-0000-0000-000000000000"}) as response:
+                        assert response.status == 403
+                    if scenario == "control":
+                        async with client.get(endpoint + "/events", headers={**event_headers,
+                                "Last-Event-ID": str(resolved["event_sequence"] + 1)}) as response:
+                            assert response.status == 403
+                    else:
+                        async with client.get(endpoint + "/events", headers=event_headers) as response:
+                            assert response.status == 200
+                            frame = await response.content.readuntil(b"\n\n")
+                            assert b"event: binding" in frame
+                            response.close()
+                    await wait_until(lambda: binding_for(claim).state == "revoked")
+                    async with client.get(descriptor["url"], headers={"Authorization": authorization}) as response:
+                        assert response.status == 403
+                    # This synthetic host has never activated a worker or opened
+                    # a file; its authenticated explicit close is truthful.
+                    async with client.post(endpoint + "/closed", json=owner, headers=headers) as response:
+                        assert response.status == 200
+                    for changed in ({**owner, "host_nonce": "old_nonce_" + "x" * 32},
+                                    {**owner, "claim_epoch": "00000000-0000-0000-0000-000000000000"}):
+                        async with client.post(endpoint + "/closed", json=changed, headers=headers) as response:
+                            assert response.status == 403
+                    direct_control_cases.append(scenario)
+                finally:
+                    release.set()
+                await asyncio.wait_for(pending, 12)
         # Real Gateway authentication and replay denial; no route overrides.
         tls = ssl.create_default_context(cafile=str(sandbox / "cert.pem"))
         async with ClientSession(connector=TCPConnector(ssl=tls), timeout=ClientTimeout(total=5)) as client:
@@ -610,6 +729,9 @@ async def child(gateway, hermes, worker):
             "real_staging_503_attempt_counts": retry_counts,
             "cancel_during_https_body_no_workcopy": True,
             "real_30_second_idle_lease_no_budget_refresh": True,
+            "lost_closed_request_local_resources_revoked_before_real_lease_barrier": True,
+            "lost_closed_request_elapsed_seconds": round(closed_elapsed, 2),
+            "independent_real_control_negative_probes": direct_control_cases,
             "stubs": ["loopback model HTTP", "upstream WeChat fetch"],
             "production_host_acceptance": False, "isolation_audit_violations": len(violations)}))
     finally:
