@@ -7,7 +7,7 @@ real registry rejection, not an authenticated Gateway dispatch.
 from __future__ import annotations
 
 import argparse
-import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -41,32 +41,25 @@ SOURCE_BLOBS = {
 }
 PLUGIN = Path(__file__).resolve().parents[1] / "plugin"
 TOOL = "filebrowser_download_inbound"
+_spec = importlib.util.spec_from_file_location("cf_hermes_probe_support", Path(__file__).with_name("hermes_probe_support.py"))
+support = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(support)
+VERSIONS = support.VERSIONS
 
 
-def verify_source(source: Path) -> None:
-    for relative, expected in SOURCE_BLOBS.items():
-        data = (source / relative).read_bytes()
-        blob = b"blob " + str(len(data)).encode("ascii") + b"\0" + data
-        if hashlib.sha1(blob).hexdigest() != expected:
-            raise ValueError(f"Hermes source mismatch at {relative}; require {HERMES_COMMIT}")
+def verify_source(source: Path, commit: str = HERMES_COMMIT, archive: Path | None = None) -> str:
+    return support.verify_source(source, commit, archive)
 
 
-def child_check(source: Path, enabled: bool) -> None:
+def child_check(source: Path, enabled: bool, commit: str = HERMES_COMMIT) -> None:
     sys.dont_write_bytecode = True
+    sandbox = Path(os.environ["HERMES_HOME"]).parent
+    support.assert_isolated_environment(sandbox)
+    support.bootstrap_system_metadata()
+    external_attempts = support.install_audit_guard(sandbox, source)
     sys.path.insert(0, str(source))
     from hermes_cli.plugins import PluginContext, PluginManager
     from tools.registry import registry
-
-    # Observe actual execution without replacing PluginContext, the manager,
-    # registry, or handlers. Any network/process launch is a test failure.
-    external_attempts = []
-
-    def deny_external(event, _args):
-        if event in {"socket.connect", "socket.getaddrinfo", "subprocess.Popen", "os.system"}:
-            external_attempts.append(event)
-            raise RuntimeError("external operation forbidden in loader test")
-
-    sys.addaudithook(deny_external)
     checks = unittest.TestCase()
     manager = PluginManager()
     try:
@@ -83,9 +76,26 @@ def child_check(source: Path, enabled: bool) -> None:
         checks.assertTrue(any(isinstance(value, PluginContext) for value in captured),
                           "read handler did not receive the real upstream PluginContext")
         entry = registry.get_entry(TOOL, scope=manager.scope_key)
+        create_entry = registry.get_entry("filebrowser_create_text", scope=manager.scope_key)
+        rejected_create_requests = 0
         if not enabled:
             checks.assertIsNone(entry, "inbound download must be disabled by default")
+            checks.assertIsNone(create_entry, "controlled create must be disabled by default")
         else:
+            checks.assertIsNotNone(create_entry, "explicit create opt-in must register the existing tool")
+            checks.assertEqual(create_entry.schema["parameters"]["properties"]["command"]["enum"],
+                               ["plan", "apply", "status"])
+            for command, data in (("approve-create", {}), ("approve", {}), ("shell", {}),
+                                  ("apply", {"approved": True}), ("apply", {"content": "override"}),
+                                  ("plan", {"local_file": "synthetic-local-file"}),
+                                  ("plan", {"url": "https://invalid.example/unused"}),
+                                  ("plan", {"apply": True})):
+                answer = registry.dispatch("filebrowser_create_text", {"command": command, "input": data},
+                                           scope=manager.scope_key)
+                result = json.loads(answer) if isinstance(answer, str) else answer
+                checks.assertFalse(result["ok"])
+                checks.assertEqual(result["error"]["code"], "invalid_tool_input")
+                rejected_create_requests += 1
             checks.assertIsNotNone(entry, "explicit inbound opt-in must register the tool")
             checks.assertEqual(set(entry.schema["parameters"]["properties"]), {"attachment_id"})
             # These are the general handler kwargs supplied by the pinned
@@ -101,12 +111,15 @@ def child_check(source: Path, enabled: bool) -> None:
         checks.assertEqual(external_attempts, [])
     finally:
         manager.unload()
-    print(json.dumps({"hermes_commit": HERMES_COMMIT, "inbound_enabled": enabled,
-                      "real_loader": True, "host_bridge_connected": False, "ok": True}))
+    print(json.dumps({"hermes_commit": commit, "inbound_enabled": enabled,
+                      "controlled_create_enabled": enabled,
+                      "controlled_create_rejected_requests": rejected_create_requests,
+                      "real_loader": True, "host_bridge_connected": False,
+                      "isolation_audit_violations": len(external_attempts), "ok": True}))
 
 
-def run(source: Path) -> None:
-    verify_source(source)
+def run(source: Path, commit: str = HERMES_COMMIT, archive: Path | None = None) -> None:
+    verify_source(source, commit, archive)
     with tempfile.TemporaryDirectory(prefix="cf-hermes-loader-") as temporary:
         root = Path(temporary).resolve()
         for enabled in (False, True):
@@ -115,25 +128,19 @@ def run(source: Path) -> None:
             plugin_copy = home / "plugins" / "cf-filebridge"
             shutil.copytree(PLUGIN, plugin_copy,
                             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-            bundled = sandbox / "empty-bundled"
-            bundled.mkdir()
             # JSON is YAML-compatible. No real profile, config, token, client,
             # Gateway URL, or previously installed plugin is consulted.
-            settings = {"inbound_enabled": True} if enabled else {}
+            settings = {"inbound_enabled": True, "create_enabled": True,
+                        "create_config_path": str(home / "unused-synthetic-create.json")} if enabled else {}
             config = {"plugins": {"enabled": ["cf-filebridge"], "entries": {
                 "cf-filebridge": {"settings": settings}
-            }}}
+            }}, "agent": {"environment_probe": False}, "security": {"allow_lazy_installs": False}}
             (home / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
-            env = {key: value for key, value in os.environ.items()
-                   if key.upper() in {"SYSTEMROOT", "WINDIR", "PATH", "TEMP", "TMP"}}
-            env.update({"HERMES_HOME": str(home), "HERMES_BUNDLED_PLUGINS": str(bundled),
-                        "HERMES_ENABLE_PROJECT_PLUGINS": "false",
-                        "USERPROFILE": str(sandbox / "user"),
-                        "APPDATA": str(sandbox / "user" / "AppData"),
-                        "LOCALAPPDATA": str(sandbox / "user" / "LocalAppData"),
-                        "PYTHONDONTWRITEBYTECODE": "1"})
-            command = [sys.executable, "-I", "-B", str(Path(__file__).resolve()),
-                       "--hermes-source", str(source), "--child", str(int(enabled))]
+            env = support.isolated_environment(sandbox)
+            command = [sys.executable, "-I", "-X", "utf8", "-B", str(Path(__file__).resolve()),
+                       "--hermes-source", str(source), "--hermes-commit", commit, "--child", str(int(enabled))]
+            if archive is not None:
+                command.extend(("--hermes-archive", str(archive)))
             completed = subprocess.run(command, cwd=sandbox, env=env, text=True,
                                        capture_output=True, timeout=60)
             if completed.returncode:
@@ -144,11 +151,14 @@ def run(source: Path) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hermes-source", required=True, type=Path)
+    parser.add_argument("--hermes-commit", choices=VERSIONS, default=HERMES_COMMIT)
+    parser.add_argument("--hermes-archive", type=Path)
     parser.add_argument("--child", choices=("0", "1"), help=argparse.SUPPRESS)
     options = parser.parse_args()
-    source_path = options.hermes_source.resolve(strict=True)
-    verify_source(source_path)
+    source_path = options.hermes_source.absolute()
+    archive = options.hermes_archive.resolve(strict=True) if options.hermes_archive else None
+    verify_source(source_path, options.hermes_commit, archive)
     if options.child is None:
-        run(source_path)
+        run(source_path, options.hermes_commit, archive)
     else:
-        child_check(source_path, options.child == "1")
+        child_check(source_path, options.child == "1", options.hermes_commit)

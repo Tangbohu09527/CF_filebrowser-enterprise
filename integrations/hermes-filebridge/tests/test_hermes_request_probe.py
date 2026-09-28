@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
-import platform
 import secrets
 import shutil
 import subprocess
@@ -22,10 +23,16 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 
 HERE = Path(__file__).resolve().parent
 PLUGIN = HERE.parent / "plugin"
 TOOL = "filebrowser_download_inbound"
+_spec = importlib.util.spec_from_file_location("cf_hermes_probe_support", HERE / "hermes_probe_support.py")
+support = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(support)
+_probe_secrets = ["public-isolated-model-stub-not-a-credential",
+                  "public-synthetic-never-a-real-credential", "public-wrong-test-value"]
 
 OBSERVER = '''import json, os, threading
 _lock = threading.Lock()
@@ -53,12 +60,8 @@ def register(ctx):
 '''
 
 
-def verify_source(source):
-    spec = importlib.util.spec_from_file_location("cf_loader_source_verifier", HERE / "test_hermes_loader.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    module.verify_source(source)
-    return module.HERMES_COMMIT
+def verify_source(source, commit=support.DEFAULT_HERMES_COMMIT, archive=None):
+    return support.verify_source(source, commit, archive)
 
 
 class ModelStub(ThreadingHTTPServer):
@@ -164,35 +167,20 @@ class ModelHandler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
 
 
-async def child_probe(source, lifecycle=False):
-    # Python 3.11 Windows caches its real OS version using `cmd /c ver`.
-    # Complete that stdlib bootstrap before guarding Hermes execution; keep
-    # actual request/agent/tool subprocess attempts forbidden below.
-    platform.system()
+async def child_probe(source, lifecycle=False, commit=support.DEFAULT_HERMES_COMMIT):
+    home = Path(os.environ["HERMES_HOME"])
+    sandbox = home.parent
+    support.assert_isolated_environment(sandbox)
+    support.bootstrap_system_metadata()
+    violations = support.install_audit_guard(sandbox, source, allow_network=True)
     model = ModelStub()
     threading.Thread(target=model.serve_forever, daemon=True).start()
-    home = Path(os.environ["HERMES_HOME"])
     config_path = home / "config.yaml"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     config["model"] = {"provider": "custom", "default": "cf-probe-model", "api_mode": "chat_completions",
                        "base_url": f"http://127.0.0.1:{model.server_port}/v1", "context_length": 131072,
                        "api_key": "public-isolated-model-stub-not-a-credential"}
     config_path.write_text(json.dumps(config), encoding="utf-8")
-    # Install the network guard before importing Hermes. Optional catalog probes
-    # cannot contact a remote endpoint, and no terminal/subprocess is authorized.
-    rejected_network = []
-    def local_only(event, args):
-        if event == "socket.connect":
-            address = args[1]
-            if isinstance(address, tuple) and address[0] not in {"127.0.0.1", "::1"}:
-                rejected_network.append(event)
-                raise RuntimeError("probe forbids external connections")
-        elif event == "socket.getaddrinfo" and args[0] not in {None, "localhost", "127.0.0.1", "::1"}:
-            rejected_network.append(event)
-            raise RuntimeError("probe forbids external DNS")
-        elif event in {"subprocess.Popen", "os.system"}:
-            raise RuntimeError("probe forbids subprocess execution")
-    sys.addaudithook(local_only)
     sys.path.insert(0, str(source))
     from aiohttp import ClientSession, ClientTimeout
     from hermes_cli.plugins import discover_plugins, get_plugin_manager
@@ -204,6 +192,7 @@ async def child_probe(source, lifecycle=False):
         loaded = manager._plugins.get(name)
         assert loaded is not None and loaded.enabled and loaded.error is None, (name, loaded)
     api_key = secrets.token_hex(32)
+    _probe_secrets.append(api_key)
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={
         "host": "127.0.0.1", "port": 0, "key": api_key, "model_name": "cf-probe-model"}))
     try:
@@ -305,16 +294,21 @@ async def child_probe(source, lifecycle=False):
                     await asyncio.sleep(0.05)
                 lifecycle_ends=[item for item in lifecycle_events if item["kind"]=="on_session_end"
                                 and item["session_id"] in {"probe-error","probe-cancel"}]
+                error_ends=[item for item in lifecycle_ends if item["session_id"]=="probe-error"]
+                cancel_ends=[item for item in lifecycle_ends if item["session_id"]=="probe-cancel"]
                 lifecycle_observations={"error_http_status":error_status,"error_response_failed":
                     bool(error_body.get("hermes",{}).get("failed")),"events":lifecycle_ends,
-                    "lifecycle_complete":False,"exception_end_hook_missing":True}
+                    "error_end_events":len(error_ends),"disconnect_end_events":len(cancel_ends),
+                    "lifecycle_complete":False,"exception_end_hook_missing":not error_ends}
                 # Regression observation of the pinned upstream GAP. A passing
                 # probe means the gap was reproduced, not that all exits revoke
                 # an authorized dispatch. Never manufacture a missing hook.
                 assert error_status==200 and lifecycle_observations["error_response_failed"], lifecycle_observations
-                assert {item["session_id"] for item in lifecycle_ends}=={"probe-cancel"}, lifecycle_observations
-                assert any(item["session_id"]=="probe-cancel" and item["interrupted"] for item in lifecycle_ends), lifecycle_observations
-        print(json.dumps({"hermes_commit": verify_source(source), "real_http_request": True,
+                expected_error_ends=int(support.VERSIONS[commit]["exception_end_hook"])
+                assert len(error_ends)==expected_error_ends, lifecycle_observations
+                assert len(cancel_ends)==1 and cancel_ends[0]["interrupted"], lifecycle_observations
+        assert violations == [], violations
+        print(json.dumps({"hermes_commit": commit, "real_http_request": True,
                           "real_plugin_loader": True, "real_agent": True, "model_stub": "loopback HTTP only",
                           "concurrent_requests": 2, "official_tool_executions": len(executions),
                           "unauthorized_http_requests_denied": 2,
@@ -323,9 +317,11 @@ async def child_probe(source, lifecycle=False):
                           "tool_execution_fields": executions[0]["fields"], "session_end_events": len(ends),
                           "authenticated_request_binding": False, "download_result": "trusted_context_unavailable",
                           "lifecycle_complete":False if lifecycle else None,
-                          "exception_end_hook_missing":True if lifecycle else None,
+                          "exception_end_hook_missing":lifecycle_observations.get("exception_end_hook_missing"),
                           "lifecycle_negative_probe":lifecycle_observations,
-                          "blocked_optional_external_attempts": len(rejected_network), "ok": True}))
+                          "blocked_optional_external_attempts": 0,
+                          "isolation_audit_violations": len(violations),
+                          "platform_probes_denied": violations.platform_probes_denied, "ok": True}))
     finally:
         await adapter.disconnect()
         manager.unload()
@@ -333,8 +329,8 @@ async def child_probe(source, lifecycle=False):
         model.server_close()
 
 
-def run(source,lifecycle=False):
-    verify_source(source)
+def run(source,lifecycle=False,commit=support.DEFAULT_HERMES_COMMIT,archive=None):
+    verify_source(source,commit,archive)
     with tempfile.TemporaryDirectory(prefix="cf-hermes-real-request-") as temporary:
         sandbox = Path(temporary).resolve()
         home = sandbox / "profile"
@@ -344,24 +340,18 @@ def run(source,lifecycle=False):
         observer.mkdir()
         (observer / "plugin.yaml").write_text('name: cf-a-request-observer\nversion: "1.0.0"\nkind: standalone\n', encoding="utf-8")
         (observer / "__init__.py").write_text(OBSERVER, encoding="utf-8")
-        bundled = sandbox / "empty-bundled"
-        bundled.mkdir()
         config = {"plugins": {"enabled": ["cf-filebridge", "cf-a-request-observer"], "entries": {
             "cf-filebridge": {"settings": {"inbound_enabled": True}}}},
             "platform_toolsets": {"api_server": ["cf_filebridge_inbound"]},
-            "agent": {"max_iterations": 4}, "memory": {"enabled": False},
+            "agent": {"max_iterations": 4, "environment_probe": False},
+            "security": {"allow_lazy_installs": False}, "memory": {"enabled": False},
             "skills": {"enabled": False}, "compression": {"enabled": False}}
         (home / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
-        env = {key: value for key, value in os.environ.items()
-               if key.upper() in {"SYSTEMROOT", "WINDIR", "PATH", "TEMP", "TMP"}}
-        env.update({"HERMES_HOME": str(home), "HERMES_BUNDLED_PLUGINS": str(bundled),
-                    "HERMES_ENABLE_PROJECT_PLUGINS": "false", "USERPROFILE": str(sandbox / "user"),
-                    "HOME": str(sandbox / "user"), "APPDATA": str(sandbox / "user" / "AppData"),
-                    "LOCALAPPDATA": str(sandbox / "user" / "LocalAppData"),
-                    "CF_HERMES_PROBE_EVENTS": str(sandbox / "events.jsonl"),
-                    "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUTF8": "1"})
-        command = [sys.executable, "-I", "-B", str(Path(__file__).resolve()),
-                   "--hermes-source", str(source), "--child"]
+        env = support.isolated_environment(sandbox, {"CF_HERMES_PROBE_EVENTS": str(sandbox / "events.jsonl")})
+        command = [sys.executable, "-I", "-X", "utf8", "-B", str(Path(__file__).resolve()),
+                   "--hermes-source", str(source), "--hermes-commit", commit, "--child"]
+        if archive is not None:
+            command.extend(("--hermes-archive", str(archive)))
         if lifecycle: command.append("--lifecycle")
         result = subprocess.run(command, cwd=sandbox, env=env, text=True, encoding="utf-8",
                                 capture_output=True, timeout=150)
@@ -374,15 +364,36 @@ def run(source,lifecycle=False):
         print(json.dumps(report))
 
 
+def run_child_sanitized(source, lifecycle, commit):
+    output, errors = io.StringIO(), io.StringIO()
+    exit_code = 0
+    with redirect_stdout(output), redirect_stderr(errors):
+        try:
+            asyncio.run(child_probe(source, lifecycle, commit))
+        except BaseException:
+            traceback.print_exc()
+            exit_code = 1
+    for stream, destination in ((output, sys.stdout), (errors, sys.stderr)):
+        text = stream.getvalue()
+        for secret in _probe_secrets:
+            text = text.replace(secret, "[REDACTED_SYNTHETIC_CREDENTIAL]")
+        print(text, end="", file=destination)
+    if exit_code:
+        raise SystemExit(exit_code)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hermes-source", required=True, type=Path)
+    parser.add_argument("--hermes-commit", choices=support.VERSIONS, default=support.DEFAULT_HERMES_COMMIT)
+    parser.add_argument("--hermes-archive", type=Path)
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--lifecycle", action="store_true", help="Also drive actual model-error and SSE-disconnect lifecycle paths")
     options = parser.parse_args()
-    source = options.hermes_source.resolve(strict=True)
-    verify_source(source)
+    source = options.hermes_source.absolute()
+    archive = options.hermes_archive.resolve(strict=True) if options.hermes_archive else None
+    verify_source(source,options.hermes_commit,archive)
     if options.child:
-        asyncio.run(child_probe(source,options.lifecycle))
+        run_child_sanitized(source,options.lifecycle,options.hermes_commit)
     else:
-        run(source,options.lifecycle)
+        run(source,options.lifecycle,options.hermes_commit,archive)

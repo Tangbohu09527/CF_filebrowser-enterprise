@@ -16,7 +16,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import platform
 import shutil
 import ssl
 import subprocess
@@ -32,6 +31,9 @@ PLUGIN = HERE.parent / "plugin"
 DOWNLOAD = "filebrowser_download_inbound"
 PROCESS = "cf_inbound_test_process_workcopy"
 DUMMY_AUTH = "Bearer public-isolated-test-capability-never-a-real-token"
+_spec = importlib.util.spec_from_file_location("cf_hermes_probe_support", HERE / "hermes_probe_support.py")
+support = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(support)
 ENTRYPOINT_BLOBS = {
     "model_tools.py": "924cd94413b18c3a069228950939c4c43fa43b3b",
     "hermes_cli/middleware.py": "897e4afc07ba0d78ba928baf39a8573422b648be",
@@ -50,17 +52,8 @@ foreach($id in @($sid.Value,'S-1-5-18','S-1-5-32-544')) {
 """
 
 
-def verify_source(source):
-    spec = importlib.util.spec_from_file_location("cf_loader_check", HERE / "test_hermes_loader.py")
-    loader_check = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(loader_check)
-    loader_check.verify_source(source)
-    for relative, expected in ENTRYPOINT_BLOBS.items():
-        data = (source / relative).read_bytes()
-        blob = b"blob " + str(len(data)).encode("ascii") + b"\0" + data
-        if hashlib.sha1(blob).hexdigest() != expected:
-            raise ValueError(f"Pinned Hermes entrypoint mismatch: {relative}")
-    return loader_check.HERMES_COMMIT
+def verify_source(source, commit=support.DEFAULT_HERMES_COMMIT, archive=None):
+    return support.verify_source(source, commit, archive)
 
 
 def private_directory(path):
@@ -82,68 +75,24 @@ class QuietServer(ThreadingHTTPServer):
         pass  # A cancelled TLS response is expected; never print request data.
 
 
-def child_check(source, worker):
-    # Python 3.11 Windows obtains its OS version through `cmd /c ver`.
-    # Cache this real stdlib OS fact before guarding Hermes execution. No
-    # Hermes code is imported or replaced during this test bootstrap.
-    platform.system()
-    # Installed before upstream imports. Profiles/config writes stay in the
-    # freshly created sandbox; imports can read only explicit source/runtime
-    # roots. Any unexpected attempted access fails the complete test even when
-    # an optional upstream import catches the immediate exception.
+def child_check(source, worker, commit=support.DEFAULT_HERMES_COMMIT):
     sandbox = Path(os.environ["HERMES_HOME"]).parent
-    allowed_roots = (sandbox, source, HERE, Path(sys.prefix), Path(sys.base_prefix))
-    read_only_os_metadata = {"/proc/1/cgroup", "/proc/self/mountinfo", "/proc/stat", "/proc/version",
-                             "/etc/os-release", "/usr/lib/os-release"}
-    violations = []
-    system_reads = set()
+    support.assert_isolated_environment(sandbox)
+    support.bootstrap_system_metadata()
 
-    def within(path, roots):
-        candidate = Path(os.path.abspath(os.fsdecode(path)))
-        return any(candidate == root or root in candidate.parents for root in roots)
+    def allowed_acl_helper(executable, command, environment):
+        if os.name != "nt":
+            return False
+        powershell = Path(os.environ["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        expected = subprocess.list2cmdline([str(powershell), "-NoProfile", "-NonInteractive",
+                                          "-Command", PRIVATE_ACL_SCRIPT])
+        executable = Path(os.path.abspath(executable)) if executable is not None else None
+        path = Path(os.path.abspath(environment.get("CF_INBOUND_TEST_DIR", "")))
+        return executable in (None, powershell) and command == expected and sandbox in path.parents
 
-    def guard(event, args):
-        denied = False
-        if event == "open" and not isinstance(args[0], int):
-            path, mode, flags = args
-            write = bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
-            roots = (sandbox,) if write else allowed_roots
-            denied = not within(path, roots) and not (not write and Path(os.path.abspath(path)) == worker)
-            # Pinned upstream config and psutil's import-time CPU probes read
-            # these exact OS metadata paths. No user/config root is allowed.
-            if not write and os.fsdecode(path) in read_only_os_metadata:
-                denied = False
-                system_reads.add(os.fsdecode(path))
-            if os.path.normcase(os.fsdecode(path)) == os.path.normcase(os.devnull):
-                denied = False
-        elif event in ("socket.bind", "socket.connect"):
-            address = args[1]
-            denied = not isinstance(address, tuple) or address[0] not in ("127.0.0.1", "::1")
-        elif event == "socket.getaddrinfo":
-            denied = args[0] not in ("127.0.0.1", "::1", "localhost")
-        elif event == "subprocess.Popen":
-            executable, command, _cwd, environment = args
-            executable = Path(os.path.abspath(executable)) if executable is not None else None
-            allowed = executable == worker and command == [str(worker)]
-            if os.name == "nt":
-                powershell = Path(os.environ["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
-                # Windows converts command lists to strings before the audit
-                # event; compare exactly with Python's own public quoting API.
-                worker_command = subprocess.list2cmdline([str(worker)])
-                acl_command = subprocess.list2cmdline([str(powershell), "-NoProfile", "-NonInteractive",
-                                                      "-Command", PRIVATE_ACL_SCRIPT])
-                allowed = ((executable in (None, worker) and command == worker_command)
-                           or (executable in (None, powershell) and command == acl_command
-                               and within(environment.get("CF_INBOUND_TEST_DIR", ""), (sandbox,))))
-            denied = not allowed
-        elif event in ("os.system", "os.exec", "os.posix_spawn"):
-            denied = True
-        if denied:
-            detail = " (" + os.fsdecode(args[0]) + ")" if event == "open" else ""
-            violations.append(event + detail)
-            raise RuntimeError("isolated middleware test blocked unexpected " + event + detail)
-
-    sys.addaudithook(guard)
+    violations = support.install_audit_guard(sandbox, source, worker=worker, allow_network=True,
+                                             allowed_subprocess=allowed_acl_helper)
+    system_reads = violations.system_reads
     sys.path.insert(0, str(source))
     from hermes_cli.plugins import PluginContext, get_plugin_manager
     from tools.registry import registry
@@ -443,7 +392,7 @@ def child_check(source, worker):
         if not result.wasSuccessful():
             raise SystemExit(1)
         checks.assertEqual(violations, [], "unexpected external operation was attempted")
-        print(json.dumps({"hermes_commit": verify_source(source), "tests": result.testsRun,
+        print(json.dumps({"hermes_commit": commit, "tests": result.testsRun,
                           "entrypoint": "model_tools.handle_function_call", "real_loader": True,
                           "real_plugin_context": True, "real_tool_execution_middleware": True,
                           "real_https_native_worker": True, "synthetic_host_bindings": True,
@@ -454,30 +403,25 @@ def child_check(source, worker):
         manager.unload()
 
 
-def run(source, worker):
+def run(source, worker, commit=support.DEFAULT_HERMES_COMMIT, archive=None):
     with tempfile.TemporaryDirectory(prefix="cf-hermes-middleware-") as temporary:
         root = Path(temporary).resolve()
         home = root / "profile"
         shutil.copytree(PLUGIN, home / "plugins/cf-filebridge",
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-        bundled = root / "empty-bundled"
-        bundled.mkdir()
-        (root / "temp").mkdir()
         config = {"plugins": {"enabled": ["cf-filebridge"], "entries": {
-            "cf-filebridge": {"settings": {"inbound_enabled": True}}}}}
+            "cf-filebridge": {"settings": {"inbound_enabled": True}}}},
+            "agent": {"environment_probe": False}, "security": {"allow_lazy_installs": False}}
         (home / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
-        env = {key: value for key, value in os.environ.items()
-               if key.upper() in {"SYSTEMROOT", "WINDIR", "PATH", "TEMP", "TMP"}}
-        env.update({"HERMES_HOME": str(home), "HERMES_BUNDLED_PLUGINS": str(bundled),
-                    "HERMES_ENABLE_PROJECT_PLUGINS": "false", "USERPROFILE": str(root / "user"),
-                    "HOME": str(root / "user"), "APPDATA": str(root / "user/AppData"),
-                    "LOCALAPPDATA": str(root / "user/LocalAppData"), "PYTHONDONTWRITEBYTECODE": "1",
-                    "TEMP": str(root / "temp"), "TMP": str(root / "temp")})
-        completed = subprocess.run([sys.executable, "-I", "-B", str(Path(__file__).resolve()),
-                                    "--hermes-source", str(source), "--worker", str(worker), "--child"],
+        env = support.isolated_environment(root)
+        command = [sys.executable, "-I", "-X", "utf8", "-B", str(Path(__file__).resolve()),
+                   "--hermes-source", str(source), "--hermes-commit", commit, "--worker", str(worker), "--child"]
+        if archive is not None:
+            command.extend(("--hermes-archive", str(archive)))
+        completed = subprocess.run(command,
                                    cwd=root, env=env, capture_output=True, text=True, timeout=90)
-        print(completed.stdout, end="")
-        print(completed.stderr, end="", file=sys.stderr)
+        print(completed.stdout.replace(DUMMY_AUTH, "[REDACTED_SYNTHETIC_CREDENTIAL]"), end="")
+        print(completed.stderr.replace(DUMMY_AUTH, "[REDACTED_SYNTHETIC_CREDENTIAL]"), end="", file=sys.stderr)
         if completed.returncode:
             raise SystemExit(completed.returncode)
 
@@ -485,6 +429,8 @@ def run(source, worker):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hermes-source", required=True, type=Path)
+    parser.add_argument("--hermes-commit", choices=support.VERSIONS, default=support.DEFAULT_HERMES_COMMIT)
+    parser.add_argument("--hermes-archive", type=Path)
     parser.add_argument("--worker", type=Path,
                         default=os.environ.get("CF_FILEBRIDGE_INBOUND_TEST_EXE"),
                         help="Explicit compiled isolated worker (or CF_FILEBRIDGE_INBOUND_TEST_EXE)")
@@ -492,10 +438,11 @@ if __name__ == "__main__":
     options = parser.parse_args()
     if not options.worker:
         parser.error("--worker or CF_FILEBRIDGE_INBOUND_TEST_EXE is required")
-    source_path = options.hermes_source.resolve(strict=True)
+    source_path = options.hermes_source.absolute()
     worker_path = options.worker.resolve(strict=True)
-    verify_source(source_path)
+    archive = options.hermes_archive.resolve(strict=True) if options.hermes_archive else None
+    verify_source(source_path, options.hermes_commit, archive)
     if options.child:
-        child_check(source_path, worker_path)
+        child_check(source_path, worker_path, options.hermes_commit)
     else:
-        run(source_path, worker_path)
+        run(source_path, worker_path, options.hermes_commit, archive)
