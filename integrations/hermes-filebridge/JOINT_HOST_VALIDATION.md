@@ -100,6 +100,9 @@ python -B -m unittest discover -s integrations/hermes-filebridge/tests -v
 <isolated-python> -I -B integrations/hermes-filebridge/tests/test_gateway_hermes_joint.py \
   --gateway-source <fixed-0ec54-snapshot> --hermes-source <fixed-4d55-snapshot> \
   --worker <current-native-linux-worker>
+<isolated-python> -I -B integrations/hermes-filebridge/tests/test_gateway_hermes_host_exit.py \
+  --gateway-source <fixed-0ec54-snapshot> --hermes-source <fixed-4d55-snapshot> \
+  --worker <current-native-linux-worker>
 powershell.exe -NoProfile -NonInteractive -File integrations/hermes-filebridge/windows/Manage-InboundClient.ps1 -Mode SelfTest
 ```
 
@@ -110,8 +113,50 @@ Linux 组合使用真实数据库、admission/claim/预绑定、认证 HTTP/even
 旧 `test_hermes_loader.py`、`test_hermes_middleware.py`、`test_hermes_request_probe.py --lifecycle`
 继续运行，其历史断言不删减。
 
-本轮执行结果和对应提交/CI 在交付时补录。现场 Windows AI 主机、CFserver、实际微信入口没有测试。
+Windows 本地已执行：独立 Go `test -count=1 ./...` / `vet ./...` 通过；Python discovery
+60 项中 59 通过、1 项 Linux 目录替换测试按平台未运行（33.052 秒），包括 EOF reader 并发关闭回归。
+Windows 原生暂存 18 项通过；
+固定官方 loader 两开关场景、middleware 6 项、真实请求 `--lifecycle` 探针全部通过。
+这些测试只读原官方源码，保留全部旧断言。新增控制端点测试明确使用合成服务，不能充当联合结果。
+
+首个 Linux 联合 CI 在 `ea44b5a1` 导入固定 Gateway 时遇到 Python 3.11 的语法错误，
+尚未进入业务链路；`687896b7` 仅为 joint venv 增加 Python 3.12，没有改固定源码或门禁。
+随后真实普通文本已成功，附件的 session API 返回 503：官方 SessionDB 自动初始化需要读取
+`/proc/<当前测试进程 pid>/stat`，测试 guard 错误拒绝。修正只允许这一个只读进程指纹文件，
+并启用官方 `HERMES_TEST_ISOLATION=1` 来防止误开真实 state.db；没有设置任何 guard bypass。
+合并 discovery 也曾发现新测试审计钩子未处理 `env=None`，修复测试作用域后保留原测试通过。
+进程退出探针准备阶段的一次 `--verify-only` 使用独立 venv/固定源码，但未先隔离继承 HOME；
+那次官方 API import 不计为隔离验证证据，也没有访问活动目录追查。该入口随后改为先创建临时
+HOME/Profile、清空凭据环境、安装访问审计再导入并重跑；实际请求测试始终在隔离 child 中。
+最终完整 Linux 组合和进程退出测试结果、对应 HEAD/CI 以 PR #2 交付记录为准。
+现场 Windows AI 主机、CFserver、实际微信入口没有测试。
 不修改 backend Lint 规则；历史红项独立保留。PDF 上游长期 pending 也独立未解决。
+
+## 修改文件及原因
+
+以下路径相对于仓库根；Go 下载、存储实现及 FileBrowser 后端/前端树未修改。
+
+| 文件 | 修改原因 |
+| --- | --- |
+| `plugin/inbound_control.py`（本集成目录下，下同） | 固定 HTTPS 控制接口、严格 schema 映射、不可续期 events、CA 字节 pin 与有界控制请求。 |
+| `plugin/inbound_host.py` | 官方 middleware/lifecycle 接线，首次调用合并、首帧门槛、同预算 tombstone、下游读取及撤销后 ACK。 |
+| `plugin/inbound_directory.py` | 操作者根下创建随机私有目录，Windows 使用原生 DACL/祖先锁，Linux 使用 dirfd/no-follow。 |
+| `plugin/inbound.py` | 复用原 worker，完善有界停止并确认实际退出/流关闭；移除宿主服务环境变量。 |
+| `plugin/__init__.py` | 独立默认关闭开关接线，原 CLI 子进程也移除专用宿主环境变量。 |
+| `tests/test_inbound_host.py` | 合成控制服务 + 真实 TLS/worker/适配器，验证 schema、认证、事件、预算和撤销次序。 |
+| `tests/test_inbound_directory.py` | 原生权限、junction、祖先替换、碰撞和未知文件保留。 |
+| `tests/test_inbound_stop.py` | 停止失败、并发回收、阻塞流与不误 ACK 的明确故障注入。 |
+| `tests/test_inbound_control_bounds.py` | DNS 挂起、取消不重连、CA 替换竞态的可复现边界测试。 |
+| `tests/test_plugin.py` | 保留原测试，并确认只读/新建 CLI 不继承宿主服务凭据。 |
+| `tests/test_gateway_hermes_joint.py` | 真 Gateway/官方 Hermes/现 worker 的组合、历史顺序、503、取消、租约、丢 closed 和真实协议负例。 |
+| `tests/test_gateway_hermes_host_exit.py` | 真 Hermes 独立进程退出后原生 worker EOF 退出及 Gateway 有界收口。 |
+| `tests/gateway-hermes-joint-requirements.txt` | 仅隔离联合 venv 的固定依赖，不修改产品依赖或用户运行环境。 |
+| `windows/Manage-InboundClient.ps1` | 候选 bundle 加入三个新插件模块，仍严格校验/不覆盖/不启用。 |
+| `tests/Test-InboundStage.ps1` | 更新虚构 bundle 清单，保留全部既有暂存安全断言。 |
+| `.github/workflows/filebridge-client.yaml` | 沿用两平台回归，新增 Linux 固定源码联合与退出测试、独立 Python 3.12 和完整制品。 |
+| `README.md` / `INBOUND_CONTEXT.md` / `INBOUND_DOWNLOAD.md` | 当前契约、实际接线与安装/验收边界。 |
+| `GATEWAY_HOST_BINDING_REQUIREMENTS.md` / `HOST_BRIDGE_VALIDATION.md` / `INBOUND_VALIDATION.md` | 明确旧基线/日期，保留历史证据，链接当前实现。 |
+| `JOINT_HOST_VALIDATION.md` | 本轮认证依据、字段映射、配置、验证及一次性验收输入。 |
 
 ## 一次性联合实机验收（需另行授权，本轮不执行）
 

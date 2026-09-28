@@ -21,6 +21,7 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import platform
 import re
 import secrets
 import shutil
@@ -257,6 +258,11 @@ def isolated_guard(sandbox, sources, worker):
     metadata = {"/proc/1/cgroup", "/proc/self/mountinfo", "/proc/stat", "/proc/version",
                 "/etc/os-release", "/usr/lib/os-release", "/etc/mime.types", "/etc/localtime",
                 "/etc/ssl/certs/ca-certificates.crt"}
+    # Pinned hermes_state_common._write_lock_holder_record and gateway.status
+    # read this exact process start fingerprint; denying it aborts SessionDB's
+    # real lock acquisition. No other PID, argv, environment or /proc tree is
+    # allowed. It is read-only kernel metadata, not a user/runtime directory.
+    metadata.add(f"/proc/{os.getpid()}/stat")
     def within(path, allowed):
         value = Path(os.path.abspath(os.fsdecode(path)))
         return any(value == root or root in value.parents for root in allowed)
@@ -287,8 +293,13 @@ def isolated_guard(sandbox, sources, worker):
         elif event in {"os.system", "os.exec", "os.posix_spawn"}:
             denied = True
         if denied:
-            violations.append(event)
-            raise RuntimeError("joint test rejected an external operation")
+            detail = {"event": event}
+            if event == "open":
+                detail["path"] = os.fsdecode(args[0])
+            violations.append(detail)
+            # Paths only (never file contents, command arguments or headers)
+            # make a swallowed optional import/SessionDB failure diagnosable.
+            raise RuntimeError("joint test rejected operation " + json.dumps(detail))
     sys.addaudithook(guard)
     return violations
 
@@ -345,6 +356,12 @@ async def child(gateway, hermes, worker):
     from hermes_cli.plugins import discover_plugins, get_plugin_manager
     from gateway.config import PlatformConfig
     from gateway.platforms.api_server import APIServerAdapter
+
+    # Fail explicitly at the real public DB boundary instead of allowing the
+    # API's optional lazy-open catch to hide a missing dependency/guard denial.
+    from hermes_state import SessionDB
+    preflight_database = SessionDB(db_path=sandbox / "preflight-state.db")
+    preflight_database.close()
 
     discover_plugins()
     manager = get_plugin_manager()
@@ -774,6 +791,7 @@ def run(gateway, hermes, worker):
             "APPDATA": str(sandbox / "user"), "LOCALAPPDATA": str(sandbox / "user"),
             "HERMES_HOME": str(home), "HERMES_BUNDLED_PLUGINS": str(sandbox / "empty-bundled"),
             "HERMES_ENABLE_PROJECT_PLUGINS": "false", "CF_JOINT_EVENTS": str(sandbox / "events.jsonl"),
+            "HERMES_TEST_ISOLATION": "1",
             "TEMP": str(sandbox / "temp"), "TMP": str(sandbox / "temp"), "TMPDIR": str(sandbox / "temp"),
             "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUTF8": "1"})
         completed = subprocess.run([sys.executable, "-I", "-B", str(Path(__file__).resolve()),
@@ -814,6 +832,50 @@ def run_child_sanitized(gateway, hermes, worker):
     print(json.dumps(report))
 
 
+def verify_isolated(gateway, hermes, *, session_probe=False):
+    with tempfile.TemporaryDirectory(prefix="cf-joint-verify-") as temporary:
+        root = Path(temporary).resolve()
+        for name in ("profile", "user", "empty-bundled", "temp"):
+            (root / name).mkdir(mode=0o700)
+        (root / "profile/config.yaml").write_text(json.dumps({"plugins": {"enabled": []},
+            "memory": {"enabled": False}, "skills": {"enabled": False}, "compression": {"enabled": False}}))
+        env = {key: value for key, value in os.environ.items() if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR"}}
+        env.update({"HERMES_HOME": str(root / "profile"), "HOME": str(root / "user"),
+            "USERPROFILE": str(root / "user"), "APPDATA": str(root / "user"), "LOCALAPPDATA": str(root / "user"),
+            "HERMES_BUNDLED_PLUGINS": str(root / "empty-bundled"), "HERMES_ENABLE_PROJECT_PLUGINS": "false",
+            "HERMES_TEST_ISOLATION": "1", "TEMP": str(root / "temp"), "TMP": str(root / "temp"),
+            "TMPDIR": str(root / "temp"), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUTF8": "1"})
+        command = [sys.executable, "-I", "-B", str(Path(__file__).resolve()), "--gateway-source", str(gateway),
+                   "--hermes-source", str(hermes), "--verify-import-child"]
+        if session_probe:
+            command.append("--session-probe")
+        completed = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, encoding="utf-8", timeout=45)
+        print(completed.stdout, end="")
+        print(completed.stderr, end="", file=sys.stderr)
+        if completed.returncode:
+            raise SystemExit(completed.returncode)
+
+
+def verify_import_child(gateway, hermes, *, session_probe=False):
+    root = Path(os.environ["HERMES_HOME"]).parent
+    platform.system()
+    mimetypes.init()
+    violations = isolated_guard(root, (gateway, hermes), root / "no-permitted-worker")
+    sys.path[:0] = [str(hermes), str(gateway / "src")]
+    from cf_agent_gateway.gateway.app import create_app
+    from cf_agent_gateway.runtime.dispatch_worker import build_dispatch_worker
+    if session_probe:
+        from hermes_state import SessionDB
+        # Public constructor in a wholly separate disposable DB. No injected
+        # adapter DB/cache or monkeypatch of the official lazy session path.
+        database = SessionDB(db_path=root / "probe-state.db")
+        database.close()
+    assert violations == [], violations
+    print(json.dumps({"source_verified": True, "dependency_imports": True, "gateway_commit": GATEWAY_COMMIT,
+        "hermes_commit": verify_sources(gateway, hermes), "isolation_audit_violations": len(violations),
+        "public_session_db_constructed": session_probe, "joint_execution_performed": False}))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gateway-source", required=True, type=Path)
@@ -821,17 +883,17 @@ if __name__ == "__main__":
     parser.add_argument("--hermes-source", required=True, type=Path)
     parser.add_argument("--worker", type=Path)
     parser.add_argument("--verify-only", action="store_true", help="Verify immutable source/dependency imports only; does not claim integration pass")
+    parser.add_argument("--session-probe", action="store_true", help="Also construct/close the official public SessionDB in an isolated temporary directory")
+    parser.add_argument("--verify-import-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     gateway = args.gateway_source.resolve(strict=True)
     hermes = args.hermes_source.resolve(strict=True)
     hermes_commit = verify_sources(gateway, hermes, args.gateway_archive)
-    if args.verify_only:
-        sys.path.insert(0, str(gateway / "src"))
-        from cf_agent_gateway.gateway.app import create_app
-        from cf_agent_gateway.runtime.dispatch_worker import build_dispatch_worker
-        print(json.dumps({"source_verified": True, "dependency_imports": True,
-            "gateway_commit": GATEWAY_COMMIT, "hermes_commit": hermes_commit, "joint_execution_performed": False}))
+    if args.verify_import_child:
+        verify_import_child(gateway, hermes, session_probe=args.session_probe)
+    elif args.verify_only:
+        verify_isolated(gateway, hermes, session_probe=args.session_probe)
     else:
         if not args.worker:
             parser.error("--worker is required for the actual integration gate")

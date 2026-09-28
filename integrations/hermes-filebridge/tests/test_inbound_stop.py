@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import queue
 import subprocess
 import sys
 import threading
@@ -81,6 +82,22 @@ class Process:
 
 
 class StopTests(unittest.TestCase):
+    def test_eof_reader_closes_output_when_other_stopper_owns_lock(self):
+        class BusyStopLock:
+            def acquire(self, timeout):
+                return False  # Another stopper did not join within the bound.
+
+        dispatch = inbound._Dispatch.__new__(inbound._Dispatch)
+        output = io.BytesIO()
+        dispatch.process = SimpleNamespace(stdout=output)
+        dispatch.reader = threading.current_thread()
+        dispatch.responses = queue.Queue()
+        dispatch.stopped = threading.Event()
+        dispatch.stop_lock = BusyStopLock()
+        dispatch._read_responses()
+        self.assertTrue(dispatch.stopped.is_set())
+        self.assertTrue(output.closed)
+
     def process(self, **kwargs):
         process = Process(**kwargs)
         def release():

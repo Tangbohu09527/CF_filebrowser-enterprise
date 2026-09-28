@@ -119,7 +119,13 @@ class _Dispatch:
                 pass
             # Lease expiry also terminates an idle native worker. Revoke Python
             # processing streams when its pipe closes, even without another call.
-            self.stop()
+            try:
+                self.stop()
+            finally:
+                # A concurrent stopper may hold stop_lock until this reader's
+                # bounded acquire expires. Release the now-idle stdout buffer
+                # in its owning reader thread even when stop could not join.
+                self._close_output_if_idle()
 
     def _wait(self, seconds):
         deadline = time.monotonic() + seconds
