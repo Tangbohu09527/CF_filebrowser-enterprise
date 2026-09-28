@@ -113,7 +113,7 @@ async def host_child(gateway, hermes, worker):
         loaded = manager._plugins.get(name)
         assert loaded and loaded.enabled and loaded.error is None
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={
-        "host": "127.0.0.1", "port": 0, "key": os.environ[HERMES_ENV], "model_name": "cf-joint-model"}))
+        "host": "127.0.0.1", "port": 0, "key": os.environ[HERMES_ENV], "model_name": "cf-hermes-api"}))
     try:
         assert await adapter.connect()
         port = adapter._site._server.sockets[0].getsockname()[1]
@@ -467,11 +467,54 @@ def verify_import_child(gateway, hermes):
     standalone.close()
     shared = acquire(sandbox / "profile" / "state.db")
     release_or_close(shared)
+    asyncio.run(verify_public_model_lock())
     assert violations == []
+    rejected_metadata = violations.platform_probes_denied
+    assert not rejected_metadata or sys.platform == "win32"
+    assert all(os.path.normcase(os.path.abspath(path)) ==
+               os.path.normcase(os.path.abspath(f"/proc/{os.getpid()}/stat"))
+               for path in rejected_metadata)
     print(json.dumps({"source_verified": True, "dependency_imports": True, "isolated_import_profile": True,
                       "session_db_initialized": True,
+                      "public_model_lock_preflight": {"colliding_virtual_name": 409, "distinct_virtual_name": 200},
+                      "platform_probes_denied": rejected_metadata,
                       "isolation_audit_violations": 0, "real_host_exit_executed": False,
                       "production_host_acceptance": False}))
+
+
+async def verify_public_model_lock():
+    """Probe the public HTTP contract without an LLM call or lock override."""
+    from aiohttp import ClientSession, ClientTimeout
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+    key = secrets.token_urlsafe(32)
+    for virtual_name, expected in (("cf-joint-model", 409), ("cf-hermes-api", 200)):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={
+            "host": "127.0.0.1", "port": 0, "key": key, "model_name": virtual_name}))
+        try:
+            async with asyncio.timeout(15):
+                assert await adapter.connect()
+                port = adapter._site._server.sockets[0].getsockname()[1]
+                origin = f"http://127.0.0.1:{port}"
+                async with ClientSession(timeout=ClientTimeout(total=5), trust_env=False,
+                                         headers={"Authorization": "Bearer " + key}) as client:
+                    async with client.post(origin + "/api/sessions", json={}) as response:
+                        assert response.status == 201
+                        session_id = (await response.json())["session"]["id"]
+                    async with client.post(origin + f"/api/sessions/{session_id}/model", json={
+                            "model": "cf-joint-model", "provider": "custom", "require_model_lock": True}) as response:
+                        assert response.status == expected
+                        result = await response.json()
+                        if expected == 409:
+                            assert result["error"]["code"] == "model_lock_unavailable"
+                        else:
+                            runtime = result["runtime"]
+                            assert runtime["model"] == "cf-joint-model"
+                            assert runtime["provider"] == "custom"
+                            assert runtime["route_source"] == "raw_request"
+                            assert runtime["model_lock"] == "accepted"
+        finally:
+            await adapter.disconnect()
 
 
 if __name__ == "__main__":

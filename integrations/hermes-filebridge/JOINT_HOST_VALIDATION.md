@@ -124,6 +124,10 @@ Windows 原生暂存 18 项通过；
 随后真实普通文本已成功，附件的 session API 返回 503：官方 SessionDB 自动初始化需要读取
 `/proc/<当前测试进程 pid>/stat`，测试 guard 错误拒绝。修正只允许这一个只读进程指纹文件，
 并启用官方 `HERMES_TEST_ISOLATION=1` 来防止误开真实 state.db；没有设置任何 guard bypass。
+`60a563c8` 已通过父会话读取与 child fork，随后模型锁返回 409：测试 Profile 把 API 虚拟
+模型名与真实模型名设为同一值，官方接口将其解释为不可锁定的全局别名。独立临时 Profile
+通过真实 HTTP 重现旧配置 409、新虚拟别名 200/`model_lock=accepted`；修正仅涉及测试配置。
+Windows 的官方 Linux self-stat 探测由 guard 精确拒绝并单列记录，不打开任何 `C:\proc` 文件。
 合并 discovery 也曾发现新测试审计钩子未处理 `env=None`，修复测试作用域后保留原测试通过。
 进程退出探针准备阶段的一次 `--verify-only` 使用独立 venv/固定源码，但未先隔离继承 HOME；
 那次官方 API import 不计为隔离验证证据，也没有访问活动目录追查。该入口随后改为先创建临时
@@ -169,6 +173,8 @@ HTTPS origin/CA、专用 host_id/profile reference/revision、合成服务 secre
    不覆盖配置或已安装版本。检查只暂存，不连接任何服务、不启用插件。
 2. 在专用验收 Profile 按上述模板提供独立输入，另行批准启用两个开关；Gateway 使用固定契约的
    host binding 模式与专用 session 入口，按兼容文档显式固定 profile runtime。
+   Hermes API 虚拟模型别名须与真实 provider model 区分；先通过真实 session `/model`
+   接口确认 `model_lock=accepted`，不得关闭模型锁检查。
 3. 由真实 Gateway admission 发起“文本 → PDF/JPEG 附件 → 文本”；观察 resolve/events
    首帧门槛、实际任务文件、大小/摘要和 handle 完整读取；保留原质量字段及 `formal_archive=false`。
 4. 两身份并发、重复调用、503 成功/耗尽、早期 lease、下载中取消、模型 failed、异常缺 hook、

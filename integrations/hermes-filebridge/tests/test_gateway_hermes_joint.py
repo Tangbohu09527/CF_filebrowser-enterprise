@@ -14,6 +14,7 @@ import base64
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 import hashlib
+import errno
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import io
@@ -64,6 +65,11 @@ GATEWAY_BLOBS = {
     "src/cf_agent_gateway/task/model/store.py": "f5daad32637b9c75e40483704506b23f0de41337",
 }
 HERMES_SESSION_BLOBS = {
+    "hermes_state.py": "84aa323d98d736c15a48596d804f629f99873672",
+    "hermes_state_common.py": "453b2ecef4fc14a6cc187543a1237d488e31d7f2",
+    "hermes_state_guard.py": "ec380a580bdf2e04c223b049113da3a97e3970d7",
+    "hermes_state_registry.py": "5b0b594ee8aff2f8202df8f51f42ad7db4a87141",
+    "gateway/status.py": "5a410f696f6b156af1dafd93f88df9967377d296",
     "hermes_state_sessions.py": "cfd7811fdf5965b735d7407114d1bb4d1c4041c8",
     "hermes_state_messages.py": "4e7b96faa7b82f23c703a4b9f58c2dcf759b712e",
     "hermes_state_compression.py": "9f8415faba7e3a356bb3b427286e86b15813c33e",
@@ -253,7 +259,11 @@ class ModelHandler(BaseHTTPRequestHandler):
 
 
 def isolated_guard(sandbox, sources, worker):
-    violations = []
+    class AuditViolations(list):
+        def __init__(self):
+            super().__init__()
+            self.platform_probes_denied = []
+    violations = AuditViolations()
     roots = (sandbox, *sources, HERE, Path(sys.prefix), Path(sys.base_prefix))
     metadata = {"/proc/1/cgroup", "/proc/self/mountinfo", "/proc/stat", "/proc/version",
                 "/etc/os-release", "/usr/lib/os-release", "/etc/mime.types", "/etc/localtime",
@@ -263,6 +273,7 @@ def isolated_guard(sandbox, sources, worker):
     # real lock acquisition. No other PID, argv, environment or /proc tree is
     # allowed. It is read-only kernel metadata, not a user/runtime directory.
     metadata.add(f"/proc/{os.getpid()}/stat")
+    windows_self_stat = os.path.normcase(os.path.abspath(f"/proc/{os.getpid()}/stat"))
     def within(path, allowed):
         value = Path(os.path.abspath(os.fsdecode(path)))
         return any(value == root or root in value.parents for root in allowed)
@@ -271,6 +282,14 @@ def isolated_guard(sandbox, sources, worker):
         if event == "open" and not isinstance(args[0], int):
             path, _mode, flags = args
             write = bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
+            if (os.name == "nt" and not write
+                    and os.path.normcase(os.path.abspath(path)) == windows_self_stat):
+                # Official runtime status tries Linux self-stat before its
+                # native Windows fallback. Explicitly DENY this exact probe:
+                # never read an unrelated C:\\proc file or fabricate metadata.
+                # FileNotFoundError preserves the real optional-OS fallback.
+                violations.platform_probes_denied.append(os.fsdecode(path))
+                raise FileNotFoundError(errno.ENOENT, "Linux self-stat is unavailable on Windows")
             denied = not within(path, (sandbox,) if write else roots)
             if not write and (os.fsdecode(path) in metadata or Path(os.path.abspath(path)) == worker):
                 denied = False
@@ -369,7 +388,9 @@ async def child(gateway, hermes, worker):
         plugin = manager._plugins.get(name)
         assert plugin and plugin.enabled and plugin.error is None, name
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={
-        "host": "127.0.0.1", "port": 0, "key": hermes_token, "model_name": "cf-joint-model"}))
+        # The API's virtual alias must differ from the actual provider model:
+        # its public /model route intentionally refuses locking a global alias.
+        "host": "127.0.0.1", "port": 0, "key": hermes_token, "model_name": "cf-hermes-api"}))
     server = None
     serving = None
     hermes_client = None
@@ -870,10 +891,41 @@ def verify_import_child(gateway, hermes, *, session_probe=False):
         # adapter DB/cache or monkeypatch of the official lazy session path.
         database = SessionDB(db_path=root / "probe-state.db")
         database.close()
+        asyncio.run(probe_public_session_api())
     assert violations == [], violations
+    expected = os.path.normcase(os.path.abspath(f"/proc/{os.getpid()}/stat"))
+    assert all(os.name == "nt" and os.path.normcase(os.path.abspath(path)) == expected
+               for path in violations.platform_probes_denied), violations.platform_probes_denied
     print(json.dumps({"source_verified": True, "dependency_imports": True, "gateway_commit": GATEWAY_COMMIT,
         "hermes_commit": verify_sources(gateway, hermes), "isolation_audit_violations": len(violations),
-        "public_session_db_constructed": session_probe, "joint_execution_performed": False}))
+        "platform_probes_denied": violations.platform_probes_denied,
+        "public_session_db_constructed": session_probe, "public_session_model_lock": session_probe,
+        "joint_execution_performed": False}))
+
+
+async def probe_public_session_api():
+    """Actual create/model HTTP routes, separate from the full Linux joint gate."""
+    from aiohttp import ClientSession, ClientTimeout
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+    token = secrets.token_urlsafe(32)
+    api = APIServerAdapter(PlatformConfig(enabled=True, extra={
+        "host": "127.0.0.1", "port": 0, "key": token, "model_name": "cf-hermes-api"}))
+    try:
+        assert await api.connect()
+        origin = f"http://127.0.0.1:{api._site._server.sockets[0].getsockname()[1]}"
+        runtime = {"model": "cf-joint-model", "provider": "custom", "model_options": {}, "require_model_lock": True}
+        async with ClientSession(timeout=ClientTimeout(total=8), headers={"Authorization": "Bearer " + token}) as client:
+            async with client.post(origin + "/api/sessions", json={"id": "joint-public-preflight", **runtime}) as response:
+                assert response.status == 201, "public session create failed"
+            async with client.post(origin + "/api/sessions/joint-public-preflight/model", json=runtime) as response:
+                assert response.status == 200, "public session model lock failed"
+                payload = await response.json()
+                assert payload["runtime"]["model_lock"] == "accepted"
+                assert payload["runtime"]["model"] == "cf-joint-model"
+                assert payload["runtime"]["requested"] == {"model": "cf-joint-model", "provider": "custom"}
+    finally:
+        await api.disconnect()
 
 
 if __name__ == "__main__":
