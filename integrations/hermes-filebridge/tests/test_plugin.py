@@ -73,16 +73,31 @@ class PluginTests(unittest.TestCase):
         payload = {"schema_version": "filebrowser-agentctl/v1", "command": "read", "ok": True,
                    "result": {"content": "实际内容", "untrusted": True}}
         result = subprocess.CompletedProcess([], 0, json.dumps(payload).encode(), b"private-do-not-echo")
-        with patch.dict(os.environ, {"FILEBROWSER_AGENT_TOKEN": "secret", "HTTPS_PROXY": "secret-url"}), patch.object(plugin.subprocess, "run", return_value=result) as run:
+        with patch.dict(os.environ, {"FILEBROWSER_AGENT_TOKEN": "secret", "HTTPS_PROXY": "secret-url",
+                                     "CF_FILEBRIDGE_HOST_TEST_SERVICE_TOKEN": "synthetic-host-service-secret-only"}), patch.object(plugin.subprocess, "run", return_value=result) as run:
             answer = plugin.handler_for(ctx)({"command": "read", "input": {"source": "s", "path": "/你好"}})
         self.assertEqual(json.loads(answer), payload)
         args = run.call_args
         self.assertFalse(args.kwargs["shell"])
         self.assertNotIn("FILEBROWSER_AGENT_TOKEN", args.kwargs["env"])
         self.assertNotIn("HTTPS_PROXY", args.kwargs["env"])
+        self.assertNotIn("CF_FILEBRIDGE_HOST_TEST_SERVICE_TOKEN", args.kwargs["env"])
         self.assertEqual(json.loads(args.kwargs["input"])["path"], "/你好")
         self.assertNotIn("--apply", args.args[0])
         self.assertNotIn("secret", repr(args.args))
+        self.assertNotIn("synthetic-host-service-secret-only", answer)
+
+        ctx.settings.update(create_enabled=True, create_config_path=ctx.settings["config_path"])
+        creation_payload = {"schema_version": "filebrowser-agentctl/v1", "command": "create-text", "ok": True}
+        creation_result = subprocess.CompletedProcess([], 0, json.dumps(creation_payload).encode(), b"")
+        with patch.dict(os.environ, {"CF_FILEBRIDGE_HOST_TEST_SERVICE_TOKEN": "synthetic-host-service-secret-only"}), patch.object(plugin.subprocess, "run", return_value=creation_result) as run:
+            creation_answer = plugin.handler_for(ctx, creation=True)({
+                "command": "plan", "input": {"source": "s", "path": "/new.txt", "content": "new text"}})
+        self.assertEqual(json.loads(creation_answer), creation_payload)
+        self.assertNotIn("CF_FILEBRIDGE_HOST_TEST_SERVICE_TOKEN", run.call_args.kwargs["env"])
+        self.assertFalse(run.call_args.kwargs["shell"])
+        self.assertNotIn("--apply", run.call_args.args[0])
+        self.assertNotIn("synthetic-host-service-secret-only", repr(run.call_args.args) + creation_answer)
 
     def test_bad_binary_pin(self):
         ctx = self.fixture()

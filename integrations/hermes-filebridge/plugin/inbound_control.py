@@ -192,6 +192,7 @@ class ControlClient:
 
     def _open(self, method, path, body=None, headers=None, timeout=3):
         conn = http.client.HTTPSConnection(self.host, self.port, context=self.tls, timeout=timeout)
+        conn.debuglevel = 0
         conn.auto_open = 0  # An aborted connection must never reconnect during request().
         aborted = threading.Event()
         completed = queue.Queue(maxsize=1)
@@ -326,7 +327,7 @@ class ControlClient:
         if _integer(item["size"]) > self.config.max_bytes:
             _reject()
         _identifier(item["sha256"], r"[0-9a-f]{64}")
-        _identifier(item["authorization"], r"Bearer [A-Za-z0-9._~-]{1,121}")
+        _identifier(item["authorization"], r"Bearer [\x21-\x7e]{1,121}")
         if item["authorization"] == "Bearer " + self.config.service_token:
             _reject()
         if type(item["url"]) is not str or not re.fullmatch(
@@ -334,7 +335,7 @@ class ControlClient:
             _reject()
         if _timestamp(item["expires_at"]) < _timestamp(parent["lease_valid_until"]):
             _reject()
-        if item["mime_type"] not in ("application/pdf", "image/jpeg"):
+        if item["mime_type"] not in ("application/pdf", "image/jpeg", "image/png", "application/octet-stream"):
             _reject()
         if item["filename"] is not None and (type(item["filename"]) is not str or len(item["filename"]) > 1024):
             _reject()
