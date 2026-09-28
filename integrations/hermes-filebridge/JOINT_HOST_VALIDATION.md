@@ -104,6 +104,7 @@ powershell.exe -NoProfile -NonInteractive -File integrations/hermes-filebridge/w
 ```
 
 Gateway 的安全暂存依赖 Linux openat/dir_fd。Windows 不使用内存暂存替身冒充整条联合通过；
+联合 venv 使用 Python 3.12（固定 Gateway 的类型别名语法要求）；原客户端/官方 Hermes 探针仍用原矩阵 Python 3.11。
 Linux 组合使用真实数据库、admission/claim/预绑定、认证 HTTP/events 和真实 Hermes 执行链。
 只允许模型服务与微信上游取件使用明确的测试替身。合成控制端点的 Windows 测试另标组件测试。
 旧 `test_hermes_loader.py`、`test_hermes_middleware.py`、`test_hermes_request_probe.py --lifecycle`

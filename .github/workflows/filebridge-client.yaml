@@ -84,6 +84,11 @@ jobs:
             --worker "$CF_FILEBRIDGE_INBOUND_TEST_EXE"
           "$runner" -I -B integrations/hermes-filebridge/tests/test_hermes_request_probe.py \
             --hermes-source "$root/source/hermes-agent-4d55ca91656ac5f83e1506679b7f81e0238e5e16" --lifecycle
+      - name: Python required by the fixed Gateway snapshot (joint test only)
+        if: runner.os == 'Linux'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
       - name: Real Gateway and official Hermes combined chain (Linux)
         if: runner.os == 'Linux'
         shell: bash
