@@ -176,6 +176,7 @@ jobs:
           set -euo pipefail
           root="$RUNNER_TEMP/filebridge-current-hermes"
           mkdir -p "$root/runtime" "$root/source" "$root/evidence" "$root/preparation-home"
+          echo "CF_CURRENT_HERMES_ROOT=$root" >> "$GITHUB_ENV"
           platform=x86_64-unknown-linux-gnu
           archive_kind=install_only
           digest=5539eaf1de20bd9b5f43ea11c3c1f84cbac74fe927ac050318a9210c022618cb
@@ -187,8 +188,9 @@ jobs:
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
             "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.14.7%2B20260924-$platform-$archive_kind.tar.gz" \
             -o "$root/python.tar.gz"
-          echo "$digest  $root/python.tar.gz" | sha256sum -c -
-          tar -xzf "$root/python.tar.gz" -C "$root/runtime"
+          echo "$digest  $root/python.tar.gz" | sha256sum -c - | tee "$root/evidence/python-archive-check.txt"
+          # GNU tar treats the colon in a Windows drive path as a remote host.
+          tar -xzf - -C "$root/runtime" < "$root/python.tar.gz"
           runtime="$root/runtime/python/bin/python3.14"
           if [ "$RUNNER_OS" = Windows ]; then runtime="$root/runtime/python/python.exe"; fi
           export HOME="$root/preparation-home" HERMES_HOME="$root/preparation-home/profile"
@@ -204,7 +206,6 @@ jobs:
             -o "$root/hermes.zip"
           echo "0607677d5e9b3e30c93af2285bbc83108a85adca4596584f471befcdd9e6b453  $root/hermes.zip" | sha256sum -c -
           unzip -q "$root/hermes.zip" -d "$root/source"
-          echo "CF_CURRENT_HERMES_ROOT=$root" >> "$GITHUB_ENV"
           echo "CF_CURRENT_HERMES_PYTHON=$hermes_python" >> "$GITHUB_ENV"
           echo "CF_CURRENT_HERMES_SOURCE=$root/source/hermes-agent-0f4a98f87c17007b81500239d0bd5b9574027b73" >> "$GITHUB_ENV"
           printf '%s\n' "python_release=20260924" "python_sha256=$digest" \

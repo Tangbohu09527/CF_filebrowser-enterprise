@@ -542,7 +542,7 @@ if __name__ == "__main__":
     gateway, hermes = args.gateway_source.resolve(strict=True), args.hermes_source.resolve(strict=True)
     hermes_options = {"hermes_commit": args.hermes_commit,
         "hermes_archive": args.hermes_archive.resolve(strict=True) if args.hermes_archive else None,
-        "hermes_python": args.hermes_python.resolve(strict=True) if args.hermes_python else None}
+        "hermes_python": joint.interpreter_entry(args.hermes_python) if args.hermes_python else None}
     joint.verify_sources(gateway, hermes, args.gateway_archive, hermes_commit=args.hermes_commit,
                          hermes_archive=hermes_options["hermes_archive"])
     if args.verify_only:

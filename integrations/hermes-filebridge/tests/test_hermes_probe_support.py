@@ -1,9 +1,11 @@
 """Synthetic source-integrity/isolation regressions, never Hermes acceptance."""
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -199,6 +201,76 @@ class HermesProbeSupportTests(unittest.TestCase):
         for candidate in denied:
             with self.subTest(path=candidate):
                 self.assertFalse(support.audit_path_within(candidate, (sandbox,), allow_extended=True))
+
+    @unittest.skipUnless(os.name == "nt", "Actual Windows extended opens through both audit guards")
+    def test_both_installed_guards_enforce_extended_read_boundaries(self):
+        sandbox, separate = self.root / "guard-sandbox", self.root / "separate"
+        sandbox.mkdir()
+        separate.mkdir()
+        ordinary, outside = sandbox / "owned.bin", separate / "unrelated.bin"
+        ordinary.write_bytes(b"owned fixture")
+        outside.write_bytes(b"unrelated fixture")
+        self.make_directory_link(sandbox / "linked", separate)
+        code = r'''
+import importlib.util, json, os, pathlib, sys
+tests, sandbox, separate = map(pathlib.Path, sys.argv[1:4])
+def load(name, filename):
+    spec = importlib.util.spec_from_file_location(name, tests / filename)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+support = load("guard_support", "hermes_probe_support.py")
+joint = load("guard_joint", "test_gateway_hermes_joint.py")
+support.assert_isolated_environment(sandbox)
+violations = (support.install_audit_guard(sandbox, tests) if sys.argv[4] == "shared"
+              else joint.isolated_guard(sandbox, (tests,), None))
+owned = "\\\\?\\" + str(sandbox / "owned.bin")
+assert pathlib.Path(owned).read_bytes() == b"owned fixture"
+assert violations == []
+denied = [(owned, "wb"), ("\\\\?\\" + str(separate / "unrelated.bin"), "rb"),
+          ("\\\\?\\" + str(sandbox / "linked" / "unrelated.bin"), "rb"),
+          (r"\\?\UNC\server\share\file", "rb"), (owned + ":stream", "rb"),
+          ("\\\\?\\" + str(sandbox / "missing.bin"), "rb"),
+          ("\\\\?\\" + str(sandbox) + "\\..\\separate\\unrelated.bin", "rb")]
+for path, mode in denied:
+    try:
+        with open(path, mode):
+            raise AssertionError("forbidden extended open succeeded")
+    except RuntimeError:
+        pass
+assert len(violations) == len(denied)
+assert all(item["event"] == "open" for item in violations)
+print(json.dumps({"guard": sys.argv[4], "allowed_reads": 1, "denied": len(violations)}))
+'''
+        environment = support.isolated_environment(sandbox)
+        for kind in ("shared", "joint"):
+            with self.subTest(guard=kind):
+                result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", "-c", code,
+                    str(HERE), str(sandbox), str(separate), kind], cwd=sandbox, env=environment,
+                    capture_output=True, text=True, encoding="utf-8", timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {"guard": kind, "allowed_reads": 1, "denied": 7})
+        self.assertEqual(ordinary.read_bytes(), b"owned fixture")
+        self.assertEqual(outside.read_bytes(), b"unrelated fixture")
+
+    def test_joint_interpreter_entry_preserves_posix_venv_symlink(self):
+        spec = importlib.util.spec_from_file_location("interpreter_joint", HERE / "test_gateway_hermes_joint.py")
+        joint = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(joint)
+        runtime = self.root / "runtime-python"
+        runtime.write_bytes(b"non-executable test fixture; never run")
+        entry = self.root / "venv" / "bin" / "python"
+        entry.parent.mkdir(parents=True)
+        if os.name == "nt":
+            entry.write_bytes(b"non-executable Windows entry fixture; never run")
+        else:
+            entry.symlink_to(runtime)
+            self.assertEqual(entry.resolve(), runtime)
+        self.assertEqual(joint.interpreter_entry(entry), entry.absolute())
+        self.assertNotEqual(joint.interpreter_entry(entry), runtime)
+        for invalid in (entry.parent, entry.parent / "missing"):
+            with self.subTest(path=str(invalid)), self.assertRaises(ValueError):
+                joint.interpreter_entry(invalid)
 
 
 if __name__ == "__main__":

@@ -305,8 +305,16 @@ def bootstrap_system_metadata():
     platform.platform()
 
 
+def interpreter_entry(path):
+    """Keep the venv entry path: resolving its symlink would select base Python."""
+    entry = Path(path).absolute()
+    if not entry.is_file():
+        raise ValueError("Hermes interpreter entry must be an existing file")
+    return entry
+
+
 def isolated_guard(sandbox, sources, worker):
-    sqlite_access_allowed = _local_module("joint_sqlite_support", "hermes_probe_support.py").sqlite_access_allowed
+    support = _local_module("joint_sqlite_support", "hermes_probe_support.py")
     class AuditViolations(list):
         def __init__(self):
             super().__init__()
@@ -322,9 +330,6 @@ def isolated_guard(sandbox, sources, worker):
     # allowed. It is read-only kernel metadata, not a user/runtime directory.
     metadata.add(f"/proc/{os.getpid()}/stat")
     windows_self_stat = os.path.normcase(os.path.abspath(f"/proc/{os.getpid()}/stat"))
-    def within(path, allowed):
-        value = Path(os.path.abspath(os.fsdecode(path)))
-        return any(value == root or root in value.parents for root in allowed)
     def guard(event, args):
         denied = False
         if event == "open" and not isinstance(args[0], int):
@@ -338,7 +343,8 @@ def isolated_guard(sandbox, sources, worker):
                 # FileNotFoundError preserves the real optional-OS fallback.
                 violations.platform_probes_denied.append(os.fsdecode(path))
                 raise FileNotFoundError(errno.ENOENT, "Linux self-stat is unavailable on Windows")
-            denied = not within(path, (sandbox,) if write else roots)
+            denied = not support.audit_path_within(path, (sandbox,) if write else roots,
+                                                  allow_extended=not write)
             if not write and (os.fsdecode(path) in metadata or Path(os.path.abspath(path)) == worker):
                 denied = False
             # Real POSIX staging/task-directory code walks ancestors with
@@ -355,7 +361,7 @@ def isolated_guard(sandbox, sources, worker):
         elif event == "socket.getaddrinfo":
             denied = args[0] not in {"127.0.0.1", "::1", "localhost", None}
         elif event == "sqlite3.connect":
-            denied = not sqlite_access_allowed(args[0], sandbox)
+            denied = not support.sqlite_access_allowed(args[0], sandbox)
         elif event == "subprocess.Popen":
             executable, command, _cwd, _env = args
             if os.name == "nt":
@@ -1053,7 +1059,7 @@ if __name__ == "__main__":
     hermes = args.hermes_source.resolve(strict=True)
     hermes_options = {"hermes_commit": args.hermes_commit,
         "hermes_archive": args.hermes_archive.resolve(strict=True) if args.hermes_archive else None,
-        "hermes_python": args.hermes_python.resolve(strict=True) if args.hermes_python else None}
+        "hermes_python": interpreter_entry(args.hermes_python) if args.hermes_python else None}
     verify_sources(gateway, hermes, args.gateway_archive, hermes_commit=args.hermes_commit,
                    hermes_archive=hermes_options["hermes_archive"])
     if args.verify_import_child:
