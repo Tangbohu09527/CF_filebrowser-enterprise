@@ -43,6 +43,7 @@ DOWNLOAD = "filebrowser_download_inbound"
 CONSUME = "probe_consume_workcopy"
 SERVICE_ENV = "CF_FILEBRIDGE_HOST_JOINT_SERVICE"
 PROFILE = "profiles/joint-isolated/1"
+DEFAULT_HERMES_COMMIT = "4d55ca91656ac5f83e1506679b7f81e0238e5e16"
 _test_secrets = []
 GATEWAY_BLOBS = {
     "docs/development/inbound-host-binding-contract.md": "c997a05af5fbe8466e13f572e4de7422b71f7615",
@@ -87,24 +88,45 @@ def verify_blobs(source, blobs):
             raise ValueError("Immutable source mismatch: " + relative)
 
 
-def verify_sources(gateway, hermes, archive=None):
+def _local_module(name, filename):
+    spec = importlib.util.spec_from_file_location(name, HERE / filename)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def hermes_arguments(commit, archive=None, python=None):
+    arguments = ["--hermes-commit", commit]
+    if archive:
+        arguments += ["--hermes-archive", str(archive)]
+    if python:
+        arguments += ["--hermes-python", str(python)]
+    return arguments
+
+
+def isolated_environment(sandbox, extra=None):
+    return _local_module("joint_isolation_support", "hermes_probe_support.py").isolated_environment(sandbox, extra)
+
+
+def verify_sources(gateway, hermes, archive=None, *, hermes_commit=DEFAULT_HERMES_COMMIT, hermes_archive=None):
     if archive is not None and hashlib.sha256(archive.read_bytes()).hexdigest() != GATEWAY_ZIP_SHA256:
         raise ValueError("Fixed Gateway archive SHA-256 mismatch")
     verify_blobs(gateway, GATEWAY_BLOBS)
-    spec = importlib.util.spec_from_file_location("joint_source_verifier", HERE / "test_hermes_loader.py")
-    verifier = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(verifier)
-    verifier.verify_source(hermes)
-    verify_blobs(hermes, HERMES_SESSION_BLOBS)
-    return verifier.HERMES_COMMIT
+    verifier = _local_module("joint_source_verifier", "hermes_probe_support.py")
+    verifier.verify_source(hermes, hermes_commit, hermes_archive)
+    if hermes_commit == DEFAULT_HERMES_COMMIT:
+        verify_blobs(hermes, HERMES_SESSION_BLOBS)
+    return hermes_commit
 
 
 # This separate observer/consumer uses only public plugin registrations. It
 # cannot issue bindings and has no Gateway credential or descriptor access.
-OBSERVER = '''import hashlib, importlib, json, os, threading
+OBSERVER = '''import hashlib, importlib, json, os, pathlib, threading
 _lock = threading.Lock()
 retained_streams = []
 native_processes = []
+host_adapters = []
 def record(kind, data):
     with _lock, open(os.environ["CF_JOINT_EVENTS"], "a", encoding="utf-8") as stream:
         stream.write(json.dumps({"kind": kind, **data}) + "\\n")
@@ -113,7 +135,12 @@ def consume(args, **kwargs):
     module = get_plugin_manager()._plugins["cf-filebridge"].module
     host = importlib.import_module(module.__name__ + ".inbound_host")
     try:
-        if os.environ.get("CF_JOINT_RETAIN_STREAM") == "1":
+        adapter, _scope = host._active_host.get()
+        if adapter not in host_adapters:
+            host_adapters.append(adapter)
+        retain_flag = os.environ.get("CF_JOINT_RETAIN_STREAM_FLAG")
+        if (os.environ.get("CF_JOINT_RETAIN_STREAM") == "1"
+                or (retain_flag and pathlib.Path(retain_flag).is_file())):
             context = host.open_workcopy(args["handle"])
             stream = context.__enter__()
             retained_streams.append((context, stream))
@@ -127,7 +154,12 @@ def consume(args, **kwargs):
                 data = stream.read()
         result = {"ok": True, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
                   "actual_stream_read": True}
-    except Exception:
+    except Exception as error:
+        code = getattr(error, "code", None)
+        if not isinstance(code, str) or not code or not all(char in "abcdefghijklmnopqrstuvwxyz_" for char in code):
+            code = None
+        record("consumer_error", {"error_type": type(error).__name__, "error_code": code,
+            "active_host_present": host._active_host.get() is not None})
         result = {"ok": False, "error": {"code": "workcopy_unavailable"}}
     return json.dumps(result)
 def register(ctx):
@@ -274,6 +306,7 @@ def bootstrap_system_metadata():
 
 
 def isolated_guard(sandbox, sources, worker):
+    sqlite_access_allowed = _local_module("joint_sqlite_support", "hermes_probe_support.py").sqlite_access_allowed
     class AuditViolations(list):
         def __init__(self):
             super().__init__()
@@ -321,14 +354,22 @@ def isolated_guard(sandbox, sources, worker):
             denied = not isinstance(address, tuple) or address[0] not in {"127.0.0.1", "::1"}
         elif event == "socket.getaddrinfo":
             denied = args[0] not in {"127.0.0.1", "::1", "localhost", None}
+        elif event == "sqlite3.connect":
+            denied = not sqlite_access_allowed(args[0], sandbox)
         elif event == "subprocess.Popen":
             executable, command, _cwd, _env = args
-            denied = Path(executable) != worker or command != [str(worker)]
+            if os.name == "nt":
+                # Windows emits a quoted command string and commonly omits
+                # executable. No shell or ACL command receives an exemption.
+                denied = not (worker is not None and executable in (None, str(worker))
+                    and command == subprocess.list2cmdline([str(worker)]))
+            else:
+                denied = worker is None or Path(executable) != worker or command != [str(worker)]
         elif event in {"os.system", "os.exec", "os.posix_spawn"}:
             denied = True
         if denied:
             detail = {"event": event}
-            if event == "open":
+            if event in {"open", "sqlite3.connect"}:
                 detail["path"] = os.fsdecode(args[0])
             # Code locations only: no frame locals, command arguments, request
             # values or credentials. Optional upstream probes often swallow
@@ -351,7 +392,10 @@ def isolated_guard(sandbox, sources, worker):
     return violations
 
 
-async def child(gateway, hermes, worker):
+async def child(gateway, hermes, worker, *, hermes_commit=DEFAULT_HERMES_COMMIT,
+                hermes_archive=None, hermes_python=None):
+    if sys.version_info[:2] != (3, 12):
+        raise RuntimeError("The pinned real Gateway joint process requires its verified Python 3.12 environment")
     sandbox = Path(os.environ["HERMES_HOME"]).parent
     home = sandbox / "profile"
     bootstrap_system_metadata()
@@ -377,8 +421,19 @@ async def child(gateway, hermes, worker):
         "ca_file": str(sandbox / "cert.pem"), "ca_sha256": hashlib.sha256((sandbox / "cert.pem").read_bytes()).hexdigest(),
         "consumer_tools": [CONSUME]}
     (home / "config.yaml").write_text(json.dumps(config))
-    violations = isolated_guard(sandbox, (gateway, hermes), worker)
-    sys.path[:0] = [str(hermes), str(gateway / "src")]
+    external = None
+    if hermes_python:
+        host_helpers = _local_module("joint_external_host", "hermes_joint_host.py")
+        external = host_helpers.ExternalHermesHost(hermes_python, hermes, sandbox, worker,
+            hermes_commit=hermes_commit, hermes_archive=hermes_archive)
+        try:
+            hermes_origin = await external.start()
+        except BaseException:
+            await external.stop()
+            raise
+    read_roots = (gateway, hermes) + ((hermes_archive,) if hermes_archive else ())
+    violations = isolated_guard(sandbox, read_roots, worker)
+    sys.path[:0] = [str(HERE), str(gateway / "src")] + ([] if external else [str(hermes)])
     import uvicorn
     from aiohttp import ClientSession, ClientTimeout, TCPConnector
     from sqlalchemy import select
@@ -399,31 +454,29 @@ async def child(gateway, hermes, worker):
     from cf_agent_gateway.runtime.dispatch_worker import build_dispatch_worker
     from cf_agent_gateway.task.model import HermesDispatchStatus
     from cf_agent_gateway.workspace.models import AIThread
-    from hermes_cli.plugins import discover_plugins, get_plugin_manager
-    from gateway.config import PlatformConfig
-    from gateway.platforms.api_server import APIServerAdapter
-
-    # Fail explicitly at the real public DB boundary instead of allowing the
-    # API's optional lazy-open catch to hide a missing dependency/guard denial.
-    from hermes_state import SessionDB
-    preflight_database = SessionDB(db_path=sandbox / "preflight-state.db")
-    preflight_database.close()
-
-    discover_plugins()
-    manager = get_plugin_manager()
-    for name in ("cf-filebridge", "cf-a-joint-observer"):
-        plugin = manager._plugins.get(name)
-        assert plugin and plugin.enabled and plugin.error is None, name
-    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={
-        # The API's virtual alias must differ from the actual provider model:
-        # its public /model route intentionally refuses locking a global alias.
-        "host": "127.0.0.1", "port": 0, "key": hermes_token, "model_name": "cf-hermes-api"}))
+    from hermes_probe_support import VERSIONS
+    manager = adapter = None
+    if not external:
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+        from gateway.config import PlatformConfig
+        from gateway.platforms.api_server import APIServerAdapter
+        from hermes_state import SessionDB
+        preflight_database = SessionDB(db_path=sandbox / "preflight-state.db")
+        preflight_database.close()
+        discover_plugins()
+        manager = get_plugin_manager()
+        for name in ("cf-filebridge", "cf-a-joint-observer"):
+            plugin = manager._plugins.get(name)
+            assert plugin and plugin.enabled and plugin.error is None, name
+        adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={
+            "host": "127.0.0.1", "port": 0, "key": hermes_token, "model_name": "cf-hermes-api"}))
     server = None
     serving = None
     hermes_client = None
     try:
-        assert await adapter.connect()
-        hermes_origin = f"http://127.0.0.1:{adapter._site._server.sockets[0].getsockname()[1]}"
+        if adapter:
+            assert await adapter.connect()
+            hermes_origin = f"http://127.0.0.1:{adapter._site._server.sockets[0].getsockname()[1]}"
         settings = Settings(database=DatabaseSettings(f"sqlite:///{(sandbox / 'gateway.db').as_posix()}"),
             logging=LoggingSettings("WARNING"),
             inbound_media=InboundMediaSettings(enabled=True, staging_root=str(sandbox / "staging"), public_base_url=origin),
@@ -585,7 +638,11 @@ async def child(gateway, hermes, worker):
             assert session.get(InboundMediaJob, failed_binding.job_id).read_token_hash is None
             failed_session = failed_binding.session_id
         events = [json.loads(line) for line in events_path.read_text().splitlines()]
-        assert not any(event["kind"] == "end" and event["session_id"] == failed_session for event in events)
+        failure_ends = [event for event in events if event["kind"] == "end" and event["session_id"] == failed_session]
+        if VERSIONS[hermes_commit]["exception_end_hook"]:
+            assert len(failure_ends) == 1 and failure_ends[0]["failed"] is True, failure_ends
+        else:
+            assert not failure_ends, {"exception_end_hook_observed": failure_ends}
         assert any(event["kind"] == "tool" and event["session_id"] == failed_session
                    and event["result"].get("verified") is True for event in events)
         def job_for(outcome):
@@ -681,8 +738,12 @@ async def child(gateway, hermes, worker):
         item = admit("lostclosed", "attachment", True)
         assert await asyncio.to_thread(intake.run_once) == "ready"
         closed_claim = dispatcher.claim_once()
-        observer = manager._plugins["cf-a-joint-observer"].module
-        os.environ["CF_JOINT_RETAIN_STREAM"] = "1"
+        observer = manager._plugins["cf-a-joint-observer"].module if manager else None
+        retain_flag = sandbox / "retain-stream"
+        if external:
+            retain_flag.touch()
+        else:
+            os.environ["CF_JOINT_RETAIN_STREAM"] = "1"
         delay_closed_requests[0] = True
         began = time.monotonic()
         try:
@@ -692,14 +753,22 @@ async def child(gateway, hermes, worker):
             assert blocked_closed_count[0] == 1, "host retried an uncertain closed request"
             assert lost_binding.closed_at is None and lost_binding.grant_ciphertext is None
             assert 25 <= closed_elapsed < 42, closed_elapsed
-            assert observer.retained_streams and all(stream.closed for _context, stream in observer.retained_streams)
-            assert observer.native_processes and all(process.poll() is not None for process in observer.native_processes)
+            if external:
+                state = await external.snapshot()
+                assert state["retained_streams_closed"] and all(state["retained_streams_closed"]), state
+                assert state["retained_worker_exits"] and all(code is not None for code in state["retained_worker_exits"]), state
+            else:
+                assert observer.retained_streams and all(stream.closed for _context, stream in observer.retained_streams)
+                assert observer.native_processes and all(process.poll() is not None for process in observer.native_processes)
         finally:
             delay_closed_requests[0] = False
             release_closed.set()
             os.environ.pop("CF_JOINT_RETAIN_STREAM", None)
-            for context, _stream in observer.retained_streams:
-                context.__exit__(None, None, None)
+            if external:
+                retain_flag.unlink()
+            else:
+                for context, _stream in observer.retained_streams:
+                    context.__exit__(None, None, None)
         # These are independent authenticated control-protocol negative probes,
         # not successful downloads or fabricated plugin bindings. A genuine
         # Gateway worker prebinds each child and waits inside the real model
@@ -777,20 +846,27 @@ async def child(gateway, hermes, worker):
                     assert response.status == 403
         # Only ciphertext is allowed in the Gateway DB; ordinary Hermes profile,
         # model traffic, tool outputs and logs must contain none of these secrets.
+        if external:
+            await external.stop()
         materials = [json.dumps(model.requests).encode(), events_path.read_bytes()]
+        if external:
+            materials.append((sandbox / "external-host.log").read_bytes())
         materials += [path.read_bytes() for path in home.rglob("*") if path.is_file()]
         for secret in _test_secrets:
             assert all(secret.encode() not in material for material in materials), "credential leaked into model/profile/output"
         assert "Bearer " not in json.dumps(model.requests)
         assert violations == [], violations
         print(json.dumps({"ok": True, "gateway_commit": GATEWAY_COMMIT,
-            "hermes_commit": verify_sources(gateway, hermes), "real_gateway_database_claim_prebinding": True,
+            "hermes_commit": hermes_commit, "separate_hermes_runtime": bool(external),
+            "gateway_python_version": sys.version.split()[0],
+            "real_gateway_database_claim_prebinding": True,
             "real_gateway_https_auth_resolve_events_closed": True, "real_hermes_http_agent_loader": True,
             "real_native_downloader": True, "authenticated_request_binding": True,
             "parallel_pdf_jpeg_verified_consumed": 2, "repeated_tools_shared_workcopy": True,
             "gateway_content_gets_for_four_tools": len(content_reads),
             "text_attachment_text_history_and_fifo": True, "expired_handle_replays_rejected": 2,
-            "model_failure_without_end_hook_revoked_by_gateway": True,
+            "model_failure_without_end_hook_revoked_by_gateway": not bool(failure_ends),
+            "exception_end_hook_observed": bool(failure_ends),
             "real_staging_503_attempt_counts": retry_counts,
             "cancel_during_https_body_no_workcopy": True,
             "real_30_second_idle_lease_no_budget_refresh": True,
@@ -802,8 +878,12 @@ async def child(gateway, hermes, worker):
     finally:
         if hermes_client:
             hermes_client.close()
-        await adapter.disconnect()
-        manager.unload()
+        if external:
+            await external.stop()
+        if adapter:
+            await adapter.disconnect()
+        if manager:
+            manager.unload()
         if server:
             server.should_exit = True
         if serving:
@@ -813,7 +893,8 @@ async def child(gateway, hermes, worker):
         model.server_close()
 
 
-def run(gateway, hermes, worker):
+def run(gateway, hermes, worker, *, hermes_commit=DEFAULT_HERMES_COMMIT,
+        hermes_archive=None, hermes_python=None):
     if sys.platform != "linux":
         raise RuntimeError("Real Gateway staging requires Linux; run this explicit joint gate on Linux CI")
     with tempfile.TemporaryDirectory(prefix="cf-gateway-hermes-joint-") as temporary:
@@ -838,16 +919,10 @@ def run(gateway, hermes, worker):
             "memory": {"enabled": False}, "skills": {"enabled": False},
             "compression": {"enabled": False}}
         (home / "config.yaml").write_text(json.dumps(config))
-        env = {key: value for key, value in os.environ.items() if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR"}}
-        env.update({"HOME": str(sandbox / "user"), "USERPROFILE": str(sandbox / "user"),
-            "APPDATA": str(sandbox / "user"), "LOCALAPPDATA": str(sandbox / "user"),
-            "HERMES_HOME": str(home), "HERMES_BUNDLED_PLUGINS": str(sandbox / "empty-bundled"),
-            "HERMES_ENABLE_PROJECT_PLUGINS": "false", "CF_JOINT_EVENTS": str(sandbox / "events.jsonl"),
-            "HERMES_TEST_ISOLATION": "1",
-            "TEMP": str(sandbox / "temp"), "TMP": str(sandbox / "temp"), "TMPDIR": str(sandbox / "temp"),
-            "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUTF8": "1"})
-        completed = subprocess.run([sys.executable, "-I", "-B", str(Path(__file__).resolve()),
-            "--gateway-source", str(gateway), "--hermes-source", str(hermes), "--worker", str(worker), "--child"],
+        env = isolated_environment(sandbox, {"CF_JOINT_EVENTS": str(sandbox / "events.jsonl")})
+        completed = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", str(Path(__file__).resolve()),
+            "--gateway-source", str(gateway), "--hermes-source", str(hermes), "--worker", str(worker), "--child",
+            *hermes_arguments(hermes_commit, hermes_archive, hermes_python)],
             cwd=sandbox, env=env, capture_output=True, text=True, encoding="utf-8", timeout=240)
         if completed.returncode:
             # All credentials are generated inside child memory/environment;
@@ -860,12 +935,12 @@ def run(gateway, hermes, worker):
         print(json.dumps(report))
 
 
-def run_child_sanitized(gateway, hermes, worker):
+def run_child_sanitized(gateway, hermes, worker, **hermes_options):
     output, errors = io.StringIO(), io.StringIO()
     failed = False
     with redirect_stdout(output), redirect_stderr(errors):
         try:
-            asyncio.run(child(gateway, hermes, worker))
+            asyncio.run(child(gateway, hermes, worker, **hermes_options))
         except BaseException:
             failed = True
             traceback.print_exc()
@@ -884,7 +959,10 @@ def run_child_sanitized(gateway, hermes, worker):
     print(json.dumps(report))
 
 
-def verify_isolated(gateway, hermes, *, session_probe=False):
+def verify_isolated(gateway, hermes, *, session_probe=False, hermes_commit=DEFAULT_HERMES_COMMIT,
+                    hermes_archive=None, hermes_python=None):
+    if hermes_python:
+        raise ValueError("Cross-runtime import preflight uses the dedicated external-host and native probes")
     with tempfile.TemporaryDirectory(prefix="cf-joint-verify-") as temporary:
         root = Path(temporary).resolve()
         for name in ("profile", "user", "empty-bundled", "temp"):
@@ -892,14 +970,10 @@ def verify_isolated(gateway, hermes, *, session_probe=False):
         (root / "profile/config.yaml").write_text(json.dumps({"plugins": {"enabled": []},
             "security": {"allow_lazy_installs": False}, "agent": {"environment_probe": False},
             "memory": {"enabled": False}, "skills": {"enabled": False}, "compression": {"enabled": False}}))
-        env = {key: value for key, value in os.environ.items() if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR"}}
-        env.update({"HERMES_HOME": str(root / "profile"), "HOME": str(root / "user"),
-            "USERPROFILE": str(root / "user"), "APPDATA": str(root / "user"), "LOCALAPPDATA": str(root / "user"),
-            "HERMES_BUNDLED_PLUGINS": str(root / "empty-bundled"), "HERMES_ENABLE_PROJECT_PLUGINS": "false",
-            "HERMES_TEST_ISOLATION": "1", "TEMP": str(root / "temp"), "TMP": str(root / "temp"),
-            "TMPDIR": str(root / "temp"), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUTF8": "1"})
-        command = [sys.executable, "-I", "-B", str(Path(__file__).resolve()), "--gateway-source", str(gateway),
-                   "--hermes-source", str(hermes), "--verify-import-child"]
+        env = isolated_environment(root)
+        command = [sys.executable, "-I", "-X", "utf8", "-B", str(Path(__file__).resolve()), "--gateway-source", str(gateway),
+                   "--hermes-source", str(hermes), "--verify-import-child",
+                   *hermes_arguments(hermes_commit, hermes_archive)]
         if session_probe:
             command.append("--session-probe")
         completed = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, encoding="utf-8", timeout=45)
@@ -909,7 +983,8 @@ def verify_isolated(gateway, hermes, *, session_probe=False):
             raise SystemExit(completed.returncode)
 
 
-def verify_import_child(gateway, hermes, *, session_probe=False):
+def verify_import_child(gateway, hermes, *, session_probe=False, hermes_commit=DEFAULT_HERMES_COMMIT,
+                        hermes_archive=None, hermes_python=None):
     root = Path(os.environ["HERMES_HOME"]).parent
     bootstrap_system_metadata()
     violations = isolated_guard(root, (gateway, hermes), root / "no-permitted-worker")
@@ -928,7 +1003,7 @@ def verify_import_child(gateway, hermes, *, session_probe=False):
     assert all(os.name == "nt" and os.path.normcase(os.path.abspath(path)) == expected
                for path in violations.platform_probes_denied), violations.platform_probes_denied
     print(json.dumps({"source_verified": True, "dependency_imports": True, "gateway_commit": GATEWAY_COMMIT,
-        "hermes_commit": verify_sources(gateway, hermes), "isolation_audit_violations": len(violations),
+        "hermes_commit": hermes_commit, "isolation_audit_violations": len(violations),
         "platform_probes_denied": violations.platform_probes_denied,
         "public_session_db_constructed": session_probe, "public_session_model_lock": session_probe,
         "joint_execution_performed": False}))
@@ -964,6 +1039,10 @@ if __name__ == "__main__":
     parser.add_argument("--gateway-source", required=True, type=Path)
     parser.add_argument("--gateway-archive", type=Path, help="Optional additional exact codeload ZIP SHA-256 verification")
     parser.add_argument("--hermes-source", required=True, type=Path)
+    parser.add_argument("--hermes-commit", default=DEFAULT_HERMES_COMMIT)
+    parser.add_argument("--hermes-archive", type=Path)
+    parser.add_argument("--hermes-python", type=Path,
+                        help="Run official Hermes in this separate interpreter; Gateway stays in the calling Python")
     parser.add_argument("--worker", type=Path)
     parser.add_argument("--verify-only", action="store_true", help="Verify immutable source/dependency imports only; does not claim integration pass")
     parser.add_argument("--session-probe", action="store_true", help="Also construct/close the official public SessionDB in an isolated temporary directory")
@@ -972,16 +1051,20 @@ if __name__ == "__main__":
     args = parser.parse_args()
     gateway = args.gateway_source.resolve(strict=True)
     hermes = args.hermes_source.resolve(strict=True)
-    hermes_commit = verify_sources(gateway, hermes, args.gateway_archive)
+    hermes_options = {"hermes_commit": args.hermes_commit,
+        "hermes_archive": args.hermes_archive.resolve(strict=True) if args.hermes_archive else None,
+        "hermes_python": args.hermes_python.resolve(strict=True) if args.hermes_python else None}
+    verify_sources(gateway, hermes, args.gateway_archive, hermes_commit=args.hermes_commit,
+                   hermes_archive=hermes_options["hermes_archive"])
     if args.verify_import_child:
-        verify_import_child(gateway, hermes, session_probe=args.session_probe)
+        verify_import_child(gateway, hermes, session_probe=args.session_probe, **hermes_options)
     elif args.verify_only:
-        verify_isolated(gateway, hermes, session_probe=args.session_probe)
+        verify_isolated(gateway, hermes, session_probe=args.session_probe, **hermes_options)
     else:
         if not args.worker:
             parser.error("--worker is required for the actual integration gate")
         worker = args.worker.resolve(strict=True)
         if args.child:
-            run_child_sanitized(gateway, hermes, worker)
+            run_child_sanitized(gateway, hermes, worker, **hermes_options)
         else:
-            run(gateway, hermes, worker)
+            run(gateway, hermes, worker, **hermes_options)

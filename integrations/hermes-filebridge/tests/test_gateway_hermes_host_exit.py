@@ -102,7 +102,7 @@ def _subreaper():
         raise RuntimeError("Cannot configure isolated child reaping")
 
 
-async def host_child(gateway, hermes, worker):
+async def host_child(gateway, hermes, worker, **hermes_options):
     global _host_guard_violations
     sandbox = Path(os.environ["HERMES_HOME"]).parent
     joint.bootstrap_system_metadata()
@@ -132,7 +132,10 @@ async def host_child(gateway, hermes, worker):
         manager.unload()
 
 
-async def orchestrate(gateway, hermes, worker):
+async def orchestrate(gateway, hermes, worker, *, hermes_commit=joint.DEFAULT_HERMES_COMMIT,
+                      hermes_archive=None, hermes_python=None):
+    if sys.version_info[:2] != (3, 12):
+        raise RuntimeError("The pinned real Gateway host-exit process requires its verified Python 3.12 environment")
     sandbox = Path(os.environ["HERMES_HOME"]).parent
     home = sandbox / "profile"
     _subreaper()
@@ -163,14 +166,15 @@ async def orchestrate(gateway, hermes, worker):
     # need. The Gateway's encryption key never enters the Hermes child.
     child_env.pop(KEY_ENV, None)
     log = (sandbox / "host-output.log").open("wb")
-    host = subprocess.Popen([sys.executable, "-I", "-B", str(Path(__file__).resolve()),
-        "--gateway-source", str(gateway), "--hermes-source", str(hermes), "--worker", str(worker), "--host-child"],
+    host = subprocess.Popen([str(hermes_python or sys.executable), "-I", "-X", "utf8", "-B", str(Path(__file__).resolve()),
+        "--gateway-source", str(gateway), "--hermes-source", str(hermes), "--worker", str(worker), "--host-child",
+        *joint.hermes_arguments(hermes_commit, hermes_archive)],
         cwd=sandbox, env=child_env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
     worker_pid = None
     native_reaped = False
     server = serving = hermes_client = pending = None
     violations = joint.isolated_guard(sandbox, (gateway, hermes), worker)
-    sys.path[:0] = [str(hermes), str(gateway / "src")]
+    sys.path[:0] = [str(gateway / "src")] + ([] if hermes_python else [str(hermes)])
     try:
         import uvicorn
         from aiohttp import ClientSession, ClientTimeout, TCPConnector
@@ -353,7 +357,8 @@ async def orchestrate(gateway, hermes, worker):
         assert "Bearer " not in json.dumps(model.requests)
         assert violations == [], _AuditDetails(violations)
         print(json.dumps({"ok": True, "gateway_commit": joint.GATEWAY_COMMIT,
-            "hermes_commit": joint.verify_sources(gateway, hermes),
+            "hermes_commit": hermes_commit, "separate_hermes_runtime": bool(hermes_python),
+            "gateway_python_version": sys.version.split()[0],
             "actual_separate_hermes_process_killed": True, "verified_workcopy_stream_held_at_exit": True,
             "native_worker_reaped_after_host_eof": True, "worker_exit_seconds": round(worker_exit_seconds, 3),
             "gateway_real_events_disconnect_revoked": True, "closed_ack_count": 0,
@@ -393,7 +398,8 @@ async def orchestrate(gateway, hermes, worker):
         log.close()
 
 
-def run(gateway, hermes, worker):
+def run(gateway, hermes, worker, *, hermes_commit=joint.DEFAULT_HERMES_COMMIT,
+        hermes_archive=None, hermes_python=None):
     if sys.platform != "linux":
         raise RuntimeError("This explicit real-process gate requires Linux Gateway staging and child reaping")
     with tempfile.TemporaryDirectory(prefix="cf-gateway-hermes-exit-") as temporary:
@@ -416,15 +422,10 @@ def run(gateway, hermes, worker):
             "memory": {"enabled": False}, "skills": {"enabled": False},
             "compression": {"enabled": False}}
         (home / "config.yaml").write_text(json.dumps(config))
-        env = {key: value for key, value in os.environ.items() if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR"}}
-        env.update({"HERMES_HOME": str(home), "HERMES_BUNDLED_PLUGINS": str(sandbox / "empty-bundled"),
-            "HERMES_ENABLE_PROJECT_PLUGINS": "false", "HERMES_TEST_ISOLATION": "1",
-            "HOME": str(sandbox / "user"), "USERPROFILE": str(sandbox / "user"),
-            "APPDATA": str(sandbox / "user"), "LOCALAPPDATA": str(sandbox / "user"),
-            "TEMP": str(sandbox / "temp"), "TMP": str(sandbox / "temp"), "TMPDIR": str(sandbox / "temp"),
-            "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUTF8": "1"})
-        result = subprocess.run([sys.executable, "-I", "-B", str(Path(__file__).resolve()),
-            "--gateway-source", str(gateway), "--hermes-source", str(hermes), "--worker", str(worker), "--orchestrator"],
+        env = joint.isolated_environment(sandbox)
+        result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", str(Path(__file__).resolve()),
+            "--gateway-source", str(gateway), "--hermes-source", str(hermes), "--worker", str(worker), "--orchestrator",
+            *joint.hermes_arguments(hermes_commit, hermes_archive, hermes_python)],
             cwd=sandbox, env=env, capture_output=True, text=True, encoding="utf-8", timeout=130)
         lines = result.stdout.strip().splitlines()
         report = json.loads(lines[-1]) if lines else {"ok": False, "stage": "isolated_child_start"}
@@ -433,8 +434,11 @@ def run(gateway, hermes, worker):
             raise SystemExit(1)
 
 
-def verify_imports(gateway, hermes):
+def verify_imports(gateway, hermes, *, hermes_commit=joint.DEFAULT_HERMES_COMMIT,
+                   hermes_archive=None, hermes_python=None):
     """Even import-only verification gets a fresh HOME and credential-free env."""
+    if hermes_python:
+        raise ValueError("Cross-runtime import preflight uses the dedicated external-host and native probes")
     with tempfile.TemporaryDirectory(prefix="cf-gateway-host-exit-imports-") as temporary:
         sandbox = Path(temporary).resolve()
         home = sandbox / "profile"
@@ -442,15 +446,10 @@ def verify_imports(gateway, hermes):
             path.mkdir(mode=0o700)
         (home / "config.yaml").write_text(json.dumps({"plugins": {"enabled": []},
             "agent": {"environment_probe": False}, "security": {"allow_lazy_installs": False}}))
-        env = {key: value for key, value in os.environ.items() if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR"}}
-        env.update({"HERMES_HOME": str(home), "HERMES_BUNDLED_PLUGINS": str(sandbox / "empty-bundled"),
-            "HERMES_ENABLE_PROJECT_PLUGINS": "false", "HERMES_TEST_ISOLATION": "1",
-            "HOME": str(sandbox / "user"), "USERPROFILE": str(sandbox / "user"),
-            "APPDATA": str(sandbox / "user"), "LOCALAPPDATA": str(sandbox / "user"),
-            "TEMP": str(sandbox / "temp"), "TMP": str(sandbox / "temp"), "TMPDIR": str(sandbox / "temp"),
-            "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUTF8": "1"})
-        result = subprocess.run([sys.executable, "-I", "-B", str(Path(__file__).resolve()),
-            "--gateway-source", str(gateway), "--hermes-source", str(hermes), "--verify-import-child"],
+        env = joint.isolated_environment(sandbox)
+        result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", str(Path(__file__).resolve()),
+            "--gateway-source", str(gateway), "--hermes-source", str(hermes), "--verify-import-child",
+            *joint.hermes_arguments(hermes_commit, hermes_archive)],
             cwd=sandbox, env=env, capture_output=True, text=True, encoding="utf-8", timeout=45)
         lines = result.stdout.strip().splitlines()
         report = json.loads(lines[-1]) if lines else {"ok": False, "stage": "isolated_import_start"}
@@ -459,7 +458,7 @@ def verify_imports(gateway, hermes):
             raise SystemExit(1)
 
 
-def verify_import_child(gateway, hermes):
+def verify_import_child(gateway, hermes, **hermes_options):
     sandbox = Path(os.environ["HERMES_HOME"]).parent
     joint.bootstrap_system_metadata()
     violations = joint.isolated_guard(sandbox, (gateway, hermes), None)
@@ -531,6 +530,9 @@ if __name__ == "__main__":
     parser.add_argument("--gateway-source", required=True, type=Path)
     parser.add_argument("--gateway-archive", type=Path)
     parser.add_argument("--hermes-source", required=True, type=Path)
+    parser.add_argument("--hermes-commit", default=joint.DEFAULT_HERMES_COMMIT)
+    parser.add_argument("--hermes-archive", type=Path)
+    parser.add_argument("--hermes-python", type=Path)
     parser.add_argument("--worker", type=Path)
     parser.add_argument("--verify-only", action="store_true")
     parser.add_argument("--verify-import-child", action="store_true", help=argparse.SUPPRESS)
@@ -538,12 +540,16 @@ if __name__ == "__main__":
     parser.add_argument("--orchestrator", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     gateway, hermes = args.gateway_source.resolve(strict=True), args.hermes_source.resolve(strict=True)
-    joint.verify_sources(gateway, hermes, args.gateway_archive)
+    hermes_options = {"hermes_commit": args.hermes_commit,
+        "hermes_archive": args.hermes_archive.resolve(strict=True) if args.hermes_archive else None,
+        "hermes_python": args.hermes_python.resolve(strict=True) if args.hermes_python else None}
+    joint.verify_sources(gateway, hermes, args.gateway_archive, hermes_commit=args.hermes_commit,
+                         hermes_archive=hermes_options["hermes_archive"])
     if args.verify_only:
-        verify_imports(gateway, hermes)
+        verify_imports(gateway, hermes, **hermes_options)
     elif args.verify_import_child:
         try:
-            verify_import_child(gateway, hermes)
+            verify_import_child(gateway, hermes, **hermes_options)
         except Exception as error:
             report = {"ok": False, "error_type": type(error).__name__, "stage": "isolated_import",
                 "locations": [f"{Path(item.filename).name}:{item.lineno}"
@@ -562,11 +568,11 @@ if __name__ == "__main__":
             parser.error("--worker is required")
         try:
             if args.host_child:
-                asyncio.run(host_child(gateway, hermes, worker))
+                asyncio.run(host_child(gateway, hermes, worker, **hermes_options))
             elif args.orchestrator:
-                asyncio.run(orchestrate(gateway, hermes, worker))
+                asyncio.run(orchestrate(gateway, hermes, worker, **hermes_options))
             else:
-                run(gateway, hermes, worker)
+                run(gateway, hermes, worker, **hermes_options)
         except Exception as error:
             # Do not echo arbitrary upstream exception text or captured logs;
             # source locations are enough to diagnose this isolated CI gate.

@@ -124,6 +124,7 @@ class HostControlTests(unittest.TestCase):
         self.first_snapshot = threading.Event()
         self.first_snapshot.set()
         self.download_entered = threading.Event()
+        self.partial_body_sent = threading.Event()
         self.download_release = threading.Event()
         self.closed_entered = threading.Event()
         self.stop_server = threading.Event()
@@ -225,6 +226,14 @@ class HostControlTests(unittest.TestCase):
                     self.send_response(200)
                     self.send_header("Content-Length", str(len(owner.body)))
                     self.end_headers()
+                    if owner.mode == "slow-body":
+                        split = max(1, len(owner.body) // 2)
+                        self.wfile.write(owner.body[:split])
+                        self.wfile.flush()
+                        owner.partial_body_sent.set()
+                        owner.download_release.wait(10)
+                        self.wfile.write(owner.body[split:])
+                        return
                     self.wfile.write(owner.body)
                     return
                 if not self.authorized():
@@ -287,6 +296,11 @@ class HostControlTests(unittest.TestCase):
                     "max_bytes": 1024 * 1024, "ca_file": str(FIXTURES / "cert.pem"),
                     "ca_sha256": hashlib.sha256((FIXTURES / "cert.pem").read_bytes()).hexdigest(),
                     "consumer_tools": [CONSUMER]}
+        # The native HTTP request probe reuses only this explicitly synthetic
+        # HTTPS service. Its adapter is loaded by the real Hermes plugin loader
+        # in a separate process; this fixture must not start or bind one there.
+        if not getattr(self, "make_adapter", True):
+            return
         self.config = control.HostConfig.from_context(Settings(self.raw))
         self.client = control.ControlClient(self.config)
         self.bridge = inbound.HostBridge(str(self.worker), self.worker_hash)
