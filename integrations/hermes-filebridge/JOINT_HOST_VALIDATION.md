@@ -52,6 +52,10 @@ ACK 失败不恢复任何本地权限；忽略取消、未退出的下游调用�
 ## 默认关闭与操作者输入
 
 以下仅是独立验收 Profile 的配置模板，不操作当前安装。合并原 settings，不覆盖既有只读/创建配置。
+该专用 Profile 的 `platform_toolsets.api_server` 只包含 `cf_filebridge`、按既有开关启用的
+`cf_filebridge_create`、`cf_filebridge_inbound` 和操作者批准的下游工具集；不授予通用 shell、
+环境变量读取或任意本地文件工具。否则那些工具可绕过本插件边界读取宿主服务环境变量。
+`consumer_tools` 是工具名称的额外白名单，不能替代 Hermes Profile 自身的工具集限制。
 运行身份事先拥有私有 work_root；Windows 要求当前 SID 所有、受保护 DACL，仅当前 SID/SYSTEM/
 Administrators 的允许项。子目录创建时即带原生 NTFS DACL，锁住全部祖先，拒绝重解析点。
 Linux 要求当前用户所有、0700，无符号链接路径。不会修复已有 ACL 或清理已有目录。
@@ -139,9 +143,39 @@ Windows 错误，原因未能复现，未据此修改下载器、权限要求或
 进程退出探针准备阶段的一次 `--verify-only` 使用独立 venv/固定源码，但未先隔离继承 HOME；
 那次官方 API import 不计为隔离验证证据，也没有访问活动目录追查。该入口随后改为先创建临时
 HOME/Profile、清空凭据环境、安装访问审计再导入并重跑；实际请求测试始终在隔离 child 中。
-最终完整 Linux 组合和进程退出测试结果、对应 HEAD/CI 以 PR #2 交付记录为准。
+### 已通过的完整组合证据
+
+代码提交 `f52c8a8082878039dff6e8d784bc204fe4788d8a` 的
+[PR CI](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/36375477751) 和
+[分支 push CI](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/36375474849)
+均为 Linux / Windows 全部成功。两份 Linux 日志分别包含两个独立 `ok=true` 报告：
+
+- 主组合：`authenticated_request_binding=true`，真实 DB/claim/prebinding、HTTPS
+  resolve/events/closed、官方 HTTP/Agent/loader/middleware、原生 worker 均为 true。
+  PDF/JPEG 并发验证并实际消费 2 份副本；4 次下载工具调用仅 2 次内容 GET。
+  实际暂存锁产生 503：成功场景 2 次、耗尽场景 4 次；重复调用不重新取得预算。
+  下载中取消不发布副本，真实 30 秒租约到期拒绝旧句柄/新下载，缺结束 hook 的模型异常仍撤销。
+  丢失 closed 时本地流与进程先停止，真实 Gateway 屏障分别在 31.23 / 31.30 秒后收口。
+  未接 events、丢序、断连、旧 owner/nonce/claim 拒绝及文本/附件/文本历史顺序均通过。
+- 进程退出：独立真实 Hermes 在持有已验证流时被测试父进程 SIGKILL；worker 在
+  0.024 / 0.025 秒后因 stdin EOF 正常退出并被回收，早于剩余租约。
+  Gateway events 断连撤销、无 closed ACK、固定 lease 到期转 uncertain、三次旧 owner/新 nonce
+  重放 403 及同线程 FIFO 屏障均通过。宿主和 Gateway 审计违规均为 0。
+- Windows：两份 CI 的 60 项测试均为 59 通过、1 项 Linux 专属测试未运行，包括真实 HTTPS/
+  worker/NTFS/适配组件；官方 loader 两种开关、6 项 middleware、真实 HTTP/lifecycle 探针通过。
+  Linux discovery 为 58 通过、2 项 Windows 专属测试未运行。旧工具断言未删除。
+- [Windows 配置 CI](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/36375477766)
+  的 Windows 2022 / 2025 均通过；[常规 CI](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/36375477748)
+  除已有 backend Lint 112 条外其余 6 项通过，112 条诊断与历史逐条一致。
+
+因此 **隔离组合宿主桥已接通，无待补的 Gateway 外部接口**。只把模型 HTTP 服务和微信原始
+取件替换为测试替身；本项目下载器、Gateway 权威接口和 Hermes 执行链没有被替换。
+网络延迟仅用于故障注入；独立直接控制协议负例明确不算插件成功链路。
+最终文档提交 HEAD 和对应 CI 另在 PR #2 正文核验，不能用历史组件探针替代以上组合证据。
 现场 Windows AI 主机、CFserver、实际微信入口没有测试。
 不修改 backend Lint 规则；历史红项独立保留。PDF 上游长期 pending 也独立未解决。
+本地未运行 FileBrowser backend/frontend/Playwright 或产品部署构建：这些目录没有变更；
+现有常规 CI 的自动检查照常执行。未安装启用候选插件、替换客户端/凭据、合并或发布。
 
 ## 修改文件及原因
 
