@@ -128,6 +128,13 @@ Windows 原生暂存 18 项通过；
 模型名与真实模型名设为同一值，官方接口将其解释为不可锁定的全局别名。独立临时 Profile
 通过真实 HTTP 重现旧配置 409、新虚拟别名 200/`model_lock=accepted`；修正仅涉及测试配置。
 Windows 的官方 Linux self-stat 探测由 guard 精确拒绝并单列记录，不打开任何 `C:\proc` 文件。
+`b25e059a` / `43bbefb4` 已完成主联合测试的业务断言，但严格审计拒绝官方可选的 Bedrock
+依赖自动安装、环境工具探测及标准库首次 CPU 探测，整体仍判失败。隔离 Profile 明确使用官方
+`security.allow_lazy_installs: false`、`agent.environment_probe: false`，标准库平台信息在准备
+阶段取得；真实请求期间只允许现有 worker，未放行安装器或其他 shell，也未替换官方执行链。
+`b25e059a` 的单个 Windows PR job 在原有 NTFS `Publish()` 测试出现一次安全拒绝，同行 push
+成功；本地原样测试连续 500 次通过，`43bbefb4` 两个 Windows job 均通过。原生日志没有细分
+Windows 错误，原因未能复现，未据此修改下载器、权限要求或断言。
 合并 discovery 也曾发现新测试审计钩子未处理 `env=None`，修复测试作用域后保留原测试通过。
 进程退出探针准备阶段的一次 `--verify-only` 使用独立 venv/固定源码，但未先隔离继承 HOME；
 那次官方 API import 不计为隔离验证证据，也没有访问活动目录追查。该入口随后改为先创建临时

@@ -74,6 +74,8 @@ HERMES_SESSION_BLOBS = {
     "hermes_state_messages.py": "4e7b96faa7b82f23c703a4b9f58c2dcf759b712e",
     "hermes_state_compression.py": "9f8415faba7e3a356bb3b427286e86b15813c33e",
     "gateway/platforms/api_server_runs.py": "3976ff02de219fa0c0de6bb7919fbb51e8cffecc",
+    "tools/lazy_deps.py": "bf057619bc0eecf5f9eac099acfcc919a28a6525",
+    "tools/env_probe.py": "6805eb807818501cf996b5709c5fc33be39657a8",
 }
 
 
@@ -258,6 +260,19 @@ class ModelHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+def bootstrap_system_metadata():
+    """Read stdlib OS metadata before the test's strict execution boundary.
+
+    Call only after HOME/profile have been redirected to a disposable directory.
+    Python 3.12 lazily obtains processor metadata with ``uname -p`` on Linux;
+    prime its public cached APIs before any official-source import. This does
+    not run Hermes environment probes or relax the later worker-only Popen gate.
+    """
+    mimetypes.init()
+    platform.processor()
+    platform.platform()
+
+
 def isolated_guard(sandbox, sources, worker):
     class AuditViolations(list):
         def __init__(self):
@@ -339,8 +354,7 @@ def isolated_guard(sandbox, sources, worker):
 async def child(gateway, hermes, worker):
     sandbox = Path(os.environ["HERMES_HOME"]).parent
     home = sandbox / "profile"
-    # Bootstrap documented stdlib OS metadata before the strict boundary.
-    mimetypes.init()
+    bootstrap_system_metadata()
     model = ModelServer()
     threading.Thread(target=model.serve_forever, daemon=True).start()
     listener = socket.socket()
@@ -817,7 +831,11 @@ def run(gateway, hermes, worker):
         config = {"plugins": {"enabled": ["cf-filebridge", "cf-a-joint-observer"], "entries": {
             "cf-filebridge": {"settings": {"inbound_enabled": True, "inbound_host_enabled": True}}}},
             "platform_toolsets": {"api_server": ["cf_filebridge_inbound", "cf_joint_probe"]},
-            "agent": {"max_iterations": 6}, "memory": {"enabled": False}, "skills": {"enabled": False},
+            # Official public switches: this custom-model fixture does not use
+            # Bedrock lazy installs or the shell-based terminal toolchain probe.
+            "security": {"allow_lazy_installs": False},
+            "agent": {"max_iterations": 6, "environment_probe": False},
+            "memory": {"enabled": False}, "skills": {"enabled": False},
             "compression": {"enabled": False}}
         (home / "config.yaml").write_text(json.dumps(config))
         env = {key: value for key, value in os.environ.items() if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR"}}
@@ -872,6 +890,7 @@ def verify_isolated(gateway, hermes, *, session_probe=False):
         for name in ("profile", "user", "empty-bundled", "temp"):
             (root / name).mkdir(mode=0o700)
         (root / "profile/config.yaml").write_text(json.dumps({"plugins": {"enabled": []},
+            "security": {"allow_lazy_installs": False}, "agent": {"environment_probe": False},
             "memory": {"enabled": False}, "skills": {"enabled": False}, "compression": {"enabled": False}}))
         env = {key: value for key, value in os.environ.items() if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR"}}
         env.update({"HERMES_HOME": str(root / "profile"), "HOME": str(root / "user"),
@@ -892,8 +911,7 @@ def verify_isolated(gateway, hermes, *, session_probe=False):
 
 def verify_import_child(gateway, hermes, *, session_probe=False):
     root = Path(os.environ["HERMES_HOME"]).parent
-    platform.system()
-    mimetypes.init()
+    bootstrap_system_metadata()
     violations = isolated_guard(root, (gateway, hermes), root / "no-permitted-worker")
     sys.path[:0] = [str(hermes), str(gateway / "src")]
     from cf_agent_gateway.gateway.app import create_app

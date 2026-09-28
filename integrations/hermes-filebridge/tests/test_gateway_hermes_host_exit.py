@@ -23,7 +23,6 @@ from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
-import mimetypes
 import os
 from pathlib import Path
 import secrets
@@ -106,7 +105,7 @@ def _subreaper():
 async def host_child(gateway, hermes, worker):
     global _host_guard_violations
     sandbox = Path(os.environ["HERMES_HOME"]).parent
-    mimetypes.init()
+    joint.bootstrap_system_metadata()
     _host_guard_violations = joint.isolated_guard(sandbox, (gateway, hermes), worker)
     sys.path.insert(0, str(hermes))
     from hermes_cli.plugins import discover_plugins, get_plugin_manager
@@ -137,7 +136,7 @@ async def orchestrate(gateway, hermes, worker):
     sandbox = Path(os.environ["HERMES_HOME"]).parent
     home = sandbox / "profile"
     _subreaper()
-    mimetypes.init()
+    joint.bootstrap_system_metadata()
     model = joint.ModelServer()
     threading.Thread(target=model.serve_forever, daemon=True).start()
     listener = socket.socket()
@@ -412,7 +411,9 @@ def run(gateway, hermes, worker):
         config = {"plugins": {"enabled": ["cf-filebridge", "cf-a-exit-observer"], "entries": {
             "cf-filebridge": {"settings": {"inbound_enabled": True, "inbound_host_enabled": True}}}},
             "platform_toolsets": {"api_server": ["cf_filebridge_inbound", "cf_joint_probe"]},
-            "agent": {"max_iterations": 6}, "memory": {"enabled": False}, "skills": {"enabled": False},
+            "agent": {"max_iterations": 6, "environment_probe": False},
+            "security": {"allow_lazy_installs": False},
+            "memory": {"enabled": False}, "skills": {"enabled": False},
             "compression": {"enabled": False}}
         (home / "config.yaml").write_text(json.dumps(config))
         env = {key: value for key, value in os.environ.items() if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR"}}
@@ -439,7 +440,8 @@ def verify_imports(gateway, hermes):
         home = sandbox / "profile"
         for path in (home, sandbox / "empty-bundled", sandbox / "user", sandbox / "temp"):
             path.mkdir(mode=0o700)
-        (home / "config.yaml").write_text(json.dumps({"plugins": {"enabled": []}}))
+        (home / "config.yaml").write_text(json.dumps({"plugins": {"enabled": []},
+            "agent": {"environment_probe": False}, "security": {"allow_lazy_installs": False}}))
         env = {key: value for key, value in os.environ.items() if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR"}}
         env.update({"HERMES_HOME": str(home), "HERMES_BUNDLED_PLUGINS": str(sandbox / "empty-bundled"),
             "HERMES_ENABLE_PROJECT_PLUGINS": "false", "HERMES_TEST_ISOLATION": "1",
@@ -459,7 +461,7 @@ def verify_imports(gateway, hermes):
 
 def verify_import_child(gateway, hermes):
     sandbox = Path(os.environ["HERMES_HOME"]).parent
-    mimetypes.init()
+    joint.bootstrap_system_metadata()
     violations = joint.isolated_guard(sandbox, (gateway, hermes), None)
     sys.path[:0] = [str(hermes), str(gateway / "src")]
     from cf_agent_gateway.runtime.dispatch_worker import build_dispatch_worker
