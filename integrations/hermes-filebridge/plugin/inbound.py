@@ -1,9 +1,9 @@
 """Host-only Dispatch bridge to the isolated inbound download worker.
 
 Nothing in this module derives authority from model arguments, handler kwargs
-or prompt text. Authenticated metadata can carry authority, but must first be
-verified and bound to the actual execution. Official tool_execution middleware
-can scope activate(); the missing Gateway handoff is documented separately.
+or prompt text. Authenticated control data must first be verified and bound to
+the actual execution. inbound_host supplies the official execution middleware;
+inbound_control authenticates the Gateway handoff before this worker is started.
 """
 from __future__ import annotations
 
@@ -67,9 +67,16 @@ class _Dispatch:
         self.responses = queue.Queue(maxsize=4)
         self.files_lock = threading.Lock()
         self.files = set()
+        self.stop_lock = threading.Lock()
+        self._stop_result = False
+        self._stdin_closer = None
+        self._streams_closer = None
+        self._streams_closed = threading.Event()
+        self._initialized = False
+        self.reader = None
         self.process = None
         self.binding_digest = hashlib.sha256(binding).digest()
-        environment = {k: v for k, v in os.environ.items() if k.upper() not in {
+        environment = {k: v for k, v in os.environ.items() if not k.upper().startswith("CF_FILEBRIDGE_HOST_") and k.upper() not in {
             "FILEBROWSER_AGENT_TOKEN", "SSLKEYLOGFILE", "HTTP_PROXY", "HTTPS_PROXY",
             "ALL_PROXY", "FTP_PROXY", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
         }}
@@ -79,15 +86,18 @@ class _Dispatch:
                 stderr=subprocess.DEVNULL, shell=False, env=environment,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            threading.Thread(target=self._read_responses, daemon=True).start()
+            self.reader = threading.Thread(target=self._read_responses, daemon=True)
+            self.reader.start()
             self.process.stdin.write(binding + b"\n")
             self.process.stdin.flush()
             response = self._wait(5)
             if response.get("ok") is not True:
                 raise BridgeError("trusted_context_invalid")
+            self._initialized = True
         except Exception:
             self.stop()
-            raise BridgeError("trusted_context_invalid") from None
+            # The owner retains this object even if a worker cannot be joined.
+            # Losing it here would let a second end_dispatch ACK a live process.
 
     def _read_responses(self):
         try:
@@ -151,31 +161,81 @@ class _Dispatch:
         # Does not acquire request.lock: end/cancel must interrupt an in-flight
         # HTTPS read, not wait until it returns. EOF is the worker revoke signal.
         self.stopped.set()
-        with self.files_lock:
-            for stream in list(self.files):
+        if not self.stop_lock.acquire(timeout=7):
+            return False
+        try:
+            if self._stop_result:
+                self._close_output_if_idle()
+                return True
+            if self._streams_closer is None:
+                with self.files_lock:
+                    streams = list(self.files)
+                    self.files.clear()
+
+                def close_streams():
+                    closed = True
+                    for stream in streams:
+                        try:
+                            stream.close()
+                        except Exception:
+                            closed = False
+                    if closed:
+                        self._streams_closed.set()
+
+                # A buffered read can hold a Python IO lock. Do not turn local
+                # cancellation or closed acknowledgment into an unbounded close.
+                self._streams_closer = threading.Thread(target=close_streams, daemon=True)
                 try:
-                    stream.close()
-                except Exception:
+                    self._streams_closer.start()
+                except RuntimeError:
+                    # Python 3.12 can refuse new threads during atexit. Still
+                    # terminate the child below, but never ACK unclosed streams.
                     pass
-            self.files.clear()
-        if self.process is None:
-            return
-        try:
-            self.process.stdin.close()
-        except Exception:
-            pass
-        try:
-            self.process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
+            if self.process is None:
+                self._stop_result = self._streams_closed.wait(2)
+                return self._stop_result
+            if self._stdin_closer is None:
+                def close_input():
+                    try:
+                        self.process.stdin.close()
+                    except Exception:
+                        pass
+
+                self._stdin_closer = threading.Thread(target=close_input, daemon=True)
+                try:
+                    self._stdin_closer.start()
+                except RuntimeError:
+                    pass
+            for action in (None, self.process.terminate, self.process.kill):
+                if self.process.poll() is not None:
+                    break
+                try:
+                    if action is not None:
+                        action()
+                except OSError:
+                    pass
+                try:
+                    self.process.wait(timeout=2)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+            exited = self.process.poll() is not None
+            self._stop_result = exited and self._streams_closed.wait(2)
+            if exited:
+                self._close_output_if_idle()
+            return self._stop_result
         finally:
-            if self.process.stdout:
+            self.stop_lock.release()
+
+    def _close_output_if_idle(self):
+        if (self.process is not None and self.process.stdout and
+                (self.reader is None or self.reader is threading.current_thread()
+                 or not self.reader.is_alive())):
+            # Never acquire a buffered stdout lock while its reader can be
+            # blocked in readline. The reader closes it in its own finally.
+            try:
                 self.process.stdout.close()
+            except Exception:
+                pass
 
 
 class HostBridge:
@@ -224,6 +284,8 @@ class HostBridge:
                 self._attachment_owners[pair] = dispatch_id
             executable = _client(self.client_path, self.client_sha256)
             self._dispatches[dispatch_id] = _Dispatch(executable, encoded)
+            if not self._dispatches[dispatch_id]._initialized:
+                raise BridgeError("trusted_context_invalid")
 
     @contextmanager
     def activate(self, dispatch_id):
@@ -240,15 +302,19 @@ class HostBridge:
     def end_dispatch(self, dispatch_id):
         with self._lock:
             dispatch = self._dispatches.get(dispatch_id)
-            self._dispatches[dispatch_id] = None
+            # Preserve failed/stopped worker objects: concurrent/repeated calls
+            # must check actual termination rather than ACK a cleared tombstone.
+            if dispatch_id not in self._dispatches:
+                self._dispatches[dispatch_id] = None
         if dispatch is not None:
-            dispatch.stop()
+            return dispatch.stop()
+        return True  # No worker was ever created for this tombstone.
 
     def close(self):
         with self._lock:
             identifiers = list(self._dispatches)
-        for dispatch_id in identifiers:
-            self.end_dispatch(dispatch_id)
+        results = [self.end_dispatch(dispatch_id) for dispatch_id in identifiers]
+        return all(results)
 
     def resolve_workcopy(self, handle):
         """Host processing API. Internal paths must never be forwarded to chat.

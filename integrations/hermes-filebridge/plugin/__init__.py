@@ -69,7 +69,7 @@ def handler_for(ctx, *, creation=False):
             if digest != expected:
                 return failure("client_digest_mismatch")
             # Credentials cannot be supplied by a user's inherited process env.
-            env = {k: v for k, v in os.environ.items() if k.upper() not in {
+            env = {k: v for k, v in os.environ.items() if not k.upper().startswith("CF_FILEBRIDGE_HOST_") and k.upper() not in {
                 "FILEBROWSER_AGENT_TOKEN", "SSLKEYLOGFILE", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY"
             }}
             argv = [str(executable), "--config", str(config), "--input", "-"]
@@ -134,3 +134,6 @@ def register(ctx):
     if ctx.get_config("inbound_enabled", False) is True:
         from .inbound import register_inbound
         register_inbound(ctx)
+        if ctx.get_config("inbound_host_enabled", False) is True:
+            from .inbound_host import register_host
+            register_host(ctx)
