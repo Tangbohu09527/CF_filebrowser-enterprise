@@ -1,8 +1,10 @@
 # 入站附件：官方 middleware 接线与外部认证契约
 
-核验基线：[官方 Hermes `4d55ca91656ac5f83e1506679b7f81e0238e5e16`](https://github.com/NousResearch/hermes-agent/tree/4d55ca91656ac5f83e1506679b7f81e0238e5e16)；[Gateway `a26f234fbe60f9a3212bf6bd3471bba3f5802997`](https://github.com/Tangbohu09527/CF_agent-gateway/tree/a26f234fbe60f9a3212bf6bd3471bba3f5802997)。本页不读取或描述用户正在运行的安装。
+核验基线：[官方 Hermes `4d55ca91656ac5f83e1506679b7f81e0238e5e16`](https://github.com/NousResearch/hermes-agent/tree/4d55ca91656ac5f83e1506679b7f81e0238e5e16)；[Gateway `0ec54bf0f25f421e37e16e11bd098a814beca258`](https://github.com/Tangbohu09527/CF_agent-gateway/tree/0ec54bf0f25f421e37e16e11bd098a814beca258)。本页不读取或描述用户正在运行的安装。
 
-**结论：官方 middleware 可以包住 `HostBridge.activate`，无需修改 Hermes 核心，也无需新增 current_dispatch API。还缺的是 Gateway 的权威 Dispatch 交接与撤销契约。** 具体字段、接口、调用时机和验收条件见 [GATEWAY_HOST_BINDING_REQUIREMENTS.md](GATEWAY_HOST_BINDING_REQUIREMENTS.md)。此前把问题归结为 PluginContext 没有完整 current-Dispatch API 的表述不准确，已更正。
+**官方 middleware 在真实工具线程包住 `HostBridge.activate`，无需修改 Hermes 核心。**
+`plugin/inbound_host.py` 消费 `inbound_control.py` 对已实现 Gateway 契约的严格验证结果。
+配置与联合证据见 [JOINT_HOST_VALIDATION.md](JOINT_HOST_VALIDATION.md)；旧配套请求保留为历史文档。
 
 `filebrowser_download_inbound` 仍默认关闭。开启只注册工具；没有经过认证的绑定仍返回 `trusted_context_unavailable`。模型仅能传入 `attachment_id`，不能签发任务、选择路径、origin 或凭据。
 
@@ -15,7 +17,8 @@ Gateway HTTP client (Bearer + X-Hermes-Session-Id)
   -> agent.tool_executor 的 tool_execution middleware
      或 model_tools.handle_function_call -> _execute_tool 的同名 middleware
   -> 插件 middleware 在当前工具执行线程内：
-       以框架关联查询并核验 Gateway 权威绑定 [当前缺少此外部契约]
+       固定后台客户端 resolve -> 字段/身份/profile/lease 验证
+       events -> 首个有效 running 快照 -> start_dispatch（一次）
        with existing_bridge.activate(authoritative_dispatch_id):
            return next_call(args)
   -> 官方 registry -> 当前 filebrowser_download_inbound handler
@@ -38,18 +41,18 @@ Gateway HTTP client (Bearer + X-Hermes-Session-Id)
 ## 关联与授权分开
 
 - `session_id` / `task_id` / `turn_id` 可用于定位真实执行，但不能证明企业身份、附件权限或仍活动的 Gateway claim。工作目录只能取自操作者配置下分配的私有目录，不能从这些 ID、原文件名或模型输入直接拼接。
-- Gateway 的 DB 身份检查和 `grant_read` 是附件授权的权威来源；经认证 HTTP 或验签后取得的 metadata **可以可信**。当前问题是官方 API 没有将该字段交给插件，且当前内容没有 Dispatch claim/lease，不能靠放宽信任补齐。
+- Gateway 的 DB 身份检查、claim 预绑定和读授权是权威来源；固定 HTTPS 服务认证接口返回的 binding 经过完整字段验证后才使用。普通 metadata 或提示正文不提供授权。
 - `descriptor.expires_at` 是读能力期限，不是 Dispatch 租约期限。收到有效 read token 也不能据此让下游文件句柄跨任务存活。
-- 现有 Gateway 会把包含 Authorization 的完整附件描述放入用户消息正文；不能从该正文提取凭据作为桥接，也不能将它继续送给模型。本项目 worker 不泄密，并不证明上游消息没有泄密；配套契约必须提供无凭据的模型投影。
-- `on_session_end` 可辅助结束回收，但 `_persist_disabled` 和非正常退出路径不能仅依赖该通知。真实请求探针已复现：模型 HTTP 400 使 `hermes.failed=true`，却没有对应结束 hook；SSE 断开事件带 `interrupted=true`，同时 `completed=true`。API SSE 断线不等于 Gateway claim 取消；Gateway 当前续租失败也没有向 Hermes 发出撤销。需权威租约、结束信号及断线拒绝，详见外部契约。
+- 新 Gateway host-binding 模式只把无凭据投影送入模型；完整 grant 仅经控制接口交给宿主。旧基线的正文泄露探针保留在历史记录，不从该正文提取任何授权。
+- `on_session_end` 只是辅助通知。固定 Hermes 的模型异常仍可能缺结束 hook；Gateway events 撤销及不可续期的 30 秒本地定时器覆盖该缺口。相同序号快照只保活，不续期；倒序、丢序、断线、终态均停止，禁止重连旧绑定。
 - plugin `on_unload` / 正常退出负责 close；意外进程退出使管道 EOF 撤销原 worker。重启必须由 Gateway 拒绝旧 claim 重放，不能重建旧下载预算。
 
 ## 证据分层
 
 1. `tests/test_inbound_plugin.py`：合成可信 binding、实际 HTTPS 和当前原生 worker，验证下载、预算、句柄消费及回收。它不证明请求认证。
 2. `tests/test_hermes_loader.py`：隔离固定官方 loader、真实 PluginContext 和 registry；验证发现、默认关闭及无绑定拒绝。
-3. 本轮真实 middleware 组件探针与真实 HTTP 请求探针分别记录于 [HOST_BRIDGE_VALIDATION.md](HOST_BRIDGE_VALIDATION.md)。合成 binding 的组件成功不升级为 authenticated request 成功。
-4. 真实 AI 主机与 Gateway 联调仍未执行；下载工具保持默认关闭。不能将模型服务替身、测试 observer 或手动 start_dispatch 当作权威交接已经存在。
+3. 历史 middleware 组件和请求探针见 [HOST_BRIDGE_VALIDATION.md](HOST_BRIDGE_VALIDATION.md)。新的真实 Gateway / Hermes 组合 runner 与 Linux 结果单独记录于 [JOINT_HOST_VALIDATION.md](JOINT_HOST_VALIDATION.md)。
+4. 实际 AI 主机与已部署 Gateway 的现场验收仍未执行，功能默认关闭；隔离 Linux 联合测试不等于 CFserver 到 Windows 现场验收。
 
 ## 独立 Windows 暂存与检查
 
@@ -57,7 +60,7 @@ Gateway HTTP client (Bearer + X-Hermes-Session-Id)
 
 除 `SelfTest` 外，必须显式提供本地绝对路径 `SourceDirectory`、独立的 `StageDirectory` 和从可信发布记录独立核验的 `ExpectedInventorySHA256`。不要仅对一个仍可变的下载目录现算摘要，就把该摘要当成发布者的独立校验值。
 
-来源包必须恰好包含 `filebridge-inbound.exe`、`plugin/__init__.py`、`plugin/plugin.yaml`、`plugin/inbound.py` 和 `inventory.json`。清单格式如下；`source_commit` 是制品真实源码提交，不能填入尚未包含当前改动的提交：
+来源包必须恰好包含下面清单中的七个文件及 `inventory.json`。`source_commit` 是制品真实源码提交：
 
 ```json
 {
@@ -67,7 +70,10 @@ Gateway HTTP client (Bearer + X-Hermes-Session-Id)
     "filebridge-inbound.exe": "<64-hex-sha256>",
     "plugin/__init__.py": "<64-hex-sha256>",
     "plugin/plugin.yaml": "<64-hex-sha256>",
-    "plugin/inbound.py": "<64-hex-sha256>"
+    "plugin/inbound.py": "<64-hex-sha256>",
+    "plugin/inbound_control.py": "<64-hex-sha256>",
+    "plugin/inbound_directory.py": "<64-hex-sha256>",
+    "plugin/inbound_host.py": "<64-hex-sha256>"
   }
 }
 ```

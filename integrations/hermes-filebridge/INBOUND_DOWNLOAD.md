@@ -1,7 +1,8 @@
 # Hermes 入站附件工作副本下载
 
 状态：本项目包含专用下载引擎、原生安全落盘、插件宿主 API、隔离测试和独立暂存检查入口。
-**真实 Hermes 的可信 Dispatch 适配器尚未接通，因此不应启用实际附件下载。**
+**功能默认关闭。** 真实宿主适配已消费 Gateway `0ec54bf0` 的固定后台契约；
+联合测试及现场验收边界见 [JOINT_HOST_VALIDATION.md](JOINT_HOST_VALIDATION.md)。
 官方 middleware 可承载工具执行范围；外部认证交接缺口及固定源码证据见 [INBOUND_CONTEXT.md](INBOUND_CONTEXT.md)。本轮未修改 Hermes
 核心、Gateway、运行中的 Profile、客户端或凭据，未连接 CFserver、发送微信或正式归档。
 
@@ -26,9 +27,11 @@
 真实宿主必须在认证后的任务创建位置调用 `HostBridge.start_dispatch(binding)`，在实际工具
 调用线程内进入 `bridge.activate(dispatch_id)`，并将结束、取消和租约撤销连接到
 `end_dispatch` / `close`。这些方法复用本项目现有 HostBridge；官方 `register_middleware("tool_execution", ...)`
-能够在真实工具分派范围调用 activate，不需要 Hermes 新增 current_dispatch。尚缺的权威交接
-契约见 [GATEWAY_HOST_BINDING_REQUIREMENTS.md](GATEWAY_HOST_BINDING_REQUIREMENTS.md)。
-插件不从正文、一般 kwargs、环境变量或未经认证的 `session_metadata` 推导授权。
+能够在真实工具分派范围调用 activate，不需要 Hermes 新增 current_dispatch。
+`inbound_host.py` 负责官方 middleware/lifecycle 接线，`inbound_control.py` 验证
+固定 HTTPS resolve / events / closed；收到首个有效 running 快照才启动现有 worker。
+插件不从正文、一般 kwargs 或未经认证的 `session_metadata` 推导授权。
+服务凭据来自操作者指定的专用环境变量，只用于控制接口，不传给 worker。
 
 `Binding` 仅经过私有管道传入 worker：`dispatch_id`、`task_id`、`thread_id`、
 `enterprise_identity_id`、`work_dir`、`gateway_origin`、`expires_at`、`max_bytes`、
@@ -76,7 +79,7 @@ worker 是 `tools/filebrowser-agentctl/cmd/filebridge-inbound`，只依赖独立
 
 ## 可重复暂存与检查
 
-现有 `FileBridge client` CI 生成固定源码产物 `inbound-bundle/`：原生 worker、三个插件文件
+现有 `FileBridge client` CI 生成固定源码产物 `inbound-bundle/`：原生 worker、六个插件文件
 和 `inventory.json`。外部 `SHA256SUMS` 包含 inventory 的 SHA-256，inventory 中绑定
 完整源码提交与每个文件 SHA-256。Windows 使用 `.exe` bundle。
 
@@ -94,8 +97,8 @@ worker 是 `tools/filebrowser-agentctl/cmd/filebridge-inbound`，只依赖独立
 # 同一参数用 -Mode Resume 续接；-Mode Check 只核对，不覆盖或修正权限。
 ```
 
-暂存成功输出仍为 `live_enabled=false`、`host_bridge_connected=false`。生产桥接未补齐前，
-不得把检查通过当作安装启用许可。
+暂存成功输出仍为 `live_enabled=false`、`host_bridge_connected=false`。
+暂存检查不会发起请求，不能把检查通过当作安装启用或现场验收。
 
 ## 验证的三个层次
 
@@ -104,8 +107,10 @@ worker 是 `tools/filebrowser-agentctl/cmd/filebridge-inbound`，只依赖独立
    binding，不是 HTTP 请求或文件字节。测试使用公开非秘密证书和临时目录。
 2. **真实插件加载**：固定公开 Hermes 源码、独立 venv 和真实 manager/context/registry。
    验证发现、注册、默认关闭与缺桥接拒绝；测试不运行真实 Dispatch。命令见上下文文档。
-3. **实际 AI 主机**：本轮未安装、启用或连接服务，尚未验收。真实宿主桥接是先决阻塞；
-   Gateway PR #14 也未在本轮部署。PDF 上游 pending 问题不由模拟 PDF 通过而消失。
+3. **隔离组合链路**：真实 Gateway 数据库/claim/HTTP 与固定官方 Hermes 请求/Agent/loader/
+   middleware 共同驱动本项目适配和 worker，见联合 runner；仅模型及微信取件使用测试替身。
+4. **实际 AI 主机**：本轮未安装、启用或连接服务，尚未验收。两端均未在本轮部署。
+   PDF 上游长期 pending 问题不由合成 PDF 通过而消失。
 
 仓库已有 CI 的原有只读/受控新建断言保留。新增测试覆盖 PDF/JPEG、503 成功/耗尽、
 重复并发预算、到期/取消、错误身份线程、CA/主机名/重定向、截断/超限/错误摘要、
@@ -113,8 +118,9 @@ worker 是 `tools/filebrowser-agentctl/cmd/filebridge-inbound`，只依赖独立
 
 ## 后续一次性实际验收（本轮不执行）
 
-1. 对应宿主项目先实现并审查上述认证后桥接，确认 Dispatch、lease、thread、identity、
-   工作目录、允许 origin 和所有结束/取消路径；保留默认关闭，不能用正文提取来补位。
+1. 采用 [JOINT_HOST_VALIDATION.md](JOINT_HOST_VALIDATION.md) 的固定两端版本、候选产物
+   与独立验收输入，确认 Dispatch、lease、thread、identity、工作目录和允许 origin。
+   保留默认关闭，不从正文提取授权；现场启用必须另行授权。
 2. 另行批准的隔离 AI 主机使用固定提交成功 CI 产物；核对 source SHA、inventory、
    Windows ACL、CA 链/主机名及 binary SHA，再按 Stage/Check 暂存。不覆盖旧版和凭据。
 3. 用专门验收 Profile 接上桥接，取得真实有效 Dispatch 的 PDF/JPEG；由专用工具下载，

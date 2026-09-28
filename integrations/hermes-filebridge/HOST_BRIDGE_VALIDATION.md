@@ -1,5 +1,9 @@
 # 真实宿主边界复核（2026-09-27）
 
+历史记录：下述“尚缺契约”结论仅针对当时 Gateway `a26f234f`。2026-09-28 已取得
+Gateway `0ec54bf0` 的实现并接入；当前状态与联合证据见 [JOINT_HOST_VALIDATION.md](JOINT_HOST_VALIDATION.md)。
+原始探针结果、失败和生命周期缺口保留，不能当作新接口仍不存在的依据。
+
 本轮起点 `0bf082c65091c38874932a3b3d7a9f66be8df6be`，工作树
 `C:\Users\Admin\.codex\worktrees\6330\CF_filebrowser-enterprise`，分支
 `feat/filebridge-hermes-crud`。检查 branch/status/remote/HEAD/log/diff 后 fetch，

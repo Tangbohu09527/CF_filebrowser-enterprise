@@ -2,7 +2,7 @@
 
 本页保留截至 `0bf082c65091c38874932a3b3d7a9f66be8df6be` 的下载组件交付记录。
 后续官方 middleware / 真实请求审查见 [HOST_BRIDGE_VALIDATION.md](HOST_BRIDGE_VALIDATION.md)；
-官方 middleware 能承载执行范围，剩余阻塞已具体化为 [Gateway 权威交接契约](GATEWAY_HOST_BINDING_REQUIREMENTS.md)。
+该页为带日期的历史证据；Gateway 配套现已实现，当前接线与测试见 [JOINT_HOST_VALIDATION.md](JOINT_HOST_VALIDATION.md)。
 
 日期：2026-09-27。工作树：`C:\Users\Admin\.codex\worktrees\6330\CF_filebrowser-enterprise`。
 分支：`feat/filebridge-hermes-crud`；起始基线 `6ba8f71fb0ba270420419618c1e07150b0b8b742`。

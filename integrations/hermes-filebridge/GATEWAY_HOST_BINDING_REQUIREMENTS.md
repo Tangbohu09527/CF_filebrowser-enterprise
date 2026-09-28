@@ -1,8 +1,11 @@
 # Gateway 与 Hermes 宿主的入站附件绑定配套要求
 
-**状态：尚未实现的 Gateway 配套请求。** 本文选择唯一方案：Gateway 为每次附件 Dispatch claim 创建或分叉一个专用的真实 Hermes session，预登记权威绑定；本项目从公开 tool execution middleware 取得实际 session/task，通过固定 Gateway 的服务认证接口取得附件 grant 和撤销 lease。**不依赖插件读取 HTTP header、HTTP metadata、提示正文中的凭据或模型提供的 task_context，不需要修改 Hermes 核心。**
+**历史提案（2026-09-27），不是当前接口状态。** Gateway 已在 `0ec54bf0f25f421e37e16e11bd098a814beca258` 实现配套。
+本项目现消费[该固定契约](https://github.com/Tangbohu09527/CF_agent-gateway/blob/0ec54bf0f25f421e37e16e11bd098a814beca258/docs/development/inbound-host-binding-contract.md)，
+字段类型、租约及会话兼容行为以定版契约为准；当前实现和验证见 [JOINT_HOST_VALIDATION.md](JOINT_HOST_VALIDATION.md)。
+以下保留当时的设计依据：Gateway 为每次附件 Dispatch claim 创建或分叉一个专用的真实 Hermes session，预登记权威绑定；本项目从公开 tool execution middleware 取得实际 session/task，通过固定 Gateway 的服务认证接口取得附件 grant 和撤销 lease。**不依赖插件读取 HTTP header、HTTP metadata、提示正文中的凭据或模型提供的 task_context，不需要修改 Hermes 核心。**
 
-本文没有执行这些接口，没有修改 Gateway、Hermes 安装或凭据。以下“拟新增”接口当前不存在；只有明确列出的 Hermes session API 已从固定源码核实。
+本文成稿时没有执行这些接口，没有修改 Gateway、Hermes 安装或凭据。以下“拟新增”“不存在”描述仅适用于下列旧基线，不能用于判断新版本。
 
 核对版本：
 - Gateway：a26f234fbe60f9a3212bf6bd3471bba3f5802997。

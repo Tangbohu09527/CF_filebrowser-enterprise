@@ -50,7 +50,8 @@ try {
     PrivateDirectory $root
     $source=Join-Path $root 'source';PrivateDirectory $source
     $sourcePlugin=Join-Path $source 'plugin';PrivateDirectory $sourcePlugin
-    $names=@('filebridge-inbound.exe','plugin/__init__.py','plugin/plugin.yaml','plugin/inbound.py')
+    $names=@('filebridge-inbound.exe','plugin/__init__.py','plugin/plugin.yaml','plugin/inbound.py',
+        'plugin/inbound_control.py','plugin/inbound_directory.py','plugin/inbound_host.py')
     $hashes=[ordered]@{}
     foreach ($name in $names) {
         $path=Join-Path $source $name

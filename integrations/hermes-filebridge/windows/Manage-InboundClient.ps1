@@ -83,7 +83,8 @@ public static class CfInboundStageNative {
 }
 $operatorSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $maxFile=64L*1024*1024
-$fileNames=@('filebridge-inbound.exe','plugin/__init__.py','plugin/plugin.yaml','plugin/inbound.py')
+$fileNames=@('filebridge-inbound.exe','plugin/__init__.py','plugin/plugin.yaml','plugin/inbound.py',
+    'plugin/inbound_control.py','plugin/inbound_directory.py','plugin/inbound_host.py')
 $allNames=@($fileNames)+@('inventory.json')
 $heldDirectories=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
 
@@ -189,7 +190,7 @@ function Assert-KnownTree([string]$Root,[bool]$Complete,[bool]$Private) {
             Hold-Directory $child.FullName
             if ($Private) { Assert-PrivateAcl $child.FullName $true }
             foreach ($leaf in @(Get-ChildItem -LiteralPath $child.FullName -Force)) {
-                if (@('__init__.py','plugin.yaml','inbound.py') -cnotcontains $leaf.Name) { throw 'Unknown file preserved; staging refused.' }
+                if (@('__init__.py','plugin.yaml','inbound.py','inbound_control.py','inbound_directory.py','inbound_host.py') -cnotcontains $leaf.Name) { throw 'Unknown file preserved; staging refused.' }
                 Assert-Node $leaf.FullName $false
                 if ($Private) { Assert-PrivateAcl $leaf.FullName $false }
             }
@@ -225,7 +226,7 @@ function Read-Inventory([string]$Root,[string]$Expected) {
         @($inventory.PSObject.Properties.Name).Count -ne 3 -or
         $inventory.schema -cne 'cf-inbound-bundle/v1' -or
         $inventory.source_commit -isnot [string] -or $inventory.source_commit -notmatch '^[0-9a-fA-F]{40}$' -or
-        $inventory.files -isnot [Management.Automation.PSCustomObject] -or @($inventory.files.PSObject.Properties.Name).Count -ne 4) {
+        $inventory.files -isnot [Management.Automation.PSCustomObject] -or @($inventory.files.PSObject.Properties.Name).Count -ne $fileNames.Count) {
         throw 'Invalid inventory schema or source commit.'
     }
     $hashes=@{'inventory.json'=$Expected.ToLowerInvariant()}

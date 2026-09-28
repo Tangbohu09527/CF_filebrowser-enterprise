@@ -2,8 +2,8 @@
 
 新增入站附件开发入口见 [INBOUND_DOWNLOAD.md](INBOUND_DOWNLOAD.md)。专用下载 worker
 将固定 Gateway 契约的字节验证后落到任务目录；模型不能传 URL、凭据或任务上下文。
-此能力默认关闭。官方 tool_execution middleware 可承载桥接；尚缺 Gateway 的权威 Dispatch 交接与撤销契约，具体证据与配套要求见
-[INBOUND_CONTEXT.md](INBOUND_CONTEXT.md)。隔离 HTTPS / Windows 测试和真实插件加载测试
+此能力默认关闭。宿主适配消费 Gateway `0ec54bf0` 的权威 resolve / events / closed 契约，
+通过官方 tool_execution middleware 复用原 HostBridge，见 [联合验证与配置](JOINT_HOST_VALIDATION.md)。隔离 HTTPS / Windows 测试和真实插件加载测试
 分别记录；这些结果不代表实际 AI 主机已安装启用或真实 Dispatch 下载已经验收。
 
 状态分层（2026-09-26）：已安装的 `04c7e717` 只读版本完成了微信真实文件读取、哈希和客户端审计关联的现场核验，详见[只读验收记录](validation/2026-09-26-wechat-read.md)。本分支新增[显式启用的受控新建文本](CONTROLLED_CREATE.md)代码，**新建版本尚未现场安装或验收**；原只读工具的命令不变，不开放覆盖、修改或删除。没有修改 Hermes 核心、Gateway 或 FileBrowser 服务端。完整微信 CRUD 与统一新机安装器尚未交付。
