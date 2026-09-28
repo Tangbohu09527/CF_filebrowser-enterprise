@@ -60,6 +60,29 @@ def _client(raw, expected):
     return path
 
 
+def _workcopy_path(raw):
+    """Use long Win32 paths without accepting device or normalized aliases."""
+    if not isinstance(raw, str):
+        raise BridgeError("invalid_handle")
+    if os.name == "nt":
+        if not re.match(r"^[A-Za-z]:\\", raw) or "/" in raw:
+            raise BridgeError("invalid_handle")
+        for part in raw[3:].split("\\"):
+            if (not part or part in {".", ".."} or part[-1] in ". "
+                    or any(ord(character) < 32 or character in '<>:"|?*' for character in part)):
+                raise BridgeError("invalid_handle")
+            base = part.split(".", 1)[0].rstrip(" ").upper()
+            if base in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} or re.fullmatch(r"(?:COM|LPT)[1-9¹²³]", base):
+                raise BridgeError("invalid_handle")
+        # Prefix only the already canonical, local drive path returned by the
+        # worker. Path.resolve would follow links and is deliberately not used.
+        return Path("\\\\?\\" + raw) if len(raw.encode("utf-16-le")) // 2 >= 260 else Path(raw)
+    path = Path(raw)
+    if not path.is_absolute():
+        raise BridgeError("invalid_handle")
+    return path
+
+
 class _Dispatch:
     def __init__(self, executable, binding):
         self.lock = threading.Lock()
@@ -350,9 +373,7 @@ class HostBridge:
         receipt = self.resolve_workcopy(handle)
         stream = None
         try:
-            path = Path(receipt["path"])
-            if not path.is_absolute():
-                raise BridgeError("invalid_handle")
+            path = _workcopy_path(receipt["path"])
             for part in (path, *path.parents):
                 info = part.lstat()
                 if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:

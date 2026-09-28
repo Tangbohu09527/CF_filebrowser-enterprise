@@ -12,6 +12,7 @@ import mimetypes
 import os
 from pathlib import Path, PurePosixPath
 import platform
+import re
 import subprocess
 import sys
 import stat
@@ -232,6 +233,38 @@ def sqlite_access_allowed(path, sandbox: Path) -> bool:
         return False
 
 
+def audit_path_within(path, allowed, *, allow_extended=False) -> bool:
+    """Compare a canonical Win32 long-path alias to the SAME allowed roots."""
+    try:
+        raw = os.fsdecode(path)
+        extended = os.name == "nt" and raw.startswith("\\\\?\\")
+        if extended:
+            if not allow_extended:
+                return False
+            raw = raw[4:]
+            if not re.match(r"^[A-Za-z]:\\", raw) or "/" in raw:
+                return False
+            if any(not part or part in {".", ".."} or part[-1] in ". "
+                   or any(ord(character) < 32 or character in '<>:"|?*' for character in part)
+                   for part in raw[3:].split("\\")):
+                return False
+        value = Path(os.path.abspath(raw))
+        if not any(value == root or root in value.parents for root in allowed):
+            return False
+        if extended:
+            # Only equivalent reads of existing ordinary objects are accepted.
+            # Inspect root-to-leaf without resolve() or following a junction.
+            for part in reversed((value, *value.parents)):
+                info = Path("\\\\?\\" + str(part)).lstat()
+                if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                    return False
+                if not (stat.S_ISREG(info.st_mode) if part == value else stat.S_ISDIR(info.st_mode)):
+                    return False
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def install_audit_guard(sandbox: Path, source: Path, *, worker: Path | None = None,
                         allow_network: bool = False, allowed_subprocess=None,
                         extra_read_roots=()) -> AuditViolations:
@@ -246,10 +279,6 @@ def install_audit_guard(sandbox: Path, source: Path, *, worker: Path | None = No
         "/etc/ssl/certs/ca-certificates.crt", f"/proc/{os.getpid()}/stat"}
     windows_self_stat = os.path.normcase(os.path.abspath(f"/proc/{os.getpid()}/stat"))
 
-    def within(path, allowed):
-        value = Path(os.path.abspath(os.fsdecode(path)))
-        return any(value == root or root in value.parents for root in allowed)
-
     def guard(event, args):
         denied = False
         if event == "open" and not isinstance(args[0], int):
@@ -258,7 +287,7 @@ def install_audit_guard(sandbox: Path, source: Path, *, worker: Path | None = No
             if os.name == "nt" and not write and os.path.normcase(os.path.abspath(path)) == windows_self_stat:
                 violations.platform_probes_denied.append(os.fsdecode(path))
                 raise FileNotFoundError(errno.ENOENT, "Linux self-stat is unavailable on Windows")
-            denied = not within(path, (sandbox,) if write else roots)
+            denied = not audit_path_within(path, (sandbox,) if write else roots, allow_extended=not write)
             if not write and (os.fsdecode(path) in metadata or Path(os.path.abspath(path)) == worker):
                 denied = False
                 if os.fsdecode(path) in metadata:

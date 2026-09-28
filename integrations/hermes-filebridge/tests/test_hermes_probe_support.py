@@ -177,6 +177,29 @@ class HermesProbeSupportTests(unittest.TestCase):
         self.assertFalse(support.sqlite_access_allowed(link / "state.db", sandbox))
         self.assertFalse(support.sqlite_access_allowed((link / "state.db").as_uri() + "?mode=ro", sandbox))
 
+    @unittest.skipUnless(os.name == "nt", "Windows extended-path audit representation")
+    def test_extended_read_alias_uses_same_roots_and_refuses_devices_and_junctions(self):
+        sandbox = self.root / "audit-sandbox"
+        sandbox.mkdir()
+        ordinary = sandbox / "owned.bin"
+        ordinary.write_bytes(b"owned fixture")
+        extended = "\\\\?\\" + str(ordinary)
+        self.assertTrue(support.audit_path_within(extended, (sandbox,), allow_extended=True))
+        self.assertFalse(support.audit_path_within(extended, (sandbox,)))
+        separate = self.root / "separate"
+        separate.mkdir()
+        outside = separate / "unrelated.bin"
+        outside.write_bytes(b"must not read")
+        link = sandbox / "linked"
+        self.make_directory_link(link, separate)
+        denied = ("\\\\?\\" + str(outside), "\\\\?\\" + str(link / outside.name),
+                  r"\\?\UNC\server\share\file", r"\\.\C:\task\file", extended + ":stream",
+                  "\\\\?\\" + str(sandbox) + "\\..\\separate\\unrelated.bin",
+                  "\\\\?\\" + str(sandbox / "missing.bin"))
+        for candidate in denied:
+            with self.subTest(path=candidate):
+                self.assertFalse(support.audit_path_within(candidate, (sandbox,), allow_extended=True))
+
 
 if __name__ == "__main__":
     unittest.main()

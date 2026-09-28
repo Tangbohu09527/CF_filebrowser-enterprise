@@ -74,6 +74,16 @@ async def orchestrate(source, worker, commit, archive, plugin_source=None):
         api_secret = secrets.token_urlsafe(32)
         host = None
         pending = None
+        owned_long_files = []
+        if name == "long-path":
+            assert os.name == "nt" and len(str(sandbox)) < 195
+            long_root = sandbox / ("work-" + "w" * (202 - len(str(sandbox)) - 6))
+            # Move only this fixture's newly created empty private directory.
+            # Its DACL is retained; the real adapter allocates the task below it.
+            fixture.work_root.rename(long_root)
+            fixture.work_root = long_root
+            fixture.raw["work_root"] = str(long_root)
+            assert len(str(long_root)) == 202
         if jpeg:
             fixture.body = (FIXTURES / "sample.jpg").read_bytes()
             fixture.mime = "image/jpeg"
@@ -221,7 +231,12 @@ async def orchestrate(source, worker, commit, archive, plugin_source=None):
                             "sha256": hashlib.sha256(fixture.body).hexdigest(), "actual_stream_read": True}
                         handles.append(downloads[0]["handle"])
                     assert len(set(handles)) == len(sessions), "concurrent sessions shared a handle"
-                    files = [path for path in fixture.work_root.rglob("*") if path.is_file()]
+                    listing_root = (Path("\\\\?\\" + str(fixture.work_root))
+                                    if name == "long-path" else fixture.work_root)
+                    files = [path for path in listing_root.rglob("*") if path.is_file()]
+                    if name == "long-path":
+                        owned_long_files.extend(files)
+                        assert len(files) == 1 and len(str(files[0])) - 4 > 260
                     assert len(files) == len(sessions) and all(path.read_bytes() == fixture.body for path in files)
                     assert len({path.parent for path in files}) == len(sessions), "sessions shared a task directory"
                     assert fixture.download_calls == len(sessions) + (1 if name == "retry" else 0)
@@ -287,14 +302,22 @@ async def orchestrate(source, worker, commit, archive, plugin_source=None):
                 if not pending.done():
                     pending.cancel()
                 await asyncio.gather(pending, return_exceptions=True)
+            # Only remove exact files observed in our freshly allocated long
+            # test directory. Product revocation itself preserves the copy.
+            for path in owned_long_files:
+                assert Path("\\\\?\\" + str(fixture.work_root)) in path.parents
+                path.unlink()
             fixture.doCleanups()
             os.environ.clear()
             os.environ.update(original_environment)
             if stop_error is not None:
                 raise stop_error
 
-    for name in ("parallel", "jpeg", "retry", "before-events", "identity-mismatch",
-                 "model-error", "cancel", "disconnect", "host-exit"):
+    cases = ["parallel", "jpeg", "retry", "before-events", "identity-mismatch",
+             "model-error", "cancel", "disconnect", "host-exit"]
+    if os.name == "nt" and plugin_source is None:
+        cases.append("long-path")
+    for name in cases:
         await scenario(name, jpeg=name == "jpeg")
     print(json.dumps({"ok": True, "hermes_commit": commit, "python": sys.version.split()[0],
         "platform": sys.platform, "cases": reports,

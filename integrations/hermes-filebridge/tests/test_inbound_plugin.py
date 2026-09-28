@@ -198,6 +198,83 @@ foreach($id in @($sid.Value,'S-1-5-18','S-1-5-32-544')) {
         self.assertEqual(self.calls, 2)
         self.assertTrue(self.headers_correct)
 
+    @unittest.skipUnless(os.name == "nt", "Windows extended-length path regression")
+    def test_native_long_workcopy_opens_and_revokes_without_new_download(self):
+        # Keep the authorized directory below MAX_PATH while the worker's
+        # generated file name pushes the verified workcopy above 260 characters.
+        # Moving THIS newly created empty directory retains its protected DACL.
+        self.assertLess(len(str(self.root)), 180)
+        parent = self.root
+        while 240 - len(str(parent)) > 80:
+            parent = parent / ("p" * 64)
+            parent.mkdir()
+        long_work = parent / ("task-" + "t" * (240 - len(str(parent)) - 6))
+        self.work.rename(long_work)
+        self.work = long_work
+        self.assertEqual(len(str(self.work)), 240)
+        binding = self.binding()
+        self.bridge.start_dispatch(binding)
+        with self.bridge.activate(binding["dispatch_id"]):
+            receipt = json.loads(self.tool({"attachment_id": 5}))
+            self.assertTrue(receipt["ok"], receipt)
+            self.assertTrue(receipt["verified"])
+            resolved = self.bridge.resolve_workcopy(receipt["handle"])
+            self.assertGreater(len(resolved["path"]), 260)
+            owned_path = resolved["path"]
+            self.assertEqual(Path(owned_path).parent, self.work)
+
+            def remove_owned_long_file():
+                self.bridge.close()
+                try:
+                    os.unlink("\\\\?\\" + owned_path)
+                except FileNotFoundError:
+                    pass
+
+            self.addCleanup(remove_owned_long_file)
+            # The regression must reach Python consumption AFTER the real
+            # native worker has downloaded, published and verified the file.
+            with self.bridge.open_workcopy(receipt["handle"]) as stream:
+                self.assertEqual(stream.read(), self.body)
+                # Point a real NTFS junction at the SAME verified file. Its
+                # matching bytes/identity must not bypass the ancestor check.
+                junction = self.work / "link"
+                powershell = Path(os.environ["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+                subprocess.run([str(powershell), "-NoProfile", "-NonInteractive", "-Command",
+                    "New-Item -ItemType Junction -Path $env:CF_INBOUND_LINK -Target $env:CF_INBOUND_TARGET -ErrorAction Stop | Out-Null"],
+                    env={**os.environ, "CF_INBOUND_LINK": str(junction), "CF_INBOUND_TARGET": str(self.work)},
+                    check=True, capture_output=True, timeout=15)
+                try:
+                    linked_receipt = {**resolved, "path": str(junction / Path(owned_path).name)}
+                    with patch.object(self.bridge, "resolve_workcopy", return_value=linked_receipt):
+                        with self.assertRaises(inbound.BridgeError) as denied:
+                            with self.bridge.open_workcopy(receipt["handle"]):
+                                self.fail("long NTFS junction path was accepted")
+                        self.assertEqual(denied.exception.code, "invalid_handle")
+                finally:
+                    os.rmdir("\\\\?\\" + str(junction))
+                repeated = json.loads(self.tool({"attachment_id": 5}))
+                self.assertEqual(repeated["handle"], receipt["handle"])
+                self.assertTrue(self.bridge.end_dispatch(binding["dispatch_id"]))
+                self.assertTrue(stream.closed)
+            with self.assertRaises(inbound.BridgeError):
+                with self.bridge.open_workcopy(receipt["handle"]):
+                    self.fail("ended Dispatch reopened its long workcopy")
+        with self.assertRaises(inbound.BridgeError):
+            with self.bridge.open_workcopy(receipt["handle"]):
+                self.fail("absent execution context reopened its long workcopy")
+        self.assertEqual(self.calls, 1)
+
+    @unittest.skipUnless(os.name == "nt", "Windows local-path representation validation")
+    def test_workcopy_path_rejects_unc_devices_ads_and_noncanonical_paths(self):
+        for raw in (r"\\server\share\file", r"\\?\C:\task\file", r"\\.\C:\task\file",
+                    r"\??\C:\task\file", r"C:task\file", r"\task\file", "C:/task/file",
+                    r"C:\task\file:stream", r"C:\task\..\file", r"C:\task\.\file",
+                    "C:\\task\\\\file", "C:\\task\\file ", "C:\\task\\file.",
+                    "C:\\task\\file\x00", r"C:\task\NUL.txt", r"C:\task\CONIN$", r"C:\task\COM¹.txt"):
+            with self.subTest(path=raw), self.assertRaises(inbound.BridgeError) as denied:
+                inbound._workcopy_path(raw)
+            self.assertEqual(denied.exception.code, "invalid_handle")
+
     def test_concurrent_repeat_503_shares_worker_and_budget(self):
         self.mode = "503_once"
         self.bridge.start_dispatch(self.binding())
