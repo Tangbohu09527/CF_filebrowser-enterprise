@@ -109,13 +109,18 @@ def child_check(source: Path, enabled: bool, commit: str = HERMES_COMMIT) -> Non
             checks.assertFalse(result["ok"])
             checks.assertEqual(result["error"]["code"], "trusted_context_unavailable")
         checks.assertEqual(external_attempts, [])
+        checks.assertNotIn("hermes_constants_scratch", sys.modules)
     finally:
         manager.unload()
     print(json.dumps({"hermes_commit": commit, "inbound_enabled": enabled,
                       "controlled_create_enabled": enabled,
                       "controlled_create_rejected_requests": rejected_create_requests,
                       "real_loader": True, "host_bridge_connected": False,
-                      "isolation_audit_violations": len(external_attempts), "ok": True}))
+                      "isolation_audit_violations": len(external_attempts),
+                      "expected_denied_housekeeping": external_attempts.expected_denied_housekeeping,
+                      "expected_denied_housekeeping_count": len(external_attempts.expected_denied_housekeeping),
+                      "scratch_housekeeping_validated": False,
+                      "ok": True}))
 
 
 def run(source: Path, commit: str = HERMES_COMMIT, archive: Path | None = None) -> None:

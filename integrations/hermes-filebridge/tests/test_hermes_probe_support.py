@@ -68,12 +68,43 @@ class HermesProbeSupportTests(unittest.TestCase):
         if os.name != "nt":
             link.symlink_to(target, target_is_directory=True)
             return
-        powershell = Path(os.environ["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
-        env = support.isolated_environment(self.root, {"CF_COMPAT_LINK": str(link), "CF_COMPAT_TARGET": str(target)})
-        result = subprocess.run([str(powershell), "-NoProfile", "-NonInteractive", "-Command",
-            "$ErrorActionPreference='Stop'; New-Item -ItemType Junction -Path $env:CF_COMPAT_LINK -Target $env:CF_COMPAT_TARGET | Out-Null"],
-            cwd=self.root, env=env, capture_output=True, text=True, timeout=15)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        import ctypes
+        from ctypes import wintypes
+        import struct
+
+        # Match store_windows_test.go's real unprivileged junction fixture.
+        # No shell startup, token adjustment, elevation or synthetic lstat.
+        self.assertTrue(link.is_absolute() and link.is_relative_to(self.root))
+        self.assertTrue(target.is_absolute() and target.is_relative_to(self.root))
+        link.mkdir()
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        create = kernel.CreateFileW
+        create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                           wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        create.restype = wintypes.HANDLE
+        control = kernel.DeviceIoControl
+        control.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                            wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+        control.restype = wintypes.BOOL
+        close = kernel.CloseHandle
+        close.argtypes, close.restype = [wintypes.HANDLE], wintypes.BOOL
+        handle = create(str(link), 0x40000000, 0, None, 3, 0x02200000, None)
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            substitute = ("\\??\\" + str(target) + "\0").encode("utf-16-le")
+            display = (str(target) + "\0").encode("utf-16-le")
+            raw = struct.pack("<IHHHHHH", 0xA0000003, 8 + len(substitute) + len(display),
+                              0, 0, len(substitute) - 2, len(substitute), len(display) - 2)
+            raw += substitute + display
+            data, returned = ctypes.create_string_buffer(raw), wintypes.DWORD()
+            if not control(handle, 0x000900A4, data, len(raw), None, 0, ctypes.byref(returned), None):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            self.assertTrue(close(handle))
+        self.assertTrue(link.lstat().st_file_attributes & 0x400)
+        self.assertEqual(link.lstat().st_reparse_tag, 0xA0000003)
+        self.assertTrue(os.path.samefile(link, target))
 
     def test_source_root_link_or_reparse_is_rejected(self):
         link = self.root / "linked-source"
@@ -271,6 +302,65 @@ print(json.dumps({"guard": sys.argv[4], "allowed_reads": 1, "denied": len(violat
         for invalid in (entry.parent, entry.parent / "missing"):
             with self.subTest(path=str(invalid)), self.assertRaises(ValueError):
                 joint.interpreter_entry(invalid)
+
+    def test_both_installed_guards_deny_only_unloaded_housekeeping_import(self):
+        sandbox = self.root / "housekeeping-sandbox"
+        sandbox.mkdir()
+        (sandbox / "hermes_constants_scratch.py").write_text(
+            "raise AssertionError('forbidden module executed')\n", encoding="utf-8")
+        (sandbox / "hermes_constants_scratch_probe.py").write_text("VALUE = 42\n", encoding="utf-8")
+        code = r'''
+import importlib.util, json, pathlib, sys, types
+tests, sandbox = map(pathlib.Path, sys.argv[1:3])
+def load(name, filename):
+    spec = importlib.util.spec_from_file_location(name, tests / filename)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+support = load("housekeeping_support", "hermes_probe_support.py")
+joint = load("housekeeping_joint", "test_gateway_hermes_joint.py")
+support.assert_isolated_environment(sandbox)
+sys.path.insert(0, str(sandbox))
+blocked = "hermes_constants_scratch"
+assert blocked not in sys.modules
+if sys.argv[4] == "preloaded":
+    # Only a synthetic marker in this dedicated subprocess. No Hermes module
+    # is imported or patched to manufacture a production lifecycle result.
+    sys.modules[blocked] = types.ModuleType(blocked)
+try:
+    violations = (support.install_audit_guard(sandbox, tests) if sys.argv[3] == "shared"
+                  else joint.isolated_guard(sandbox, (tests,), None))
+except RuntimeError as error:
+    assert sys.argv[4] == "preloaded" and blocked in str(error), str(error)
+    print(json.dumps({"guard": sys.argv[3], "preloaded_rejected": True}))
+else:
+    assert sys.argv[4] == "clean", "audit accepted a preloaded housekeeping module"
+    for _ in range(2):
+        try:
+            __import__(blocked)
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("housekeeping import was not denied")
+        assert blocked not in sys.modules
+    assert __import__("hermes_constants_scratch_probe").VALUE == 42
+    assert violations == [], violations
+    assert violations.expected_denied_housekeeping == [blocked, blocked]
+    print(json.dumps({"guard": sys.argv[3], "expected_denied_housekeeping":
+                      violations.expected_denied_housekeeping, "normal_import": True}))
+'''
+        environment = support.isolated_environment(sandbox)
+        for kind in ("shared", "joint"):
+            for phase in ("clean", "preloaded"):
+                with self.subTest(guard=kind, phase=phase):
+                    result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", "-c", code,
+                        str(HERE), str(sandbox), kind, phase], cwd=sandbox, env=environment,
+                        capture_output=True, text=True, encoding="utf-8", timeout=15)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    expected = ({"guard": kind, "preloaded_rejected": True} if phase == "preloaded" else
+                                {"guard": kind, "expected_denied_housekeeping":
+                                 ["hermes_constants_scratch"] * 2, "normal_import": True})
+                    self.assertEqual(json.loads(result.stdout), expected)
 
 
 if __name__ == "__main__":

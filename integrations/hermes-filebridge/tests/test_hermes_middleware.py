@@ -392,12 +392,16 @@ def child_check(source, worker, commit=support.DEFAULT_HERMES_COMMIT):
         if not result.wasSuccessful():
             raise SystemExit(1)
         checks.assertEqual(violations, [], "unexpected external operation was attempted")
+        checks.assertNotIn("hermes_constants_scratch", sys.modules)
         print(json.dumps({"hermes_commit": commit, "tests": result.testsRun,
                           "entrypoint": "model_tools.handle_function_call", "real_loader": True,
                           "real_plugin_context": True, "real_tool_execution_middleware": True,
                           "real_https_native_worker": True, "synthetic_host_bindings": True,
                           "authenticated_request_binding": False, "live_enabled": False,
                           "isolation_audit_violations": len(violations),
+                          "expected_denied_housekeeping": violations.expected_denied_housekeeping,
+                          "expected_denied_housekeeping_count": len(violations.expected_denied_housekeeping),
+                          "scratch_housekeeping_validated": False,
                           "readonly_system_metadata": sorted(system_reads), "ok": True}))
     finally:
         manager.unload()

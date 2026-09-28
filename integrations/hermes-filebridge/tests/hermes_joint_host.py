@@ -156,6 +156,7 @@ class ExternalHermesHost:
 
 
 def _snapshot(observer, violations, *, closed=False, registered_adapters=()):
+    assert "hermes_constants_scratch" not in sys.modules
     scopes = []
     adapters = list(registered_adapters)
     for adapter in getattr(observer, "host_adapters", []):
@@ -178,6 +179,9 @@ def _snapshot(observer, violations, *, closed=False, registered_adapters=()):
                 "ended": scope.session_id in ended})
     return {"pid": os.getpid(), "closed": closed, "python_version": sys.version.split()[0], "audit_violations": list(violations),
         "platform_probes_denied": violations.platform_probes_denied,
+        "expected_denied_housekeeping": list(violations.expected_denied_housekeeping),
+        "expected_denied_housekeeping_count": len(violations.expected_denied_housekeeping),
+        "scratch_housekeeping_validated": False,
         "scopes": scopes, "active_scopes": sum(not s["stopped"] for s in scopes),
         "retained_streams_closed": [stream.closed for _context, stream in getattr(observer, "retained_streams", [])],
         "retained_worker_exits": [process.poll() for process in getattr(observer, "native_processes", [])]}
@@ -220,9 +224,13 @@ async def serve(args):
         "key": os.environ[args.key_env], "model_name": "cf-hermes-api"}))
     try:
         assert await api.connect()
+        assert "hermes_constants_scratch" not in sys.modules
         origin = f"http://127.0.0.1:{api._site._server.sockets[0].getsockname()[1]}"
         _write(sandbox / "external-host-ready.json", {"pid": os.getpid(), "origin": origin,
             "hermes_commit": args.hermes_commit, "audit_violations": list(violations),
+            "expected_denied_housekeeping": list(violations.expected_denied_housekeeping),
+            "expected_denied_housekeeping_count": len(violations.expected_denied_housekeeping),
+            "scratch_housekeeping_validated": False,
             "python_version": sys.version.split()[0]})
         while not (sandbox / "external-host-stop").exists():
             _write(sandbox / "external-host-status.json", _snapshot(observer, violations,
@@ -253,6 +261,9 @@ if __name__ == "__main__":
         # No arbitrary upstream exception text, log contents or frame locals.
         report = {"ok": False, "error_type": type(error).__name__,
             "audit_violations": list(_audit_violations),
+            "expected_denied_housekeeping": list(getattr(_audit_violations, "expected_denied_housekeeping", [])),
+            "expected_denied_housekeeping_count": len(getattr(_audit_violations, "expected_denied_housekeeping", [])),
+            "scratch_housekeeping_validated": False,
             "locations": [f"{Path(frame.filename).name}:{frame.lineno}"
                           for frame in traceback.extract_tb(error.__traceback__)]}
         if isinstance(error, ModuleNotFoundError):

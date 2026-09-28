@@ -308,6 +308,7 @@ async def child_probe(source, lifecycle=False, commit=support.DEFAULT_HERMES_COM
                 assert len(error_ends)==expected_error_ends, lifecycle_observations
                 assert len(cancel_ends)==1 and cancel_ends[0]["interrupted"], lifecycle_observations
         assert violations == [], violations
+        assert "hermes_constants_scratch" not in sys.modules
         print(json.dumps({"hermes_commit": commit, "real_http_request": True,
                           "real_plugin_loader": True, "real_agent": True, "model_stub": "loopback HTTP only",
                           "concurrent_requests": 2, "official_tool_executions": len(executions),
@@ -321,6 +322,9 @@ async def child_probe(source, lifecycle=False, commit=support.DEFAULT_HERMES_COM
                           "lifecycle_negative_probe":lifecycle_observations,
                           "blocked_optional_external_attempts": 0,
                           "isolation_audit_violations": len(violations),
+                          "expected_denied_housekeeping": violations.expected_denied_housekeeping,
+                          "expected_denied_housekeeping_count": len(violations.expected_denied_housekeeping),
+                          "scratch_housekeeping_validated": False,
                           "platform_probes_denied": violations.platform_probes_denied, "ok": True}))
     finally:
         await adapter.disconnect()

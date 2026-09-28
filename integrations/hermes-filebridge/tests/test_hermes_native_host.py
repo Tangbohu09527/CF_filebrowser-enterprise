@@ -261,12 +261,16 @@ async def orchestrate(source, worker, commit, archive, plugin_source=None):
                 # briefly. Join the real host before reading every persisted
                 # file; do not skip locked files or weaken the secret scan.
                 await host.stop()
+                final_snapshot = await host.snapshot()
                 materials = [json.dumps(model.requests).encode(), event_path.read_bytes()]
                 materials += [path.read_bytes() for path in home.rglob("*") if path.is_file()]
                 assert all(secret.encode() not in material for secret in (SERVICE_SECRET, READ_SECRET, api_secret)
                            for material in materials), "synthetic authorization leaked into model/profile/history"
                 reports.append({"case": name, "actual_http_agent_worker": True,
-                                "download_requests": fixture.download_calls, "closed": fixture.closed_calls})
+                                "download_requests": fixture.download_calls, "closed": fixture.closed_calls,
+                                "expected_denied_housekeeping": final_snapshot["expected_denied_housekeeping"],
+                                "expected_denied_housekeeping_count": len(final_snapshot["expected_denied_housekeeping"]),
+                                "scratch_housekeeping_validated": False})
         except BaseException:
             diagnostic = {"case": name, "resolve": fixture.resolve_calls,
                 "events": fixture.event_calls, "downloads": fixture.download_calls,

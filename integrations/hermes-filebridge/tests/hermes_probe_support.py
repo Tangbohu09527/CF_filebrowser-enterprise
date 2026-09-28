@@ -179,6 +179,7 @@ class AuditViolations(list):
         super().__init__()
         self.system_reads = set()
         self.platform_probes_denied = []
+        self.expected_denied_housekeeping = []
 
 
 def sqlite_access_allowed(path, sandbox: Path) -> bool:
@@ -269,6 +270,8 @@ def install_audit_guard(sandbox: Path, source: Path, *, worker: Path | None = No
                         allow_network: bool = False, allowed_subprocess=None,
                         extra_read_roots=()) -> AuditViolations:
     """Guard before any Hermes import; optional callers may allow exact helpers."""
+    if "hermes_constants_scratch" in sys.modules:
+        raise RuntimeError("hermes_constants_scratch was loaded before test isolation")
     sandbox, source = Path(sandbox).resolve(), Path(source).resolve()
     worker = Path(worker).resolve() if worker is not None else None
     roots = (sandbox, source, HERE, Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve(),
@@ -281,7 +284,12 @@ def install_audit_guard(sandbox: Path, source: Path, *, worker: Path | None = No
 
     def guard(event, args):
         denied = False
-        if event == "open" and not isinstance(args[0], int):
+        if event == "import" and args[0] == "hermes_constants_scratch":
+            # Optional upstream housekeeping enumerates other processes. Its
+            # existing suppress(Exception) handles this explicit test denial.
+            violations.expected_denied_housekeeping.append(args[0])
+            raise PermissionError("Test isolation denies optional global process housekeeping")
+        elif event == "open" and not isinstance(args[0], int):
             path, _mode, flags = args
             write = bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
             if os.name == "nt" and not write and os.path.normcase(os.path.abspath(path)) == windows_self_stat:
@@ -316,14 +324,14 @@ def install_audit_guard(sandbox: Path, source: Path, *, worker: Path | None = No
         elif event in {"os.system", "os.exec", "os.posix_spawn"}:
             denied = True
         if denied:
-            detail = {"event": event}
+            detail = {"event": event, "pid": os.getpid(), "ppid": os.getppid()}
             if event in {"open", "sqlite3.connect"}:
                 detail["path"] = os.fsdecode(args[0])
             # Retain only file/function/line diagnostics; never subprocess
             # arguments, headers, environment values or frame locals.
             callers = []
             frame = sys._getframe(1)
-            for _ in range(5):
+            for _ in range(12):
                 if frame is None:
                     break
                 callers.append({"file": frame.f_code.co_filename,

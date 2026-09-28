@@ -64,10 +64,13 @@ def consume(args, **_context):
         data = stream.read()
         adapter, scope = host._active_host.get()
         dispatch = adapter.bridge._dispatches[scope.resolved.worker_binding["dispatch_id"]]
+        assert "hermes_constants_scratch" not in sys.modules
         receipt = {"host_pid": os.getpid(), "worker_pid": dispatch.process.pid,
             "bytes_read": len(data), "sha256": hashlib.sha256(data).hexdigest(),
             "stream_open": not stream.closed, "worker_alive": dispatch.process.poll() is None,
             "host_audit_violations_before_kill": len(sys.modules["__main__"]._host_guard_violations),
+            "expected_denied_housekeeping": list(sys.modules["__main__"]._host_guard_violations.expected_denied_housekeeping),
+            "expected_denied_housekeeping_count": len(sys.modules["__main__"]._host_guard_violations.expected_denied_housekeeping),
             "host_audit_details": list(sys.modules["__main__"]._host_guard_violations)}
         path = pathlib.Path(os.environ["CF_EXIT_STREAM_RECEIPT"])
         temporary = path.with_suffix(".tmp")
@@ -124,7 +127,9 @@ async def host_child(gateway, hermes, worker, **hermes_options):
         ready = sandbox / "host-ready.json"
         temporary = ready.with_suffix(".tmp")
         assert _host_guard_violations == [], _AuditDetails(_host_guard_violations)
-        temporary.write_text(json.dumps({"pid": os.getpid(), "origin": f"http://127.0.0.1:{port}"}))
+        assert "hermes_constants_scratch" not in sys.modules
+        temporary.write_text(json.dumps({"pid": os.getpid(), "origin": f"http://127.0.0.1:{port}",
+                                         "python_version": sys.version.split()[0]}))
         temporary.replace(ready)
         await asyncio.Event().wait()
     finally:
@@ -356,9 +361,16 @@ async def orchestrate(gateway, hermes, worker, *, hermes_commit=joint.DEFAULT_HE
             assert all(secret.encode() not in data for data in materials), "credential leaked in the isolated probe"
         assert "Bearer " not in json.dumps(model.requests)
         assert violations == [], _AuditDetails(violations)
+        assert "hermes_constants_scratch" not in sys.modules
+        denied_housekeeping = [*violations.expected_denied_housekeeping,
+                               *receipt["expected_denied_housekeeping"]]
         print(json.dumps({"ok": True, "gateway_commit": joint.GATEWAY_COMMIT,
             "hermes_commit": hermes_commit, "separate_hermes_runtime": bool(hermes_python),
             "gateway_python_version": sys.version.split()[0],
+            "hermes_python_version": ready["python_version"],
+            "expected_denied_housekeeping": denied_housekeeping,
+            "expected_denied_housekeeping_count": len(denied_housekeeping),
+            "scratch_housekeeping_validated": False,
             "actual_separate_hermes_process_killed": True, "verified_workcopy_stream_held_at_exit": True,
             "native_worker_reaped_after_host_eof": True, "worker_exit_seconds": round(worker_exit_seconds, 3),
             "gateway_real_events_disconnect_revoked": True, "closed_ack_count": 0,
@@ -477,6 +489,7 @@ def verify_import_child(gateway, hermes, **hermes_options):
     release_or_close(shared)
     asyncio.run(verify_public_model_lock())
     assert violations == [], _AuditDetails(violations)
+    assert "hermes_constants_scratch" not in sys.modules
     rejected_metadata = violations.platform_probes_denied
     assert not rejected_metadata or sys.platform == "win32"
     assert all(os.path.normcase(os.path.abspath(path)) ==
@@ -486,6 +499,9 @@ def verify_import_child(gateway, hermes, **hermes_options):
                       "session_db_initialized": True,
                       "public_model_lock_preflight": {"colliding_virtual_name": 409, "distinct_virtual_name": 200},
                       "platform_probes_denied": rejected_metadata,
+                      "expected_denied_housekeeping": list(violations.expected_denied_housekeeping),
+                      "expected_denied_housekeeping_count": len(violations.expected_denied_housekeeping),
+                      "scratch_housekeeping_validated": False,
                       "isolation_audit_violations": 0, "real_host_exit_executed": False,
                       "production_host_acceptance": False}))
 

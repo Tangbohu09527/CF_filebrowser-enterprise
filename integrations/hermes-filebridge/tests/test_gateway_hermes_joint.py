@@ -314,11 +314,14 @@ def interpreter_entry(path):
 
 
 def isolated_guard(sandbox, sources, worker):
+    if "hermes_constants_scratch" in sys.modules:
+        raise RuntimeError("hermes_constants_scratch was loaded before test isolation")
     support = _local_module("joint_sqlite_support", "hermes_probe_support.py")
     class AuditViolations(list):
         def __init__(self):
             super().__init__()
             self.platform_probes_denied = []
+            self.expected_denied_housekeeping = []
     violations = AuditViolations()
     roots = (sandbox, *sources, HERE, Path(sys.prefix), Path(sys.base_prefix))
     metadata = {"/proc/1/cgroup", "/proc/self/mountinfo", "/proc/stat", "/proc/version",
@@ -332,7 +335,10 @@ def isolated_guard(sandbox, sources, worker):
     windows_self_stat = os.path.normcase(os.path.abspath(f"/proc/{os.getpid()}/stat"))
     def guard(event, args):
         denied = False
-        if event == "open" and not isinstance(args[0], int):
+        if event == "import" and args[0] == "hermes_constants_scratch":
+            violations.expected_denied_housekeeping.append(args[0])
+            raise PermissionError("Test isolation denies optional global process housekeeping")
+        elif event == "open" and not isinstance(args[0], int):
             path, _mode, flags = args
             write = bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
             if (os.name == "nt" and not write
@@ -374,7 +380,7 @@ def isolated_guard(sandbox, sources, worker):
         elif event in {"os.system", "os.exec", "os.posix_spawn"}:
             denied = True
         if denied:
-            detail = {"event": event}
+            detail = {"event": event, "pid": os.getpid(), "ppid": os.getppid()}
             if event in {"open", "sqlite3.connect"}:
                 detail["path"] = os.fsdecode(args[0])
             # Code locations only: no frame locals, command arguments, request
@@ -382,7 +388,7 @@ def isolated_guard(sandbox, sources, worker):
             # exceptions, so retain their bounded call sites for diagnosis.
             callers = []
             frame = sys._getframe(1)
-            for _ in range(5):
+            for _ in range(12):
                 if frame is None:
                     break
                 callers.append({"file": frame.f_code.co_filename,
@@ -852,8 +858,13 @@ async def child(gateway, hermes, worker, *, hermes_commit=DEFAULT_HERMES_COMMIT,
                     assert response.status == 403
         # Only ciphertext is allowed in the Gateway DB; ordinary Hermes profile,
         # model traffic, tool outputs and logs must contain none of these secrets.
+        denied_housekeeping = list(violations.expected_denied_housekeeping)
+        hermes_python_version = sys.version.split()[0]
         if external:
             await external.stop()
+            host_status = await external.snapshot()
+            denied_housekeeping.extend(host_status["expected_denied_housekeeping"])
+            hermes_python_version = host_status["python_version"]
         materials = [json.dumps(model.requests).encode(), events_path.read_bytes()]
         if external:
             materials.append((sandbox / "external-host.log").read_bytes())
@@ -862,9 +873,14 @@ async def child(gateway, hermes, worker, *, hermes_commit=DEFAULT_HERMES_COMMIT,
             assert all(secret.encode() not in material for material in materials), "credential leaked into model/profile/output"
         assert "Bearer " not in json.dumps(model.requests)
         assert violations == [], violations
+        assert "hermes_constants_scratch" not in sys.modules
         print(json.dumps({"ok": True, "gateway_commit": GATEWAY_COMMIT,
             "hermes_commit": hermes_commit, "separate_hermes_runtime": bool(external),
             "gateway_python_version": sys.version.split()[0],
+            "hermes_python_version": hermes_python_version,
+            "expected_denied_housekeeping": denied_housekeeping,
+            "expected_denied_housekeeping_count": len(denied_housekeeping),
+            "scratch_housekeeping_validated": False,
             "real_gateway_database_claim_prebinding": True,
             "real_gateway_https_auth_resolve_events_closed": True, "real_hermes_http_agent_loader": True,
             "real_native_downloader": True, "authenticated_request_binding": True,
@@ -1005,12 +1021,16 @@ def verify_import_child(gateway, hermes, *, session_probe=False, hermes_commit=D
         database.close()
         asyncio.run(probe_public_session_api())
     assert violations == [], violations
+    assert "hermes_constants_scratch" not in sys.modules
     expected = os.path.normcase(os.path.abspath(f"/proc/{os.getpid()}/stat"))
     assert all(os.name == "nt" and os.path.normcase(os.path.abspath(path)) == expected
                for path in violations.platform_probes_denied), violations.platform_probes_denied
     print(json.dumps({"source_verified": True, "dependency_imports": True, "gateway_commit": GATEWAY_COMMIT,
         "hermes_commit": hermes_commit, "isolation_audit_violations": len(violations),
         "platform_probes_denied": violations.platform_probes_denied,
+        "expected_denied_housekeeping": list(violations.expected_denied_housekeeping),
+        "expected_denied_housekeeping_count": len(violations.expected_denied_housekeeping),
+        "scratch_housekeeping_validated": False,
         "public_session_db_constructed": session_probe, "public_session_model_lock": session_probe,
         "joint_execution_performed": False}))
 
