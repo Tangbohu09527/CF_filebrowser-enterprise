@@ -212,6 +212,11 @@ def _parser_guard():
             raise PermissionError("parser_io_denied")
 
     sys.addaudithook(audit)
+    # Only this dedicated parser process uses the public MIME-file list. Its
+    # formats come from verified bytes, and openpyxl registers its own OOXML
+    # mappings; importing it must not depend on host /etc/mime.types files.
+    import mimetypes
+    mimetypes.knownfiles = []
 
 
 async def _run_parser(data, executable=None):

@@ -126,6 +126,58 @@ print(json.dumps(denied))
             self.assertEqual(json.loads(result.stdout), ["outside_read", "write", "traversal", "network", "process"])
             self.assertEqual(outside.read_bytes(), b"must not read")
 
+    def test_cold_office_parser_does_not_read_host_mime_configuration(self):
+        # Openpyxl's MimeTypes() consults public mimetypes.knownfiles on its
+        # first import. An existing synthetic file reproduces Linux /etc/mime.types
+        # on Windows without accessing the machine's real MIME configuration.
+        code = r'''
+import importlib.util,json,mimetypes,os,sys
+spec=importlib.util.spec_from_file_location('cold_content_parser',sys.argv[1]);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+assert mimetypes.inited is False
+mimetypes.knownfiles=[sys.argv[2]]
+payload=sys.stdin.buffer.read()
+denied=[]
+original=sys.addaudithook
+def install(callback):
+ def observed(event,args):
+  try: return callback(event,args)
+  except PermissionError:
+   detail={'event':event}
+   if event=='open' and not isinstance(args[0],int): detail['path']=os.fsdecode(args[0])
+   stack=[];frame=sys._getframe(1)
+   for _ in range(8):
+    if frame is None: break
+    stack.append({'file':frame.f_code.co_filename,'function':frame.f_code.co_name,'line':frame.f_lineno});frame=frame.f_back
+   detail['callers']=stack;denied.append(detail)
+   raise
+ original(observed)
+sys.addaudithook=install
+try: module._parser_guard()
+finally: sys.addaudithook=original
+result=module._extract_document(payload)
+import_denials=list(denied)
+direct_denied=False
+try: open(sys.argv[2],'rb')
+except PermissionError: direct_denied=True
+print(json.dumps({'ok':result['ok'],'error':result.get('error'),'format':result.get('format'),
+ 'import_denials':import_denials,'direct_denied':direct_denied}))
+'''
+        with tempfile.TemporaryDirectory(prefix="cf-parser-mime-") as raw:
+            configuration = Path(raw) / "synthetic-mime.types"
+            configuration.write_text("application/x-synthetic-mime never-used\n", encoding="ascii")
+            env = {key: value for key, value in os.environ.items() if key.upper() in {"SYSTEMROOT", "WINDIR"}}
+            for kind in ("docx", "xlsx", "pptx"):
+                with self.subTest(kind=kind):
+                    result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", "-c", code,
+                        content.__file__, str(configuration)], input=office_fixture(kind),
+                        env=env, cwd=raw, capture_output=True, timeout=8)
+                    self.assertEqual(result.returncode, 0, result.stderr.decode())
+                    report = json.loads(result.stdout)
+                    self.assertTrue(report["ok"], {"requested_format": kind, **report})
+                    self.assertEqual(report["format"], kind)
+                    self.assertEqual(report["import_denials"], [], report)
+                    self.assertTrue(report["direct_denied"], report)
+
 
 class ContentWireTests(unittest.TestCase):
     @classmethod
@@ -188,15 +240,16 @@ class ContentWireTests(unittest.TestCase):
     def test_office_documents_reach_real_parser_through_verified_workcopy(self):
         f = self.service
         for kind in ("docx", "xlsx", "pptx"):
-            f.body = office_fixture(kind)
-            # Gateway v1 carries non-PDF documents as octet-stream. The actual
-            # verified bytes determine content type; no descriptor broadening.
-            f.mime = "application/octet-stream"
-            result = self.call(session="office-" + kind)
-            self.assertTrue(result["ok"], result)
-            self.assertEqual(result["format"], kind)
-            self.assertIn("1234", result["content"])
-            f.adapter.on_session_end(session_id="office-" + kind)
+            with self.subTest(kind=kind):
+                f.body = office_fixture(kind)
+                # Gateway v1 carries non-PDF documents as octet-stream. The actual
+                # verified bytes determine content type; no descriptor broadening.
+                f.mime = "application/octet-stream"
+                result = self.call(session="office-" + kind)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["format"], kind)
+                self.assertIn("1234", result["content"])
+                f.adapter.on_session_end(session_id="office-" + kind)
 
     def test_revocation_stops_actual_parser_and_returns_no_cached_content(self):
         f = self.service

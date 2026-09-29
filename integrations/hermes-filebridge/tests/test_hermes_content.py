@@ -95,6 +95,7 @@ class ModelServer(ThreadingHTTPServer):
     def __init__(self):
         super().__init__(("127.0.0.1", 0), ModelHandler)
         self.requests = []
+        self.catalog_requests = 0
         self.lock = threading.Lock()
         self.revoke_entered = threading.Event()
         self.revoke_release = threading.Event()
@@ -116,6 +117,18 @@ class ModelHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if self.path == "/models-dev.json":
+            with self.server.lock:
+                self.server.catalog_requests += 1
+            # Public models_dev.url mirror for this synthetic model only.
+            # Fixed official agent/models_dev.py validates/parses this data;
+            # no real provider catalog, cache or capability function is patched.
+            self.send_json({"custom": {"id": "custom", "name": "Isolated model fixture", "models": {
+                "cf-content-model": {"id": "cf-content-model", "name": "Deterministic content fixture",
+                    "tool_call": True, "attachment": True,
+                    "modalities": {"input": ["text", "image"], "output": ["text"]},
+                    "limit": {"context": 131072, "output": 4096}}}}})
+            return
         self.send_json({"object": "list", "data": [{"id": "cf-content-model", "object": "model"}]})
 
     def do_POST(self):
@@ -243,6 +256,7 @@ async def orchestrate(args):
                     "base_url": f"http://127.0.0.1:{model.server_port}/v1", "context_length": 131072,
                     "supports_vision": True, "api_key": "public-isolated-model-not-a-credential"},
                 "agent": {"max_iterations": 6, "environment_probe": False},
+                "models_dev": {"url": f"http://127.0.0.1:{model.server_port}/models-dev.json"},
                 "security": {"allow_lazy_installs": False}, "memory": {"enabled": False},
                 "skills": {"enabled": False}, "compression": {"enabled": False}}
             if kind == "image-internal":
@@ -330,6 +344,7 @@ async def orchestrate(args):
                 "ended_consumer_rejected": True, "legacy_tools_registered": True,
                 "official_vision_pixels_in_model_request": kind in {"image", "image-internal"},
                 "vision_toolset_enabled": kind != "image-internal", "audit_violations": [],
+                "model_catalog_mirror_requests": model.catalog_requests,
                 "python": snapshot["python_version"], "scratch_housekeeping_validated": False})
         except BaseException:
             diagnostic = {"case": kind, "resolve": fixture.resolve_calls, "events": fixture.event_calls,
@@ -358,7 +373,7 @@ async def orchestrate(args):
     print(json.dumps({"ok": True, "hermes_commit": args.hermes_commit, "cases": reports,
         "actual_official_http_agent_loader_middleware": True, "actual_native_worker": True,
         "real_gateway_joint": False, "production_acceptance": False, "real_visual_accuracy_validated": False,
-        "stubs": ["TLS Gateway control/media", "deterministic loopback model"]}))
+        "stubs": ["TLS Gateway control/media", "deterministic loopback model and its capability catalog"]}))
 
 
 def run(args):

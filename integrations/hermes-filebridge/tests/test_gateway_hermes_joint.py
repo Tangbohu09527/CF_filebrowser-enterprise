@@ -203,6 +203,16 @@ class ModelHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path == "/models-dev.json":
+            # Public Hermes models_dev.url mirror configuration. This is
+            # metadata for the same declared deterministic model fixture;
+            # capability discovery must not contact a real external catalog.
+            self.send_json({"custom": {"id": "custom", "name": "Isolated model fixture",
+                "models": {"cf-joint-model": {"id": "cf-joint-model", "name": "Joint fixture",
+                    "tool_call": True, "attachment": True,
+                    "modalities": {"input": ["text", "image"], "output": ["text"]},
+                    "limit": {"context": 131072, "output": 4096}}}}})
+            return
         self.send_json({"object": "list", "data": [{"id": "cf-joint-model", "object": "model"}]})
 
     def send_json(self, payload, status=200):
@@ -413,12 +423,16 @@ def isolated_guard(sandbox, sources, worker, *, allow_content_parser=False):
             detail = {"event": event, "pid": os.getpid(), "ppid": os.getppid()}
             if event in {"open", "sqlite3.connect"}:
                 detail["path"] = os.fsdecode(args[0])
+            elif event == "socket.getaddrinfo":
+                hostname = args[0]
+                detail["hostname"] = (hostname if isinstance(hostname, str)
+                    and re.fullmatch(r"[A-Za-z0-9_.:-]{1,253}", hostname) else "<noncanonical>")
             # Code locations only: no frame locals, command arguments, request
             # values or credentials. Optional upstream probes often swallow
             # exceptions, so retain their bounded call sites for diagnosis.
             callers = []
             frame = sys._getframe(1)
-            for _ in range(12):
+            for _ in range(20):
                 if frame is None:
                     break
                 callers.append({"file": frame.f_code.co_filename,
@@ -457,6 +471,7 @@ async def child(gateway, hermes, worker, *, hermes_commit=DEFAULT_HERMES_COMMIT,
         "base_url": f"http://127.0.0.1:{model.server_port}/v1", "context_length": 131072,
         "supports_vision": True,
         "api_key": "public-isolated-model-not-a-credential"}
+    config["models_dev"] = {"url": f"http://127.0.0.1:{model.server_port}/models-dev.json"}
     config["plugins"]["entries"]["cf-filebridge"]["settings"]["inbound_host"] = {
         "gateway_origin": origin, "service_token_env": SERVICE_ENV, "profile_reference": PROFILE,
         "profile_revision": 1, "work_root": str(sandbox / "work"), "client_path": str(worker),
