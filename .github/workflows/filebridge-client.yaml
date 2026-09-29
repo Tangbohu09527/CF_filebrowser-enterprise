@@ -61,7 +61,11 @@ jobs:
           go build -trimpath -mod=readonly -o "$output" ./cmd/filebridge-inbound
           echo "CF_FILEBRIDGE_INBOUND_TEST_EXE=$output" >> "$GITHUB_ENV"
       - name: Test existing Hermes tools and inbound HTTPS worker wiring
-        run: python -B -X utf8 -m unittest discover -s integrations/hermes-filebridge/tests -v
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I -B -m pip --isolated install --disable-pip-version-check --only-binary=:all: --require-hashes -r integrations/hermes-filebridge/requirements-inbound-content.txt
+          python -B -X utf8 -m unittest discover -s integrations/hermes-filebridge/tests -v
       - name: Verify official Hermes loader, middleware and HTTP request boundary
         shell: bash
         run: |
@@ -80,6 +84,7 @@ jobs:
           runner="$root/venv/bin/python"
           if [ "$RUNNER_OS" = Windows ]; then runner="$root/venv/Scripts/python.exe"; fi
           "$runner" -m pip install --disable-pip-version-check -r integrations/hermes-filebridge/tests/hermes-probe-requirements.txt
+          "$runner" -I -B -m pip --isolated install --disable-pip-version-check --only-binary=:all: --require-hashes -r integrations/hermes-filebridge/requirements-inbound-content.txt
           "$runner" -I -B -X utf8 integrations/hermes-filebridge/tests/test_hermes_loader.py \
             --hermes-source "$root/source/hermes-agent-4d55ca91656ac5f83e1506679b7f81e0238e5e16" --hermes-archive "$root/source.zip"
           "$runner" -I -B -X utf8 integrations/hermes-filebridge/tests/test_hermes_middleware.py \
@@ -139,7 +144,19 @@ jobs:
           binary="filebridge-inbound"
           if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
           CGO_ENABLED=0 go build -trimpath -mod=readonly -o "$inbound/$binary" ./cmd/filebridge-inbound
-          cp ../../integrations/hermes-filebridge/plugin/{__init__.py,inbound.py,inbound_control.py,inbound_directory.py,inbound_host.py,plugin.yaml} "$inbound/plugin/"
+          cp ../../integrations/hermes-filebridge/plugin/{__init__.py,inbound.py,inbound_control.py,inbound_directory.py,inbound_host.py,inbound_content.py,plugin.yaml} "$inbound/plugin/"
+          cp ../../integrations/hermes-filebridge/requirements-inbound-content.txt "$inbound/"
+          wheels="$RUNNER_TEMP/filebridge-content-wheels"
+          mkdir -p "$wheels"
+          target=()
+          if [ "$RUNNER_OS" = Windows ]; then
+            # The deployed Windows host uses CPython 3.14; do not build this
+            # offline payload for this legacy regression job's Python 3.11.
+            target=(--platform win_amd64 --python-version 3.14 --implementation cp --abi cp314 --abi abi3 --abi none)
+          fi
+          python -I -B -m pip --isolated download --disable-pip-version-check --only-binary=:all: --no-deps --require-hashes \
+            "${target[@]}" --dest "$wheels" -r "$inbound/requirements-inbound-content.txt"
+          CONTENT_WHEELS="$wheels" INBOUND_BUNDLE="$inbound" python -I -B -c 'import os,pathlib,zipfile; root=pathlib.Path(os.environ["CONTENT_WHEELS"]); files=sorted(root.iterdir()); assert files and all(p.is_file() and p.suffix==".whl" for p in files); archive=pathlib.Path(os.environ["INBOUND_BUNDLE"])/"content-wheels.zip"; z=zipfile.ZipFile(archive,"x",compression=zipfile.ZIP_STORED); [z.write(p,p.name) for p in files]; z.close()'
           INBOUND_BUNDLE="$inbound" python -c 'import hashlib,json,os,pathlib,subprocess; p=pathlib.Path(os.environ["INBOUND_BUNDLE"]); files={f.relative_to(p).as_posix():hashlib.sha256(f.read_bytes()).hexdigest() for f in sorted(p.rglob("*")) if f.is_file()}; (p/"inventory.json").write_text(json.dumps({"schema":"cf-inbound-bundle/v1","source_commit":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),"files":files},indent=2)+"\n",encoding="utf-8")'
           git diff --exit-code
           cd "$RUNNER_TEMP/filebridge-evidence"
@@ -206,6 +223,8 @@ jobs:
           if [ "$RUNNER_OS" = Windows ]; then hermes_python="$root/hermes-venv/Scripts/python.exe"; fi
           "$hermes_python" -I -B -X utf8 -m pip --isolated install --disable-pip-version-check --no-cache-dir \
             -r integrations/hermes-filebridge/tests/hermes-probe-requirements.txt
+          "$hermes_python" -I -B -X utf8 -m pip --isolated install --disable-pip-version-check --only-binary=:all: --require-hashes \
+            -r integrations/hermes-filebridge/requirements-inbound-content.txt
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
             --retry 2 --retry-delay 5 --retry-max-time 60 \
             https://codeload.github.com/NousResearch/hermes-agent/zip/0f4a98f87c17007b81500239d0bd5b9574027b73 \
@@ -250,6 +269,20 @@ jobs:
             --hermes-source "$CF_CURRENT_HERMES_SOURCE" --hermes-commit 0f4a98f87c17007b81500239d0bd5b9574027b73 \
             --hermes-archive "$CF_CURRENT_HERMES_ROOT/hermes.zip" --worker "$CF_FILEBRIDGE_INBOUND_TEST_EXE" \
             | tee "$CF_CURRENT_HERMES_ROOT/evidence/native-request.jsonl"
+      - name: Authorized content reaches document parsers and official vision
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$CF_CURRENT_HERMES_PYTHON" -I -B -X utf8 integrations/hermes-filebridge/tests/test_hermes_content.py \
+            --hermes-source "$CF_CURRENT_HERMES_SOURCE" --hermes-commit 0f4a98f87c17007b81500239d0bd5b9574027b73 \
+            --hermes-archive "$CF_CURRENT_HERMES_ROOT/hermes.zip" --worker "$CF_FILEBRIDGE_INBOUND_TEST_EXE" \
+            | tee "$CF_CURRENT_HERMES_ROOT/evidence/content-request.jsonl"
+      - name: Offline incremental Windows upgrade preserves the installed configuration
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          & integrations/hermes-filebridge/tests/Test-InboundStage.ps1
+          & integrations/hermes-filebridge/tests/Test-InboundUpgrade.ps1 -PythonPath $env:CF_CURRENT_HERMES_PYTHON
       - name: Real Gateway Python 3.12 with current Hermes Python 3.14.7 joint chain
         if: runner.os == 'Linux'
         shell: bash

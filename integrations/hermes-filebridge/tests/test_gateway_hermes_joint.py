@@ -41,6 +41,7 @@ GATEWAY_COMMIT = "0ec54bf0f25f421e37e16e11bd098a814beca258"
 GATEWAY_ZIP_SHA256 = "c0ad44618fcd7c640c640f921e8910b8292dcadc24dd2c03cc03a34c2761c445"
 DOWNLOAD = "filebrowser_download_inbound"
 CONSUME = "probe_consume_workcopy"
+READ_CONTENT = "filebrowser_read_inbound"
 SERVICE_ENV = "CF_FILEBRIDGE_HOST_JOINT_SERVICE"
 PROFILE = "profiles/joint-isolated/1"
 DEFAULT_HERMES_COMMIT = "4d55ca91656ac5f83e1506679b7f81e0238e5e16"
@@ -165,8 +166,10 @@ def consume(args, **kwargs):
 def register(ctx):
     def execution(*, next_call, tool_name, args, **context):
         result = next_call(args)
-        if tool_name in ("filebrowser_download_inbound", "probe_consume_workcopy"):
+        if tool_name in ("filebrowser_download_inbound", "probe_consume_workcopy", "filebrowser_read_inbound"):
             parsed = json.loads(result) if isinstance(result, str) else result
+            if isinstance(parsed, dict) and parsed.get("_multimodal"):
+                parsed = json.loads(parsed["text_summary"])
             record("tool", {"tool": tool_name, "session_id": context.get("session_id"),
                 "task_id": context.get("task_id"), "result": parsed})
         return result
@@ -214,7 +217,8 @@ class ModelHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         messages = body.get("messages", [])
         user_index = next((i for i in range(len(messages)-1, -1, -1)
-                           if messages[i].get("role") == "user"), -1)
+                           if messages[i].get("role") == "user"
+                           and "joint-" in str(messages[i].get("content", ""))), -1)
         text = str(messages[user_index].get("content", "")) if user_index >= 0 else ""
         results = [m["content"] for m in messages[user_index+1:] if m.get("role") == "tool"]
         tools = {t.get("function", {}).get("name") for t in body.get("tools", [])}
@@ -234,7 +238,12 @@ class ModelHandler(BaseHTTPRequestHandler):
             # model connection idle; no frozen clock or synthetic end event.
             time.sleep(31)
         call = None
-        if tools and ("joint-attachment" in text or "joint-error" in text):
+        if tools and "joint-readcontent" in text:
+            match = re.search(r'"attachment_id"\s*:\s*(\d+)', text)
+            assert match is not None, "Gateway omitted content attachment ID"
+            if len(results) < 2:
+                call = (READ_CONTENT, {"attachment_id": int(match.group(1))})
+        elif tools and ("joint-attachment" in text or "joint-error" in text):
             match = re.search(r'"attachment_id"\s*:\s*(\d+)', text)
             assert match is not None, "Gateway omitted attachment ID"
             attachment_id = int(match.group(1))
@@ -313,7 +322,26 @@ def interpreter_entry(path):
     return entry
 
 
-def isolated_guard(sandbox, sources, worker):
+def content_parser_launch_allowed(sandbox, executable, command, cwd, environment):
+    """One explicit byte-parser launch; never a general Python exemption."""
+    parser = Path(sandbox) / "profile/plugins/cf-filebridge/inbound_content.py"
+    expected = [sys.executable, "-I", "-X", "utf8", "-B", str(parser), "--parse-stdin"]
+    if (not isinstance(environment, dict) or not isinstance(cwd, str)
+            or not Path(cwd).is_absolute() or Path(cwd) != parser.parent
+            or any(key.upper() not in {"SYSTEMROOT", "WINDIR"} for key in environment)):
+        return False
+    if any(value != os.environ.get(key) for key, value in environment.items()):
+        return False
+    if os.name == "nt":
+        # Official Windows plugin loading normalizes __file__ to lower case.
+        # Only the path spelling varies; -I/-X/-B and every argument stay exact.
+        lowered_path = [*expected[:5], os.path.normcase(str(parser)), expected[-1]]
+        return (executable in (None, sys.executable) and
+                command in (subprocess.list2cmdline(expected), subprocess.list2cmdline(lowered_path)))
+    return executable == sys.executable and command == expected
+
+
+def isolated_guard(sandbox, sources, worker, *, allow_content_parser=False):
     if "hermes_constants_scratch" in sys.modules:
         raise RuntimeError("hermes_constants_scratch was loaded before test isolation")
     support = _local_module("joint_sqlite_support", "hermes_probe_support.py")
@@ -377,6 +405,8 @@ def isolated_guard(sandbox, sources, worker):
                     and command == subprocess.list2cmdline([str(worker)]))
             else:
                 denied = worker is None or Path(executable) != worker or command != [str(worker)]
+            if denied and allow_content_parser:
+                denied = not content_parser_launch_allowed(sandbox, executable, command, _cwd, _env)
         elif event in {"os.system", "os.exec", "os.posix_spawn"}:
             denied = True
         if denied:
@@ -425,19 +455,20 @@ async def child(gateway, hermes, worker, *, hermes_commit=DEFAULT_HERMES_COMMIT,
     config = json.loads((home / "config.yaml").read_text())
     config["model"] = {"provider": "custom", "default": "cf-joint-model", "api_mode": "chat_completions",
         "base_url": f"http://127.0.0.1:{model.server_port}/v1", "context_length": 131072,
+        "supports_vision": True,
         "api_key": "public-isolated-model-not-a-credential"}
     config["plugins"]["entries"]["cf-filebridge"]["settings"]["inbound_host"] = {
         "gateway_origin": origin, "service_token_env": SERVICE_ENV, "profile_reference": PROFILE,
         "profile_revision": 1, "work_root": str(sandbox / "work"), "client_path": str(worker),
         "client_sha256": hashlib.sha256(worker.read_bytes()).hexdigest(),
         "ca_file": str(sandbox / "cert.pem"), "ca_sha256": hashlib.sha256((sandbox / "cert.pem").read_bytes()).hexdigest(),
-        "consumer_tools": [CONSUME]}
+        "consumer_tools": [CONSUME] + ([READ_CONTENT] if hermes_python else [])}
     (home / "config.yaml").write_text(json.dumps(config))
     external = None
     if hermes_python:
         host_helpers = _local_module("joint_external_host", "hermes_joint_host.py")
         external = host_helpers.ExternalHermesHost(hermes_python, hermes, sandbox, worker,
-            hermes_commit=hermes_commit, hermes_archive=hermes_archive)
+            hermes_commit=hermes_commit, hermes_archive=hermes_archive, allow_content_parser=True)
         try:
             hermes_origin = await external.start()
         except BaseException:
@@ -545,7 +576,7 @@ async def child(gateway, hermes, worker, *, hermes_commit=DEFAULT_HERMES_COMMIT,
                 await asyncio.sleep(0.02)
         sessions = app.state.database_session_factory
         with sessions() as session:
-            for name in ("alice", "bob", "error", "retry", "exhaust", "lease", "cancel", "lostclosed", "control", "disconnect"):
+            for name in ("alice", "bob", "error", "retry", "exhaust", "lease", "cancel", "lostclosed", "control", "disconnect", "contentpdf", "contentimage"):
                 identity_service = IdentityService(session)
                 identity = identity_service.create_identity(employee_id="joint-" + name)
                 identity_service.create_mapping(platform="wechat", account_id="wxid-joint-gateway",
@@ -561,16 +592,19 @@ async def child(gateway, hermes, worker, *, hermes_commit=DEFAULT_HERMES_COMMIT,
                 "source_message_id_is_fallback": False, "event_id": "joint:" + str(sequence),
                 "conversation_id": "wxid-" + name, "conversation_type": "private", "conversation_name": name,
                 "sender_type": "human", "sender_id": "wxid-" + name, "sender_name": name,
-                "message_type": ("image" if name == "bob" else "file") if media else "text",
-                "raw_type": (3 if name == "bob" else 49) if media else 1,
+                "message_type": ("image" if name in {"bob", "contentimage"} else "file") if media else "text",
+                "raw_type": (3 if name in {"bob", "contentimage"} else 49) if media else 1,
                 "content": "joint-" + stage + "-" + name, "timestamp": datetime.now(timezone.utc),
                 "is_mentioned": None, "is_self": False, "reply": None})
             with sessions() as session:
                 return MessageAdmissionService(session, inbound_media=settings.inbound_media).process(message)
+        reading_fixture = [False]
         class WechatFetchStub:
             def fetch(self, source):
                 jpeg = source.raw_type == 3
                 data = (HERE / "fixtures" / ("sample.jpg" if jpeg else "sample.pdf")).read_bytes()
+                if reading_fixture[0] and not jpeg:
+                    data = _local_module("joint_content_fixtures", "inbound_content_fixtures.py").pdf_fixture()
                 return BoundMediaResult(source.fingerprint, parse_inbound_media({"type": "image" if jpeg else "file",
                     "filename": "joint.jpg" if jpeg else "joint.pdf", "data": base64.b64encode(data).decode()}))
         intake = InboundMediaWorker(sessions, WechatFetchStub(), InboundMediaStaging(sandbox / "staging"))
@@ -856,6 +890,52 @@ async def child(gateway, hermes, worker, *, hermes_commit=DEFAULT_HERMES_COMMIT,
                 headers = {} if token is None else {"Authorization": "Bearer " + token}
                 async with client.post(origin + "/internal/hermes/inbound-bindings/resolve", json=body, headers=headers) as response:
                     assert response.status == 403
+        # Product content tool through the same real admission/claim/auth/SSE
+        # chain. The old-reference gate retains its original dependency/runtime
+        # contract; the explicit current-Hermes process includes pinned parsers.
+        content_cases = []
+        if external:
+            for name, kind in (("contentpdf", "pdf"), ("contentimage", "jpeg")):
+                reading_fixture[0] = True
+                outcome = admit(name, "readcontent", True)
+                assert await asyncio.to_thread(intake.run_once) == "ready"
+                reading_fixture[0] = False
+                claim = dispatcher.claim_once()
+                assert claim and claim.record_id == outcome.dispatch_record_id
+                before_gets = sum(re.fullmatch(r"/inbound-media/\d+/content", item[1]) is not None
+                                  for item in gateway_requests)
+                model_start = len(model.requests)
+                completed = await asyncio.to_thread(dispatcher.process_claim, claim)
+                assert completed.status is HermesDispatchStatus.SUCCESS, completed.error_code
+                binding = binding_for(claim)
+                assert binding.closed_at is not None and binding.grant_ciphertext is None
+                values = tool_events(binding.session_id, READ_CONTENT)
+                assert len(values) == 2 and all(value.get("ok") is True for value in values), values
+                assert values[0]["handle"] == values[1]["handle"]
+                assert all(value["verified"] and value["formal_archive"] is False for value in values)
+                after_gets = sum(re.fullmatch(r"/inbound-media/\d+/content", item[1]) is not None
+                                 for item in gateway_requests)
+                assert after_gets - before_gets == 1, "product content repeat refreshed the download"
+                assert values[0]["format"] == kind
+                requests = model.requests[model_start:]
+                expected_bytes = ((HERE / "fixtures/sample.jpg").read_bytes() if kind == "jpeg" else
+                    _local_module("joint_content_fixtures", "inbound_content_fixtures.py").pdf_fixture())
+                assert all(value["bytes_written"] == len(expected_bytes) and
+                           value["sha256"] == hashlib.sha256(expected_bytes).hexdigest() for value in values)
+                if kind == "pdf":
+                    assert "Quarterly revenue is 1234 USD." in values[0]["content"]
+                    assert "Quarterly revenue is 1234 USD." in json.dumps(requests)
+                else:
+                    assert values[0]["vision"] == "native_image_attached", values[0]
+                    after_tool = [request for request in requests if any(
+                        message.get("role") == "tool" and "native_image_attached" in str(message.get("content", ""))
+                        for message in request.get("messages", []))]
+                    image_values = re.findall(r'data:image/[^;]+;base64,([A-Za-z0-9+/=]+)', json.dumps(after_tool))
+                    assert image_values, "official vision never delivered image bytes to model HTTP"
+                    assert any(base64.b64decode(value) == expected_bytes
+                               for value in image_values), "model did not receive the actual authorized JPEG"
+                content_cases.append({"format": kind, "actual_content_in_model_request": True,
+                                      "repeated_tools_one_get": True, "gateway_closed": True})
         # Only ciphertext is allowed in the Gateway DB; ordinary Hermes profile,
         # model traffic, tool outputs and logs must contain none of these secrets.
         denied_housekeeping = list(violations.expected_denied_housekeeping)
@@ -895,6 +975,8 @@ async def child(gateway, hermes, worker, *, hermes_commit=DEFAULT_HERMES_COMMIT,
             "lost_closed_request_local_resources_revoked_before_real_lease_barrier": True,
             "lost_closed_request_elapsed_seconds": round(closed_elapsed, 2),
             "independent_real_control_negative_probes": direct_control_cases,
+            "product_content_cases": content_cases,
+            "real_visual_accuracy_validated": False,
             "stubs": ["loopback model HTTP", "upstream WeChat fetch"],
             "production_host_acceptance": False, "isolation_audit_violations": len(violations)}))
     finally:
@@ -932,8 +1014,10 @@ def run(gateway, hermes, worker, *, hermes_commit=DEFAULT_HERMES_COMMIT,
         for name in ("cert.pem", "key.pem"):
             shutil.copyfile(HERE / "fixtures" / name, sandbox / name)
         config = {"plugins": {"enabled": ["cf-filebridge", "cf-a-joint-observer"], "entries": {
-            "cf-filebridge": {"settings": {"inbound_enabled": True, "inbound_host_enabled": True}}}},
-            "platform_toolsets": {"api_server": ["cf_filebridge_inbound", "cf_joint_probe"]},
+            "cf-filebridge": {"settings": {"inbound_enabled": True, "inbound_host_enabled": True,
+                "inbound_content_enabled": bool(hermes_python)}}}},
+            "platform_toolsets": {"api_server": ["cf_filebridge_inbound", "cf_joint_probe"] +
+                (["cf_filebridge_inbound_content"] if hermes_python else [])},
             # Official public switches: this custom-model fixture does not use
             # Bedrock lazy installs or the shell-based terminal toolchain probe.
             "security": {"allow_lazy_installs": False},

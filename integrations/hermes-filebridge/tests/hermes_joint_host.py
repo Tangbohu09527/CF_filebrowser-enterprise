@@ -69,11 +69,12 @@ def _write(path, payload):
 class ExternalHermesHost:
     def __init__(self, python, source, sandbox, worker, *, hermes_commit,
                  hermes_archive=None, hermes_key_env="CF_JOINT_HERMES_KEY",
-                 observer="cf-a-joint-observer"):
+                 observer="cf-a-joint-observer", allow_content_parser=False):
         self.python, self.source = Path(python), Path(source)
         self.sandbox, self.worker = Path(sandbox), Path(worker)
         self.commit, self.archive = hermes_commit, hermes_archive
         self.key_env, self.observer = hermes_key_env, observer
+        self.allow_content_parser = allow_content_parser
         self.process = self.log = None
         self.ready = self.sandbox / "external-host-ready.json"
         self.status = self.sandbox / "external-host-status.json"
@@ -87,6 +88,8 @@ class ExternalHermesHost:
                    "--observer", self.observer]
         if self.archive:
             command += ["--hermes-archive", str(self.archive)]
+        if self.allow_content_parser:
+            command.append("--allow-content-parser")
         env = dict(os.environ)
         for name in ("CF_JOINT_GRANT_KEY", "CF_EXIT_GRANT_KEY"):
             env.pop(name, None)
@@ -198,7 +201,8 @@ async def serve(args):
     support.verify_source(args.hermes_source, args.hermes_commit, args.hermes_archive)
     joint.bootstrap_system_metadata()
     read_roots = (args.hermes_source,) + ((args.hermes_archive,) if args.hermes_archive else ())
-    violations = joint.isolated_guard(sandbox, read_roots, args.worker)
+    violations = joint.isolated_guard(sandbox, read_roots, args.worker,
+                                      allow_content_parser=args.allow_content_parser)
     _audit_violations = violations
     # All official imports take place after the disposable HOME and strict
     # audit guard are active.
@@ -254,6 +258,7 @@ if __name__ == "__main__":
     parser.add_argument("--worker", required=True, type=Path)
     parser.add_argument("--key-env", default="CF_JOINT_HERMES_KEY")
     parser.add_argument("--observer", default="cf-a-joint-observer")
+    parser.add_argument("--allow-content-parser", action="store_true")
     arguments = parser.parse_args()
     try:
         asyncio.run(serve(arguments))

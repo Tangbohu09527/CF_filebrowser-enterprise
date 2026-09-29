@@ -1,7 +1,7 @@
 # Stage an independently pinned inbound bundle. Never installs/enables Hermes.
 [CmdletBinding()]
 param(
-    [ValidateSet('Stage','Resume','Check','SelfTest')][string]$Mode='Check',
+    [ValidateSet('Stage','Resume','Check','Inspect','SelfTest')][string]$Mode='Check',
     [string]$SourceDirectory='',
     [string]$StageDirectory='',
     [string]$ExpectedInventorySHA256=''
@@ -15,7 +15,7 @@ if ($Mode -eq 'SelfTest') {
     & (Join-Path $PSScriptRoot '../tests/Test-InboundStage.ps1')
     return
 }
-if (-not $SourceDirectory -or -not $StageDirectory -or $ExpectedInventorySHA256 -notmatch '^[0-9a-fA-F]{64}$') {
+if (-not $SourceDirectory -or ($Mode -ne 'Inspect' -and -not $StageDirectory) -or $ExpectedInventorySHA256 -notmatch '^[0-9a-fA-F]{64}$') {
     throw 'SourceDirectory, StageDirectory and independently verified ExpectedInventorySHA256 are required.'
 }
 
@@ -190,11 +190,11 @@ function Assert-KnownTree([string]$Root,[bool]$Complete,[bool]$Private) {
             Hold-Directory $child.FullName
             if ($Private) { Assert-PrivateAcl $child.FullName $true }
             foreach ($leaf in @(Get-ChildItem -LiteralPath $child.FullName -Force)) {
-                if (@('__init__.py','plugin.yaml','inbound.py','inbound_control.py','inbound_directory.py','inbound_host.py') -cnotcontains $leaf.Name) { throw 'Unknown file preserved; staging refused.' }
+                if ($fileNames -cnotcontains ('plugin/'+$leaf.Name)) { throw 'Unknown file preserved; staging refused.' }
                 Assert-Node $leaf.FullName $false
                 if ($Private) { Assert-PrivateAcl $leaf.FullName $false }
             }
-        } elseif (@('filebridge-inbound.exe','inventory.json') -ccontains $child.Name) {
+        } elseif ($allNames -ccontains $child.Name) {
             Assert-Node $child.FullName $false
             if ($Private) { Assert-PrivateAcl $child.FullName $false }
         } else { throw 'Unknown file preserved; staging refused.' }
@@ -274,11 +274,27 @@ function Copy-NewFile([string]$Source,[string]$Destination,[string]$Expected) {
 
 try {
     $source=Normalize-LocalAbsolute $SourceDirectory
+    Hold-Directory $source
+    # Keep the exact legacy inventory accepted. A consumer release is a
+    # separate fixed shape: code AND the pinned dependency list are required.
+    if ((Test-Path -LiteralPath (Join-Path $source 'plugin/inbound_content.py')) -or
+        (Test-Path -LiteralPath (Join-Path $source 'requirements-inbound-content.txt'))) {
+        $fileNames+=@('plugin/inbound_content.py','requirements-inbound-content.txt','content-wheels.zip')
+        $allNames=@($fileNames)+@('inventory.json')
+    }
+    if ($Mode -eq 'Inspect') {
+        Assert-KnownTree $source $true $false
+        $inventory=Read-Inventory $source $ExpectedInventorySHA256
+        Verify-Files $source $inventory.hashes $true
+        @{verified=$true;staged=$false;live_enabled=$false;host_bridge_connected=$false;mode=$Mode;
+          source_commit=$inventory.commit;inventory_sha256=$ExpectedInventorySHA256.ToLowerInvariant();
+          payload_count=$fileNames.Count} | ConvertTo-Json -Compress
+        return
+    }
     $stage=Normalize-LocalAbsolute $StageDirectory
     if ($source.Equals($stage,[StringComparison]::OrdinalIgnoreCase) -or
         $source.StartsWith($stage+'\',[StringComparison]::OrdinalIgnoreCase) -or
         $stage.StartsWith($source+'\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Source and stage must be separate non-nested directories.' }
-    Hold-Directory $source
     $parent=[IO.Path]::GetDirectoryName($stage)
     Hold-Directory $parent
     Assert-PrivateAcl $parent $true $true

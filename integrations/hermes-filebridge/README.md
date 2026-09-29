@@ -1,4 +1,9 @@
-# Hermes FileBridge：内部 CA、只读接入与受控新建
+# Hermes FileBridge：只读接入、受控新建与入站内容读取
+
+0.4.0 新增 [入站内容读取](INBOUND_CONTENT.md)：一次 `filebrowser_read_inbound`
+调用沿用已授权下载与工作副本句柄，提取 PDF / DOCX / XLSX / PPTX 文本，或把实际图片
+字节交给官方 Hermes 视觉入口。内容能力默认关闭；增量安装入口保留原客户端、模型、
+CA、宿主凭据引用和工作根。隔离测试通过不代表已安装环境或微信端到端已验收。
 
 当前官方 Hermes `0f4a98f` / 独立 Python 3.14.7 与旧版参考的兼容检查，见
 [当前版本兼容记录](CURRENT_HERMES_COMPATIBILITY.md)。固定源码用于复现，不要求修改已安装 Hermes；

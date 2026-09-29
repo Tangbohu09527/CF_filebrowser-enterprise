@@ -62,6 +62,8 @@ try {
     $inventoryPath=Join-Path $source 'inventory.json'
     [IO.File]::WriteAllText($inventoryPath,($inventory | ConvertTo-Json -Depth 4),$utf8)
     $pin=Hash $inventoryPath
+    $inspected=& $driver -Mode Inspect -SourceDirectory $source -ExpectedInventorySHA256 $pin | ConvertFrom-Json
+    Require ($inspected.verified -and -not $inspected.staged -and $inspected.payload_count -eq 7) 'source Inspect does not require or create stage'
     $stage=Join-Path $root 'release'
     CheckResult (Run 'Stage' $stage) 'stage'
     $worker=Join-Path $stage 'filebridge-inbound.exe'
@@ -74,6 +76,43 @@ try {
     Require ((Hash $worker) -ceq $beforeBytes -and (Security $worker) -ceq $beforeAcl -and
         (Get-Item -LiteralPath $worker).LastWriteTimeUtc -eq $beforeWrite) 'resume/check preserve existing file and exact ACL'
     $cases++;Write-Output 'INBOUND_STAGE_CASE=stage-resume-check:PASS'
+
+    # The next consumer bundle remains independently pinned and must include
+    # both its code and exact dependency inventory. Legacy seven-file bundles
+    # above continue through the same Stage/Resume/Check assertions.
+    $contentSource=Join-Path $root 'content-source';PrivateDirectory $contentSource
+    Copy-Item -LiteralPath $sourcePlugin -Destination $contentSource -Recurse
+    Copy-Item -LiteralPath (Join-Path $source 'filebridge-inbound.exe') -Destination $contentSource
+    $contentHashes=[ordered]@{}
+    foreach ($name in $names) { $contentHashes[$name]=Hash (Join-Path $contentSource $name) }
+    foreach ($name in @('plugin/inbound_content.py','requirements-inbound-content.txt','content-wheels.zip')) {
+        [IO.File]::WriteAllText((Join-Path $contentSource $name),('consumer dummy fixture: '+$name),$utf8)
+        $contentHashes[$name]=Hash (Join-Path $contentSource $name)
+    }
+    $contentInventory=Join-Path $contentSource 'inventory.json'
+    [IO.File]::WriteAllText($contentInventory,([ordered]@{schema='cf-inbound-bundle/v1';source_commit=('a'*40);files=$contentHashes} | ConvertTo-Json -Depth 4),$utf8)
+    $contentPin=Hash $contentInventory
+    $contentStage=Join-Path $root 'content-release'
+    foreach ($action in @('Stage','Resume','Check')) {
+        $result=Run $action $contentStage $contentSource $contentPin
+        Require ($result.staged -and -not $result.live_enabled -and $result.inventory_sha256 -ceq $contentPin) 'consumer bundle independently verified'
+    }
+    Require ((Hash (Join-Path $contentStage 'plugin/inbound_content.py')) -ceq $contentHashes['plugin/inbound_content.py']) 'consumer bytes pinned'
+    Require ((Hash (Join-Path $contentStage 'requirements-inbound-content.txt')) -ceq $contentHashes['requirements-inbound-content.txt']) 'consumer dependencies pinned'
+    Refused { Run 'Check' $contentStage $source $pin } 'consumer-not-accepted-as-legacy-stage'
+    $missingRequirements=Join-Path $root 'content-missing-requirements';PrivateDirectory $missingRequirements
+    Copy-Item -LiteralPath (Join-Path $contentSource 'plugin') -Destination $missingRequirements -Recurse
+    Copy-Item -LiteralPath (Join-Path $contentSource 'filebridge-inbound.exe') -Destination $missingRequirements
+    Copy-Item -LiteralPath (Join-Path $contentSource 'content-wheels.zip') -Destination $missingRequirements
+    Copy-Item -LiteralPath $contentInventory -Destination $missingRequirements
+    Refused { Run 'Stage' (Join-Path $root 'missing-requirements-release') $missingRequirements $contentPin } 'consumer-requires-dependency-list'
+    $missingWheels=Join-Path $root 'content-missing-wheels';PrivateDirectory $missingWheels
+    Copy-Item -LiteralPath (Join-Path $contentSource 'plugin') -Destination $missingWheels -Recurse
+    foreach ($name in @('filebridge-inbound.exe','requirements-inbound-content.txt','inventory.json')) {
+        Copy-Item -LiteralPath (Join-Path $contentSource $name) -Destination $missingWheels
+    }
+    Refused { Run 'Stage' (Join-Path $root 'missing-wheels-release') $missingWheels $contentPin } 'consumer-requires-offline-wheel-payload'
+    $cases++;Write-Output 'INBOUND_STAGE_CASE=consumer-stage-resume-check:PASS'
     Refused { Run 'Stage' $stage } 'stage-existing'
     Refused { & $driver -SourceDirectory $source -StageDirectory $stage } 'missing-independent-pin'
     Refused { Run 'Check' $stage $source ('0'*64) } 'wrong-independent-pin'
