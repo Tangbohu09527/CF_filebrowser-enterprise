@@ -76,12 +76,23 @@ def child_check(source: Path, enabled: bool, commit: str = HERMES_COMMIT) -> Non
         checks.assertTrue(any(isinstance(value, PluginContext) for value in captured),
                           "read handler did not receive the real upstream PluginContext")
         entry = registry.get_entry(TOOL, scope=manager.scope_key)
+        content_entry = registry.get_entry("filebrowser_read_inbound", scope=manager.scope_key)
         create_entry = registry.get_entry("filebrowser_create_text", scope=manager.scope_key)
         rejected_create_requests = 0
         if not enabled:
             checks.assertIsNone(entry, "inbound download must be disabled by default")
+            checks.assertIsNone(content_entry, "content reading must be disabled by default")
             checks.assertIsNone(create_entry, "controlled create must be disabled by default")
         else:
+            checks.assertIsNotNone(content_entry, "content opt-in must register a real consumer")
+            checks.assertEqual(set(content_entry.schema["parameters"]["properties"]),
+                               {"attachment_id", "question"})
+            unbound = registry.dispatch("filebrowser_read_inbound", {"attachment_id": 1},
+                                       scope=manager.scope_key,
+                                       task_id="untrusted-test-task", session_id="untrusted-test-session")
+            unbound = json.loads(unbound) if isinstance(unbound, str) else unbound
+            checks.assertFalse(unbound["ok"])
+            checks.assertEqual(unbound["error"]["code"], "trusted_context_unavailable")
             checks.assertIsNotNone(create_entry, "explicit create opt-in must register the existing tool")
             checks.assertEqual(create_entry.schema["parameters"]["properties"]["command"]["enum"],
                                ["plan", "apply", "status"])
@@ -135,7 +146,7 @@ def run(source: Path, commit: str = HERMES_COMMIT, archive: Path | None = None) 
                             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
             # JSON is YAML-compatible. No real profile, config, token, client,
             # Gateway URL, or previously installed plugin is consulted.
-            settings = {"inbound_enabled": True, "create_enabled": True,
+            settings = {"inbound_enabled": True, "inbound_content_enabled": True, "create_enabled": True,
                         "create_config_path": str(home / "unused-synthetic-create.json")} if enabled else {}
             config = {"plugins": {"enabled": ["cf-filebridge"], "entries": {
                 "cf-filebridge": {"settings": settings}

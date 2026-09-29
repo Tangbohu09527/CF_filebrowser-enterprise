@@ -27,6 +27,33 @@ _JOIN_SECONDS = 5.0
 _active_host = ContextVar("cf_filebridge_authorized_host", default=None)
 
 
+def authorized_remaining_seconds():
+    """Remaining authority for a consumer, never a fresh processing budget.
+
+    Read only the middleware-bound scope. Tool kwargs, prompts and copied
+    contexts cannot extend the original Gateway lease or revive an ended task.
+    """
+    active = _active_host.get()
+    if active is None:
+        raise BridgeError("trusted_context_unavailable")
+    adapter, scope = active
+    with scope.lock:
+        if scope.stopped.is_set() or not scope.started or scope.resolved is None:
+            raise BridgeError("task_cancelled")
+        remaining = scope.resolved.deadline_monotonic - time.monotonic()
+        dispatch_id = scope.resolved.worker_binding["dispatch_id"]
+    with adapter.bridge._lock:
+        dispatch = adapter.bridge._dispatches.get(dispatch_id)
+    if remaining <= 0 or dispatch is None or dispatch.stopped.is_set():
+        raise BridgeError("task_cancelled")
+    return remaining
+
+
+def ensure_active():
+    """Reject consumer results when authority ended during parsing/vision."""
+    authorized_remaining_seconds()
+
+
 class _Scope:
     def __init__(self, session_id, task_id):
         self.session_id = session_id

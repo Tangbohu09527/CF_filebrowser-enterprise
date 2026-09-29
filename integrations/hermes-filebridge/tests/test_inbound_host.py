@@ -4,6 +4,7 @@ These are not joint Gateway/Hermes acceptance tests. Framework identifiers and
 Gateway responses are synthetic test inputs; production classes are unmodified.
 """
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -307,6 +308,28 @@ class HostControlTests(unittest.TestCase):
         self.adapter = host.HostAdapter(self.client, self.bridge, downstream_tools=[CONSUMER])
         self.addCleanup(self.adapter.close)
         self.download_handler = inbound.handler_for(Settings(self.raw))
+
+    def test_consumer_deadline_requires_live_scope_and_revokes_copied_context(self):
+        with self.assertRaises(inbound.BridgeError):
+            host.authorized_remaining_seconds()
+        captured = []
+
+        def consume(_args):
+            host.ensure_active()
+            remaining = host.authorized_remaining_seconds()
+            self.assertGreater(remaining, 0)
+            self.assertLessEqual(remaining, self.lease_seconds)
+            captured.append(copy_context())
+            return json.dumps({"ok": True})
+
+        result = self.adapter.middleware(CONSUMER, {}, consume,
+                                         session_id="consumer-lease", task_id="consumer-lease")
+        self.assertTrue(json.loads(result)["ok"])
+        self.adapter.on_session_end(session_id="consumer-lease")
+        with self.assertRaises(inbound.BridgeError):
+            captured[0].run(host.ensure_active)
+        with self.assertRaises(inbound.BridgeError):
+            host.authorized_remaining_seconds()
 
     def resolve_response(self, record):
         serial = record["serial"]

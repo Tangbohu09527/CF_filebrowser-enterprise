@@ -134,6 +134,9 @@ def register(ctx):
     if ctx.get_config("inbound_enabled", False) is True:
         from .inbound import register_inbound
         register_inbound(ctx)
+        if ctx.get_config("inbound_content_enabled", False) is True:
+            from .inbound_content import register_content
+            register_content(ctx)
         if ctx.get_config("inbound_host_enabled", False) is True:
             from .inbound_host import register_host
             register_host(ctx)
