@@ -56,11 +56,11 @@ def child_check(source: Path, enabled: bool, commit: str = HERMES_COMMIT) -> Non
     sandbox = Path(os.environ["HERMES_HOME"]).parent
     support.assert_isolated_environment(sandbox)
     support.bootstrap_system_metadata()
-    # The real async registry dispatcher creates an asyncio self-pipe via a
-    # loopback socket pair on Windows. The existing guard still rejects every
-    # non-loopback destination and subprocess; no service is contacted here.
+    # The real async registry dispatcher can create/probe loopback sockets.
+    # Keep the existing request-probe boundary on both platforms: every
+    # non-loopback destination and subprocess is still rejected.
     external_attempts = support.install_audit_guard(sandbox, source,
-        allow_network=enabled and os.name == "nt")
+        allow_network=enabled)
     sys.path.insert(0, str(source))
     from hermes_cli.plugins import PluginContext, PluginManager
     from tools.registry import registry
@@ -123,7 +123,7 @@ def child_check(source: Path, enabled: bool, commit: str = HERMES_COMMIT) -> Non
             result = json.loads(answer) if isinstance(answer, str) else answer
             checks.assertFalse(result["ok"])
             checks.assertEqual(result["error"]["code"], "trusted_context_unavailable")
-        checks.assertEqual(external_attempts, [])
+        checks.assertEqual(external_attempts, [], json.dumps(external_attempts))
         checks.assertNotIn("hermes_constants_scratch", sys.modules)
     finally:
         manager.unload()
