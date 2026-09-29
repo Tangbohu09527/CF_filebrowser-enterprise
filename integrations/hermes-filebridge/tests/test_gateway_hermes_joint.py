@@ -673,7 +673,17 @@ async def child(gateway, hermes, worker, *, hermes_commit=DEFAULT_HERMES_COMMIT,
         expected = {hashlib.sha256((HERE / "fixtures" / name).read_bytes()).hexdigest() for name in ("sample.pdf", "sample.jpg")}
         assert {hashlib.sha256(path.read_bytes()).hexdigest() for path in files} == expected
         content_reads = [item for item in gateway_requests if re.fullmatch(r"/inbound-media/\d+/content", item[1])]
-        assert len(content_reads) == 2 and all(item[2] == 200 for item in content_reads), content_reads
+        expected_content_paths = {f"/inbound-media/{binding.job_id}/content" for binding in bindings}
+        assert len(expected_content_paths) == 2
+        assert {path for _method, path, _status in content_reads} == expected_content_paths, content_reads
+        assert all(method == "GET" for method, _path, _status in content_reads), content_reads
+        for path in expected_content_paths:
+            statuses = [status for _method, request_path, status in content_reads if request_path == path]
+            # Concurrent genuine staging reads may contend on Gateway's lock.
+            # Only bounded 503s before the single success are permitted; the
+            # repeated tool call must issue no request after that success.
+            assert 1 <= len(statuses) <= 4, statuses
+            assert statuses == [503] * (len(statuses) - 1) + [200], statuses
         assert sum(path.endswith("/resolve") and status == 200 for _method, path, status in gateway_requests) == 2
         assert sum(path.endswith("/events") and status == 200 for _method, path, status in gateway_requests) == 2
         assert sum(path.endswith("/closed") and status == 200 for _method, path, status in gateway_requests) == 2
@@ -981,6 +991,7 @@ async def child(gateway, hermes, worker, *, hermes_commit=DEFAULT_HERMES_COMMIT,
             "real_native_downloader": True, "authenticated_request_binding": True,
             "parallel_pdf_jpeg_verified_consumed": 2, "repeated_tools_shared_workcopy": True,
             "gateway_content_gets_for_four_tools": len(content_reads),
+            "gateway_successful_content_gets_for_four_tools": sum(status == 200 for _method, _path, status in content_reads),
             "text_attachment_text_history_and_fifo": True, "expired_handle_replays_rejected": 2,
             "model_failure_without_end_hook_revoked_by_gateway": not bool(failure_ends),
             "exception_end_hook_observed": bool(failure_ends),

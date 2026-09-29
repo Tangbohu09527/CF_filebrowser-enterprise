@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 
 HERE = Path(__file__).resolve().parent
@@ -101,10 +102,17 @@ class HermesJointHostIPCTests(unittest.TestCase):
 
     def test_bad_json_is_not_retried(self):
         self.status.write_text("{bad", encoding="utf-8")
-        start = time.monotonic()
-        with self.assertRaises(json.JSONDecodeError):
-            asyncio.run(self.subject.snapshot())
-        self.assertLess(time.monotonic() - start, 0.5)
+        # Observe real file parsing and both retry layers. Windows event-loop
+        # startup latency is unrelated to whether malformed JSON is retried.
+        with patch.object(host, "_read_json", wraps=host._read_json) as read_json, \
+             patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text) as read_text, \
+             patch.object(host.asyncio, "sleep", side_effect=AssertionError("Malformed JSON must not back off")) as sleep:
+            with self.assertRaises(json.JSONDecodeError):
+                asyncio.run(self.subject.snapshot())
+            read_json.assert_awaited_once_with(self.status)
+            read_text.assert_called_once_with(self.status, encoding="utf-8")
+            sleep.assert_not_called()
+            sleep.assert_not_awaited()
 
     def test_missing_snapshot_retains_five_second_timeout(self):
         self.status.unlink()
