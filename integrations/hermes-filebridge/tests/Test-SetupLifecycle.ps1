@@ -12,9 +12,12 @@ function Require([bool]$Value,[string]$Message) { if (-not $Value) { throw ('TES
 function NewFixture {
     $s=@{clock=0.0;calls=[Collections.Generic.List[object]]::new();processes=@();tasks=@();unknown=@();resolveMismatch=$false;stopFails=$false;respawn=$false;inspectCalls=0}
     $proof=@{launcher='C:\synthetic\hermes.cmd';launcher_sha256=('a'*64);source_root='C:\synthetic\home\hermes-agent';python='C:\synthetic\home\tools\python.exe';python_sha256=('b'*64);source_commit='0f4a98f87c17007b81500239d0bd5b9574027b73'}
+    # A closure's dynamic module cannot resolve this test script's local functions
+    # when CI invokes it through a parent script. Capture the function explicitly.
+    $processFactory=${function:NewProcess}
     $deps=@{
-        Inspect={param($home,$launcher,$source) $s.inspectCalls++; return $proof}.GetNewClosure()
-        Snapshot={param($home,$profile) return @{processes=@($s.processes);tasks=@($s.tasks);unknown=@($s.unknown)}}.GetNewClosure()
+        Inspect={param($targetHome,$launcher,$source) $s.inspectCalls++; return $proof}.GetNewClosure()
+        Snapshot={param($targetHome,$profile) return @{processes=@($s.processes);tasks=@($s.tasks);unknown=@($s.unknown)}}.GetNewClosure()
         Run={param($p,$operation,$arguments)
             $s.calls.Add(@{operation=$operation;arguments=@($arguments)})
             if ($operation -eq 'resolve') {
@@ -27,12 +30,12 @@ function NewFixture {
             }
             if ($operation -eq 'start') {
                 $kind=if ($arguments -contains 'gateway') {'gateway'} else {'dashboard'}
-                $s.processes+=NewProcess $kind 99
+                $s.processes+=(& $processFactory $kind 99)
                 return @{exit_code=0;stdout='synthetic-secret-output';pid=99}
             }
             throw 'TEST_FAILED: unrecognized operation'
         }.GetNewClosure()
-        Sleep={param($seconds) $s.clock+=$seconds; if ($s.respawn) {$s.processes=@(NewProcess 'gateway' 77)}}.GetNewClosure()
+        Sleep={param($seconds) $s.clock+=$seconds; if ($s.respawn) {$s.processes=@(& $processFactory 'gateway' 77)}}.GetNewClosure()
         Monotonic={return [double]$s.clock}.GetNewClosure()
     }
     return @{state=$s;dependencies=$deps;proof=$proof}
@@ -54,10 +57,11 @@ Case 'approval-required-before-runtime-resolution' {
 }
 Case 'stop-ten-seconds-and-restore-original-running' {
     $f=NewFixture;$f.state.processes=@(NewProcess);$p=Plan $f;Require $p.ok 'running plan';$r=Stop-FileBridgeLifecycle -Plan $p -Approved
-    Require $r.ok ('stopped: '+$r.code);Require ($f.state.clock -ge 10) 'ten continuous seconds';Require ((Restore-FileBridgeLifecycle -Plan $p -UpgradeSucceeded).ok) 'restore'
+    Require $r.ok ('stopped: '+$r.code);Require ($f.state.clock -ge 10) 'ten continuous seconds'
+    $restored=Restore-FileBridgeLifecycle -Plan $p -UpgradeSucceeded;Require $restored.ok ('restore: '+$restored.code)
     Require (@($f.state.calls|Where-Object operation -eq 'start').Count -eq 1) 'only one original component';Require (($r|ConvertTo-Json -Depth 6) -notmatch 'synthetic-secret-output|bootstrap|python.exe') 'safe result'
 }
-foreach($flag in @('managed','shared')) { $name=$flag;Case ('refuse-'+$flag) { $f=NewFixture;$q=NewProcess;$q[$name]=$true;$f.state.processes=@($q);$p=Plan $f;Require (-not $p.ok) 'blocked';Require ($f.state.calls.Count -eq 0) 'no command' }.GetNewClosure() }
+foreach($flag in @('managed','shared')) { Case ('refuse-'+$flag) { $f=NewFixture;$q=NewProcess;$q[$flag]=$true;$f.state.processes=@($q);$p=Plan $f;Require (-not $p.ok) 'blocked';Require ($f.state.calls.Count -eq 0) 'no command' } }
 Case 'unknown-gateway-refused' {$f=NewFixture;$f.state.unknown=@('foreign_gateway');$p=Plan $f;Require ($p.code -eq 'lifecycle_unknown_process') 'unknown';Require ($f.state.calls.Count -eq 0) 'no command'}
 Case 'scheduled-task-refused' {$f=NewFixture;$f.state.tasks=@('Hermes_Gateway');$p=Plan $f;Require ($p.code -eq 'lifecycle_scheduled_task_unsupported') 'task';Require ($f.state.calls.Count -eq 0) 'no command'}
 Case 'identity-change-before-stop-refused' {$f=NewFixture;$f.state.processes=@(NewProcess);$p=Plan $f;$f.state.processes=@(NewProcess 'gateway' 42);$r=Stop-FileBridgeLifecycle -Plan $p -Approved;Require ($r.code -eq 'lifecycle_instance_changed') 'identity';Require ($f.state.calls.Count -eq 0) 'no command'}
