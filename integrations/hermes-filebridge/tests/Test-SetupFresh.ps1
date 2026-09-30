@@ -106,14 +106,17 @@ foreach($mode in @('existing-plugin','late-plugin','config-change','unknown-plan
 foreach($flowMode in @('normal','partial')) {
     $argsMap=Fixture ('flow-'+$flowMode);$config=Join-Path $argsMap.ProfileDirectory 'config.yaml';$beforeHash=Hash $config;$beforeAcl=Get-CfConfigSddl $config
     $calls=[Collections.Generic.List[string]]::new()
+    # These callbacks execute synchronously before the loop advances. Keep the
+    # script scope: GetNewClosure creates a module that cannot resolve functions
+    # dot-sourced in this child script when CI invokes it with the & operator.
     $actions=@{
-        Check={$calls.Add('check');$r=Invoke-CfFreshSetup @argsMap -Mode Check;return @{transaction_state=$r.state}}.GetNewClosure()
-        Prepare={$calls.Add('prepare');Invoke-CfFreshSetup @argsMap -Mode Prepare}.GetNewClosure()
-        Save={$calls.Add('save');return @{synthetic_stopped_lifecycle=$true}}.GetNewClosure()
-        Stop={$calls.Add('stop');return @{synthetic_stopped_lifecycle=$true}}.GetNewClosure()
-        Apply={$calls.Add('apply');Invoke-CfFreshSetup @argsMap -Mode Apply -HermesStopped}.GetNewClosure()
-        Verify={$calls.Add('verify');$r=Invoke-CfFreshSetup @argsMap -Mode Check;if($r.state -cne 'complete'){throw 'CF_SETUP_POST_VERIFY_FAILED'}}.GetNewClosure()
-        Restore={$calls.Add('restore');return @{synthetic_stopped_lifecycle=$true}}.GetNewClosure()
+        Check={$calls.Add('check');$r=Invoke-CfFreshSetup @argsMap -Mode Check;return @{transaction_state=$r.state}}
+        Prepare={$calls.Add('prepare');Invoke-CfFreshSetup @argsMap -Mode Prepare}
+        Save={$calls.Add('save');return @{synthetic_stopped_lifecycle=$true}}
+        Stop={$calls.Add('stop');return @{synthetic_stopped_lifecycle=$true}}
+        Apply={$calls.Add('apply');Invoke-CfFreshSetup @argsMap -Mode Apply -HermesStopped}
+        Verify={$calls.Add('verify');$r=Invoke-CfFreshSetup @argsMap -Mode Check;if($r.state -cne 'complete'){throw 'CF_SETUP_POST_VERIFY_FAILED'}}
+        Restore={$calls.Add('restore');return @{synthetic_stopped_lifecycle=$true}}
     }
     if($flowMode -eq 'partial'){
         $script:publishCount=0
@@ -130,7 +133,7 @@ foreach($flowMode in @('normal','partial')) {
         $calls.Clear()
     }
     $result=Invoke-CfSetupFlow -Dependencies $actions -Approved
-    Require $result.ok ('real Flow '+$flowMode+' complete')
+    Require $result.ok ('real Flow '+$flowMode+' complete; stage='+$result.stage+'; code='+$result.code)
     $expected=if($flowMode -eq 'normal'){'check,prepare,save,stop,apply,verify,restore'}else{'check,save,stop,apply,verify,restore'}
     Require (($calls -join ',') -ceq $expected) 'real Flow lifecycle order'
     foreach($name in $names){Require ((Hash (Join-Path $argsMap.ProfileDirectory ('plugins/cf-filebridge/'+$name))) -ceq $files['plugin/'+$name]) 'real Flow actual payload'}
