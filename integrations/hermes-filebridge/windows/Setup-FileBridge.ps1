@@ -159,19 +159,21 @@ function Get-CfSetupLocation([string]$LocalData,[string]$Source) {
         if($profile -cne 'default'){$profileRoot=Join-Path (Join-Path $homePath 'profiles') $profile}
     }
     $key=Get-CfSetupTextHash $profileRoot.ToLowerInvariant()
-    $storage=Join-Path $LocalData 'CF-FileBridge';$transactions=Join-Path $storage 'transactions';$account=Join-Path $transactions $key
+    # Keep offline wheel members within ordinary Windows path limits. These
+    # labels are not identity: mutex/receipts/checkpoints retain full hashes.
+    $storage=Join-Path $LocalData 'CF-FileBridge';$transactions=Join-Path $storage 't';$account=Join-Path $transactions $key.Substring(0,32)
     $legacy=Join-Path $LocalData 'CF-FileBridge-upgrade-6f59267c/plan'
     $plans=@()
     if(Test-Path -LiteralPath $legacy){$plans+=,$legacy}
     if(Test-Path -LiteralPath $account) {
         Assert-CfSetupDirectory $account
         foreach($entry in @(Get-ChildItem -LiteralPath $account -Force)) {
-            if(-not $entry.PSIsContainer -or $entry.Name -notmatch '^[a-f0-9]{40}$' -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'CF_SETUP_UNKNOWN_TRANSACTION_FILE'}
+            if(-not $entry.PSIsContainer -or $entry.Name -notmatch '^[a-f0-9]{12}$' -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'CF_SETUP_UNKNOWN_TRANSACTION_FILE'}
             $plans+=,$entry.FullName
         }
     }
     if($plans.Count -gt 1){throw 'CF_SETUP_AMBIGUOUS_TRANSACTIONS'}
-    $planPath=if($plans.Count){$plans[0]}else{Join-Path $account $Source}
+    $planPath=if($plans.Count){$plans[0]}else{Join-Path $account $Source.Substring(0,12)}
     return @{Home=$homePath;Profile=$profile;ProfileRoot=$profileRoot;Storage=$storage;Transactions=$transactions;Account=$account;Plan=$planPath;Key=$key;
         Python=(Join-Path $homePath 'hermes-agent/venv/Scripts/python.exe');Launcher=(Join-Path $env:USERPROFILE '.local/bin/hermes.cmd')}
 }

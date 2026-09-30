@@ -124,6 +124,31 @@ try {
             [Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow))
     }
     [IO.Directory]::CreateDirectory($fixture,$acl)|Out-Null
+    $source='b'*40;$layout=Get-CfSetupLocation $fixture $source
+    $profileKey=Get-CfSetupTextHash ([IO.Path]::Combine($fixture,'hermes').ToLowerInvariant())
+    # Longest real member of the fixed 6f wheel archive (both cp311/cp314):
+    # 91 characters, from lxml 6.1.3. Keep a 64-character LocalAppData prefix
+    # budget; this is stricter than the default profile observed in the native
+    # failure. The constraint comes from the installed file, not folder labels.
+    $longestWheelMember='lxml/isoschematron/resources/xsl/iso-schematron-xslt1/iso_schematron_skeleton_for_xslt1.xsl'
+    Assert ($longestWheelMember.Length -eq 91) 'fixed real wheel member evidence length'
+    $runtimeMember='parser-runtime/Lib/site-packages/'+$longestWheelMember
+    $projectedInstalledLength=64+($layout.Plan.Length-$fixture.Length)+1+$runtimeMember.Length
+    Assert ($projectedInstalledLength -lt 260) 'default transaction keeps actual longest wheel file below legacy MAX_PATH with 64-char profile-root budget'
+    Assert ($layout.Transactions -ceq (Join-Path $fixture 'CF-FileBridge/t')) 'new transaction layout avoids long-path wheel extraction'
+    Assert ($layout.Key -ceq $profileKey -and $layout.Key.Length -eq 64) 'mutex and checkpoint retain full profile identity'
+    Assert ([IO.Path]::GetFileName($layout.Account) -ceq $profileKey.Substring(0,32) -and [IO.Path]::GetFileName($layout.Plan) -ceq $source.Substring(0,12)) 'only directory labels shorten identity'
+    foreach($path in @($layout.Storage,$layout.Transactions,$layout.Account,$layout.Plan)){[IO.Directory]::CreateDirectory($path,$acl)|Out-Null}
+    $discovered=Get-CfSetupLocation $fixture $source
+    Assert ($discovered.Plan -ceq $layout.Plan) 'strict 12-hex transaction discovered'
+    $unknown=Join-Path $layout.Account ('c'*40);[IO.Directory]::CreateDirectory($unknown,$acl)|Out-Null
+    $refused=$false;try {Get-CfSetupLocation $fixture $source|Out-Null}catch{$refused=$_.Exception.Message -ceq 'CF_SETUP_UNKNOWN_TRANSACTION_FILE'}
+    Assert ($refused -and (Test-Path -LiteralPath $unknown)) 'unknown long-name transaction remains untouched and refuses discovery'
+    $legacyData=Join-Path $fixture 'legacy-localdata';[IO.Directory]::CreateDirectory($legacyData,$acl)|Out-Null
+    $legacyPlan=Join-Path $legacyData 'CF-FileBridge-upgrade-6f59267c/plan';[IO.Directory]::CreateDirectory($legacyPlan)|Out-Null
+    $legacyLocation=Get-CfSetupLocation $legacyData $source
+    Assert ($legacyLocation.Plan -ceq $legacyPlan) 'existing fixed 6f plan path is unchanged'
+    Write-Output 'FILEBRIDGE_SETUP_LAYOUT=PASS:4;full_profile_identity_preserved=true;legacy_path_unchanged=true'
     $receipt=Join-Path $fixture 'fresh.json'
     $first=InvokeActualActions $receipt 'fresh' $true
     Assert ($first.result.ok -and $first.state -ceq 'complete') 'real Start fresh action construction succeeds'

@@ -56,6 +56,10 @@
 - `Setup-FileBridge.ps1` 自动读取本机 HOME/Profile、既有 worker 清单与规划解释器，
   识别 fresh / unprepared / prepared / partial / complete，复用现有 Stage 与 Upgrade。
   规划器和服务执行器是两个不同概念；不因机器存在 Python 3.14 而切换 3.11 规划器。
+  新事务使用较短的自动目录名，避免 Windows 默认路径长度限制阻断离线依赖解包；
+  目录缩写不充当授权，完整 Profile/源码/清单身份仍由原检查点核对，冲突即拒绝。
+  旧 6f 计划保持原路径，不移动、不重建。本轮已在等长合成目录用真实 wheels 复现
+  原布局失败和短布局成功；不修改系统长路径策略，异常长的自定义路径仍可能被拒绝。
 - `ConfigFile.ps1` 仅在自己的候选上使用 Win32 DACL setter 保持原描述符，最终仍做完整
   owner/group/DACL 精确比较。每个目标有不可变 intent 和 owned 记录，绑定源/候选文件身份、
   原后摘要、安全描述符及相对目标。配置和七个插件组成可恢复事务，**不是整体原子交换**。
