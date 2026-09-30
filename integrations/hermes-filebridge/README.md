@@ -1,5 +1,10 @@
 # Hermes FileBridge：只读接入、受控新建与入站内容读取
 
+Windows 当前交付入口是 [统一安装与中断恢复](WINDOWS_SETUP.md)：下载固定制品后双击
+`FileBridge-Setup.exe`，由入口选择安全路径。原 Check / Apply / Resume 保留为内部组件，
+不再要求操作者逐段复制 PowerShell。2026-09-30 已确认存在部分升级现场；开发测试没有
+执行现场恢复、启停或安装。
+
 0.4.0 新增 [入站内容读取](INBOUND_CONTENT.md)：一次 `filebrowser_read_inbound`
 调用沿用已授权下载与工作副本句柄，提取 PDF / DOCX / XLSX / PPTX 文本，或把实际图片
 字节交给官方 Hermes 视觉入口。内容能力默认关闭；增量安装入口保留原客户端、模型、

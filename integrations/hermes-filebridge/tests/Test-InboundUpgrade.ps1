@@ -1,6 +1,7 @@
 # Real native PS, YAML planner and offline pip/venv; only synthetic private fixtures.
 [CmdletBinding()]
-param([Parameter(Mandatory=$true)][string]$PythonPath,[string]$AlternatePythonPath='',[string]$WheelArchive='')
+param([Parameter(Mandatory=$true)][string]$PythonPath,[string]$AlternatePythonPath='',[string]$WheelArchive='',
+    [string]$LegacyBundleDirectory='',[string]$LegacyDriver='')
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version 2.0
 if ($env:OS -ne 'Windows_NT' -or $PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5) { throw 'Native Windows PowerShell 5.1 required.' }
@@ -74,6 +75,110 @@ function StopFixturePython {
             Require ($script:runningPython.ExitCode -eq 0) 'owned interpreter and Windows venv launcher exited cleanly'
         } finally { $script:runningPython.Dispose();$script:runningPython=$null }
     }
+}
+function TestLegacyRecovery {
+    Require ($LegacyBundleDirectory -and $LegacyDriver) 'legacy bundle and original driver must be supplied together'
+    Require ((Hash (Join-Path $LegacyBundleDirectory 'inventory.json')) -ceq 'c0210fe182748e45be7f446e3f5b78b86935fe984910106f4d9be54bc605f3d0') 'fixed original 6f inventory'
+    $legacyInventory=[IO.File]::ReadAllText((Join-Path $LegacyBundleDirectory 'inventory.json')) | ConvertFrom-Json
+    Require ($legacyInventory.source_commit -ceq '6f59267ccdfe004ac10777a0be84a0526d6aaab5') 'fixed original 6f source'
+    $fixture=Join-Path $root 'legacy';PrivateDirectory $fixture
+    $profileRoot=Join-Path $fixture 'profile';PrivateDirectory $profileRoot
+    $plugins=Join-Path $profileRoot 'plugins';PrivateDirectory $plugins
+    $plugin=Join-Path $plugins 'cf-filebridge';PrivateDirectory $plugin
+    foreach ($name in $names) { Copy-Item -LiteralPath (Join-Path $upgrade ('plugin.before/'+$name)) -Destination (Join-Path $plugin $name) }
+    # Match the actual protected-at-create shape. The residue is deliberately
+    # unjournaled and unowned; only the fixed compatibility policy may classify it.
+    $hostFile=Join-Path $plugin 'inbound_host.py';$hostBytes=[IO.File]::ReadAllBytes($hostFile)
+    Remove-Item -LiteralPath $hostFile
+    $acl=[Security.AccessControl.FileSecurity]::new();$acl.SetOwner($sid);$acl.SetGroup($sid);$acl.SetAccessRuleProtection($true,$false)
+    foreach ($who in @($sid.Value,'S-1-5-18') | Select-Object -Unique) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($who),[Security.AccessControl.FileSystemRights]::FullControl,[Security.AccessControl.AccessControlType]::Allow))
+    }
+    $stream=[IO.FileStream]::new($hostFile,[IO.FileMode]::CreateNew,[Security.AccessControl.FileSystemRights]::FullControl,[IO.FileShare]::None,4096,[IO.FileOptions]::WriteThrough,$acl)
+    try { $stream.Write($hostBytes,0,$hostBytes.Length);$stream.Flush($true) } finally { $stream.Dispose() }
+    $previous=Join-Path $fixture 'previous';PrivateDirectory $previous
+    Copy-Item -LiteralPath $worker -Destination (Join-Path $previous 'filebridge-inbound.exe')
+    Copy-Item -LiteralPath ([IO.Path]::Combine([IO.Path]::GetDirectoryName($worker),'inventory.json')) -Destination (Join-Path $previous 'inventory.json')
+    $config=Join-Path $profileRoot 'config.yaml'
+    [IO.File]::WriteAllText($config,$configuration.Replace($worker,(Join-Path $previous 'filebridge-inbound.exe')),$utf8)
+    $upgrade=Join-Path $fixture 'plan'
+    $legacyParameters=@{Mode='Prepare';BundleDirectory=$LegacyBundleDirectory;ExpectedInventorySHA256='c0210fe182748e45be7f446e3f5b78b86935fe984910106f4d9be54bc605f3d0';
+        HermesHome=$profileRoot;PythonPath=$PythonPath;UpgradeDirectory=$upgrade}
+    $prepared=(& $LegacyDriver @legacyParameters | Out-String) | ConvertFrom-Json
+    Require ($prepared.prepared -and -not $prepared.applied) 'original 6f code prepared real legacy checkpoint'
+    $legacyCheckpointHash=Hash (Join-Path $upgrade 'upgrade.json');$legacyRuntimeHash=Hash (Join-Path $upgrade 'runtime.inventory.json')
+    $legacyStageWorkerHash=Hash (Join-Path $upgrade 'bundle/filebridge-inbound.exe')
+    Copy-Item -LiteralPath (Join-Path $LegacyBundleDirectory 'plugin/inbound_content.py') -Destination (Join-Path $plugin 'inbound_content.py')
+    $residue=Join-Path $plugin ('.cf-config-'+[Guid]::NewGuid().ToString('N')+'.tmp')
+    [IO.File]::Copy($hostFile,$residue,$false)
+    $targetSddl=(Get-Acl -LiteralPath $hostFile).Sddl
+    $residueAcl=Get-Acl -LiteralPath $residue
+    $residueAcl.SetSecurityDescriptorSddlForm($targetSddl,[Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group -bor [Security.AccessControl.AccessControlSections]::Access)
+    [IO.File]::SetAccessControl($residue,$residueAcl)
+    $residueHash=Hash $residue;$residueSddl=(Get-Acl -LiteralPath $residue).Sddl
+    Require (([int]([Security.AccessControl.RawSecurityDescriptor]::new($residueSddl)).ControlFlags -bxor [int]([Security.AccessControl.RawSecurityDescriptor]::new($targetSddl)).ControlFlags) -eq 1024) 'real legacy residue differs only in AI control flag'
+    $bundle=Join-Path $fixture 'repair';PrivateDirectory $bundle
+    Copy-Item -Path (Join-Path $LegacyBundleDirectory '*') -Destination $bundle -Recurse
+    # These intentionally unusable replacement worker/wheel bytes must never be
+    # selected for a legacy plan. The complete new inventory still verifies.
+    [IO.File]::WriteAllText((Join-Path $bundle 'filebridge-inbound.exe'),'repair worker must not replace active old worker',$utf8)
+    [IO.File]::WriteAllText((Join-Path $bundle 'content-wheels.zip'),'repair wheels must not enter legacy runtime',$utf8)
+    $repairInventory=[IO.File]::ReadAllText((Join-Path $bundle 'inventory.json')) | ConvertFrom-Json
+    $repairInventory.source_commit='d'*40
+    foreach ($name in @('filebridge-inbound.exe','content-wheels.zip')) { $repairInventory.files.PSObject.Properties[$name].Value=Hash (Join-Path $bundle $name) }
+    [IO.File]::WriteAllText((Join-Path $bundle 'inventory.json'),($repairInventory | ConvertTo-Json -Depth 4),$utf8)
+    $pin=Hash (Join-Path $bundle 'inventory.json')
+    $savedInventory=[IO.File]::ReadAllBytes((Join-Path $bundle 'inventory.json'))
+    $newContent=Join-Path $bundle 'plugin/inbound_content.py';$savedContent=[IO.File]::ReadAllBytes($newContent)
+    try {
+        [IO.File]::AppendAllText($newContent,'# a different consumer cannot claim installer-only compatibility',$utf8)
+        $repairInventory.files.'plugin/inbound_content.py'=Hash $newContent
+        [IO.File]::WriteAllText((Join-Path $bundle 'inventory.json'),($repairInventory | ConvertTo-Json -Depth 4),$utf8)
+        $pin=Hash (Join-Path $bundle 'inventory.json')
+        Refused { InvokeUpgrade 'Check' } 'legacy-different-plugin-payload-refused' 'CF_UPGRADE_CHECKPOINT_PAYLOAD_NOT_COMPATIBLE'
+    } finally {
+        [IO.File]::WriteAllBytes($newContent,$savedContent)
+        [IO.File]::WriteAllBytes((Join-Path $bundle 'inventory.json'),$savedInventory)
+        $pin=Hash (Join-Path $bundle 'inventory.json')
+    }
+    try {
+        [IO.File]::AppendAllText($residue,'unknown bytes are never classified by basename alone',$utf8)
+        Refused { InvokeUpgrade 'Check' } 'legacy-residue-different-bytes-refused'
+    } finally { [IO.File]::WriteAllBytes($residue,$hostBytes) }
+    $check=InvokeUpgrade 'Check'
+    Require ($check.transaction_state -ceq 'partial' -and $check.safe_to_resume -and $check.compatibility_policy -ceq '6f59267-installer-only-repair-v1') 'fixed old plan is proven compatible'
+    Require ($check.preserved_legacy_residue_count -eq 1 -and -not $check.legacy_residue_ownership_claimed) 'legacy residue remains explicitly unowned'
+    $setupTokens=$null;$setupErrors=$null
+    $setupAst=[Management.Automation.Language.Parser]::ParseFile([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../windows/Setup-FileBridge.ps1')),[ref]$setupTokens,[ref]$setupErrors)
+    Require ($setupErrors.Count -eq 0) 'unified entry syntax'
+    $flowAst=$setupAst.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-CfSetupFlow'},$true)
+    Require ($null -ne $flowAst) 'actual unified flow exists'
+    . ([scriptblock]::Create($flowAst.Extent.Text))
+    $order=[Collections.Generic.List[string]]::new();$flowValues=@{}
+    # Actual plan check/resume/final check use the same partial fixture. Only
+    # process lifecycle operations are marked stubs: this fixture has no Hermes
+    # service, terminal session or listener to save, stop or restore.
+    $dependencies=@{
+        Check={ $order.Add('check');return (InvokeUpgrade 'Check') }
+        Prepare={ throw 'TEST_FAILED: a proved partial plan must not be prepared again' }
+        Save={ $order.Add('save-stub') };Stop={ $order.Add('stop-stub') }
+        Apply={ $order.Add('resume');$flowValues.applied=InvokeUpgrade 'Resume' -Stopped;return $flowValues.applied }
+        Verify={ $order.Add('verify');$state=InvokeUpgrade 'Check';Require ($state.transaction_state -ceq 'complete' -and $state.safe_to_resume) 'unified final verification requires real complete state' }
+        Restore={ $order.Add('restore-stub') }
+    }
+    $flow=Invoke-CfSetupFlow -Dependencies $dependencies -Approved
+    Require ($flow.ok -and $flow.code -ceq 'CF_SETUP_COMPLETE') 'unified flow completes real legacy transaction'
+    Require (($order -join ',') -ceq 'check,save-stub,stop-stub,resume,verify,restore-stub') 'unified flow orders check lifecycle resume verification restoration'
+    $result=$flowValues.applied
+    $script:cases++;Write-Output 'INBOUND_UPGRADE_CASE=unified-flow-real-legacy-resume-lifecycle-stub:PASS'
+    Require ($result.transaction_state -ceq 'complete' -and $result.active_inventory_sha256 -ceq $legacyParameters.ExpectedInventorySHA256 -and $result.requested_inventory_sha256 -ceq $pin) 'repair resumes original active release'
+    Require ((Hash (Join-Path $upgrade 'upgrade.json')) -ceq $legacyCheckpointHash -and (Hash (Join-Path $upgrade 'runtime.inventory.json')) -ceq $legacyRuntimeHash -and (Hash (Join-Path $upgrade 'bundle/filebridge-inbound.exe')) -ceq $legacyStageWorkerHash) 'legacy immutable plan stage and runtime remain byte exact'
+    Require ((Hash $residue) -ceq $residueHash -and (Get-Acl -LiteralPath $residue).Sddl -ceq $residueSddl) 'legacy residue preserved in place with exact bytes and security'
+    $complete=InvokeUpgrade 'Check';Require ($complete.transaction_state -ceq 'complete' -and $complete.preserved_legacy_residue_count -eq 1) 'completed legacy recovery remains verifiable with preserved residue'
+    $extra=Join-Path $plugin ('.cf-config-'+[Guid]::NewGuid().ToString('N')+'.tmp');[IO.File]::Copy($residue,$extra,$false)
+    Refused { InvokeUpgrade 'Check' } 'second-unowned-legacy-residue-refused'
+    Require (Test-Path -LiteralPath $extra) 'unowned second residue never deleted'
+    $script:cases++;Write-Output 'INBOUND_UPGRADE_CASE=fixed-6f-installer-only-recovery:PASS'
 }
 try {
     PrivateDirectory $root
@@ -261,7 +366,20 @@ plugins:
     Require ((Hash $runtime) -ceq $runtimeHash -and (Hash (Join-Path $upgrade 'runtime.inventory.json')) -ceq $runtimeReceiptHash) 'Prepare reuses verified runtime without reinstall'
     $cases++;Write-Output 'INBOUND_UPGRADE_CASE=offline-prepare-resume:PASS'
     Require ((Get-Acl -LiteralPath $upgradeParent).AreAccessRulesProtected) 'new private parent created with protected ACL'
-    $ready=InvokeUpgrade 'Check';Require ($ready.ready_to_apply -and -not $ready.writes_performed) 'prepared Check validates runtime read-only'
+    $ready=InvokeUpgrade 'Check';Require ($ready.ready_to_apply -and -not $ready.writes_performed -and $ready.transaction_state -ceq 'prepared' -and $ready.safe_to_resume) 'prepared Check validates runtime read-only'
+    $checkpointHash=Hash (Join-Path $upgrade 'upgrade.json')
+    foreach ($relative in @('plugin.before/inbound_host.py','config.after.yaml','bundle/plugin/inbound_content.py')) {
+        $tampered=Join-Path $upgrade $relative;$saved=[IO.File]::ReadAllBytes($tampered)
+        try {
+            [IO.File]::AppendAllText($tampered,'synthetic-owned-fixture-tamper',$utf8)
+            Refused { InvokeUpgrade 'Check' } ('checkpoint-integrity-'+$relative.Replace('/','-'))
+        } finally { [IO.File]::WriteAllBytes($tampered,$saved) }
+    }
+    $journal=Join-Path $upgrade 'candidate-journal';PrivateDirectory $journal
+    $unknownJournal=Join-Path $journal 'unknown.json';[IO.File]::WriteAllText($unknownJournal,'preserve unknown journal',$utf8)
+    Refused { InvokeUpgrade 'Check' } 'unknown-journal-preserved'
+    Require ([IO.File]::ReadAllText($unknownJournal) -ceq 'preserve unknown journal') 'unknown journal never deleted'
+    Remove-Item -LiteralPath $unknownJournal
     $runtimeUnknown=Join-Path $upgrade 'parser-runtime/unknown.py';[IO.File]::WriteAllText($runtimeUnknown,'preserve runtime change',$utf8)
     Refused { InvokeUpgrade 'Prepare' } 'modified-runtime-preserved' 'CF_UPGRADE_PYTHON_STEP_FAILED:runtime_inventory:runtime_modified_or_unknown'
     Require ([IO.File]::ReadAllText($runtimeUnknown) -ceq 'preserve runtime change') 'unknown runtime file untouched'
@@ -287,6 +405,38 @@ plugins:
             StopFixturePython
         }
     }
+    $applyOrder=@('inbound_content.py','inbound.py','inbound_control.py','inbound_directory.py','inbound_host.py','__init__.py','plugin.yaml','config.yaml')
+    # A real NTFS sharing violation interrupts each existing-file rename. The
+    # read handle permits all preflight verification but denies write/delete.
+    # Release only our own handle, then prove the journaled partial transaction
+    # is safe to resume. No production file or process participates.
+    foreach ($blockedName in $applyOrder | Select-Object -Skip 1) {
+        $blocked=if ($blockedName -ceq 'config.yaml') { $config } else { Join-Path $plugin $blockedName }
+        $relative=if ($blockedName -ceq 'config.yaml') { $blockedName } else { 'plugin/'+$blockedName }
+        $lock=[IO.File]::Open($blocked,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        $failed=$false
+        try {
+            try { InvokeUpgrade 'Resume' -Stopped | Out-Null } catch {
+                $failed=$true
+                Require ($_.Exception.Data['cf_target'] -ceq $relative) 'failure identifies only fixed relative target'
+                Require ($_.Exception.Data['cf_stage'] -ceq 'rename') 'real rename interruption reached expected stage'
+                Require (-not $_.Exception.Data['cf_rename_completed'] -and $_.Exception.Data['cf_staging_exists']) 'owned candidate retained before rename'
+                Require (-not $_.ToString().Contains('synthetic-config-private-sentinel') -and -not $_.Exception.Message.Contains($root)) 'safe failure contains no private data or absolute path'
+            }
+        } finally { $lock.Dispose() }
+        Require $failed 'sharing lock must cause real interruption'
+        $beforeBlocked=$true
+        foreach ($name in $applyOrder | Where-Object { $_ -cne 'config.yaml' }) {
+            if ($name -ceq $blockedName) { $beforeBlocked=$false }
+            $expected=if ($beforeBlocked) { $newHashes['plugin/'+$name] } else { $oldHashes['plugin/'+$name] }
+            Require ((Hash (Join-Path $plugin $name)) -ceq $expected) 'only proven completed prefix changed'
+        }
+        Require ((Hash $config) -ceq $configHash) 'configuration remains old through all interrupted plugin writes'
+        $partialCheck=InvokeUpgrade 'Check'
+        Require ($partialCheck.transaction_state -ceq 'partial' -and $partialCheck.safe_to_resume -and -not $partialCheck.writes_performed) 'partial Check validates journal and recovery without writes'
+        Require ((Hash (Join-Path $upgrade 'upgrade.json')) -ceq $checkpointHash -and (Hash (Join-Path $upgrade 'runtime.inventory.json')) -ceq $runtimeReceiptHash) 'immutable checkpoint and runtime receipt retained'
+        $cases++;Write-Output ('INBOUND_UPGRADE_CASE=interrupted-rename-'+$blockedName+':PASS')
+    }
     $applied=InvokeUpgrade 'Apply' -Stopped
     Require ($applied.applied -and $applied.existing_worker_preserved -and -not $applied.bundle_worker_matches_existing -and -not $applied.live_restarted) 'explicit narrow apply'
     Require ($applied.planner_python_version -ceq $actualPlannerVersion) 'Apply reports actual planner version'
@@ -296,13 +446,16 @@ plugins:
         Require ((Hash (Join-Path $plugin $name)) -ceq $newHashes['plugin/'+$name]) 'new plugin file verified'
         Require ((Hash (Join-Path (Join-Path $upgrade 'plugin.before') $name)) -ceq $oldHashes['plugin/'+$name]) 'old plugin backup retained'
     }
-    $resume=InvokeUpgrade 'Resume' -Stopped;Require $resume.applied 'completed resume idempotent'
+    $resume=InvokeUpgrade 'Resume' -Stopped;Require ($resume.applied -and $resume.transaction_state -ceq 'complete' -and $resume.safe_to_resume) 'completed resume idempotent'
+    $completeCheck=InvokeUpgrade 'Check';Require ($completeCheck.transaction_state -ceq 'complete' -and $completeCheck.safe_to_resume) 'complete is distinguished from prepared and partial'
     $cacheHandle.Dispose();$cacheHandle=$null
     Require ([IO.File]::ReadAllText($cacheFile) -ceq 'opaque original cache') 'existing pycache preserved without read or cleanup'
     [IO.File]::WriteAllBytes((Join-Path $plugin 'inbound.py'),[IO.File]::ReadAllBytes((Join-Path $upgrade 'plugin.before/inbound.py')))
-    $partial=InvokeUpgrade 'Resume' -Stopped
-    Require ($partial.applied -and (Hash (Join-Path $plugin 'inbound.py')) -ceq $newHashes['plugin/inbound.py']) 'partial known old/new plugin switch resumes'
+    Refused { InvokeUpgrade 'Resume' -Stopped } 'completed-owned-target-modification-preserved'
+    Require ((Hash (Join-Path $plugin 'inbound.py')) -ceq $oldHashes['plugin/inbound.py']) 'changed completed target is not silently overwritten'
+    [IO.File]::WriteAllBytes((Join-Path $plugin 'inbound.py'),[IO.File]::ReadAllBytes((Join-Path $newPlugin 'inbound.py')))
     $cases++;Write-Output 'INBOUND_UPGRADE_CASE=explicit-apply-idempotent-resume:PASS'
+    if ($LegacyBundleDirectory -or $LegacyDriver) { TestLegacyRecovery }
     [IO.File]::AppendAllText($config,"`n# operator change must survive`n",$utf8)
     $modifiedHash=Hash $config
     Refused { InvokeUpgrade 'Resume' -Stopped } 'modified-config-preserved'

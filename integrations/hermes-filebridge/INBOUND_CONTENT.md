@@ -64,7 +64,9 @@
 ## 增量安装与恢复
 
 操作者使用成功 CI 的 Windows 制品及对应源码包运行
-`windows/Upgrade-InboundClient.ps1`。本轮开发测试没有执行真实安装、停止或重启服务。
+`windows/Upgrade-InboundClient.ps1`。该组件现在由 [统一 Windows 入口](WINDOWS_SETUP.md)
+编排，操作者无需选择内部阶段。下文保留组件设计及先前交付记录；2026-09-30 的部分升级
+现场与恢复边界以统一入口记录为准。本轮开发测试没有执行真实安装、停止或重启服务。
 脚本默认 `Check`，写模式为 `Prepare` / `Apply` / `Resume`。它读取实际 Profile 的已有配置，
 核对旧 worker 摘要及其受保护的 inventory，逐个核对旧插件内容；冲突保留并拒绝。
 不会要求重新抄模型、CA、Token 或工作根，也不读取凭据值来构造新授权。

@@ -32,6 +32,12 @@ $pluginNames=@($oldPluginNames)+@('inbound_content.py')
 $utf8=[Text.UTF8Encoding]::new($false)
 $runtimePython='';$runtimeHash=''
 $upgrade=$null
+$transactionState='unprepared';$safeToResume=$false;$compatibilityPolicy='none'
+$upgradePhase='preflight';$upgradeTarget='none';$legacyResidueCount=0
+$requestedInventorySHA256=$ExpectedInventorySHA256.ToLowerInvariant()
+$activeInventorySHA256=$requestedInventorySHA256
+$legacyRepairInventory='c0210fe182748e45be7f446e3f5b78b86935fe984910106f4d9be54bc605f3d0'
+$legacyRepairSource='6f59267ccdfe004ac10777a0be84a0526d6aaab5'
 
 function LocalPath([string]$Path) {
     if ($Path -notmatch '^[A-Za-z]:[\\/]' -or $Path.Substring(2).Contains(':') -or
@@ -63,7 +69,7 @@ function Private([string]$Path) {
 }
 function Security([bool]$Directory) {
     $acl=if ($Directory) { [Security.AccessControl.DirectorySecurity]::new() } else { [Security.AccessControl.FileSecurity]::new() }
-    $acl.SetOwner([Security.Principal.SecurityIdentifier]::new($sid));$acl.SetAccessRuleProtection($true,$false)
+    $acl.SetOwner([Security.Principal.SecurityIdentifier]::new($sid));$acl.SetGroup([Security.Principal.SecurityIdentifier]::new($sid));$acl.SetAccessRuleProtection($true,$false)
     $inherit=if ($Directory) { [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit } else { [Security.AccessControl.InheritanceFlags]::None }
     foreach ($who in @($sid,'S-1-5-18') | Select-Object -Unique) {
         $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($who),
@@ -277,7 +283,7 @@ function ReplaceKnown([string]$Path,[byte[]]$Bytes,[string]$Before,[string]$Afte
     $beforeLength=$beforeInfo.Length;$beforeTime=$beforeInfo.LastWriteTimeUtc
     $sddl=Get-CfConfigSddl $Path
     ReleaseFile $Path
-    $result=Set-CfConfigBytesExact -Destination $Path -Bytes $Bytes -BeforeSha256 $Before -AfterSha256 $After -OriginalSddl $sddl
+    $result=Set-CfConfigBytesExact -Destination $Path -Bytes $Bytes -BeforeSha256 $Before -AfterSha256 $After -OriginalSddl $sddl -TransactionDirectory (Join-Path $upgrade 'candidate-journal') -TargetName $upgradeTarget
     if ($Path.EndsWith('.py',[StringComparison]::OrdinalIgnoreCase) -and $beforeLength -eq $Bytes.Length) {
         $afterTime=(Get-Item -LiteralPath $Path).LastWriteTimeUtc
         $epoch=[DateTime]::SpecifyKind([DateTime]'1970-01-01',[DateTimeKind]::Utc)
@@ -290,10 +296,85 @@ function ReplaceKnown([string]$Path,[byte[]]$Bytes,[string]$Before,[string]$Afte
     $verified=ReadLocked $Path $After $true
 }
 
+function CreateKnown([string]$Path,[byte[]]$Bytes,[string]$After) {
+    if (Test-Path -LiteralPath $Path) { $verified=ReadLocked $Path $After $true;return }
+    $sddl=(Security $false).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
+    $result=Set-CfConfigBytesExact -Destination $Path -Bytes $Bytes -BeforeSha256 '' -AfterSha256 $After -OriginalSddl $sddl -AllowCreate -TransactionDirectory (Join-Path $upgrade 'candidate-journal') -TargetName $upgradeTarget
+    $verified=ReadLocked $Path $After $true
+}
+
+function AssertJournals {
+    $allowed=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $journal=Join-Path $upgrade 'candidate-journal'
+    if (-not (Test-Path -LiteralPath $journal)) { return ,$allowed }
+    if (-not $checkpoint) { throw 'CF_UPGRADE_JOURNAL_WITHOUT_CHECKPOINT' }
+    Hold $journal;Private $journal
+    $known=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($relative in @($pluginNames | ForEach-Object { 'plugin/'+$_ })+@('config.yaml')) {
+        $isConfig=$relative -ceq 'config.yaml';$isCreate=$relative -ceq 'plugin/inbound_content.py'
+        $name=[IO.Path]::GetFileName($relative)
+        $destination=if ($isConfig) { $config } else { Join-Path $plugin $name }
+        $before=if ($isConfig) { $checkpoint.config_before_sha256 } elseif ($isCreate) { '' } else { $originalHashes[$name] }
+        $after=if ($isConfig) { $checkpoint.config_after_sha256 } else { $newInventory.files.PSObject.Properties[$relative].Value }
+        $sddl=if ($isCreate) { (Security $false).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All) } else { Get-CfConfigSddl $destination }
+        $state=Assert-CfConfigTransactionJournal -TransactionDirectory $journal -TargetName $relative -Destination $destination -BeforeSha256 $before -AfterSha256 $after -OriginalSddl $sddl -AllowCreate:$isCreate
+        foreach ($entry in @($state.journal_names)) { $known.Add($entry) | Out-Null }
+        if ($state.candidate_exists -and $state.owned_candidate) {
+            $allowed.Add((Join-Path ([IO.Path]::GetDirectoryName($destination)) $state.candidate_name)) | Out-Null
+        }
+    }
+    foreach ($node in @(Get-ChildItem -LiteralPath $journal -Force)) {
+        if ($node.PSIsContainer -or -not $known.Contains($node.Name)) { throw 'CF_UPGRADE_UNKNOWN_JOURNAL_ENTRY_PRESERVED' }
+    }
+    return ,$allowed
+}
+
+function ReadCheckpoint([string]$Path) {
+    $text=$utf8.GetString((ReadLocked $Path '' $true))
+    $keys=@('schema','inventory_sha256','previous_inventory_sha256','profile_sha256',
+        'upgrade_directory_sha256','runtime_inventory_sha256','config_before_sha256','config_after_sha256')
+    $matches=[regex]::Matches($text,'"([^"\\]*)"\s*:')
+    if ($matches.Count -ne $keys.Count) { throw 'CF_UPGRADE_CHECKPOINT_SHAPE_INVALID' }
+    $names=@($matches | ForEach-Object { $_.Groups[1].Value })
+    if (@($names | Select-Object -Unique).Count -ne $keys.Count) { throw 'CF_UPGRADE_CHECKPOINT_SHAPE_INVALID' }
+    foreach ($name in $names) { if ($keys -cnotcontains $name) { throw 'CF_UPGRADE_CHECKPOINT_SHAPE_INVALID' } }
+    $value=$text | ConvertFrom-Json
+    if ($value.schema -cne 'cf-inbound-upgrade/v1') { throw 'CF_UPGRADE_CHECKPOINT_CONFLICT' }
+    foreach ($name in $keys | Where-Object { $_ -cne 'schema' }) {
+        if ($value.$name -isnot [string] -or $value.$name -cnotmatch '^[0-9a-f]{64}$') { throw 'CF_UPGRADE_CHECKPOINT_SHAPE_INVALID' }
+    }
+    return $value
+}
+
+function AssertStage([string]$Path,[string]$Pin) {
+    $verified=& $stageDriver -Mode Inspect -SourceDirectory $Path -ExpectedInventorySHA256 $Pin | ConvertFrom-Json
+    if (-not $verified.verified -or $verified.payload_count -ne 10) { throw 'CF_UPGRADE_CONSUMER_BUNDLE_REQUIRED' }
+    $inventory=$utf8.GetString((ReadLocked (Join-Path $Path 'inventory.json') $Pin $true)) | ConvertFrom-Json
+    foreach ($entry in $inventory.files.PSObject.Properties) {
+        $bytes=ReadLocked (Join-Path $Path $entry.Name) $entry.Value $true
+    }
+    return $inventory
+}
+
+function GetTransactionState($Current,[string]$ConfigHash,[string]$Before,[string]$After) {
+    $allNew=$ConfigHash -ceq $After;$allOld=$ConfigHash -ceq $Before
+    foreach ($name in $pluginNames) {
+        if ($Current[$name] -cne $newInventory.files.PSObject.Properties['plugin/'+$name].Value) { $allNew=$false }
+        if ($name -ceq 'inbound_content.py') {
+            if ($Current[$name]) { $allOld=$false }
+        } elseif ($Current[$name] -cne $originalHashes[$name]) { $allOld=$false }
+    }
+    if ($allNew) { return 'complete' }
+    if ($allOld) { return 'prepared' }
+    return 'partial'
+}
+
 try {
     $bundle=LocalPath $BundleDirectory;$profileRoot=LocalPath $HermesHome;$python=LocalPath $PythonPath
+    $upgradePhase='bundle_check'
     $inspection=& $stageDriver -Mode Inspect -SourceDirectory $bundle -ExpectedInventorySHA256 $ExpectedInventorySHA256 | ConvertFrom-Json
     if (-not $inspection.verified -or $inspection.payload_count -ne 10) { throw 'CF_UPGRADE_CONSUMER_BUNDLE_REQUIRED' }
+    $upgradePhase='profile_check'
     Hold $profileRoot;Private $profileRoot
     if (-not $Profile -and (Test-Path -LiteralPath (Join-Path $profileRoot 'active_profile'))) {
         $selection=ReadLocked (Join-Path $profileRoot 'active_profile') '' $true
@@ -311,19 +392,13 @@ try {
     $pythonBytes=ReadLocked $python
     $configBytes=ReadLocked $config '' $true
     if ($configBytes.Length -gt 2097152) { throw 'CF_UPGRADE_CONFIG_TOO_LARGE' }
-    foreach ($node in @(Get-ChildItem -LiteralPath $plugin -Force)) {
-        if ($node.Name -ceq '__pycache__' -and $node.PSIsContainer) {
-            if ($node.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'CF_UPGRADE_REPARSE_CACHE_REFUSED' }
-            continue # Preserve opaque bytecode directory; do not inspect it.
-        }
-        if ($node.PSIsContainer -or $pluginNames -cnotcontains $node.Name) { throw 'CF_UPGRADE_UNKNOWN_PLUGIN_ENTRY_PRESERVED' }
-    }
     $newInventory=($utf8.GetString((ReadLocked (Join-Path $bundle 'inventory.json') $ExpectedInventorySHA256))) | ConvertFrom-Json
     foreach ($entry in $newInventory.files.PSObject.Properties) {
         $verified=ReadLocked (Join-Path $bundle $entry.Name) $entry.Value
     }
     $plannerInfo=RunPython $python @('-I','-S','-X','utf8','-B','-c',"import json,sys,struct,sysconfig;print(json.dumps(dict(version=list(sys.version_info[:3]),bits=8*struct.calcsize('P'),platform=sysconfig.get_platform(),implementation=sys.implementation.name)))")
     $plannerVersion=Get-CfUpgradePlannerVersion $plannerInfo
+    $upgradePhase='plan_check'
     $plan=RunPlanner
     $worker=LocalPath $plan.worker_path
     $workerBytes=ReadLocked $worker $plan.worker_sha256 $true
@@ -347,47 +422,116 @@ try {
         if (Test-Path -LiteralPath $upgrade) {
             Hold $upgrade;Private $upgrade
             foreach ($node in @(Get-ChildItem -LiteralPath $upgrade -Force)) {
-                if (@('bundle','plugin.before','config.before.yaml','config.after.yaml','upgrade.json','wheels','parser-runtime','runtime.inventory.json') -cnotcontains $node.Name) {
+                if (@('bundle','plugin.before','config.before.yaml','config.after.yaml','upgrade.json','wheels','parser-runtime','runtime.inventory.json','candidate-journal') -cnotcontains $node.Name) {
                     throw 'CF_UPGRADE_UNKNOWN_CHECKPOINT_ENTRY_PRESERVED'
                 }
             }
             $checkpointPath=Join-Path $upgrade 'upgrade.json'
             if (Test-Path -LiteralPath $checkpointPath) {
-                $checkpoint=($utf8.GetString((ReadLocked $checkpointPath '' $true))) | ConvertFrom-Json
-                if ($checkpoint.schema -cne 'cf-inbound-upgrade/v1' -or $checkpoint.inventory_sha256 -cne $ExpectedInventorySHA256.ToLowerInvariant() -or
-                    $checkpoint.previous_inventory_sha256 -cne $previousHash -or $checkpoint.profile_sha256 -cne (HashBytes $utf8.GetBytes($profileRoot.ToLowerInvariant())) -or
+                $checkpoint=ReadCheckpoint $checkpointPath
+                if ($checkpoint.previous_inventory_sha256 -cne $previousHash -or $checkpoint.profile_sha256 -cne (HashBytes $utf8.GetBytes($profileRoot.ToLowerInvariant())) -or
                     $checkpoint.upgrade_directory_sha256 -cne (HashBytes $utf8.GetBytes($upgrade.ToLowerInvariant()))) {
                     throw 'CF_UPGRADE_CHECKPOINT_CONFLICT'
+                }
+                $savedStage=Join-Path $upgrade 'bundle'
+                $savedInventory=AssertStage $savedStage $checkpoint.inventory_sha256
+                if ($checkpoint.inventory_sha256 -cne $requestedInventorySHA256) {
+                    if ($checkpoint.inventory_sha256 -cne $legacyRepairInventory -or $savedInventory.source_commit -cne $legacyRepairSource) {
+                        throw 'CF_UPGRADE_CHECKPOINT_RELEASE_NOT_COMPATIBLE'
+                    }
+                    # Explicit installer-only repair policy. The old worker,
+                    # wheel ZIP, runtime and immutable plan remain authoritative.
+                    # Seven plugin files and the exact requirements must agree.
+                    foreach ($relative in @($pluginNames | ForEach-Object { 'plugin/'+$_ })+@('requirements-inbound-content.txt')) {
+                        if ($savedInventory.files.PSObject.Properties[$relative].Value -cne $newInventory.files.PSObject.Properties[$relative].Value) {
+                            throw 'CF_UPGRADE_CHECKPOINT_PAYLOAD_NOT_COMPATIBLE'
+                        }
+                    }
+                    $compatibilityPolicy='6f59267-installer-only-repair-v1'
+                    $activeInventorySHA256=$checkpoint.inventory_sha256
+                    $bundle=$savedStage;$newInventory=$savedInventory
                 }
             }
         }
     }
-    $originalHashes=@{}
+    $originalHashes=@{};$currentHashes=@{}
     foreach ($name in $oldPluginNames) {
         $expected=$old.files.PSObject.Properties['plugin/'+$name]
         if ($null -eq $expected -or $expected.Value -notmatch '^[0-9a-fA-F]{64}$') { throw 'CF_UPGRADE_PREVIOUS_PLUGIN_DIGEST_MISSING' }
         $originalHashes[$name]=$expected.Value.ToLowerInvariant()
         $currentHash=HashBytes (ReadLocked (Join-Path $plugin $name) '' $true)
+        $currentHashes[$name]=$currentHash
         if ($currentHash -cne $originalHashes[$name] -and
             ($null -eq $checkpoint -or $currentHash -cne $newInventory.files.PSObject.Properties['plugin/'+$name].Value)) {
             throw 'CF_UPGRADE_LOCAL_PLUGIN_MODIFICATION_PRESERVED'
         }
     }
     $contentPath=Join-Path $plugin 'inbound_content.py'
+    $currentHashes['inbound_content.py']=''
     if (Test-Path -LiteralPath $contentPath) {
         if ($null -eq $checkpoint) { throw 'CF_UPGRADE_UNKNOWN_CONSUMER_FILE_PRESERVED' }
         $verified=ReadLocked $contentPath $newInventory.files.'plugin/inbound_content.py' $true
+        $currentHashes['inbound_content.py']=HashBytes $verified
+    }
+    $allowedCandidates=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    if ($upgrade -and (Test-Path -LiteralPath $upgrade)) { $allowedCandidates=AssertJournals }
+    foreach ($node in @(Get-ChildItem -LiteralPath $plugin -Force)) {
+        if ($node.Name -ceq '__pycache__' -and $node.PSIsContainer) {
+            if ($node.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'CF_UPGRADE_REPARSE_CACHE_REFUSED' }
+            continue # Preserve opaque bytecode directory; do not inspect it.
+        }
+        if (-not $node.PSIsContainer -and $allowedCandidates.Contains($node.FullName)) { continue }
+        if (-not $node.PSIsContainer -and $compatibilityPolicy -ceq '6f59267-installer-only-repair-v1' -and
+            $node.Name -cmatch '^\.cf-config-[0-9a-f]{32}\.tmp$') {
+            if ($legacyResidueCount -ne 0) {
+                throw 'CF_UPGRADE_LEGACY_RESIDUE_CONFLICT'
+            }
+            $residueBytes=ReadLocked $node.FullName $originalHashes['inbound_host.py'] $true
+            $legacyState=Assert-CfConfigLegacyResidue -Path $node.FullName -Target (Join-Path $plugin 'inbound_host.py')
+            if (-not $legacyState.compatible -or $legacyState.owned) {
+                throw 'CF_UPGRADE_LEGACY_RESIDUE_CONFLICT'
+            }
+            # A narrowly classified legacy object remains unowned. It is never
+            # removed, reused as a candidate, or read as an installation payload.
+            $legacyResidueCount++;continue
+        }
+        if ($node.PSIsContainer -or $pluginNames -cnotcontains $node.Name) { throw 'CF_UPGRADE_UNKNOWN_PLUGIN_ENTRY_PRESERVED' }
+    }
+    foreach ($node in @(Get-ChildItem -LiteralPath $profileRoot -Force -Filter '.cf-config-*.tmp')) {
+        if ($node.PSIsContainer -or -not $allowedCandidates.Contains($node.FullName)) { throw 'CF_UPGRADE_UNKNOWN_CONFIG_CANDIDATE_PRESERVED' }
     }
     if ($checkpoint -and $plan.config_before_sha256 -cne $checkpoint.config_before_sha256 -and
         $plan.config_before_sha256 -cne $checkpoint.config_after_sha256) { throw 'CF_UPGRADE_LOCAL_CONFIG_MODIFICATION_PRESERVED' }
+    if ($checkpoint) {
+        $upgradePhase='checkpoint_check'
+        $backup=Join-Path $upgrade 'plugin.before';Hold $backup;Private $backup
+        foreach ($node in @(Get-ChildItem -LiteralPath $backup -Force)) {
+            if ($node.PSIsContainer -or $oldPluginNames -cnotcontains $node.Name) { throw 'CF_UPGRADE_UNKNOWN_BACKUP_ENTRY_PRESERVED' }
+        }
+        foreach ($name in $oldPluginNames) { $verified=ReadLocked (Join-Path $backup $name) $originalHashes[$name] $true }
+        $verified=ReadLocked (Join-Path $upgrade 'config.before.yaml') $checkpoint.config_before_sha256 $true
+        $candidateBytes=ReadLocked (Join-Path $upgrade 'config.after.yaml') $checkpoint.config_after_sha256 $true
+        if (-not (Test-Path -LiteralPath (Join-Path $upgrade 'parser-runtime')) -or
+            -not (Test-Path -LiteralPath (Join-Path $upgrade 'runtime.inventory.json'))) { throw 'CF_UPGRADE_RUNTIME_CHECKPOINT_INCOMPLETE' }
+        $upgradePhase='runtime_check';$status=PrepareRuntime
+        $plan.dependency_ready=$status.dependency_ready;$plan.dependency_blockers=$status.dependency_blockers
+        $upgradePhase='checkpoint_check'
+        $candidatePlan=RunPlanner
+        if ($candidatePlan.config_after_sha256 -cne $checkpoint.config_after_sha256) { throw 'CF_UPGRADE_CANDIDATE_SEMANTIC_CONFLICT' }
+        $transactionState=GetTransactionState $currentHashes $plan.config_before_sha256 $checkpoint.config_before_sha256 $checkpoint.config_after_sha256
+        $safeToResume=$true
+    }
     if ($Mode -eq 'Check') {
-        if ($upgrade -and (Test-Path -LiteralPath (Join-Path $upgrade 'runtime.inventory.json'))) {
+        if (-not $checkpoint -and $upgrade -and (Test-Path -LiteralPath (Join-Path $upgrade 'runtime.inventory.json'))) {
             if (-not (Test-Path -LiteralPath (Join-Path $upgrade 'parser-runtime'))) { throw 'CF_UPGRADE_RUNTIME_CHECKPOINT_INCOMPLETE' }
             $status=PrepareRuntime
             $plan.dependency_ready=$status.dependency_ready;$plan.dependency_blockers=$status.dependency_blockers
         }
         @{ok=$true;mode=$Mode;planner_python_version=$plannerVersion;writes_performed=$false;configuration_preserved=$true;previous_plugin_verified=$true;
-          dependency_ready=$plan.dependency_ready;ready_to_apply=$plan.dependency_ready;dependency_blockers=$plan.dependency_blockers;
+          dependency_ready=$plan.dependency_ready;ready_to_apply=($checkpoint -and $safeToResume);dependency_blockers=$plan.dependency_blockers;
+          transaction_state=$transactionState;safe_to_resume=$safeToResume;compatibility_policy=$compatibilityPolicy;
+          requested_inventory_sha256=$requestedInventorySHA256;active_inventory_sha256=$activeInventorySHA256;
+          preserved_legacy_residue_count=$legacyResidueCount;legacy_residue_ownership_claimed=$false;
           existing_worker_preserved=$true;bundle_worker_matches_existing=($newInventory.files.'filebridge-inbound.exe' -ceq $plan.worker_sha256);
           live_restarted=$false;network_requests=$false} | ConvertTo-Json -Depth 5 -Compress
         return
@@ -395,9 +539,14 @@ try {
     NewDirectory ([IO.Path]::GetDirectoryName($upgrade))
     NewDirectory $upgrade
     $stage=Join-Path $upgrade 'bundle'
-    $stageResult=& $stageDriver -Mode Resume -SourceDirectory $bundle -StageDirectory $stage -ExpectedInventorySHA256 $ExpectedInventorySHA256 | ConvertFrom-Json
-    $status=PrepareRuntime
+    $upgradePhase='stage_prepare'
+    if (-not $checkpoint) {
+        $stageResult=& $stageDriver -Mode Resume -SourceDirectory $bundle -StageDirectory $stage -ExpectedInventorySHA256 $activeInventorySHA256 | ConvertFrom-Json
+    }
+    $upgradePhase='runtime_prepare'
+    if (-not $checkpoint) { $status=PrepareRuntime }
     $plan.dependency_ready=$status.dependency_ready;$plan.dependency_blockers=$status.dependency_blockers
+    $upgradePhase='backup_prepare'
     $backup=Join-Path $upgrade 'plugin.before';NewDirectory $backup
     foreach ($node in @(Get-ChildItem -LiteralPath $backup -Force)) {
         if ($node.PSIsContainer -or $oldPluginNames -cnotcontains $node.Name) { throw 'CF_UPGRADE_UNKNOWN_BACKUP_ENTRY_PRESERVED' }
@@ -421,29 +570,62 @@ try {
         if (Test-Path -LiteralPath $destination) { $verified=ReadLocked $destination $originalHashes[$name] $true }
         else { NewFile $destination (ReadLocked (Join-Path $plugin $name) $originalHashes[$name] $true) }
     }
-    $record=[ordered]@{schema='cf-inbound-upgrade/v1';inventory_sha256=$ExpectedInventorySHA256.ToLowerInvariant();
+    $record=[ordered]@{schema='cf-inbound-upgrade/v1';inventory_sha256=$activeInventorySHA256;
         previous_inventory_sha256=$previousHash;profile_sha256=(HashBytes $utf8.GetBytes($profileRoot.ToLowerInvariant()));
         upgrade_directory_sha256=(HashBytes $utf8.GetBytes($upgrade.ToLowerInvariant()));
         runtime_inventory_sha256=(HashBytes (ReadLocked (Join-Path $upgrade 'runtime.inventory.json') '' $true));
         config_before_sha256=$beforeConfig;config_after_sha256=$afterConfig}
-    NewFile (Join-Path $upgrade 'upgrade.json') $utf8.GetBytes(($record | ConvertTo-Json -Compress))
+    if (-not $checkpoint) { NewFile (Join-Path $upgrade 'upgrade.json') $utf8.GetBytes(($record | ConvertTo-Json -Compress)) }
+    if (-not $checkpoint) { $transactionState='prepared';$safeToResume=$true }
     if ($Mode -in @('Apply','Resume')) {
         if (-not $plan.dependency_ready) { throw 'CF_UPGRADE_DEPENDENCIES_MISSING_NO_AUTO_INSTALL' }
         AssertStopped
+        NewDirectory (Join-Path $upgrade 'candidate-journal')
+        if ($transactionState -cne 'complete') { $transactionState='partial' }
         # The operator stopped Hermes. Resume accepts only pinned old/new bytes;
         # no file is deleted and the old client/worker/config references stay.
         foreach ($name in @('inbound_content.py','inbound.py','inbound_control.py','inbound_directory.py','inbound_host.py','__init__.py','plugin.yaml')) {
+            $upgradePhase='apply_plugin';$upgradeTarget='plugin/'+$name
             $bytes=ReadLocked (Join-Path $stage ('plugin/'+$name)) $newInventory.files.PSObject.Properties['plugin/'+$name].Value $true
             $path=Join-Path $plugin $name
-            if ($name -eq 'inbound_content.py') { NewFile $path $bytes }
+            if ($name -eq 'inbound_content.py') { CreateKnown $path $bytes $newInventory.files.PSObject.Properties['plugin/'+$name].Value }
             else { ReplaceKnown $path $bytes $originalHashes[$name] $newInventory.files.PSObject.Properties['plugin/'+$name].Value }
         }
+        $upgradePhase='apply_config';$upgradeTarget='config.yaml'
         ReplaceKnown $config $candidateBytes $beforeConfig $afterConfig
+        $transactionState='complete'
     }
+    $upgradePhase='complete';$upgradeTarget='none'
     @{ok=$true;mode=$Mode;planner_python_version=$plannerVersion;prepared=$true;applied=($Mode -in @('Apply','Resume'));existing_worker_preserved=$true;
       dependency_ready=$plan.dependency_ready;dependency_blockers=$plan.dependency_blockers;
+      transaction_state=$transactionState;safe_to_resume=$safeToResume;compatibility_policy=$compatibilityPolicy;
+      requested_inventory_sha256=$requestedInventorySHA256;active_inventory_sha256=$activeInventorySHA256;
+      preserved_legacy_residue_count=$legacyResidueCount;legacy_residue_ownership_claimed=$false;
       bundle_worker_matches_existing=($newInventory.files.'filebridge-inbound.exe' -ceq $plan.worker_sha256);
       rollback_performed=$false;live_restarted=$false;network_requests=$false} | ConvertTo-Json -Depth 5 -Compress
+} catch {
+    # Never return native exception text, paths, SDDL or private planner output.
+    # The unified entry point can read these fixed diagnostic metadata fields.
+    $errorCode='CF_UPGRADE_OPERATION_FAILED'
+    $cause=$_.Exception;$configData=@{}
+    while ($cause) {
+        if ($cause.Data.Contains('cf_stage') -and @('input_validate','source_validate','candidate_create','candidate_security','candidate_write',
+            'candidate_verify','target_recheck','rename','final_verify','journal_validate','journal_create','journal_recover') -ccontains [string]$cause.Data['cf_stage']) {
+            $configData['cf_stage']=[string]$cause.Data['cf_stage']
+            foreach ($key in @('cf_rename_completed','cf_staging_exists')) {
+                if ($cause.Data.Contains($key) -and $cause.Data[$key] -is [bool]) { $configData[$key]=$cause.Data[$key] }
+            }
+        }
+        if ($cause.Message -cmatch '^CF_(?:UPGRADE|CONFIG)_[A-Z0-9_]+(?::[a-z_]+:[a-z_]+)?$' -and $cause.Message.Length -le 180) {
+            if ($errorCode -ceq 'CF_UPGRADE_OPERATION_FAILED') { $errorCode=$cause.Message }
+        }
+        $cause=$cause.InnerException
+    }
+    $safe=[InvalidOperationException]::new($errorCode)
+    $safe.Data['cf_upgrade_stage']=$upgradePhase;$safe.Data['cf_target']=$upgradeTarget
+    $safe.Data['cf_transaction_state']=$transactionState
+    foreach ($key in $configData.Keys) { $safe.Data[$key]=$configData[$key] }
+    throw $safe
 } finally {
     foreach ($stream in $streams.Values) { $stream.Dispose() }
     foreach ($handle in $directories.Values) { $handle.Dispose() }

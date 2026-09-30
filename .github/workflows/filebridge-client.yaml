@@ -23,6 +23,11 @@ concurrency:
 jobs:
   client:
     name: Client regression (${{ matrix.os }})
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -191,6 +196,48 @@ jobs:
           & $planner -I -S -c 'import sys; assert sys.version_info[:3] == (3,11,16)'
           if ($LASTEXITCODE -ne 0) { throw 'Unexpected isolated planner version' }
           & integrations/hermes-filebridge/tests/Test-InboundUpgrade.ps1 -PythonPath $planner -WheelArchive (Join-Path $env:RUNNER_TEMP 'filebridge-evidence/inbound-bundle/content-wheels.zip')
+      - name: Fixed failed package recovery and unified Windows entry
+        if: runner.os == 'Windows'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $root=Join-Path $env:RUNNER_TEMP 'filebridge-legacy-6f59267c'
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+          # A separately pinned CI artifact, never an active installation.
+          $zip=Join-Path $root 'artifact.zip'
+          $headers=@{Authorization=('Bearer '+$env:GH_TOKEN);Accept='application/vnd.github+json'}
+          Invoke-WebRequest -Uri 'https://api.github.com/repos/Tangbohu09527/CF_filebrowser-enterprise/actions/artifacts/11075196992/zip' -Headers $headers -OutFile $zip -UseBasicParsing
+          if((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -cne '80135e45b99caafdd33d12c21ee9fdfaea54e7ecd78fa4a4b70caa6bfa09ead6'){throw 'Legacy ZIP mismatch'}
+          Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $root 'artifact')
+          $archive=Join-Path $root 'artifact/filebridge-source.tar.gz'
+          if((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -cne 'b47c4511eb3416d4a7d5613a8c10eb0335a7e5ad448411069c7bdf243d2199a1'){throw 'Legacy source mismatch'}
+          New-Item -ItemType Directory -Path (Join-Path $root 'source') | Out-Null
+          tar -xzf $archive -C (Join-Path $root 'source')
+          if($LASTEXITCODE -ne 0){throw 'Legacy source extraction failed'}
+          $planner=Join-Path $env:RUNNER_TEMP 'filebridge-hermes-loader/venv/Scripts/python.exe'
+          & integrations/hermes-filebridge/tests/Test-InboundUpgrade.ps1 -PythonPath $planner -WheelArchive (Join-Path $env:RUNNER_TEMP 'filebridge-evidence/inbound-bundle/content-wheels.zip') -LegacyBundleDirectory (Join-Path $root 'artifact/inbound-bundle') -LegacyDriver (Join-Path $root 'source/integrations/hermes-filebridge/windows/Upgrade-InboundClient.ps1')
+          & integrations/hermes-filebridge/tests/Test-FileBridgeSetup.ps1
+          & integrations/hermes-filebridge/tests/Test-SetupLifecycle.ps1
+          & integrations/hermes-filebridge/tests/Test-SetupFresh.ps1 -PythonPath $planner
+      - name: Build the fixed one-click Windows package
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          & integrations/hermes-filebridge/windows/Build-SetupBundle.ps1 -EvidenceDirectory (Join-Path $env:RUNNER_TEMP 'filebridge-evidence') -SourceCommit '${{ github.sha }}'
+      - name: Attest the Windows entry and embedded release manifest
+        if: runner.os == 'Windows' && github.event_name == 'push'
+        id: setup-attestation
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: |
+            ${{ runner.temp }}/filebridge-evidence/windows-setup/FileBridge-Setup.exe
+            ${{ runner.temp }}/filebridge-evidence/windows-setup/release-manifest.json
+      - name: Retain independent provenance proof
+        if: runner.os == 'Windows' && github.event_name == 'push'
+        shell: powershell
+        run: |
+          Copy-Item -LiteralPath '${{ steps.setup-attestation.outputs.bundle-path }}' -Destination (Join-Path $env:RUNNER_TEMP 'filebridge-evidence/windows-setup/provenance.sigstore.jsonl') -ErrorAction Stop
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: filebridge-client-${{ matrix.os }}-${{ github.sha }}
