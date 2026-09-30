@@ -25,6 +25,7 @@ type CLIOptions struct {
 
 var supportedCommands = map[string]struct{}{
 	"ping": {}, "whoami": {}, "capabilities": {}, "sources": {}, "list": {}, "search": {},
+	"create-text": {}, "approve-create": {}, "create-approved": {}, "create-status": {},
 	"stat": {}, "checksum": {}, "read": {}, "download": {}, "mkdir": {}, "upload-new": {},
 }
 
@@ -52,7 +53,7 @@ func RunCLI(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		return 2
 	}
 	if options.Apply && !isWriteCommand(options.Command) {
-		writeResponse(stdout, startupError(options.Command, bridgeError("invalid_cli", "--apply is valid only for mkdir and upload-new")))
+		writeResponse(stdout, startupError(options.Command, bridgeError("invalid_cli", "--apply is valid only for controlled write commands")))
 		return 2
 	}
 
@@ -189,7 +190,7 @@ func helpResponse() Response {
 		DryRun:        false,
 		Result: map[string]any{
 			"usage":      "filebrowser-agentctl --config <file> [--input <file|->] [--token-stdin] [--allow-localhost-http] [--apply] <command>",
-			"commands":   []string{"ping", "whoami", "capabilities", "sources", "list", "search", "stat", "checksum", "read", "download", "mkdir", "upload-new"},
+			"commands":   []string{"ping", "whoami", "capabilities", "sources", "list", "search", "stat", "checksum", "read", "download", "mkdir", "upload-new", "create-text", "approve-create", "create-approved", "create-status"},
 			"prohibited": []string{"delete", "share", "token management", "user management", "ACL management", "arbitrary HTTP", "shell", "move", "rename", "overwrite"},
 		},
 	}

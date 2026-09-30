@@ -33,6 +33,8 @@ const (
 )
 
 type Config struct {
+	CreateText *CreateTextPolicy `json:"create_text,omitempty"`
+	TrustOptions
 	BaseURL              string                  `json:"base_url"`
 	TokenFile            string                  `json:"token_file,omitempty"`
 	AuditLog             string                  `json:"audit_log,omitempty"`
@@ -161,6 +163,10 @@ func (c *Config) applyDefaultsAndValidate(allowLocalhostHTTP bool) error {
 	if err != nil {
 		return err
 	}
+	c.CAFile = resolveConfigRelative(c.configDir, c.CAFile)
+	if _, err := trustRoots(c.TrustOptions); err != nil {
+		return bridgeError("invalid_trust", "CA file and SHA-256 must identify a valid certificate bundle")
+	}
 	c.parsedBaseURL = base
 	c.requestTimeout = time.Duration(c.TimeoutSeconds) * time.Second
 	c.retryDelay = time.Duration(c.RetryDelayMillis) * time.Millisecond
@@ -173,7 +179,7 @@ func (c *Config) applyDefaultsAndValidate(allowLocalhostHTTP bool) error {
 	for index, root := range c.LocalWriteRoots {
 		c.LocalWriteRoots[index] = resolveConfigRelative(c.configDir, root)
 	}
-	return nil
+	return c.initializeCreatePolicy()
 }
 
 func validateBaseURL(raw string, allowLocalhostHTTP bool) (*url.URL, error) {

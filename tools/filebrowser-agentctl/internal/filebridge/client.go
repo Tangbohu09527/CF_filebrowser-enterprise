@@ -24,6 +24,7 @@ type Client struct {
 	config     *Config
 	token      string
 	httpClient *http.Client
+	initErr    error
 }
 
 type requestOptions struct {
@@ -39,11 +40,14 @@ type requestOptions struct {
 }
 
 func NewClient(config *Config, token string) *Client {
+	transport, err := filebridgeTransport(config.TrustOptions)
 	return &Client{
-		config: config,
-		token:  token,
+		config:  config,
+		token:   token,
+		initErr: err,
 		httpClient: &http.Client{
-			Timeout: config.requestTimeout,
+			Timeout:   config.requestTimeout,
+			Transport: transport,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -52,6 +56,9 @@ func NewClient(config *Config, token string) *Client {
 }
 
 func (c *Client) do(ctx context.Context, options requestOptions) (*http.Response, error) {
+	if c.initErr != nil {
+		return nil, bridgeError("invalid_trust", "CA configuration is invalid; no request was sent")
+	}
 	attempts := 1
 	if options.retry429 {
 		attempts += c.config.MaxRetries

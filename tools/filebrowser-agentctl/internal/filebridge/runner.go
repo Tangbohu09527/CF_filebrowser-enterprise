@@ -19,9 +19,10 @@ import (
 )
 
 type Runner struct {
-	config *Config
-	client *Client
-	audit  *AuditLogger
+	createClock func() time.Time
+	config      *Config
+	client      *Client
+	audit       *AuditLogger
 }
 
 const maxSearchQueryBytes = 4096
@@ -60,9 +61,13 @@ func (r *Runner) Run(ctx context.Context, command string, input Input, apply boo
 	case validateErr != nil:
 		err = validateErr
 	default:
+		input.RequestID, input.OperationID = requestID, operationID
 		result, bytesProcessed, err = r.execute(ctx, command, input, apply, requestID)
 	}
 
+	if created, ok := result.(CreateTextResult); ok {
+		input.Source, input.Path = created.Source, created.Path
+	}
 	resultCode := "ok"
 	httpStatus := 0
 	if err != nil {
@@ -95,6 +100,17 @@ func (r *Runner) Run(ctx context.Context, command string, input Input, apply boo
 
 func (r *Runner) execute(ctx context.Context, command string, input Input, apply bool, requestID string) (any, int64, error) {
 	switch command {
+	case "create-text":
+		result, err := r.planCreateText(ctx, requestID, input)
+		return result, 0, err
+	case "approve-create":
+		result, err := r.approveCreateText(input, apply)
+		return result, 0, err
+	case "create-approved":
+		return r.applyCreateText(ctx, requestID, input, apply)
+	case "create-status":
+		result, err := r.createTextStatus(input)
+		return result, 0, err
 	case "ping":
 		result, err := r.client.ping(ctx, requestID)
 		return result, 0, err
@@ -639,11 +655,12 @@ func normalizeIdentifier(value, prefix string) (string, error) {
 }
 
 func isWriteCommand(command string) bool {
-	return command == "mkdir" || command == "upload-new"
+	return command == "mkdir" || command == "upload-new" || command == "create-text" || command == "approve-create" || command == "create-approved"
 }
 
 func validateCommandInput(command string, input Input) error {
 	used := map[string]bool{
+		"content": input.Content != nil, "plan_sha256": input.PlanSHA256 != "",
 		"source":          input.Source != "",
 		"path":            input.Path != "",
 		"query":           input.Query != "",
@@ -667,6 +684,10 @@ func validateCommandInput(command string, input Input) error {
 	case "upload-new":
 		allowed["source"], allowed["path"], allowed["local_file"] = true, true, true
 		allowed["expected_bytes"], allowed["expected_sha256"] = true, true
+	case "create-text":
+		allowed["source"], allowed["path"], allowed["content"] = true, true, true
+	case "approve-create", "create-approved", "create-status":
+		allowed["plan_sha256"] = true
 	case "ping", "whoami", "capabilities", "sources":
 		// These commands accept only common request metadata.
 	default:
@@ -681,6 +702,13 @@ func validateCommandInput(command string, input Input) error {
 }
 
 func validateApprovalInput(command string, input Input, apply bool) error {
+	if command == "create-text" && apply {
+		return bridgeError("invalid_input", "create-text only plans; operator approval is a separate command")
+	}
+	if (command == "approve-create" || command == "create-approved" || command == "create-status") && input.OperationID == "" {
+		return bridgeError("invalid_operation_id", "recorded creation operation_id is required")
+	}
+
 	if apply && isWriteCommand(command) && input.OperationID == "" {
 		return bridgeError("invalid_input", "operation_id is required with --apply")
 	}
