@@ -35,6 +35,22 @@ class ConfigChecks(unittest.TestCase):
                         "profile_reference": "synthetic", "profile_revision": 1, "work_root": "synthetic-root",
                         "client_path": "synthetic-client", "client_sha256": "b" * 64, "consumer_tools": ["existing"]}}}}}}
 
+    def test_missing_api_selection_keeps_official_default_resolution(self):
+        from ruamel.yaml import YAML
+        for section in ({"cli": ["synthetic-cli-choice"]}, {}):
+            with self.subTest(section=section):
+                config = self.config()
+                config["platform_toolsets"] = section
+                output, _, _ = upgrade.build(json.dumps(config).encode(), OLD, NEW)
+                self.assertEqual(YAML(typ="safe").load(output)["platform_toolsets"], section)
+
+    def test_missing_platform_section_is_not_materialized(self):
+        from ruamel.yaml import YAML
+        config = self.config()
+        del config["platform_toolsets"]
+        output, _, _ = upgrade.build(json.dumps(config).encode(), OLD, NEW)
+        self.assertNotIn("platform_toolsets", YAML(typ="safe").load(output))
+
     def test_semantics_and_comment_preserved(self):
         original = self.config()
         output, worker, digest = upgrade.build(b"# operator comment\n" + json.dumps(original).encode(), OLD, NEW)
@@ -44,7 +60,6 @@ class ConfigChecks(unittest.TestCase):
         settings = expected["plugins"]["entries"]["cf-filebridge"]["settings"]
         settings["inbound_content_enabled"] = True
         settings["inbound_host"]["consumer_tools"].append(upgrade.TOOL)
-        expected["platform_toolsets"]["api_server"].append(upgrade.TOOLSET)
         self.assertEqual(parsed, expected)
         self.assertIn(b"# operator comment", output)
         self.assertEqual(worker, "synthetic-client")
@@ -55,11 +70,96 @@ class ConfigChecks(unittest.TestCase):
             upgrade.build(b"model: a\nmodel: b\n", OLD, NEW)
         config = self.config()
         from ruamel.yaml import YAML
-        common = config["platform_toolsets"]["api_server"]
+        common = config["plugins"]["entries"]["cf-filebridge"]["settings"]["inbound_host"]["consumer_tools"]
         config["unrelated_alias"] = common
         stream = io.StringIO(); YAML().dump(config, stream)
         with self.assertRaisesRegex(upgrade.Refused, "yaml_alias_changes_unrelated_settings"):
             upgrade.build(stream.getvalue().encode(), OLD, NEW)
+
+    def test_api_alias_and_all_unrelated_comments_are_preserved(self):
+        config = self.config()
+        from ruamel.yaml import YAML
+        config["unrelated_alias"] = config["platform_toolsets"]["api_server"]
+        stream = io.StringIO(); YAML().dump(config, stream)
+        output, _, _ = upgrade.build(b"# keep operator selection\n" + stream.getvalue().encode(), OLD, NEW)
+        parsed = YAML().load(output)
+        self.assertIs(parsed["unrelated_alias"], parsed["platform_toolsets"]["api_server"])
+        self.assertEqual(parsed["unrelated_alias"], ["existing"])
+        self.assertIn(b"# keep operator selection", output)
+
+    def test_null_empty_explicit_and_literal_selections_are_not_rewritten(self):
+        from ruamel.yaml import YAML
+        for selection in (None, [], ["file", "mcp_existing", "custom", "no_mcp"],
+                          "[]", "['file', 'mcp_existing', 'custom']"):
+            with self.subTest(selection=selection):
+                config = self.config()
+                config["platform_toolsets"] = {"api_server": selection, "cli": ["unrelated"]}
+                output, _, _ = upgrade.build(json.dumps(config).encode(), OLD, NEW)
+                self.assertEqual(YAML(typ="safe").load(output)["platform_toolsets"], config["platform_toolsets"])
+        config["platform_toolsets"] = None
+        output, _, _ = upgrade.build(json.dumps(config).encode(), OLD, NEW)
+        self.assertIsNone(YAML(typ="safe").load(output)["platform_toolsets"])
+
+    def test_ambiguous_invalid_selection_is_refused_without_guessing_permissions(self):
+        for value in ("file", "[broken", "['file', 1]", {}, 4, False, ["file", None], ["file", 1], [["file"]]):
+            with self.subTest(value=value):
+                config = self.config(); config["platform_toolsets"]["api_server"] = value
+                with self.assertRaisesRegex(upgrade.Refused, "api_toolsets_invalid"):
+                    upgrade.build(json.dumps(config).encode(), OLD, NEW)
+        for value in ([], "api_server", 1, False):
+            config = self.config(); config["platform_toolsets"] = value
+            with self.assertRaisesRegex(upgrade.Refused, "platform_toolsets_invalid"):
+                upgrade.build(json.dumps(config).encode(), OLD, NEW)
+
+    def test_known_content_optout_is_refused_other_plugin_selections_preserved(self):
+        from ruamel.yaml import YAML
+        config = self.config()
+        config["known_plugin_toolsets"] = {"api_server": ["operator_declined_plugin"], "cli": ["cli_choice"]}
+        output, _, _ = upgrade.build(json.dumps(config).encode(), OLD, NEW)
+        self.assertEqual(YAML(typ="safe").load(output)["known_plugin_toolsets"], config["known_plugin_toolsets"])
+        config["known_plugin_toolsets"]["api_server"].append(upgrade.TOOLSET)
+        with self.assertRaisesRegex(upgrade.Refused, "content_toolset_disabled"):
+            upgrade.build(json.dumps(config).encode(), OLD, NEW)
+        config["platform_toolsets"]["api_server"].append(upgrade.TOOLSET)
+        output, _, _ = upgrade.build(json.dumps(config).encode(), OLD, NEW)
+        self.assertEqual(YAML(typ="safe").load(output)["known_plugin_toolsets"], config["known_plugin_toolsets"])
+        config["plugins"]["disabled"] = ["cf-filebridge"]
+        with self.assertRaisesRegex(upgrade.Refused, "existing_plugin_not_enabled"):
+            upgrade.build(json.dumps(config).encode(), OLD, NEW)
+
+    def test_null_known_platform_keeps_official_empty_known_set(self):
+        from ruamel.yaml import YAML
+        config = self.config()
+        config["known_plugin_toolsets"] = {"api_server": None, "cli": ["untouched"]}
+        output, _, _ = upgrade.build(json.dumps(config).encode(), OLD, NEW)
+        self.assertEqual(YAML(typ="safe").load(output)["known_plugin_toolsets"], config["known_plugin_toolsets"])
+        for invalid in ("known", {}, True, ["known", None]):
+            config["known_plugin_toolsets"]["api_server"] = invalid
+            with self.assertRaisesRegex(upgrade.Refused, "known_plugin_toolsets_invalid"):
+                upgrade.build(json.dumps(config).encode(), OLD, NEW)
+
+    def test_global_suppression_never_removed_or_overridden(self):
+        from ruamel.yaml import YAML
+        for disabled in (["terminal"], "terminal", "['terminal', 'web']", [], None):
+            config = self.config(); config["agent"] = {"disabled_toolsets": disabled}
+            output, _, _ = upgrade.build(json.dumps(config).encode(), OLD, NEW)
+            self.assertEqual(YAML(typ="safe").load(output)["agent"], config["agent"])
+        for disabled in ([upgrade.TOOLSET], upgrade.TOOLSET, "all", ["*"], "['all']", [upgrade.TOOL]):
+            config = self.config(); config["agent"] = {"disabled_toolsets": disabled}
+            with self.assertRaisesRegex(upgrade.Refused, "content_toolset_disabled"):
+                upgrade.build(json.dumps(config).encode(), OLD, NEW)
+        for disabled in ({}, True, ["terminal", 1], "[broken"):
+            config = self.config(); config["agent"] = {"disabled_toolsets": disabled}
+            with self.assertRaisesRegex(upgrade.Refused, "disabled_toolsets_invalid"):
+                upgrade.build(json.dumps(config).encode(), OLD, NEW)
+
+    def test_failure_record_has_only_safe_stage_and_code(self):
+        self.assertEqual(upgrade.failure_record(upgrade.Refused("content_toolset_disabled"), "config_semantic_plan"),
+                         {"ok": False, "stage": "config_semantic_plan", "error": "content_toolset_disabled"})
+        for error in (upgrade.Refused("private-sentinel"), ValueError("private-sentinel")):
+            output = upgrade.failure_record(error, "private-sentinel")
+            self.assertEqual(output, {"ok": False, "stage": "config_semantic_plan", "error": "configuration_plan_failed"})
+            self.assertNotIn("private-sentinel", json.dumps(output))
 
     def test_integer_revision_exact(self):
         for revision in (True, False, "1", 0, -1, 1.0, None):

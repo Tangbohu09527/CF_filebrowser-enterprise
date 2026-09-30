@@ -6,6 +6,7 @@ candidate file. stdout contains bounded metadata, never configuration values.
 from __future__ import annotations
 
 import argparse
+import ast
 import copy
 import hashlib
 import importlib.metadata
@@ -22,6 +23,22 @@ import zipfile
 TOOL = "filebrowser_read_inbound"
 TOOLSET = "cf_filebridge_inbound_content"
 MAX_CONFIG = 2 * 1024 * 1024
+SAFE_STAGES = frozenset({"config_semantic_plan", "runtime_dependencies", "runtime_extract_wheels", "runtime_inventory"})
+SAFE_ERRORS = frozenset({
+    "absolute_path_required", "reparse_refused", "input_size_or_type", "yaml_mapping_required",
+    "plugin_version_conflict", "existing_plugin_not_enabled", "existing_inbound_not_enabled",
+    "existing_host_settings_missing", "existing_host_settings_incomplete", "existing_profile_revision_invalid",
+    "existing_worker_digest_invalid", "consumer_allowlist_missing", "api_toolsets_missing", "runtime_pin_invalid",
+    "yaml_alias_changes_unrelated_settings", "candidate_size_exceeded", "candidate_roundtrip_failed",
+    "dependency_inventory_invalid", "dependency_inventory_incomplete", "runtime_reparse_refused",
+    "runtime_size_exceeded", "runtime_node_refused", "runtime_empty", "checkpoint_conflict",
+    "wheels_directory_required", "wheel_archive_shape", "wheel_archive_member", "wheel_archive_size",
+    "runtime_modified_or_unknown", "candidate_absolute_required", "prepared_candidate_conflict",
+    "configuration_plan_failed", "platform_toolsets_invalid", "api_toolsets_invalid",
+    "known_plugin_toolsets_invalid", "agent_configuration_invalid", "disabled_toolsets_invalid",
+    "content_toolset_disabled",
+})
+_failure_stage = "config_semantic_plan"
 
 
 class Refused(Exception):
@@ -46,6 +63,52 @@ def read(path, limit=MAX_CONFIG):
              "reparse_refused")
     need(path.is_file() and path.stat().st_size <= limit, "input_size_or_type")
     return path.read_bytes()
+
+
+def _string_selection(value, code, *, scalar=False):
+    """Inspect supported names without rewriting the operator's representation.
+
+    The fixed official reader also understands Python/JSON list-literal strings.
+    Malformed/mixed lists are refused here rather than guessing at permissions.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value.strip().startswith("["):
+            try:
+                value = ast.literal_eval(value.strip())
+            except (ValueError, SyntaxError):
+                raise Refused(code) from None
+        elif scalar:
+            value = [value]
+    need(isinstance(value, list) and all(isinstance(name, str) for name in value), code)
+    return value
+
+
+def check_content_selection(document):
+    """Keep official default/empty/explicit/MCP/custom selection semantics.
+
+    Newly discovered plugin toolsets are enabled by the official loader unless
+    known-and-omitted or globally disabled. Materializing a default selection
+    changes its meaning, so no platform or known-toolset field is ever written.
+    This does not replace Hermes' final tool-level global suppression.
+    """
+    platforms = document.get("platform_toolsets")
+    need(platforms is None or isinstance(platforms, dict), "platform_toolsets_invalid")
+    selected = _string_selection((platforms or {}).get("api_server"), "api_toolsets_invalid")
+    known = document.get("known_plugin_toolsets")
+    need(known is None or isinstance(known, dict), "known_plugin_toolsets_invalid")
+    known_api = (known or {}).get("api_server", [])
+    if known_api is None:
+        known_api = []  # Official empty-known-set semantics; leave YAML null untouched.
+    need(isinstance(known_api, list) and all(isinstance(name, str) for name in known_api),
+         "known_plugin_toolsets_invalid")
+    need(TOOLSET not in known_api or TOOLSET in (selected or []), "content_toolset_disabled")
+    agent = document.get("agent")
+    need(agent is None or isinstance(agent, dict), "agent_configuration_invalid")
+    disabled = _string_selection((agent or {}).get("disabled_toolsets"), "disabled_toolsets_invalid", scalar=True)
+    need(not {name.strip() for name in disabled or []} & {TOOLSET, TOOL, "all", "*"},
+         "content_toolset_disabled")
 
 
 def build(config_bytes, installed_manifest, release_manifest, runtime=None, runtime_sha256=None):
@@ -85,9 +148,7 @@ def build(config_bytes, installed_manifest, release_manifest, runtime=None, runt
         consumers = host.setdefault("consumer_tools", [])
         need(isinstance(consumers, list) and all(isinstance(value, str) for value in consumers),
              "consumer_allowlist_missing")
-        toolsets = document.get("platform_toolsets", {}).get("api_server")
-        need(isinstance(toolsets, list) and all(isinstance(value, str) for value in toolsets),
-             "api_toolsets_missing")
+        check_content_selection(document)
         settings["inbound_content_enabled"] = True
         if runtime:
             need(Path(runtime).is_absolute() and re.fullmatch(r"[0-9a-f]{64}", runtime_sha256 or ""), "runtime_pin_invalid")
@@ -95,8 +156,6 @@ def build(config_bytes, installed_manifest, release_manifest, runtime=None, runt
             settings["inbound_content_python_sha256"] = runtime_sha256
         if TOOL not in consumers:
             consumers.append(TOOL)
-        if TOOLSET not in toolsets:
-            toolsets.append(TOOLSET)
 
     patch(expected)
     candidate = copy.deepcopy(config)
@@ -201,6 +260,7 @@ def runtime_mode(args):
 
 
 def main():
+    global _failure_stage
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("config", "installed-manifest", "release-manifest", "requirements"):
         parser.add_argument("--" + name, type=Path, required=name == "requirements")
@@ -215,6 +275,9 @@ def main():
     parser.add_argument("--runtime-root", type=Path)
     parser.add_argument("--verify-runtime", action="store_true")
     args = parser.parse_args()
+    _failure_stage = ("runtime_extract_wheels" if args.extract_wheels else
+                      "runtime_inventory" if args.runtime_receipt else
+                      "runtime_dependencies" if args.dependencies_only else "config_semantic_plan")
     if args.dependencies_only or args.extract_wheels or args.runtime_receipt:
         runtime_mode(args)
         return
@@ -236,18 +299,21 @@ def main():
         "worker_path": worker, "worker_sha256": worker_hash,
         "dependency_blockers": [{"name": name, "required_version": version} for name, version in required.items()],
         "dependency_ready": False,
-        "changed_settings": ["inbound_content_enabled", "inbound_host.consumer_tools", "platform_toolsets.api_server"]
+        "changed_settings": ["inbound_content_enabled", "inbound_host.consumer_tools"]
             + (["inbound_content_python", "inbound_content_python_sha256"] if args.runtime_python else [])}))
+
+
+def failure_record(error, stage):
+    code = str(error) if isinstance(error, Refused) else "configuration_plan_failed"
+    return {"ok": False, "stage": stage if stage in SAFE_STAGES else "config_semantic_plan",
+            "error": code if code in SAFE_ERRORS else "configuration_plan_failed"}
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Refused as error:
-        print(json.dumps({"ok": False, "error": str(error)}))
-        raise SystemExit(1) from None
-    except Exception:
+    except Exception as error:
         # YAML parser exceptions can contain configuration lines. Never print
         # arbitrary exceptions, traceback text, config bodies or environment.
-        print(json.dumps({"ok": False, "error": "configuration_plan_failed"}))
+        print(json.dumps(failure_record(error, _failure_stage)))
         raise SystemExit(1) from None
