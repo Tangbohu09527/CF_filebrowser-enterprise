@@ -38,8 +38,24 @@ jobs:
           go-version-file: tools/filebrowser-agentctl/go.mod
           cache: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        if: runner.os == 'Linux'
         with:
           python-version: '3.11.16'
+      - name: Verified independent Windows Python 3.11.16
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/filebridge-upgrade-python311"
+          mkdir -p "$root/runtime"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 2 --retry-delay 5 --retry-max-time 60 \
+            https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.11.16%2B20260924-x86_64-pc-windows-msvc-install_only_stripped.tar.gz \
+            -o "$root/python.tar.gz"
+          echo "f86b3cbd425e1c446b56aa24e20a7be1223c1a8146e5e3a68c8e18d08b76e810  $root/python.tar.gz" | sha256sum -c -
+          tar -xzf - -C "$(cygpath -u "$root/runtime")" < "$root/python.tar.gz"
+          "$root/runtime/python/python.exe" -I -B -c 'import sys; assert sys.version_info[:3] == (3,11,16); print(sys.version)'
+          cygpath -w "$root/runtime/python" >> "$GITHUB_PATH"
       - name: Test and vet independent client
         working-directory: tools/filebrowser-agentctl
         shell: bash
@@ -296,9 +312,19 @@ jobs:
             | tee "$CF_CURRENT_HERMES_ROOT/evidence/content-request.jsonl"
       - name: Independent default upgrade-planner interpreter (Windows only)
         if: runner.os == 'Windows'
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
-        with:
-          python-version: '3.11.16'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/filebridge-upgrade-python311"
+          mkdir -p "$root/runtime"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 2 --retry-delay 5 --retry-max-time 60 \
+            https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.11.16%2B20260924-x86_64-pc-windows-msvc-install_only_stripped.tar.gz \
+            -o "$root/python.tar.gz"
+          echo "f86b3cbd425e1c446b56aa24e20a7be1223c1a8146e5e3a68c8e18d08b76e810  $root/python.tar.gz" | sha256sum -c -
+          tar -xzf - -C "$(cygpath -u "$root/runtime")" < "$root/python.tar.gz"
+          "$root/runtime/python/python.exe" -I -B -c 'import sys; assert sys.version_info[:3] == (3,11,16); print(sys.version)'
+          cygpath -w "$root/runtime/python" >> "$GITHUB_PATH"
       - name: Offline incremental Windows upgrade preserves the installed configuration
         if: runner.os == 'Windows'
         shell: powershell

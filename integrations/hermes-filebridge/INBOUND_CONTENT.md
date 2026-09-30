@@ -111,6 +111,9 @@ check_fn 就绪判断之前，不声称 MCP 连接或运行时服务已可用。
 解释器检查，还保守拒绝同一 HermesHome 下正在运行的 Python 进程；这不代表这些
 进程全是 Hermes API，脚本不会识别其业务或自动停止它们。
 
+Windows CI 的 `setup-python` 不提供 3.11.16，首轮实际失败因此保留；后续使用与本机
+隔离验证相同的 `python-build-standalone` 20260924 发行及固定 SHA-256，不改用较旧版本。
+
 Python 3.11 的 ensurepip 在合成 Windows 长路径下曾因随附 setuptools 深层文件名
 失败，原始失败证据保留。新解析 venv 使用 `--without-pip`，通过所选规划器已有 pip
 的[公开 `--python` 参数](https://pip.pypa.io/en/stable/topics/python-option/)指定新 venv
