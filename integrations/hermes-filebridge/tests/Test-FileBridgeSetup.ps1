@@ -13,7 +13,7 @@ function Dependencies($State,$Failure='') {
         Stop={ $script:trace.Add('stop'); if($script:failure -eq 'stop'){throw 'fixture-private-secret'} }
         Apply={ $script:trace.Add('apply'); if($script:failure -eq 'apply'){throw 'fixture-private-secret'} }
         Verify={ $script:trace.Add('verify'); if($script:failure -eq 'verify'){throw 'fixture-private-secret'} }
-        Restore={ $script:trace.Add('restore') }
+        Restore={ $script:trace.Add('restore'); if($script:failure -eq 'restore'){throw 'fixture-private-secret'} }
     }
 }
 foreach($state in @('fresh','unprepared','prepared','partial','complete')) {
@@ -32,7 +32,20 @@ $script:trace.Clear();$result=Invoke-CfSetupFlow -Dependencies (Dependencies 'pa
 Assert (-not $result.ok -and ($script:trace -join ',') -eq 'check') 'approval required before any mutation'
 $script:trace.Clear();$result=Invoke-CfSetupFlow -Dependencies (Dependencies 'unknown') -Approved
 Assert (-not $result.ok -and ($script:trace -join ',') -eq 'check') 'unknown state never adopted'
-Write-Output 'FILEBRIDGE_SETUP_POLICY=PASS:11'
+$script:trace.Clear();$result=Invoke-CfSetupFlow -Dependencies (Dependencies 'complete' 'restore') -Approved
+Assert (-not $result.ok -and $result.services_restored -ceq 'uncertain') 'failed restore cannot claim no service started'
+foreach($code in @('CF_CONFIG_CONCURRENT_CHANGE','CF_UPGRADE_CHECKPOINT_PAYLOAD_NOT_COMPATIBLE','CF_UPGRADE_LEGACY_RESIDUE_CONFLICT')) {
+    $exception=[InvalidOperationException]::new($code);$exception.Data['cf_target']='plugin/inbound_host.py';$exception.Data['cf_stage']='target_recheck';$exception.Data['cf_rename_completed']=$false
+    $result=Get-CfSetupFailure ([pscustomobject]@{Exception=$exception}) 'preflight'
+    Assert ($result.code -ceq $code -and $result.target -ceq 'plugin/inbound_host.py' -and $result.detail_stage -ceq 'target_recheck' -and $result.replacement_completed -eq $false) 'bounded concrete diagnostics'
+}
+$result=Get-CfSetupFailure ([pscustomobject]@{Exception=[Exception]::new('CF_CONFIG_FUTURE_PRIVATE_SENTINEL')}) 'preflight'
+Assert ($result.code -ceq 'CF_SETUP_STEP_FAILED') 'unknown same-prefix errors stay redacted'
+$result=Get-CfSetupFailure ([pscustomobject]@{Exception=[Exception]::new('CF_UPGRADE_PYTHON_STEP_FAILED:config_semantic_plan:content_toolset_disabled')}) 'preflight'
+Assert ($result.code -ceq 'CF_UPGRADE_PYTHON_STEP_FAILED' -and $result.reason_code -ceq 'content_toolset_disabled') 'known permission conflict remains diagnostic'
+$result=Get-CfSetupFailure ([pscustomobject]@{Exception=[Exception]::new('CF_UPGRADE_PYTHON_STEP_FAILED:config_semantic_plan:private_value')}) 'preflight'
+Assert ($result.code -ceq 'CF_SETUP_STEP_FAILED' -and $result.reason_code -ceq 'none') 'unknown parser value redacted'
+Write-Output 'FILEBRIDGE_SETUP_POLICY=PASS:18'
 
 # Reuse the actual Start function's assignment ASTs instead of constructing an
 # equivalent action table. This catches GetNewClosure dynamic-module resolution

@@ -10,7 +10,7 @@ Set-StrictMode -Version 2.0
 . (Join-Path $PSScriptRoot 'Setup-Fresh.ps1')
 
 function Get-CfSetupFailure($Failure,[string]$Stage) {
-    $code='CF_SETUP_STEP_FAILED';$target='none';$renamed='unknown';$detail='none';$lifecycle='none'
+    $code='CF_SETUP_STEP_FAILED';$target='none';$renamed='unknown';$detail='none';$lifecycle='none';$reason='none'
     $known=@(
         'CF_CONFIG_BEFORE_CHANGED','CF_CONFIG_CANDIDATE_HASH_MISMATCH','CF_CONFIG_CANDIDATE_SECURITY_MISMATCH',
         'CF_CONFIG_CONCURRENT_CHANGE','CF_CONFIG_DIFFERENT_VOLUME','CF_CONFIG_FILE_TYPE_OR_SIZE','CF_CONFIG_FINAL_READBACK_FAILED',
@@ -42,6 +42,16 @@ function Get-CfSetupFailure($Failure,[string]$Stage) {
     $cause=$Failure.Exception
     while($cause) {
         if($known -ccontains $cause.Message){$code=$cause.Message}
+        if($cause.Message -cmatch '^CF_UPGRADE_PYTHON_STEP_FAILED:(config_semantic_plan|runtime_dependencies|runtime_extract_wheels|runtime_inventory):([a-z_]+)$') {
+            $allowedReasons=@('plugin_version_conflict','existing_plugin_not_enabled','existing_inbound_not_enabled',
+                'existing_host_settings_missing','existing_host_settings_incomplete','existing_profile_revision_invalid',
+                'existing_worker_digest_invalid','consumer_allowlist_missing','platform_toolsets_invalid','api_toolsets_invalid',
+                'known_plugin_toolsets_invalid','agent_configuration_invalid','disabled_toolsets_invalid','content_toolset_disabled',
+                'yaml_alias_changes_unrelated_settings','candidate_roundtrip_failed','runtime_pin_invalid','dependency_inventory_invalid',
+                'dependency_inventory_incomplete','runtime_modified_or_unknown','wheel_archive_shape','wheel_archive_member',
+                'wheel_archive_size','checkpoint_conflict','prepared_candidate_conflict','configuration_plan_failed')
+            if($allowedReasons -ccontains $Matches[2]){$code='CF_UPGRADE_PYTHON_STEP_FAILED';$detail=$Matches[1];$reason=$Matches[2]}
+        }
         if($cause.Data.Contains('cf_lifecycle_code')){$lifecycle=Get-CfLifecycleError ([pscustomobject]@{Exception=[Exception]::new([string]$cause.Data['cf_lifecycle_code'])})}
         if($cause.Data.Contains('cf_target')) {
             $value=[string]$cause.Data['cf_target']
@@ -54,7 +64,7 @@ function Get-CfSetupFailure($Failure,[string]$Stage) {
         }
         $cause=$cause.InnerException
     }
-    return @{ok=$false;stage=$Stage;detail_stage=$detail;lifecycle_code=$lifecycle;code=$code;target=$target;replacement_completed=$renamed;recoverable='recheck_required';services_restored=$false}
+    return @{ok=$false;stage=$Stage;detail_stage=$detail;reason_code=$reason;lifecycle_code=$lifecycle;code=$code;target=$target;replacement_completed=$renamed;recoverable='recheck_required';services_restored=$(if($Stage -ceq 'restore'){'uncertain'}else{$false})}
 }
 function Assert-CfSetupLifecycleResult($Result) {
     if($Result.ok -ne $true){
@@ -231,7 +241,7 @@ function Start-CfFileBridgeSetup([string]$Package) {
         $result=Invoke-CfSetupFlow -Dependencies $actions -Approved
         $result.source_commit=$manifest.source_commit;$result.fresh_install=$fresh;$result.installed_disabled=$fresh
         Write-CfSetupNewFile (Join-Path $receiptRoot ('result-'+[Guid]::NewGuid().ToString('N')+'.json')) ($result|ConvertTo-Json -Depth 5)
-        $summary=if($result.ok){if($fresh){'Installed with inbound features disabled. Gateway authorization/configuration is still required.'}else{'Upgrade verified. Original stopped/running state preserved.'}}else{'Stopped safely at '+$result.stage+'/'+$result.detail_stage+'; '+$result.code+'; '+$result.lifecycle_code+'; target='+$result.target+'; replaced='+$result.replacement_completed+'; recovery='+$result.recoverable+'. No mixed installation was started.'}
+        $summary=if($result.ok){if($fresh){'Installed with inbound features disabled. Gateway authorization/configuration is still required.'}else{'Upgrade verified. Original stopped/running state preserved.'}}else{'Stopped safely at '+$result.stage+'/'+$result.detail_stage+'; '+$result.code+'; '+$result.reason_code+'; '+$result.lifecycle_code+'; target='+$result.target+'; replaced='+$result.replacement_completed+'; recovery='+$result.recoverable+'. No mixed installation was started.'}
         [Windows.Forms.MessageBox]::Show($summary,'FileBridge Setup',[Windows.Forms.MessageBoxButtons]::OK,[Windows.Forms.MessageBoxIcon]::Information)|Out-Null
         if(-not $result.ok){throw 'CF_SETUP_TRANSACTION_STOPPED'}
     }finally{if($locked){$mutex.ReleaseMutex()};$mutex.Dispose()}
@@ -245,8 +255,8 @@ if($Run) {
         $known=@('CF_SETUP_OTHER_UPGRADE_ACTIVE','CF_SETUP_UNKNOWN_TRANSACTION_FILE','CF_SETUP_AMBIGUOUS_TRANSACTIONS','CF_SETUP_EXISTING_HERMES_REQUIRED','CF_SETUP_PRIVATE_DIRECTORY_REQUIRED','CF_SETUP_PROFILE_SELECTOR_REFUSED','CF_SETUP_RELEASE_MANIFEST_REFUSED','CF_SETUP_TRANSACTION_STOPPED','CF_SETUP_RESTORE_OUTCOME_UNCERTAIN','CF_SETUP_LIFECYCLE_RECEIPT_CONFLICT','CF_SETUP_LIFECYCLE_REFUSED')
         $safe=if($known -ccontains $_.Exception.Message){$_.Exception.Message}else{'CF_SETUP_PREFLIGHT_REFUSED'}
         $failure=Get-CfSetupFailure $_ 'preflight'
-        $detail=$safe+'; '+$failure.code+'; target='+$failure.target+'; stage='+$failure.detail_stage+'; '+$failure.lifecycle_code+'; replaced='+$failure.replacement_completed+'; recovery='+$failure.recoverable
-        [Windows.Forms.MessageBox]::Show($detail+"`r`nNo automatic cleanup or service restart was performed.",'FileBridge Setup',[Windows.Forms.MessageBoxButtons]::OK,[Windows.Forms.MessageBoxIcon]::Error)|Out-Null
+        $detail=$safe+'; '+$failure.code+'; '+$failure.reason_code+'; target='+$failure.target+'; stage='+$failure.detail_stage+'; '+$failure.lifecycle_code+'; replaced='+$failure.replacement_completed+'; recovery='+$failure.recoverable
+        [Windows.Forms.MessageBox]::Show($detail+"`r`nNo cleanup or further restart will be attempted. Preserve the recorded recovery state.",'FileBridge Setup',[Windows.Forms.MessageBoxButtons]::OK,[Windows.Forms.MessageBoxIcon]::Error)|Out-Null
         exit 1
     }
 }

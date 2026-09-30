@@ -27,6 +27,12 @@
 核对时相关 Python 和两个已知监听端口均为零。现场敏感身份、完整 SDDL、路径和配置
 保留在本机私有证据中，没有写入仓库。
 
+随后以本地修复构建及独立 Python 3.11.16 对该真实计划执行了只读 `Check`：
+返回 `transaction_state=partial`、`safe_to_resume=true`、`dependency_ready=true`，
+兼容策略为固定 6f installer-only-repair；保留一个未认领残留、旧 worker 和原配置，
+`writes_performed=false`、`live_restarted=false`。这是现场只读恢复条件核验，**不是现场
+恢复或安装成功**。新入口的实际只读生命周期发现也确认 gateway/dashboard 均停止。
+
 新入口对这个固定旧计划执行：核验新包 → 核验旧 checkpoint、旧清单全部载荷、备份、
 运行时、配置语义及当前八个目标 → 确认实例仍停止 → 按 journal 接续未完成文件 →
 再次核验完整安装。原本停止的服务保持停止。**本轮开发没有实际执行这些现场恢复步骤。**
