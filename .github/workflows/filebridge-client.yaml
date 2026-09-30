@@ -39,7 +39,7 @@ jobs:
           cache: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
-          python-version: '3.11'
+          python-version: '3.11.16'
       - name: Test and vet independent client
         working-directory: tools/filebrowser-agentctl
         shell: bash
@@ -148,19 +148,33 @@ jobs:
           cp ../../integrations/hermes-filebridge/requirements-inbound-content.txt "$inbound/"
           wheels="$RUNNER_TEMP/filebridge-content-wheels"
           mkdir -p "$wheels"
-          target=()
           if [ "$RUNNER_OS" = Windows ]; then
-            # The deployed Windows host uses CPython 3.14; do not build this
-            # offline payload for this legacy regression job's Python 3.11.
-            target=(--platform win_amd64 --python-version 3.14 --implementation cp --abi cp314 --abi abi3 --abi none)
+            # The upgrade planner and serving API may use different runtimes.
+            # Keep both tested Windows ABIs offline; never switch the operator's
+            # interpreter to make a single-ABI bundle install successfully.
+            for version in 3.11 3.14; do
+              abi="cp${version/./}"
+              python -I -B -m pip --isolated download --disable-pip-version-check --only-binary=:all: --no-deps --require-hashes \
+                --platform win_amd64 --python-version "$version" --implementation cp --abi "$abi" --abi abi3 --abi none \
+                --dest "$wheels" -r "$inbound/requirements-inbound-content.txt"
+            done
+          else
+            python -I -B -m pip --isolated download --disable-pip-version-check --only-binary=:all: --no-deps --require-hashes \
+              --dest "$wheels" -r "$inbound/requirements-inbound-content.txt"
           fi
-          python -I -B -m pip --isolated download --disable-pip-version-check --only-binary=:all: --no-deps --require-hashes \
-            "${target[@]}" --dest "$wheels" -r "$inbound/requirements-inbound-content.txt"
           CONTENT_WHEELS="$wheels" INBOUND_BUNDLE="$inbound" python -I -B -c 'import os,pathlib,zipfile; root=pathlib.Path(os.environ["CONTENT_WHEELS"]); files=sorted(root.iterdir()); assert files and all(p.is_file() and p.suffix==".whl" for p in files); archive=pathlib.Path(os.environ["INBOUND_BUNDLE"])/"content-wheels.zip"; z=zipfile.ZipFile(archive,"x",compression=zipfile.ZIP_STORED); [z.write(p,p.name) for p in files]; z.close()'
           INBOUND_BUNDLE="$inbound" python -c 'import hashlib,json,os,pathlib,subprocess; p=pathlib.Path(os.environ["INBOUND_BUNDLE"]); files={f.relative_to(p).as_posix():hashlib.sha256(f.read_bytes()).hexdigest() for f in sorted(p.rglob("*")) if f.is_file()}; (p/"inventory.json").write_text(json.dumps({"schema":"cf-inbound-bundle/v1","source_commit":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),"files":files},indent=2)+"\n",encoding="utf-8")'
           git diff --exit-code
           cd "$RUNNER_TEMP/filebridge-evidence"
           sha256sum filebrowser-agentctl* filebridge-source.tar.gz inbound-bundle/inventory.json > SHA256SUMS
+      - name: Exact packaged wheels support the default Windows upgrade planner
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $planner=Join-Path $env:RUNNER_TEMP 'filebridge-hermes-loader/venv/Scripts/python.exe'
+          & $planner -I -S -c 'import sys; assert sys.version_info[:3] == (3,11,16)'
+          if ($LASTEXITCODE -ne 0) { throw 'Unexpected isolated planner version' }
+          & integrations/hermes-filebridge/tests/Test-InboundUpgrade.ps1 -PythonPath $planner -WheelArchive (Join-Path $env:RUNNER_TEMP 'filebridge-evidence/inbound-bundle/content-wheels.zip')
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: filebridge-client-${{ matrix.os }}-${{ github.sha }}
@@ -260,6 +274,9 @@ jobs:
           "$CF_CURRENT_HERMES_PYTHON" -I -B -X utf8 "$tests/test_hermes_loader.py" "${base[@]}" | tee "$CF_CURRENT_HERMES_ROOT/evidence/loader.jsonl"
           "$CF_CURRENT_HERMES_PYTHON" -I -B -X utf8 "$tests/test_hermes_middleware.py" "${base[@]}" --worker "$CF_FILEBRIDGE_INBOUND_TEST_EXE" | tee "$CF_CURRENT_HERMES_ROOT/evidence/middleware.jsonl"
           "$CF_CURRENT_HERMES_PYTHON" -I -B -X utf8 "$tests/test_hermes_request_probe.py" "${base[@]}" --lifecycle | tee "$CF_CURRENT_HERMES_ROOT/evidence/request.jsonl"
+          "$CF_CURRENT_HERMES_PYTHON" -I -B -X utf8 "$tests/test_hermes_upgrade_tools.py" \
+            --hermes-source "$CF_CURRENT_HERMES_SOURCE" --hermes-archive "$CF_CURRENT_HERMES_ROOT/hermes.zip" \
+            | tee "$CF_CURRENT_HERMES_ROOT/evidence/upgrade-tool-selection.jsonl"
       - name: Native Windows request to verified file and handle revocation
         if: runner.os == 'Windows'
         shell: bash
@@ -277,12 +294,30 @@ jobs:
             --hermes-source "$CF_CURRENT_HERMES_SOURCE" --hermes-commit 0f4a98f87c17007b81500239d0bd5b9574027b73 \
             --hermes-archive "$CF_CURRENT_HERMES_ROOT/hermes.zip" --worker "$CF_FILEBRIDGE_INBOUND_TEST_EXE" \
             | tee "$CF_CURRENT_HERMES_ROOT/evidence/content-request.jsonl"
+      - name: Independent default upgrade-planner interpreter (Windows only)
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11.16'
       - name: Offline incremental Windows upgrade preserves the installed configuration
         if: runner.os == 'Windows'
         shell: powershell
         run: |
           & integrations/hermes-filebridge/tests/Test-InboundStage.ps1
           & integrations/hermes-filebridge/tests/Test-InboundUpgrade.ps1 -PythonPath $env:CF_CURRENT_HERMES_PYTHON
+          $plannerRoot=Join-Path $env:CF_CURRENT_HERMES_ROOT 'upgrade-planner-311'
+          $env:HOME=Join-Path $env:CF_CURRENT_HERMES_ROOT 'preparation-home'
+          $env:USERPROFILE=$env:HOME;$env:HERMES_HOME=Join-Path $env:HOME 'profile'
+          python -I -B -m venv $plannerRoot
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated planner venv creation failed' }
+          $planner=Join-Path $plannerRoot 'Scripts/python.exe'
+          & $planner -I -B -m pip --isolated install --disable-pip-version-check -r integrations/hermes-filebridge/tests/hermes-probe-requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated planner test dependencies unavailable' }
+          & $planner -I -S -c 'import sys; assert sys.version_info[:3] == (3,11,16)'
+          if ($LASTEXITCODE -ne 0) { throw 'Unexpected isolated planner version' }
+          & integrations/hermes-filebridge/tests/Test-InboundUpgrade.ps1 -PythonPath $planner -AlternatePythonPath $env:CF_CURRENT_HERMES_PYTHON
+          & $planner -I -B -X utf8 integrations/hermes-filebridge/tests/test_hermes_upgrade_tools.py --hermes-source $env:CF_CURRENT_HERMES_SOURCE --hermes-archive (Join-Path $env:CF_CURRENT_HERMES_ROOT 'hermes.zip')
+          if ($LASTEXITCODE -ne 0) { throw 'Default planner official-tool-selection regression failed' }
       - name: Real Gateway Python 3.12 with current Hermes Python 3.14.7 joint chain
         if: runner.os == 'Linux'
         shell: bash

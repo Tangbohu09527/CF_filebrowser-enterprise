@@ -74,7 +74,9 @@
 升级在全新的私有计划目录中生成备份、离线解析 venv、配置候选和摘要检查点。
 仅向该新 venv 用 `--no-index --only-binary=:all: --no-deps --require-hashes` 安装制品内 wheel。
 旧客户端及 worker 保留，CA / Token 引用 / 工作根 / 模型 / 其它工具语义保持。
-仅追加内容能力、允许 consumer、工具集以及新解析器路径/摘要。
+仅追加内容能力、允许 consumer 以及新解析器路径/摘要。
+保留 `platform_toolsets` 的原始选择形态，由官方解析器发现新插件工具；不把缺省变成
+显式列表，也不复制 CLI 选择。已有 known-plugin 退出选择和全局禁用不自动解除。
 
 `Apply` / `Resume` 要求操作者已停止选定 Hermes 进程并传 `-HermesStopped`；
 脚本核对进程可执行路径，绝不自行停止或重启。已知插件和配置原子替换，保留原 ACL 与私有备份；
@@ -82,6 +84,44 @@
 若 venv 创建/安装在形成完整 runtime inventory 前中断，部分目录会原样保留并拒绝复用；
 需选择全新的计划目录。已形成检查点的插件/配置切换才可以原目录续接。
 最终固定产物编号、摘要和一条安装命令以本次交付为准。
+
+### 升级器兼容修正（2026-09-30）
+
+旧升级器将 `platform_toolsets.api_server` 的显式字符串列表误当作必要条件，合成
+“只有 cli、API 缺省”和“整个 section 缺省”用例复现 `api_toolsets_missing` 后才修复。
+固定官方 `0f4a98f` 的 API 入口使用有效配置加载器和 `_get_platform_tools`；缺省或
+null 使用平台默认，显式空列表保留空选择，列表字面量字符串也有正式解析支持。
+升级规划器保留这些原始字段，不使用 `value or 默认列表`，不把权限扩大为 all。
+普通标量字符串、混合元素及其它含糊类型保守拒绝并返回 `api_toolsets_invalid`，不替
+操作者采用官方警告后的 fallback 或字符串强制转换。全局 all / * / 内容工具禁用，
+以及 known_plugin_toolsets 中已经明确放弃的内容工具，均返回 `content_toolset_disabled`。
+其它平台、MCP、自定义选择与全局禁止项保留原样；共享 YAML consumer 别名若连带改变
+无关字段仍拒绝，未修改的工具选择别名及注释保留。
+
+真实官方 discovery → API 有效配置加载 → 平台解析 → 工具名筛选，在隔离 Profile
+比较升级前后权限。新插件工具按 Hermes 的默认发现规则也可能出现在其它平台；唯一
+允许新增的是本次批准的内容工具，已有权限不变，无可信绑定仍拒绝。检查发生在工具
+check_fn 就绪判断之前，不声称 MCP 连接或运行时服务已可用。任意用户插件可以通过
+代码定义动态组合禁止项；离线 YAML 规划器不会执行这类代码来猜权限，官方最终抑制
+仍保留。探针对这种组合明确记录内容工具不可用，不把它记作可用升级成功。
+
+规划器解释器与实际 HTTP 服务执行器可以不同。Windows 离线包同时包含原固定版本
+的 CPython 3.11 / 3.14 wheel，不切换或升级操作者的解释器，也不修改现有依赖环境。
+验证范围为独立 Python 3.11.16 和 3.14.7。Apply 仍要求停机确认，除了原所选/base
+解释器检查，还保守拒绝同一 HermesHome 下正在运行的 Python 进程；这不代表这些
+进程全是 Hermes API，脚本不会识别其业务或自动停止它们。
+
+Python 3.11 的 ensurepip 在合成 Windows 长路径下曾因随附 setuptools 深层文件名
+失败，原始失败证据保留。新解析 venv 使用 `--without-pip`，通过所选规划器已有 pip
+的[公开 `--python` 参数](https://pip.pypa.io/en/stable/topics/python-option/)指定新 venv
+离线安装；只读检查 pip 至少为 22.3，缺失或不支持时明确拒绝，不自动升级 pip。
+解析环境不需要 pip/setuptools；不修改系统长路径设置或向原解释器环境安装包。
+
+可诊断失败只公开固定白名单的阶段与错误码，例如
+`CF_UPGRADE_PYTHON_STEP_FAILED:config_semantic_plan:content_toolset_disabled`。
+仅接受本规划器的有界、严格三字段错误对象，非规划器输出、未知码、重复字段、额外
+文本和 stderr 继续脱敏；不输出配置片段或 traceback。旧制品与失败现场原样保留，
+修复使用追加提交对应的新 Windows 制品和源码包。
 
 ## 可重复验证与验收层级
 
@@ -111,7 +151,11 @@ requests 调用中的外部 DNS；首轮短栈不足以确认调用源，完整�
 - `tests/test_gateway_hermes_joint.py`：Linux 固定 Gateway 数据库、claim、预绑定、认证
   resolve/events/closed → 独立当前 Hermes → 本产品 PDF/图片读取；仅微信取件和模型为替身。
 - `tests/Test-InboundStage.ps1`、`tests/Test-InboundUpgrade.ps1`：新临时目录中的实际 NTFS
-  与离线升级测试，旧安装不作为测试夹具。
+  与离线升级测试，旧安装不作为测试夹具。升级测试可传 `-WheelArchive` 验证实际制品内
+  的离线包，传 `-AlternatePythonPath` 验证规划器与服务执行器不同时仍拒绝在线 Apply。
+- `tests/test_hermes_upgrade_tools.py --hermes-source <固定完整源码> --hermes-archive <已核验ZIP>`：
+  Python 3.11.16 / 3.14.7 下真实官方 loader 与 API 配置解析；15 组合法配置前后比较、
+  5 组明确禁用、1 组动态组合禁用边界。每次导入前建立独立 Profile 和审计。
 
 三层验收分别记录：①代码与隔离测试；②操作者升级后的本机授权实际读取；
 ③微信收到 PDF 实际正文与图片分析。确定性模型只证明图片进入模型，不能证明真实视觉判断。

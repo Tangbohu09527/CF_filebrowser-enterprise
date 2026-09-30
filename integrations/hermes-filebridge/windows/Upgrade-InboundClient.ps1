@@ -113,7 +113,51 @@ function NewFile([string]$Path,[byte[]]$Bytes) {
     finally { $stream.Dispose() }
     $verified=ReadLocked $Path (HashBytes $Bytes) $true
 }
-function RunPython([string]$Executable,[string[]]$Arguments,[bool]$Json=$true) {
+function Get-CfUpgradeSafePythonFailure([string]$Text,[string]$ExpectedStage) {
+    $safeStages=@('config_semantic_plan','runtime_dependencies','runtime_extract_wheels','runtime_inventory')
+    $safeErrors=@(
+        'absolute_path_required','reparse_refused','input_size_or_type','yaml_mapping_required','plugin_version_conflict',
+        'existing_plugin_not_enabled','existing_inbound_not_enabled','existing_host_settings_missing','existing_host_settings_incomplete',
+        'existing_profile_revision_invalid','existing_worker_digest_invalid','consumer_allowlist_missing','api_toolsets_missing',
+        'runtime_pin_invalid','yaml_alias_changes_unrelated_settings','candidate_size_exceeded','candidate_roundtrip_failed',
+        'dependency_inventory_invalid','dependency_inventory_incomplete','runtime_reparse_refused','runtime_size_exceeded',
+        'runtime_node_refused','runtime_empty','checkpoint_conflict','wheels_directory_required','wheel_archive_shape',
+        'wheel_archive_member','wheel_archive_size','runtime_modified_or_unknown','candidate_absolute_required','prepared_candidate_conflict',
+        'configuration_plan_failed','platform_toolsets_invalid','api_toolsets_invalid','known_plugin_toolsets_invalid',
+        'agent_configuration_invalid','disabled_toolsets_invalid','content_toolset_disabled'
+    )
+    if ($Text.Length -gt 512 -or $safeStages -cnotcontains $ExpectedStage) { return $null }
+    # Deliberately accept only the planner's fixed three-key serialization.
+    # A strict shape rejects duplicate keys, extra fields, free text and JSON
+    # string escapes before any diagnostic can reach an operator's terminal.
+    $match=[regex]::Match($Text,'\A\s*\{\s*"ok"\s*:\s*false\s*,\s*"stage"\s*:\s*"([a-z_]+)"\s*,\s*"error"\s*:\s*"([a-z_]+)"\s*\}\s*\z')
+    if (-not $match.Success -or $match.Groups[1].Value -cne $ExpectedStage -or $safeErrors -cnotcontains $match.Groups[2].Value) { return $null }
+    return ('CF_UPGRADE_PYTHON_STEP_FAILED:'+$ExpectedStage+':'+$match.Groups[2].Value)
+}
+function Get-CfUpgradePlannerVersion($Info) {
+    if ($null -eq $Info -or @($Info.PSObject.Properties).Count -ne 4 -or
+        $null -eq $Info.PSObject.Properties['version'] -or $null -eq $Info.PSObject.Properties['bits'] -or
+        $null -eq $Info.PSObject.Properties['platform'] -or $null -eq $Info.PSObject.Properties['implementation']) {
+        throw 'CF_UPGRADE_UNSUPPORTED_PYTHON_ABI'
+    }
+    $version=@($Info.version)
+    if ($version.Count -ne 3 -or ($Info.bits -isnot [int] -and $Info.bits -isnot [long]) -or $Info.bits -ne 64 -or $Info.platform -cne 'win-amd64' -or $Info.implementation -cne 'cpython') {
+        throw 'CF_UPGRADE_UNSUPPORTED_PYTHON_ABI'
+    }
+    foreach ($part in $version) {
+        if (($part -isnot [int] -and $part -isnot [long]) -or $part -lt 0) { throw 'CF_UPGRADE_UNSUPPORTED_PYTHON_ABI' }
+    }
+    if ($version[0] -ne 3 -or $version[1] -notin @(11,14)) { throw 'CF_UPGRADE_UNSUPPORTED_PYTHON_ABI' }
+    return ($version -join '.')
+}
+function Assert-CfUpgradeTargetPip($Version) {
+    # pip documents --python for managing a pip-less venv from version 22.3.
+    # Never upgrade the selected planner's packages to acquire this capability.
+    if ($Version -isnot [string] -or $Version.Length -gt 24 -or $Version -cnotmatch '^[0-9]{1,6}\.[0-9]{1,6}(?:\.[0-9]{1,6})?$') { throw 'CF_UPGRADE_PLANNER_PIP_UNSUPPORTED' }
+    $parts=$Version.Split('.')
+    if ([long]$parts[0] -lt 22 -or ([long]$parts[0] -eq 22 -and [long]$parts[1] -lt 3)) { throw 'CF_UPGRADE_PLANNER_PIP_UNSUPPORTED' }
+}
+function RunPython([string]$Executable,[string[]]$Arguments,[bool]$Json=$true,[string]$FailureStage='') {
     # Only this explicit interpreter; no inherited credentials or package-index
     # settings. stdout/stderr stay private and only bounded metadata is emitted.
     $start=[Diagnostics.ProcessStartInfo]::new();$start.FileName=$Executable
@@ -124,6 +168,10 @@ function RunPython([string]$Executable,[string[]]$Arguments,[bool]$Json=$true) {
     $start.EnvironmentVariables.Clear()
     $start.EnvironmentVariables['SystemRoot']=$env:SystemRoot
     $start.EnvironmentVariables['WINDIR']=$env:SystemRoot
+    # pip --python re-launches the target without the parent's -I/-B flags.
+    # These fixed values also protect that child from user-site and pyc writes.
+    $start.EnvironmentVariables['PYTHONDONTWRITEBYTECODE']='1'
+    $start.EnvironmentVariables['PYTHONNOUSERSITE']='1'
     $start.EnvironmentVariables['PATH']=[IO.Path]::GetDirectoryName($Executable)+';'+(Join-Path $env:SystemRoot 'System32')
     # Before preparation, use the operator-selected private profile only as a
     # read-only HOME. Python is isolated and no Hermes module is imported.
@@ -138,8 +186,23 @@ function RunPython([string]$Executable,[string[]]$Arguments,[bool]$Json=$true) {
         $output=$process.StandardOutput.ReadToEndAsync();$errors=$process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit(120000)) { $process.Kill();$process.WaitForExit();throw 'CF_UPGRADE_PYTHON_TIMEOUT' }
         $text=$output.GetAwaiter().GetResult();$privateError=$errors.GetAwaiter().GetResult()
-        if ($process.ExitCode -ne 0) { throw 'CF_UPGRADE_PYTHON_STEP_FAILED_NO_PRIVATE_OUTPUT' }
-        if ($Json) { return ($text | ConvertFrom-Json) }
+        if ($process.ExitCode -ne 0) {
+            $safeFailure=$null
+            if ($Json -and $FailureStage -and $Arguments.Count -ge 5 -and $Arguments[0] -ceq '-I' -and
+                $Arguments[1] -ceq '-X' -and $Arguments[2] -ceq 'utf8' -and $Arguments[3] -ceq '-B' -and
+                [IO.Path]::IsPathRooted($Arguments[4])) {
+                $plannerScript=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'inbound_upgrade_config.py'))
+                if ([IO.Path]::GetFullPath($Arguments[4]).Equals($plannerScript,[StringComparison]::OrdinalIgnoreCase)) {
+                    $safeFailure=Get-CfUpgradeSafePythonFailure $text $FailureStage
+                }
+            }
+            if ($safeFailure) { throw $safeFailure }
+            throw 'CF_UPGRADE_PYTHON_STEP_FAILED_NO_PRIVATE_OUTPUT'
+        }
+        if ($Json) {
+            try { return ($text | ConvertFrom-Json) }
+            catch { throw 'CF_UPGRADE_PYTHON_RESPONSE_INVALID_NO_PRIVATE_OUTPUT' }
+        }
     } finally { $process.Dispose() }
 }
 function RunPlanner([string]$Candidate='') {
@@ -149,7 +212,7 @@ function RunPlanner([string]$Candidate='') {
         '--requirements',(Join-Path $bundle 'requirements-inbound-content.txt'))
     if ($Candidate) { $arguments+=@('--candidate',$Candidate) }
     if ($runtimePython) { $arguments+=@('--runtime-python',$runtimePython,'--runtime-sha256',$runtimeHash) }
-    $value=RunPython $python $arguments
+    $value=RunPython $python $arguments $true 'config_semantic_plan'
     if (-not $value.ok) { throw 'CF_UPGRADE_CONFIGURATION_PLAN_FAILED' }
     return $value
 }
@@ -167,6 +230,18 @@ function AssertStopped {
         $running=@(Get-CimInstance -ClassName Win32_Process -Filter ("ExecutablePath='"+$escaped+"'") -Property ExecutablePath,ProcessId)
         if ($running.Count -ne 0) { throw 'CF_UPGRADE_SELECTED_HERMES_PYTHON_STILL_RUNNING' }
     }
+    # The selected planner can differ from the serving runtime. Constrain the
+    # provider query to this exact HermesHome subtree; never fetch command lines
+    # or inspect processes in another application's directory.
+    $hermesPrefix=(LocalPath $HermesHome)+'\'
+    $likePrefix=$hermesPrefix.Replace('[','[[]').Replace('%','[%]').Replace('_','[_]').Replace('\','\\').Replace("'","\'")
+    $running=@(Get-CimInstance -ClassName Win32_Process -Filter ("Name LIKE 'python%.exe' AND ExecutablePath LIKE '"+$likePrefix+"%'") -Property ExecutablePath,ProcessId)
+    foreach ($process in $running) {
+        if ($process.ExecutablePath -and $process.ExecutablePath.StartsWith($hermesPrefix,[StringComparison]::OrdinalIgnoreCase) -and
+            [IO.Path]::GetFileName($process.ExecutablePath) -match '^python(?:[0-9]+(?:\.[0-9]+)*)?w?\.exe$') {
+            throw 'CF_UPGRADE_HERMES_HOME_PYTHON_STILL_RUNNING'
+        }
+    }
 }
 function PrepareRuntime {
     $runtime=Join-Path $upgrade 'parser-runtime';$receipt=Join-Path $upgrade 'runtime.inventory.json'
@@ -174,21 +249,23 @@ function PrepareRuntime {
         Hold $runtime;Private $runtime
         if (-not (Test-Path -LiteralPath $receipt)) { throw 'CF_UPGRADE_PARTIAL_RUNTIME_PRESERVED_USE_NEW_PLAN_DIRECTORY' }
         if ($checkpoint) { $verified=ReadLocked $receipt $checkpoint.runtime_inventory_sha256 $true }
-        $check=RunPython $python (RuntimeArguments @('--runtime-receipt',$receipt,'--runtime-root',$runtime,'--verify-runtime'))
+        $check=RunPython $python (RuntimeArguments @('--runtime-receipt',$receipt,'--runtime-root',$runtime,'--verify-runtime')) $true 'runtime_inventory'
     } else {
+        $pipVersion=RunPython $python @('-I','-X','utf8','-B','-c',"import json,importlib.util,importlib.metadata;print(json.dumps(importlib.metadata.version('pip') if importlib.util.find_spec('pip') is not None else None))")
+        Assert-CfUpgradeTargetPip $pipVersion
         $wheels=Join-Path $upgrade 'wheels';NewDirectory $wheels
-        $extracted=RunPython $python (RuntimeArguments @('--extract-wheels','--wheel-archive',(Join-Path $bundle 'content-wheels.zip'),'--wheels',$wheels))
+        $extracted=RunPython $python (RuntimeArguments @('--extract-wheels','--wheel-archive',(Join-Path $bundle 'content-wheels.zip'),'--wheels',$wheels)) $true 'runtime_extract_wheels'
         NewDirectory $runtime
-        RunPython $python @('-I','-X','utf8','-B','-m','venv',$runtime) $false
+        RunPython $python @('-I','-X','utf8','-B','-m','venv','--without-pip',$runtime) $false
         $createdPython=Join-Path $runtime 'Scripts/python.exe'
-        RunPython $createdPython @('-I','-X','utf8','-B','-m','pip','--isolated','install','--no-index','--no-cache-dir',
+        RunPython $python @('-I','-X','utf8','-B','-m','pip','--isolated','--python',$createdPython,'install','--no-index','--no-cache-dir',
             '--no-compile','--only-binary=:all:','--no-deps','--require-hashes','--find-links',$wheels,
             '-r',(Join-Path $bundle 'requirements-inbound-content.txt')) $false
-        $check=RunPython $python (RuntimeArguments @('--runtime-receipt',$receipt,'--runtime-root',$runtime))
+        $check=RunPython $python (RuntimeArguments @('--runtime-receipt',$receipt,'--runtime-root',$runtime)) $true 'runtime_inventory'
     }
     $script:runtimePython=Join-Path $runtime 'Scripts/python.exe'
     $script:runtimeHash=HashBytes (ReadLocked $runtimePython '' $true)
-    $status=RunPython $runtimePython (RuntimeArguments @('--dependencies-only'))
+    $status=RunPython $runtimePython (RuntimeArguments @('--dependencies-only')) $true 'runtime_dependencies'
     if (-not $status.dependency_ready) { throw 'CF_UPGRADE_OFFLINE_RUNTIME_DEPENDENCY_MISMATCH' }
     return $status
 }
@@ -245,6 +322,8 @@ try {
     foreach ($entry in $newInventory.files.PSObject.Properties) {
         $verified=ReadLocked (Join-Path $bundle $entry.Name) $entry.Value
     }
+    $plannerInfo=RunPython $python @('-I','-S','-X','utf8','-B','-c',"import json,sys,struct,sysconfig;print(json.dumps(dict(version=list(sys.version_info[:3]),bits=8*struct.calcsize('P'),platform=sysconfig.get_platform(),implementation=sys.implementation.name)))")
+    $plannerVersion=Get-CfUpgradePlannerVersion $plannerInfo
     $plan=RunPlanner
     $worker=LocalPath $plan.worker_path
     $workerBytes=ReadLocked $worker $plan.worker_sha256 $true
@@ -307,7 +386,7 @@ try {
             $status=PrepareRuntime
             $plan.dependency_ready=$status.dependency_ready;$plan.dependency_blockers=$status.dependency_blockers
         }
-        @{ok=$true;mode=$Mode;writes_performed=$false;configuration_preserved=$true;previous_plugin_verified=$true;
+        @{ok=$true;mode=$Mode;planner_python_version=$plannerVersion;writes_performed=$false;configuration_preserved=$true;previous_plugin_verified=$true;
           dependency_ready=$plan.dependency_ready;ready_to_apply=$plan.dependency_ready;dependency_blockers=$plan.dependency_blockers;
           existing_worker_preserved=$true;bundle_worker_matches_existing=($newInventory.files.'filebridge-inbound.exe' -ceq $plan.worker_sha256);
           live_restarted=$false;network_requests=$false} | ConvertTo-Json -Depth 5 -Compress
@@ -361,7 +440,7 @@ try {
         }
         ReplaceKnown $config $candidateBytes $beforeConfig $afterConfig
     }
-    @{ok=$true;mode=$Mode;prepared=$true;applied=($Mode -in @('Apply','Resume'));existing_worker_preserved=$true;
+    @{ok=$true;mode=$Mode;planner_python_version=$plannerVersion;prepared=$true;applied=($Mode -in @('Apply','Resume'));existing_worker_preserved=$true;
       dependency_ready=$plan.dependency_ready;dependency_blockers=$plan.dependency_blockers;
       bundle_worker_matches_existing=($newInventory.files.'filebridge-inbound.exe' -ceq $plan.worker_sha256);
       rollback_performed=$false;live_restarted=$false;network_requests=$false} | ConvertTo-Json -Depth 5 -Compress
