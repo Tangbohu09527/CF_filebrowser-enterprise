@@ -1,6 +1,12 @@
 # Hermes FileBridge：只读接入、受控新建与入站内容读取
 
-Windows 当前交付入口是 [统一安装与中断恢复](WINDOWS_SETUP.md)：下载固定制品后双击
+当前推荐路线（2026-10-06）：通过受限 FileBrowser HTTP API 将已批准文件下载到 AI 主机，
+再用 Hermes 原生能力读取；安装器路线暂停。实际验证进度与边界见
+[通用 HTTP 下载与原生读取记录](validation/2026-10-06-native-api-read.md)。
+这条路线读取 FileBrowser 已存文件；下述 Gateway 微信入站附件能力使用独立契约。
+PDF / 图片尚无已批准的现场样本，不宣称已通过验收。
+
+此前的 Windows 安装器入口是 [统一安装与中断恢复](WINDOWS_SETUP.md)：下载固定制品后双击
 `FileBridge-Setup.exe`，由入口选择安全路径。原 Check / Apply / Resume 保留为内部组件，
 不再要求操作者逐段复制 PowerShell。2026-09-30 已确认存在部分升级现场；开发测试没有
 执行现场恢复、启停或安装。
