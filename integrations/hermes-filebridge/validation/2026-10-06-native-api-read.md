@@ -1,5 +1,9 @@
 # 2026-10-06：既有 FileBrowser API → Hermes 原生读取实证
 
+以下保留 `26db524c` 的首次文本验收及当时目录快照。操作者随后上传获批样本后的
+PDF / PNG 下载、原生正文提取和真实视觉回答，另见[后续媒体验收记录](2026-10-06-native-media-read.md)。
+不将后续结果倒填为首次测试已执行的项目。
+
 按 [PR #2 交接留言](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/pull/2#issuecomment-6006915789)
 停止推进专用安装器路线。本次只有受限 HTTP 文本下载和同一文件的原生正文读取通过；
 PDF、图片及微信端到端未验收。没有运行安装器、FileBridge CLI、专用下载 worker 或生产服务入口。

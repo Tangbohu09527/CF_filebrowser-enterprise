@@ -2,9 +2,11 @@
 
 当前推荐路线（2026-10-06）：通过受限 FileBrowser HTTP API 将已批准文件下载到 AI 主机，
 再用 Hermes 原生能力读取；安装器路线暂停。实际验证进度与边界见
-[通用 HTTP 下载与原生读取记录](validation/2026-10-06-native-api-read.md)。
+[首次文本记录](validation/2026-10-06-native-api-read.md)及
+[PDF / PNG 实际下载与原生读取记录](validation/2026-10-06-native-media-read.md)。
 这条路线读取 FileBrowser 已存文件；下述 Gateway 微信入站附件能力使用独立契约。
-PDF / 图片尚无已批准的现场样本，不宣称已通过验收。
+获批 PDF / PNG 均与上传前原始字节基准一致；PDF 正文及真实辅助视觉回答完成独立核对。
+完整 Agent 会话与微信端到端仍未验收，不以本机成功替代。
 
 此前的 Windows 安装器入口是 [统一安装与中断恢复](WINDOWS_SETUP.md)：下载固定制品后双击
 `FileBridge-Setup.exe`，由入口选择安全路径。原 Check / Apply / Resume 保留为内部组件，
