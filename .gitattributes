@@ -1,3 +1,5 @@
 deploy/** text eol=lf
 scripts/** text eol=lf
 .github/workflows/deployment-assets.yaml text eol=lf
+integrations/hermes-filebridge/tests/fixtures/*.pdf binary
+integrations/hermes-filebridge/tests/fixtures/*.jpg binary

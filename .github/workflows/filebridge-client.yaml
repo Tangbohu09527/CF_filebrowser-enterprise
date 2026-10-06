@@ -1,0 +1,426 @@
+name: FileBridge client
+
+on:
+  push:
+    branches: ['feat/filebridge-hermes-crud']
+    paths:
+      - 'tools/filebrowser-agentctl/**'
+      - 'integrations/hermes-filebridge/**'
+      - '.github/workflows/filebridge-client.yaml'
+  pull_request:
+    paths:
+      - 'tools/filebrowser-agentctl/**'
+      - 'integrations/hermes-filebridge/**'
+      - '.github/workflows/filebridge-client.yaml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: filebridge-client-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  client:
+    name: Client regression (${{ matrix.os }})
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: tools/filebrowser-agentctl/go.mod
+          cache: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        if: runner.os == 'Linux'
+        with:
+          python-version: '3.11.16'
+      - name: Verified independent Windows Python 3.11.16
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/filebridge-upgrade-python311"
+          mkdir -p "$root/runtime"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 2 --retry-delay 5 --retry-max-time 60 \
+            https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.11.16%2B20260924-x86_64-pc-windows-msvc-install_only_stripped.tar.gz \
+            -o "$root/python.tar.gz"
+          echo "f86b3cbd425e1c446b56aa24e20a7be1223c1a8146e5e3a68c8e18d08b76e810  $root/python.tar.gz" | sha256sum -c -
+          tar -xzf - -C "$(cygpath -u "$root/runtime")" < "$root/python.tar.gz"
+          "$root/runtime/python/python.exe" -I -B -c 'import sys; assert sys.version_info[:3] == (3,11,16); print(sys.version)'
+          cygpath -w "$root/runtime/python" >> "$GITHUB_PATH"
+      - name: Test and vet independent client
+        working-directory: tools/filebrowser-agentctl
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version
+          unformatted=$(gofmt -l cmd internal)
+          printf '%s\n' "$unformatted"
+          test -z "$unformatted"
+          go test -count=1 ./...
+          go vet ./...
+      - name: Build isolated inbound worker for native plugin integration tests
+        working-directory: tools/filebrowser-agentctl
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/filebridge-inbound"
+          if [ "$RUNNER_OS" = Windows ]; then output="$output.exe"; fi
+          go build -trimpath -mod=readonly -o "$output" ./cmd/filebridge-inbound
+          echo "CF_FILEBRIDGE_INBOUND_TEST_EXE=$output" >> "$GITHUB_ENV"
+      - name: Test existing Hermes tools and inbound HTTPS worker wiring
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I -B -m pip --isolated install --disable-pip-version-check --only-binary=:all: --require-hashes -r integrations/hermes-filebridge/requirements-inbound-content.txt
+          python -B -X utf8 -m unittest discover -s integrations/hermes-filebridge/tests -v
+      - name: Verify official Hermes loader, middleware and HTTP request boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/filebridge-hermes-loader"
+          echo "CF_HERMES_TEST_SOURCE=$root/source/hermes-agent-4d55ca91656ac5f83e1506679b7f81e0238e5e16" >> "$GITHUB_ENV"
+          echo "CF_HERMES_TEST_ARCHIVE=$root/source.zip" >> "$GITHUB_ENV"
+          mkdir -p "$root/source"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 2 --retry-delay 5 --retry-max-time 60 \
+            https://codeload.github.com/NousResearch/hermes-agent/zip/4d55ca91656ac5f83e1506679b7f81e0238e5e16 \
+            -o "$root/source.zip"
+          echo "3c04b108ae0fcf0e84524ce31b1ea1a739a087a15c0c1382af86260dc84c3979  $root/source.zip" | sha256sum -c -
+          unzip -q "$root/source.zip" -d "$root/source"
+          python -m venv "$root/venv"
+          runner="$root/venv/bin/python"
+          if [ "$RUNNER_OS" = Windows ]; then runner="$root/venv/Scripts/python.exe"; fi
+          "$runner" -m pip install --disable-pip-version-check -r integrations/hermes-filebridge/tests/hermes-probe-requirements.txt
+          "$runner" -I -B -m pip --isolated install --disable-pip-version-check --only-binary=:all: --require-hashes -r integrations/hermes-filebridge/requirements-inbound-content.txt
+          "$runner" -I -B -X utf8 integrations/hermes-filebridge/tests/test_hermes_loader.py \
+            --hermes-source "$root/source/hermes-agent-4d55ca91656ac5f83e1506679b7f81e0238e5e16" --hermes-archive "$root/source.zip"
+          "$runner" -I -B -X utf8 integrations/hermes-filebridge/tests/test_hermes_middleware.py \
+            --hermes-source "$root/source/hermes-agent-4d55ca91656ac5f83e1506679b7f81e0238e5e16" \
+            --hermes-archive "$root/source.zip" \
+            --worker "$CF_FILEBRIDGE_INBOUND_TEST_EXE"
+          "$runner" -I -B -X utf8 integrations/hermes-filebridge/tests/test_hermes_request_probe.py \
+            --hermes-source "$root/source/hermes-agent-4d55ca91656ac5f83e1506679b7f81e0238e5e16" --hermes-archive "$root/source.zip" --lifecycle
+      - name: Python required by the fixed Gateway snapshot (joint test only)
+        if: runner.os == 'Linux'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Real Gateway and official Hermes combined chain (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/filebridge-gateway-joint"
+          mkdir -p "$root/source"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 2 --retry-delay 5 --retry-max-time 60 \
+            https://codeload.github.com/Tangbohu09527/CF_agent-gateway/zip/0ec54bf0f25f421e37e16e11bd098a814beca258 \
+            -o "$root/source.zip"
+          echo "c0ad44618fcd7c640c640f921e8910b8292dcadc24dd2c03cc03a34c2761c445  $root/source.zip" | sha256sum -c -
+          unzip -q "$root/source.zip" -d "$root/source"
+          python -m venv "$root/venv"
+          "$root/venv/bin/python" -m pip install --disable-pip-version-check \
+            -r integrations/hermes-filebridge/tests/gateway-hermes-joint-requirements.txt
+          joint_status=0
+          "$root/venv/bin/python" -I -B -X utf8 integrations/hermes-filebridge/tests/test_gateway_hermes_joint.py \
+            --gateway-source "$root/source/CF_agent-gateway-0ec54bf0f25f421e37e16e11bd098a814beca258" \
+            --gateway-archive "$root/source.zip" \
+            --hermes-source "$CF_HERMES_TEST_SOURCE" --hermes-archive "$CF_HERMES_TEST_ARCHIVE" --worker "$CF_FILEBRIDGE_INBOUND_TEST_EXE" || joint_status=$?
+          exit_status=0
+          "$root/venv/bin/python" -I -B -X utf8 integrations/hermes-filebridge/tests/test_gateway_hermes_host_exit.py \
+            --gateway-source "$root/source/CF_agent-gateway-0ec54bf0f25f421e37e16e11bd098a814beca258" \
+            --gateway-archive "$root/source.zip" \
+            --hermes-source "$CF_HERMES_TEST_SOURCE" --hermes-archive "$CF_HERMES_TEST_ARCHIVE" --worker "$CF_FILEBRIDGE_INBOUND_TEST_EXE" || exit_status=$?
+          # Run both independent boundaries; either failure keeps the gate red.
+          test "$joint_status" -eq 0
+          test "$exit_status" -eq 0
+      - name: Build client and retain fixed-source inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/filebridge-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/filebridge-evidence/source-sha.txt"
+          go version > "$RUNNER_TEMP/filebridge-evidence/go-version.txt"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/filebridge-evidence/filebridge-source.tar.gz" HEAD tools/filebrowser-agentctl integrations/hermes-filebridge
+          cd tools/filebrowser-agentctl
+          output="$RUNNER_TEMP/filebridge-evidence/filebrowser-agentctl"
+          if [ "$RUNNER_OS" = Windows ]; then output="$output.exe"; fi
+          CGO_ENABLED=0 go build -trimpath -mod=readonly -o "$output" ./cmd/filebrowser-agentctl
+          inbound="$RUNNER_TEMP/filebridge-evidence/inbound-bundle"
+          mkdir -p "$inbound/plugin"
+          binary="filebridge-inbound"
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          CGO_ENABLED=0 go build -trimpath -mod=readonly -o "$inbound/$binary" ./cmd/filebridge-inbound
+          cp ../../integrations/hermes-filebridge/plugin/{__init__.py,inbound.py,inbound_control.py,inbound_directory.py,inbound_host.py,inbound_content.py,plugin.yaml} "$inbound/plugin/"
+          cp ../../integrations/hermes-filebridge/requirements-inbound-content.txt "$inbound/"
+          wheels="$RUNNER_TEMP/filebridge-content-wheels"
+          mkdir -p "$wheels"
+          if [ "$RUNNER_OS" = Windows ]; then
+            # The upgrade planner and serving API may use different runtimes.
+            # Keep both tested Windows ABIs offline; never switch the operator's
+            # interpreter to make a single-ABI bundle install successfully.
+            for version in 3.11 3.14; do
+              abi="cp${version/./}"
+              python -I -B -m pip --isolated download --disable-pip-version-check --only-binary=:all: --no-deps --require-hashes \
+                --platform win_amd64 --python-version "$version" --implementation cp --abi "$abi" --abi abi3 --abi none \
+                --dest "$wheels" -r "$inbound/requirements-inbound-content.txt"
+            done
+          else
+            python -I -B -m pip --isolated download --disable-pip-version-check --only-binary=:all: --no-deps --require-hashes \
+              --dest "$wheels" -r "$inbound/requirements-inbound-content.txt"
+          fi
+          CONTENT_WHEELS="$wheels" INBOUND_BUNDLE="$inbound" python -I -B -c 'import os,pathlib,zipfile; root=pathlib.Path(os.environ["CONTENT_WHEELS"]); files=sorted(root.iterdir()); assert files and all(p.is_file() and p.suffix==".whl" for p in files); archive=pathlib.Path(os.environ["INBOUND_BUNDLE"])/"content-wheels.zip"; z=zipfile.ZipFile(archive,"x",compression=zipfile.ZIP_STORED); [z.write(p,p.name) for p in files]; z.close()'
+          INBOUND_BUNDLE="$inbound" python -c 'import hashlib,json,os,pathlib,subprocess; p=pathlib.Path(os.environ["INBOUND_BUNDLE"]); files={f.relative_to(p).as_posix():hashlib.sha256(f.read_bytes()).hexdigest() for f in sorted(p.rglob("*")) if f.is_file()}; (p/"inventory.json").write_text(json.dumps({"schema":"cf-inbound-bundle/v1","source_commit":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),"files":files},indent=2)+"\n",encoding="utf-8")'
+          git diff --exit-code
+          cd "$RUNNER_TEMP/filebridge-evidence"
+          sha256sum filebrowser-agentctl* filebridge-source.tar.gz inbound-bundle/inventory.json > SHA256SUMS
+      - name: Exact packaged wheels support the default Windows upgrade planner
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $planner=Join-Path $env:RUNNER_TEMP 'filebridge-hermes-loader/venv/Scripts/python.exe'
+          & $planner -I -S -c 'import sys; assert sys.version_info[:3] == (3,11,16)'
+          if ($LASTEXITCODE -ne 0) { throw 'Unexpected isolated planner version' }
+          & integrations/hermes-filebridge/tests/Test-InboundUpgrade.ps1 -PythonPath $planner -WheelArchive (Join-Path $env:RUNNER_TEMP 'filebridge-evidence/inbound-bundle/content-wheels.zip')
+      - name: Fixed failed package recovery and unified Windows entry
+        if: runner.os == 'Windows'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $root=Join-Path $env:RUNNER_TEMP 'filebridge-legacy-6f59267c'
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+          # A separately pinned CI artifact, never an active installation.
+          $zip=Join-Path $root 'artifact.zip'
+          $headers=@{Authorization=('Bearer '+$env:GH_TOKEN);Accept='application/vnd.github+json'}
+          Invoke-WebRequest -Uri 'https://api.github.com/repos/Tangbohu09527/CF_filebrowser-enterprise/actions/artifacts/11075196992/zip' -Headers $headers -OutFile $zip -UseBasicParsing
+          if((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -cne '80135e45b99caafdd33d12c21ee9fdfaea54e7ecd78fa4a4b70caa6bfa09ead6'){throw 'Legacy ZIP mismatch'}
+          Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $root 'artifact')
+          $archive=Join-Path $root 'artifact/filebridge-source.tar.gz'
+          if((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -cne 'b47c4511eb3416d4a7d5613a8c10eb0335a7e5ad448411069c7bdf243d2199a1'){throw 'Legacy source mismatch'}
+          New-Item -ItemType Directory -Path (Join-Path $root 'source') | Out-Null
+          tar -xzf $archive -C (Join-Path $root 'source')
+          if($LASTEXITCODE -ne 0){throw 'Legacy source extraction failed'}
+          $planner=Join-Path $env:RUNNER_TEMP 'filebridge-hermes-loader/venv/Scripts/python.exe'
+          & integrations/hermes-filebridge/tests/Test-InboundUpgrade.ps1 -PythonPath $planner -WheelArchive (Join-Path $env:RUNNER_TEMP 'filebridge-evidence/inbound-bundle/content-wheels.zip') -LegacyBundleDirectory (Join-Path $root 'artifact/inbound-bundle') -LegacyDriver (Join-Path $root 'source/integrations/hermes-filebridge/windows/Upgrade-InboundClient.ps1')
+          & integrations/hermes-filebridge/tests/Test-FileBridgeSetup.ps1
+          & integrations/hermes-filebridge/tests/Test-SetupLifecycle.ps1
+          & integrations/hermes-filebridge/tests/Test-SetupFresh.ps1 -PythonPath $planner
+      - name: Build the fixed one-click Windows package
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          & integrations/hermes-filebridge/windows/Build-SetupBundle.ps1 -EvidenceDirectory (Join-Path $env:RUNNER_TEMP 'filebridge-evidence') -SourceCommit '${{ github.sha }}'
+      - name: Attest the Windows entry and embedded release manifest
+        if: runner.os == 'Windows' && github.event_name == 'push'
+        id: setup-attestation
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: |
+            ${{ runner.temp }}/filebridge-evidence/windows-setup/FileBridge-Setup.exe
+            ${{ runner.temp }}/filebridge-evidence/windows-setup/release-manifest.json
+      - name: Retain independent provenance proof
+        if: runner.os == 'Windows' && github.event_name == 'push'
+        shell: powershell
+        run: |
+          Copy-Item -LiteralPath '${{ steps.setup-attestation.outputs.bundle-path }}' -Destination (Join-Path $env:RUNNER_TEMP 'filebridge-evidence/windows-setup/provenance.sigstore.jsonl') -ErrorAction Stop
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: filebridge-client-${{ matrix.os }}-${{ github.sha }}
+          path: ${{ runner.temp }}/filebridge-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  current-hermes:
+    name: Hermes 0f4a98f / Python 3.14.7 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: tools/filebrowser-agentctl/go.mod
+          cache: false
+      # Gateway retains its validated runtime. The Hermes interpreter below is
+      # a separately fetched, exact upstream standalone Python distribution.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Verify independent Python and complete official source archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/filebridge-current-hermes"
+          mkdir -p "$root/runtime" "$root/source" "$root/evidence" "$root/preparation-home"
+          echo "CF_CURRENT_HERMES_ROOT=$root" >> "$GITHUB_ENV"
+          platform=x86_64-unknown-linux-gnu
+          archive_kind=install_only
+          digest=5539eaf1de20bd9b5f43ea11c3c1f84cbac74fe927ac050318a9210c022618cb
+          if [ "$RUNNER_OS" = Windows ]; then
+            platform=x86_64-pc-windows-msvc
+            archive_kind=install_only_stripped
+            digest=1493fc4185edf84bbd4305c15c5fbac2d4fcd4ddd7eb6273903669a5d3106178
+          fi
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 2 --retry-delay 5 --retry-max-time 60 \
+            "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.14.7%2B20260924-$platform-$archive_kind.tar.gz" \
+            -o "$root/python.tar.gz"
+          echo "$digest  $root/python.tar.gz" | sha256sum -c - | tee "$root/evidence/python-archive-check.txt"
+          # GNU tar treats the colon in a Windows drive path as a remote host.
+          tar_directory="$root/runtime"
+          if [ "$RUNNER_OS" = Windows ]; then tar_directory="$(cygpath -u "$tar_directory")"; fi
+          tar -xzf - -C "$tar_directory" < "$root/python.tar.gz"
+          runtime="$root/runtime/python/bin/python3.14"
+          if [ "$RUNNER_OS" = Windows ]; then runtime="$root/runtime/python/python.exe"; fi
+          export HOME="$root/preparation-home" HERMES_HOME="$root/preparation-home/profile"
+          export USERPROFILE="$HOME" APPDATA="$HOME/AppData" LOCALAPPDATA="$HOME/LocalAppData"
+          "$runtime" -I -B -X utf8 -c 'import sys; assert sys.version_info[:3] == (3,14,7), sys.version; print(sys.version)' | tee "$root/evidence/python-version.txt"
+          "$runtime" -I -B -X utf8 -m venv "$root/hermes-venv"
+          hermes_python="$root/hermes-venv/bin/python"
+          if [ "$RUNNER_OS" = Windows ]; then hermes_python="$root/hermes-venv/Scripts/python.exe"; fi
+          "$hermes_python" -I -B -X utf8 -m pip --isolated install --disable-pip-version-check --no-cache-dir \
+            -r integrations/hermes-filebridge/tests/hermes-probe-requirements.txt
+          "$hermes_python" -I -B -X utf8 -m pip --isolated install --disable-pip-version-check --only-binary=:all: --require-hashes \
+            -r integrations/hermes-filebridge/requirements-inbound-content.txt
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 2 --retry-delay 5 --retry-max-time 60 \
+            https://codeload.github.com/NousResearch/hermes-agent/zip/0f4a98f87c17007b81500239d0bd5b9574027b73 \
+            -o "$root/hermes.zip"
+          echo "0607677d5e9b3e30c93af2285bbc83108a85adca4596584f471befcdd9e6b453  $root/hermes.zip" | sha256sum -c -
+          unzip -q "$root/hermes.zip" -d "$root/source"
+          echo "CF_CURRENT_HERMES_PYTHON=$hermes_python" >> "$GITHUB_ENV"
+          echo "CF_CURRENT_HERMES_SOURCE=$root/source/hermes-agent-0f4a98f87c17007b81500239d0bd5b9574027b73" >> "$GITHUB_ENV"
+          printf '%s\n' "python_release=20260924" "python_sha256=$digest" \
+            "hermes_commit=0f4a98f87c17007b81500239d0bd5b9574027b73" \
+            "hermes_zip_sha256=0607677d5e9b3e30c93af2285bbc83108a85adca4596584f471befcdd9e6b453" \
+            > "$root/evidence/provenance.txt"
+      - name: Build existing native worker
+        working-directory: tools/filebrowser-agentctl
+        shell: bash
+        run: |
+          set -euo pipefail
+          worker="$CF_CURRENT_HERMES_ROOT/filebridge-inbound"
+          if [ "$RUNNER_OS" = Windows ]; then worker="$worker.exe"; fi
+          CGO_ENABLED=0 go build -trimpath -mod=readonly -o "$worker" ./cmd/filebridge-inbound
+          echo "CF_FILEBRIDGE_INBOUND_TEST_EXE=$worker" >> "$GITHUB_ENV"
+      - name: Existing tools and native HTTPS safety regression on Python 3.14.7
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$CF_CURRENT_HERMES_PYTHON" -B -X utf8 -m unittest discover -s integrations/hermes-filebridge/tests -v
+      - name: Current official loader, middleware and real request lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=(--hermes-source "$CF_CURRENT_HERMES_SOURCE" --hermes-commit 0f4a98f87c17007b81500239d0bd5b9574027b73 --hermes-archive "$CF_CURRENT_HERMES_ROOT/hermes.zip")
+          tests=integrations/hermes-filebridge/tests
+          "$CF_CURRENT_HERMES_PYTHON" -I -B -X utf8 "$tests/test_hermes_loader.py" "${base[@]}" | tee "$CF_CURRENT_HERMES_ROOT/evidence/loader.jsonl"
+          "$CF_CURRENT_HERMES_PYTHON" -I -B -X utf8 "$tests/test_hermes_middleware.py" "${base[@]}" --worker "$CF_FILEBRIDGE_INBOUND_TEST_EXE" | tee "$CF_CURRENT_HERMES_ROOT/evidence/middleware.jsonl"
+          "$CF_CURRENT_HERMES_PYTHON" -I -B -X utf8 "$tests/test_hermes_request_probe.py" "${base[@]}" --lifecycle | tee "$CF_CURRENT_HERMES_ROOT/evidence/request.jsonl"
+          "$CF_CURRENT_HERMES_PYTHON" -I -B -X utf8 "$tests/test_hermes_upgrade_tools.py" \
+            --hermes-source "$CF_CURRENT_HERMES_SOURCE" --hermes-archive "$CF_CURRENT_HERMES_ROOT/hermes.zip" \
+            | tee "$CF_CURRENT_HERMES_ROOT/evidence/upgrade-tool-selection.jsonl"
+      - name: Native Windows request to verified file and handle revocation
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$CF_CURRENT_HERMES_PYTHON" -I -B -X utf8 integrations/hermes-filebridge/tests/test_hermes_native_host.py \
+            --hermes-source "$CF_CURRENT_HERMES_SOURCE" --hermes-commit 0f4a98f87c17007b81500239d0bd5b9574027b73 \
+            --hermes-archive "$CF_CURRENT_HERMES_ROOT/hermes.zip" --worker "$CF_FILEBRIDGE_INBOUND_TEST_EXE" \
+            | tee "$CF_CURRENT_HERMES_ROOT/evidence/native-request.jsonl"
+      - name: Authorized content reaches document parsers and official vision
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$CF_CURRENT_HERMES_PYTHON" -I -B -X utf8 integrations/hermes-filebridge/tests/test_hermes_content.py \
+            --hermes-source "$CF_CURRENT_HERMES_SOURCE" --hermes-commit 0f4a98f87c17007b81500239d0bd5b9574027b73 \
+            --hermes-archive "$CF_CURRENT_HERMES_ROOT/hermes.zip" --worker "$CF_FILEBRIDGE_INBOUND_TEST_EXE" \
+            | tee "$CF_CURRENT_HERMES_ROOT/evidence/content-request.jsonl"
+      - name: Independent default upgrade-planner interpreter (Windows only)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/filebridge-upgrade-python311"
+          mkdir -p "$root/runtime"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 2 --retry-delay 5 --retry-max-time 60 \
+            https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.11.16%2B20260924-x86_64-pc-windows-msvc-install_only_stripped.tar.gz \
+            -o "$root/python.tar.gz"
+          echo "f86b3cbd425e1c446b56aa24e20a7be1223c1a8146e5e3a68c8e18d08b76e810  $root/python.tar.gz" | sha256sum -c -
+          tar -xzf - -C "$(cygpath -u "$root/runtime")" < "$root/python.tar.gz"
+          "$root/runtime/python/python.exe" -I -B -c 'import sys; assert sys.version_info[:3] == (3,11,16); print(sys.version)'
+          cygpath -w "$root/runtime/python" >> "$GITHUB_PATH"
+      - name: Offline incremental Windows upgrade preserves the installed configuration
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          & integrations/hermes-filebridge/tests/Test-InboundStage.ps1
+          & integrations/hermes-filebridge/tests/Test-InboundUpgrade.ps1 -PythonPath $env:CF_CURRENT_HERMES_PYTHON
+          $plannerRoot=Join-Path $env:CF_CURRENT_HERMES_ROOT 'upgrade-planner-311'
+          $env:HOME=Join-Path $env:CF_CURRENT_HERMES_ROOT 'preparation-home'
+          $env:USERPROFILE=$env:HOME;$env:HERMES_HOME=Join-Path $env:HOME 'profile'
+          python -I -B -m venv $plannerRoot
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated planner venv creation failed' }
+          $planner=Join-Path $plannerRoot 'Scripts/python.exe'
+          & $planner -I -B -m pip --isolated install --disable-pip-version-check -r integrations/hermes-filebridge/tests/hermes-probe-requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated planner test dependencies unavailable' }
+          & $planner -I -S -c 'import sys; assert sys.version_info[:3] == (3,11,16)'
+          if ($LASTEXITCODE -ne 0) { throw 'Unexpected isolated planner version' }
+          & integrations/hermes-filebridge/tests/Test-InboundUpgrade.ps1 -PythonPath $planner -AlternatePythonPath $env:CF_CURRENT_HERMES_PYTHON
+          & $planner -I -B -X utf8 integrations/hermes-filebridge/tests/test_hermes_upgrade_tools.py --hermes-source $env:CF_CURRENT_HERMES_SOURCE --hermes-archive (Join-Path $env:CF_CURRENT_HERMES_ROOT 'hermes.zip')
+          if ($LASTEXITCODE -ne 0) { throw 'Default planner official-tool-selection regression failed' }
+      - name: Real Gateway Python 3.12 with current Hermes Python 3.14.7 joint chain
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$CF_CURRENT_HERMES_ROOT"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 2 --retry-delay 5 --retry-max-time 60 \
+            https://codeload.github.com/Tangbohu09527/CF_agent-gateway/zip/0ec54bf0f25f421e37e16e11bd098a814beca258 \
+            -o "$root/gateway.zip"
+          echo "c0ad44618fcd7c640c640f921e8910b8292dcadc24dd2c03cc03a34c2761c445  $root/gateway.zip" | sha256sum -c -
+          unzip -q "$root/gateway.zip" -d "$root/source"
+          python -m venv "$root/gateway-venv"
+          "$root/gateway-venv/bin/python" -I -B -X utf8 -m pip --isolated install --disable-pip-version-check --no-cache-dir \
+            -r integrations/hermes-filebridge/tests/gateway-hermes-joint-requirements.txt
+          args=(--gateway-source "$root/source/CF_agent-gateway-0ec54bf0f25f421e37e16e11bd098a814beca258" --gateway-archive "$root/gateway.zip"
+            --hermes-source "$CF_CURRENT_HERMES_SOURCE" --hermes-commit 0f4a98f87c17007b81500239d0bd5b9574027b73
+            --hermes-archive "$root/hermes.zip" --hermes-python "$CF_CURRENT_HERMES_PYTHON" --worker "$CF_FILEBRIDGE_INBOUND_TEST_EXE")
+          joint_status=0
+          "$root/gateway-venv/bin/python" -I -B -X utf8 integrations/hermes-filebridge/tests/test_gateway_hermes_joint.py "${args[@]}" \
+            | tee "$root/evidence/linux-joint.jsonl" || joint_status=$?
+          exit_status=0
+          "$root/gateway-venv/bin/python" -I -B -X utf8 integrations/hermes-filebridge/tests/test_gateway_hermes_host_exit.py "${args[@]}" \
+            | tee "$root/evidence/linux-host-exit.jsonl" || exit_status=$?
+          test "$joint_status" -eq 0
+          test "$exit_status" -eq 0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: hermes-current-compatibility-${{ matrix.os }}-${{ github.sha }}
+          path: ${{ runner.temp }}/filebridge-current-hermes/evidence/
+          if-no-files-found: error
+          retention-days: 14

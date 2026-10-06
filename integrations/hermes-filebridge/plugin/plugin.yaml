@@ -1,0 +1,9 @@
+name: cf-filebridge
+version: "0.4.0"
+kind: standalone
+description: Scoped files, approved text creation and authorized inbound content reading
+provides_tools:
+  - filebrowser_files
+  - filebrowser_create_text
+  - filebrowser_download_inbound
+  - filebrowser_read_inbound

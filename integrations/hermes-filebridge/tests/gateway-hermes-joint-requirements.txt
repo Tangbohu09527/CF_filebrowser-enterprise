@@ -1,0 +1,8 @@
+# Only the disposable joint-test venv; no application dependency changes.
+-r hermes-probe-requirements.txt
+alembic==1.20.0
+cryptography==46.0.7
+fastapi==0.141.1
+psycopg[binary]==3.3.6
+SQLAlchemy==2.1.1
+uvicorn[standard]==0.54.0
