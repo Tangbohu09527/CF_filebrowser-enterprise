@@ -1,5 +1,11 @@
 # 入站附件内容读取（0.4.0，2026-09-29）
 
+2026-10-11 范围说明：`0.4.0` 是本插件历史版本，不是 FileBrowser 发布版本或当前安装成功声明。
+本页保留专用插件与增量安装的技术说明；安装器路线已暂停，当前优先受限 FileBrowser API
+下载后调用官方原生能力，无需先修复部分安装。10 月 6 日原生 PDF/真实辅助视觉与
+10 月 7 日完整 Agent/微信文字结果的分项证据见[集成状态矩阵](README.md)，
+不能归入本插件已实机启用，也不等于微信实际文件/图片回传或自动归档完成。
+
 `filebrowser_read_inbound({"attachment_id": 123})` 在一次工具调用内下载并读取正文。
 可选 `question` 最长 512 字符，用于图片分析。模型不能传路径、URL、任务身份、目录或凭据。
 此工具不创建正式归档，不修改、删除、重命名文件，不执行宏、文档指令或外部链接。
@@ -61,7 +67,7 @@
 `requirements-inbound-content.txt`，精确版本及官方 PyPI wheel SHA-256；不修改 Hermes
 依赖目录、全局 Python、Go module 或前端锁文件，不允许运行时自动安装依赖。
 
-## 增量安装与恢复
+## 历史增量安装与恢复（路线暂停）
 
 操作者使用成功 CI 的 Windows 制品及对应源码包运行
 `windows/Upgrade-InboundClient.ps1`。该组件现在由 [统一 Windows 入口](WINDOWS_SETUP.md)

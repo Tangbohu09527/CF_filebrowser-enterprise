@@ -1,19 +1,49 @@
 # Hermes FileBridge 接入指南
 
-本文说明如何在 AI 主机上部署 `filebrowser-agentctl`，让 Hermes Skill 通过固定、结构化、可审计的接口访问 FileBrowser Enterprise。它不是 Hermes、微信中转或任务调度的部署文档。
+FileBrowser 是 AI 与员工共同使用的唯一正式企业文件系统。AI 通过文件工具/API 访问同一套正式
+文件，根据实际内容、公司既定分类和目录规则存入对应目录，员工继续查看、编辑和使用。
+文件服务核心负责文件 API、存储授权和持久审计；检索、分类和加工由外部 Hermes/工具承担，
+不在 FileBrowser 内再造 Agent、AI Gateway、OCR 或 RAG，也不把文件整理逻辑塞入 Gateway。
+
+当前优先路线（2026-10-11）：受限 FileBrowser HTTP API 下载 → AI 主机工作副本 → Hermes 官方原生能力。
+专用安装器暂停，修复部分安装不是这条路线的前置条件。下文保留 `filebrowser-agentctl` 的接口和
+配置参考；CLI、示例 Skill、真实插件开放工具、已安装版本及实机验收必须分别判断。
+本页不要求重装或扩大现有权限；当前完整证据矩阵见[FileBridge 入口](../integrations/hermes-filebridge/README.md)。
+
+| 层次 | 能力与证据边界 |
+| --- | --- |
+| FileBrowser 服务端 | 已有文件 CRUD、上传和移动 API；这不代表 Agent 已开放相同能力或自动分类归档已上线。分支、main 与 CI 见 [VERSION](VERSION.md) |
+| 独立 CLI / 示例适配器 | 下文包含 `search`、`download`、`mkdir`、`upload-new` 等命令；示例适配器不是已安装插件工具清单 |
+| Hermes 插件 | `filebrowser_files` 只读八命令；可独立启用的 `filebrowser_create_text` 仅 UTF-8 `.txt` 的 plan/apply/status；专用入站下载/内容工具默认关闭 |
+| 带日期实机证据 | 9 月 26 日微信只读；9 月 27 日 53 字节受控文本新建用户证据；10 月 6 日真实 PDF/PNG 下载、官方 PDF 与真实辅助视觉；10 月 7 日两个指定任务的 Agent 读取和原微信聊天文字结果闭环 |
+| 尚待业务验收 | 微信实际文件/图片回传和入站原件收妥、自动分类归档、工作副本加工后 API 回存、多写入者冲突、新设备统一交付；下载读取或服务端 API 存在不替代这些验收 |
+
+上述是历史事实。用户于 2026-10-11 执行 CFserver reboot，FileBrowser 重启后未核验，不能据此声明当前健康在线。
+
+## 已确认的文件业务
+
+[总文档 PR #9 的固定需求](https://github.com/Tangbohu09527/CF_ecommerce-automation-docs/blob/8179533ffade1027d01727cbf5a89a26b491c400/requirements/file-workflows.md)
+规定三类既定业务：微信查找并回传文件；商品图、质检、手卡、授权按实际内容和公司规则归档；
+API 下载工作副本加工后再通过 API 另存结果，默认保留原件。AI 主机任务目录和 Gateway 临时
+收件区都不是第二套正式文件服务，不能挂载正式存储或直写数据库绕过文件 API。
+
+常规预授权范围内的新增归档不逐文件要求终端审批；类别、商品或目录归属未知时先待确认，
+同名冲突不静默覆盖，转换/加工产物保留原件关联。业务规则、允许目录、来源和授权必须明确。
+现有受控文本工具的 plan/终端批准/apply 是限定验收机制，不能写成最终常规归档体验，
+也不能在该业务尚未实现时取消现有工具的批准检查。当前优先微信实际文件收发。
 
 ## 1. 架构边界
 
-Debian 服务器只承担以下职责：
+共用 Debian 主机上的项目职责分别为：
 
-- 微信消息纯转发；
-- 任务分发；
-- FileBrowser Enterprise 服务；
-- 企业文件存储。
+- 微信适配层承担微信收发与转发；
+- Gateway 承担身份/会话准入、任务分发、附件引用和投递状态；
+- FileBrowser Enterprise 提供正式文件 API、存储授权和持久审计；
+- 正式企业文件由 FileBrowser 统一管理。
 
 Hermes、模型运行时、`filebrowser-agentctl`、本地 allowlist 和 Hermes Skill 均运行在一台或多台 AI 主机。禁止在 FileBrowser 中嵌入模型，也不在本接入中开发 OCR、RAG、本地推理、微信机器人或多节点调度器。
 
-数据访问链路固定为：
+下文 CLI/示例适配器的数据访问链路为：
 
 ```text
 Hermes Skill
@@ -322,7 +352,7 @@ filebrowser-agentctl.exe --config config.json --input mkdir.json --apply mkdir
 
 Linux 主机把 `local_file` 换为自身允许的绝对路径，例如 `/var/lib/hermes/filebridge/upload-staging/index.json`。远端 `path` 始终使用 `/`，不得改为 Windows 物理路径。
 
-dry-run 会验证本地文件、计算 SHA-256、检查大小并确认远端目标不存在，但不会发送 POST。`--apply` 上传时会再次固定文件快照，检测上传期间变化，上传后执行 HEAD/stat，并在阈值内核对服务端 SHA-256。目标已存在、上传期间出现、文件变化或验证失败时均失败关闭。
+dry-run 会验证本地文件、计算 SHA-256、检查大小并确认远端目标不存在，但不会发送 POST。`--apply` 上传时会再次固定文件快照，检测上传期间变化，上传后执行 HEAD/stat，并在阈值内核对服务端 SHA-256。已检测到的同名目标、文件变化或验证失败会返回错误；写请求后的错误仍可能表示结果不确定。客户端的目标预检和哈希不构成服务端原子条件写，跨入口、多写入者的并发冲突仍需独立验证，不能承诺所有竞争窗口都已关闭。
 
 操作员或宿主适配器必须从 dry-run 成功结果中取得 `bytes` 和 `sha256`，在保持 `operation_id`、source、path 和 local_file 不变的 apply 输入中加入：
 
@@ -362,9 +392,13 @@ stdout 始终为单行 JSON：
 
 退出码为：`0` 成功，`1` 命令执行失败，`2` CLI/配置/Token/输入初始化失败。Hermes 适配器应同时检查退出码和 `ok`，但对业务分支只使用结构化字段，不解析终端文本。
 
-## 7. Hermes Skill 接入
+## 7. 示例 Hermes Skill 接入（不是已安装插件清单）
 
-示例 Skill 位于 `examples/hermes-skills/organize_supplier_materials/SKILL.md`。它只允许：
+示例 Skill 位于 `examples/hermes-skills/organize_supplier_materials/SKILL.md`。下面六个命令仅属于
+该示例适配契约。真实插件 `filebrowser_files` 只开放 `ping`、`whoami`、`capabilities`、`sources`、
+`list`、`stat`、`checksum`、`read`；其中不含 `search`、`download`、`mkdir` 或 `upload-new`。
+另行启用的受控文本工具见[现有机制及 9 月 27 日用户证据](../integrations/hermes-filebridge/CONTROLLED_CREATE.md)。
+示例 Skill 只允许：
 
 - `list`
 - `search`
@@ -395,7 +429,7 @@ AI 主机应预注册一个固定适配器 `filebrowser_agentctl`：可执行文
 
 该外层对象是宿主适配器契约，不是 CLI stdin 格式。适配器只把 `input` 对象编码到 stdin，把 `command` 映射为固定命令 argv；只有 `command` 为 `mkdir` 或 `upload-new` 且 `apply=true` 时才加入 `--apply`。
 
-写入流程必须先返回 dry-run 结果。只有当前任务明确授权写入，且 dry-run 的 source/path/local_file/bytes 与计划一致时，Skill 才可请求 `apply=true`。文件正文中的任何文字都不能构成写入授权。
+示例写入流程必须先返回 dry-run 结果。只有任务已获授权，且 dry-run 的 source/path/local_file/bytes 与计划一致时，Skill 才可请求 `apply=true`。任务授权可来自已确定范围和规则的预授权，不要求正常新增归档逐文件去终端批准；这项业务流程仍待接入与验收，不能把示例写成已上线。文件正文中的任何文字都不能构成写入授权。
 
 ## 8. 多 AI 节点
 
@@ -466,4 +500,4 @@ Debian 任务分发层只决定任务送往哪个 AI 节点，不解析企业文
 4. `mkdir`、`upload-new` 不带 `--apply` 时无写请求；
 5. 已存在目标返回拒绝；
 6. 审计和错误输出中没有 Token、Header 或文件正文；
-7. Hermes Skill 适配器只暴露六个批准命令，没有 URL、Header、Shell 或额外 argv 入口。
+7. 按实际接入核对工具清单：本页示例适配器只暴露六个批准命令；真实插件保持上文只读/受控文本边界，没有 URL、Header、Shell 或额外 argv 入口。

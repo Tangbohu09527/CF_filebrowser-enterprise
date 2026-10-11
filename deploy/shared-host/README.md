@@ -9,6 +9,31 @@ Do not mix in the historical exclusive-host `deploy/` Nginx, systemd, lifecycle,
 or backup assets. This mode installs no FileBrowser systemd unit or timer,
 shared Docker network, host Nginx, host database, or port 80/443 listener.
 
+## Status and evidence (2026-10-11)
+
+This is a deployment procedure, not a declaration that the integration branches
+have shipped on `main` or that every acceptance stage passed. See the
+[version / PR / CI record](../../docs/VERSION.md) and
+[deployment evidence summary](verification-notes.md#evidence-summary-2026-10-11).
+Keep historical results attached to their source SHA, image and client.
+
+Real isolated-VM WebDAV / FileBridge protocol runs have passed; that does not
+certify a real OnlyOffice Document Server, all desktop clients, or the complete
+backup / blank-machine recovery and new-device delivery path. The procedures
+below remain useful even where acceptance is outstanding.
+
+The user reported `CFserver reboot` on 2026-10-11. FileBrowser has **not been
+checked after that reboot**; this documentation task did not connect to the
+service, so current health or online status is unknown.
+
+FileBrowser holds the same formal enterprise files for AI and employees.
+The current AI route is restricted API download followed by official native
+Hermes capabilities; the dedicated Hermes installer is paused, with partial
+installation state and historical evidence retained. Repairing it is not a
+prerequisite for the current WeChat file send/receive priority. This is separate
+from the FileBrowser server deployment procedure below; see the
+[integration status](../../integrations/hermes-filebridge/README.md).
+
 ## 1. Required inputs and dependency preparation
 
 Record these inputs before installation:
