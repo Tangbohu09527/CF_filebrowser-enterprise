@@ -1,5 +1,33 @@
 # Verification notes
 
+## Evidence summary (2026-10-11)
+
+The entries below are historical execution records. Their failures, successful
+prefixes and later repairs stay associated with their recorded source SHA;
+an older failure does not cancel a later bounded success, and a bounded success
+does not certify the whole delivery path. Current PR heads and CI are tracked in
+[VERSION.md](../../docs/VERSION.md); the integration PRs remain Draft / Open,
+so these records are not a `main` release declaration.
+
+| Area | Completed evidence | Remaining boundary |
+| --- | --- | --- |
+| Fixed-source VM installation | `a42d1bd5` and later recorded runs completed real installation and selected LAN checks | A procedure or passed prefix is not complete target-device delivery |
+| WebDAV / FileBridge | `ac9f7a5b` passed 235 protocol checks; `e5deaed7` and `49ea34bc` passed 236, including real HTTPS and ordinary-user / Token boundaries | No blanket desktop-client, Hermes or WeChat acceptance; current host state is separate |
+| OnlyOffice | Existing integration code and tests; document preview / storage evidence where individually recorded | No real Document Server plus client editing acceptance established by these runs |
+| Interrupted upload recovery | `49ea34bc` passed the 19 real Pending interruption/recovery orchestration checks | This specific same-image restart is not normal container / daemon / host reboot or complete backup recovery |
+| Backup / blank recovery | Formal stopped-backup, verification and empty-target restore entries, plus source / image / path refusal regressions | Local tests and deployment CI do not establish complete blank-machine recovery or off-device disaster recovery; retain each real run's reached stage and failures |
+| New equipment / AI installation | Fixed-source build / image-transfer and isolated Debian installation evidence; separate dated Hermes installation records | Actual target-device and employee-client delivery remain separate; the paused Hermes installer is not a prerequisite for restricted API download and native content reading |
+| Live host | User reports `CFserver reboot` on 2026-10-11 | FileBrowser post-reboot health and persistence have not been checked; this documentation task did not connect to the host |
+
+For the dated September 26 read-only, September 27 controlled text-create and
+October 6 actual PDF / PNG download and native-content evidence, use the
+[Hermes integration entry](../../integrations/hermes-filebridge/README.md).
+Those records do not certify automatic classification/archive, concurrent
+cross-entry writes, working-copy result save-back or actual WeChat file/image
+return. Preserve the partial installer state and historical records; the
+current priority is WeChat file send/receive using the restricted API and
+official native capability route.
+
 ## CI compatibility and whole-package budgets (2026-09-07)
 
 These are observed failures and repair inputs, not a claim that the repaired jobs passed.

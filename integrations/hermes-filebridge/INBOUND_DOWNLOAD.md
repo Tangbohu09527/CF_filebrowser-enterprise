@@ -1,5 +1,11 @@
 # Hermes 入站附件工作副本下载
 
+2026-10-11 范围说明：本页保留专用入站下载组件的实现与隔离验收路线。当前优先使用受限
+FileBrowser API 下载既有正式文件，再调用 Hermes 官方原生能力；安装器路线暂停，
+不以安装或修复本组件作为前置条件。10 月 6 日本机读取和 10 月 7 日微信文字结果闭环
+不证明本页的微信入站原件取件、专用宿主完整生命周期或实际文件/图片回传，详见[状态矩阵](README.md)。
+工作副本不是第二套正式文件库，分类归档和加工结果 API 回存仍需各自业务验收。
+
 状态：本项目包含专用下载引擎、原生安全落盘、插件宿主 API、隔离测试和独立暂存检查入口。
 **功能默认关闭。** 真实宿主适配已消费 Gateway `0ec54bf0` 的固定后台契约；
 联合测试及现场验收边界见 [JOINT_HOST_VALIDATION.md](JOINT_HOST_VALIDATION.md)。
@@ -116,7 +122,7 @@ worker 是 `tools/filebrowser-agentctl/cmd/filebridge-inbound`，只依赖独立
 重复并发预算、到期/取消、错误身份线程、CA/主机名/重定向、截断/超限/错误摘要、
 路径及 NTFS 边界、失败不交付半文件、工作句柄实际消费和授权值不外泄。
 
-## 后续一次性实际验收（本轮不执行）
+## 保留的专用组件实际验收步骤（路线暂停，本轮不执行）
 
 1. 采用 [JOINT_HOST_VALIDATION.md](JOINT_HOST_VALIDATION.md) 的固定两端版本、候选产物
    与独立验收输入，确认 Dispatch、lease、thread、identity、工作目录和允许 origin。
