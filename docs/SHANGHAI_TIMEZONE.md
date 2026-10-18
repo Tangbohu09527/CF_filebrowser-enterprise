@@ -9,3 +9,5 @@ FileBrowser audit and token expiry use UTC/epoch; indexing uses Unix-second slot
 The targeted deployment test checks both Compose profiles, runtime zoneinfo availability declared by the Dockerfiles and the explicit backup calendar/UTC record boundary. Existing deployment CI additionally validates the actual systemd unit syntax.
 
 Local targeted result: `python -m unittest discover -s deploy/tests -p test_timezone_defaults.py -v` passed all three tests. Actual systemd syntax and rendered deployment checks are delegated to the existing Linux CI job; they were not executed on Windows.
+
+The initial deployment-assets CI correctly rejected the new environment field because its existing exact allowlist had not yet been extended. The follow-up changes only the fixed `TZ: Asia/Shanghai` entry in official/shared-host raw and rendered allowlists. Arbitrary TZ values, paths and other environment keys still reject. Targeted checks now execute the actual production validator and verify negative cases; no allowlist is removed.
