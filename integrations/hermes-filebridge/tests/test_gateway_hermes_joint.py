@@ -37,8 +37,8 @@ import traceback
 
 HERE = Path(__file__).resolve().parent
 PLUGIN = HERE.parent / "plugin"
-GATEWAY_COMMIT = "0ec54bf0f25f421e37e16e11bd098a814beca258"
-GATEWAY_ZIP_SHA256 = "c0ad44618fcd7c640c640f921e8910b8292dcadc24dd2c03cc03a34c2761c445"
+GATEWAY_COMMIT = "1a8ce964246c896d6d72dee8a037f962c58447a0"
+GATEWAY_ZIP_SHA256 = "4838af70860a6e983f965b4c01006f0578e98ce56263f41aa0656d7626265490"
 DOWNLOAD = "filebrowser_download_inbound"
 CONSUME = "probe_consume_workcopy"
 READ_CONTENT = "filebrowser_read_inbound"
@@ -47,22 +47,22 @@ PROFILE = "profiles/joint-isolated/1"
 DEFAULT_HERMES_COMMIT = "4d55ca91656ac5f83e1506679b7f81e0238e5e16"
 _test_secrets = []
 GATEWAY_BLOBS = {
-    "docs/development/inbound-host-binding-contract.md": "c997a05af5fbe8466e13f572e4de7422b71f7615",
+    "docs/development/inbound-host-binding-contract.md": "7f9b888d52a7dba0ab909accb2f7681ddf7658fd",
     "docs/development/inbound-host-session-compatibility.md": "699caa7b271724d8b71d60438955b73dcfe6abff",
     "tests/fixtures/inbound-host-binding-v1.json": "a2f4868b7fd4a1bce0b13c6c33b2afbd90df3efb",
     "src/cf_agent_gateway/adapters/wechat/inbound_media_staging.py": "08a2619565d0a9ffe04b0e855391112abd95e67c",
-    "src/cf_agent_gateway/database.py": "111b4aa0e745c37b5b915495e18562700c6f3374",
-    "src/cf_agent_gateway/gateway/app.py": "6e67f84a252d93bfa360a50e423422c2f4e99d17",
+    "src/cf_agent_gateway/database.py": "c5e7dba323ed60bf72fa79be6768aa861af2709b",
+    "src/cf_agent_gateway/gateway/app.py": "a5eb692720774b36a08472c3d84f4e3484f2f1a5",
     "src/cf_agent_gateway/gateway/security.py": "b3772f0d426c7b415c51dd340e7fcd4433fb7012",
-    "src/cf_agent_gateway/hermes/client.py": "a95c1f082af959f8de027685a728241f10f2ab75",
-    "src/cf_agent_gateway/hermes/service.py": "fdc501938cdb7cde10d334fab577e2a940ae4d35",
-    "src/cf_agent_gateway/hermes/worker.py": "81d6bcd7dfb3f893565a7cf92539e1056c9fa0fb",
+    "src/cf_agent_gateway/hermes/client.py": "2280e81a14a6958dee319cfe3bbeb22d78449bbb",
+    "src/cf_agent_gateway/hermes/service.py": "96426ddb17d0dd82699991497d28b8b5163e4cf6",
+    "src/cf_agent_gateway/hermes/worker.py": "5a636e7b0d3610f119e181720df87e6c2979debf",
     "src/cf_agent_gateway/inbound/access.py": "46c4c8552c82485f41076bd392e674a4c30f2b45",
-    "src/cf_agent_gateway/inbound/host_binding.py": "42988da5fda0d13c81334eec1f2b7ed63ae5f62b",
-    "src/cf_agent_gateway/inbound/host_binding_config.py": "8df47b4dcfa6dd6db85fc1dd9ffba0c55d9d39a7",
-    "src/cf_agent_gateway/inbound/host_binding_models.py": "594ff7e2c1f46290504da103feb95de7685850a6",
-    "src/cf_agent_gateway/inbound/host_binding_routes.py": "a953033ce1b3dbd1b8333208c378a298d463c8de",
-    "src/cf_agent_gateway/inbound/store.py": "097297ab54cc874b5272f072edac2f8cfc83dd63",
+    "src/cf_agent_gateway/inbound/host_binding.py": "2038d7b56ec7c560c92213c7a3d6a8a6cd4743bf",
+    "src/cf_agent_gateway/inbound/host_binding_config.py": "a2db5767fa09db548e1cf7fe8f6bb8d993e73c5f",
+    "src/cf_agent_gateway/inbound/host_binding_models.py": "674c24ce3e87be24ca0eebc3fe09ac11c4c0a77d",
+    "src/cf_agent_gateway/inbound/host_binding_routes.py": "894931b9473faae0fa75a6e8d4b0870922149edc",
+    "src/cf_agent_gateway/inbound/store.py": "2319bbbae63f4a9cbe0eddee38ec7287ede1bcec",
     "src/cf_agent_gateway/inbound/worker.py": "a43eafb37c248d447d8287462677329ef419ceb9",
     "src/cf_agent_gateway/task/model/store.py": "f5daad32637b9c75e40483704506b23f0de41337",
 }

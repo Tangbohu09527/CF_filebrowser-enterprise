@@ -59,7 +59,7 @@ class ConfigChecks(unittest.TestCase):
         expected = copy.deepcopy(original)
         settings = expected["plugins"]["entries"]["cf-filebridge"]["settings"]
         settings["inbound_content_enabled"] = True
-        settings["inbound_host"]["consumer_tools"].append(upgrade.TOOL)
+        settings["inbound_host"]["consumer_tools"].extend([upgrade.TOOL, upgrade.RETURN_TOOL])
         self.assertEqual(parsed, expected)
         self.assertIn(b"# operator comment", output)
         self.assertEqual(worker, "synthetic-client")
@@ -180,7 +180,7 @@ class ConfigChecks(unittest.TestCase):
         output, _, _ = upgrade.build(json.dumps(config).encode(), OLD, NEW)
         from ruamel.yaml import YAML
         actual = YAML(typ="safe").load(output)
-        self.assertEqual(actual["plugins"]["entries"]["cf-filebridge"]["settings"]["inbound_host"]["consumer_tools"], [upgrade.TOOL])
+        self.assertEqual(actual["plugins"]["entries"]["cf-filebridge"]["settings"]["inbound_host"]["consumer_tools"], [upgrade.TOOL, upgrade.RETURN_TOOL])
         for invalid in (None, "existing", {}, 1, True):
             with self.subTest(value=invalid):
                 host["consumer_tools"] = invalid
@@ -192,6 +192,31 @@ class ConfigChecks(unittest.TestCase):
         self.assertEqual(upgrade.requirements(content), {"package": "1.0"})
         current = upgrade.requirements((Path(__file__).parents[1] / "requirements-inbound-content.txt").read_bytes())
         self.assertEqual(len(current), 9)
+
+    def test_formats_are_explicit_and_default_does_not_restrict_existing_policy(self):
+        from ruamel.yaml import YAML
+        original = self.config()
+        settings = original["plugins"]["entries"]["cf-filebridge"]["settings"]
+        settings["inbound_content_formats"] = ["pdf"]
+        output, _, _ = upgrade.build(json.dumps(original).encode(), OLD, NEW)
+        self.assertEqual(YAML(typ="safe").load(output)["plugins"]["entries"]["cf-filebridge"]["settings"]["inbound_content_formats"], ["pdf"])
+        selected, _, _ = upgrade.build(json.dumps(original).encode(), OLD, NEW, content_formats=["pdf", "png"])
+        self.assertEqual(YAML(typ="safe").load(selected)["plugins"]["entries"]["cf-filebridge"]["settings"]["inbound_content_formats"], ["pdf", "png"])
+
+    def test_invalid_explicit_format_plans_are_refused(self):
+        for formats in ([], "pdf", ["pdf", "pdf"], ["docx"], [{}]):
+            with self.subTest(formats=formats), self.assertRaisesRegex(upgrade.Refused, "content_formats_invalid"):
+                upgrade.build(json.dumps(self.config()).encode(), OLD, NEW, content_formats=formats)
+
+    def test_pdf_png_subset_lock_reuses_exact_existing_pins(self):
+        base = Path(__file__).parents[1]
+        subset = (base / "requirements-inbound-pdf-png.txt").read_bytes()
+        full = (base / "requirements-inbound-content.txt").read_bytes()
+        self.assertEqual(upgrade.requirements(subset), {"firecrawl-anydoc": "0.2.4", "Pillow": "12.3.0"})
+        # Every selected wheel digest was already in the unchanged full lock.
+        import re
+        self.assertLessEqual(set(re.findall(rb"--hash=sha256:[0-9a-f]{64}", subset)),
+                             set(re.findall(rb"--hash=sha256:[0-9a-f]{64}", full)))
 
     def test_unsafe_requirements_refused(self):
         for data in (b"package==1.0", REQUIREMENTS + REQUIREMENTS, b"--index-url https://example.invalid\n" + REQUIREMENTS,

@@ -108,6 +108,7 @@ class HostControlTests(unittest.TestCase):
         self.mime = "application/pdf"
         self.mode = "ok"
         self.lease_seconds = 20
+        self.server_clock_offset_seconds = 0.0
         self.response_transform = None
         self.event_transform = None
         self.redirect_location = None
@@ -172,18 +173,28 @@ class HostControlTests(unittest.TestCase):
                             self.send_header("Content-Length", "0")
                             self.end_headers()
                             return
+                        resolve_schema = body.get("schema")
+                        if resolve_schema not in (control.SCHEMA, "cf-inbound-host-binding/resolve/v2"):
+                            self.send_json({"detail": "unavailable"}, 403)
+                            return
+                        # Only resolve is versioned. SSE and close retain the
+                        # original v1 owner, nonce, epoch and immutable lease.
+                        owner_body = {**body, "schema": control.SCHEMA}
+                        server_now = owner.server_now()
                         record = owner.records.get(body["session_id"])
                         if record is None:
                             serial = len(owner.records) + 1
-                            expiry = (datetime.now(timezone.utc) + timedelta(seconds=owner.lease_seconds)).isoformat()
-                            record = {"owner": body, "binding_id": str(uuid.uuid4()), "epoch": str(uuid.uuid4()),
+                            expiry = (server_now + timedelta(seconds=owner.lease_seconds)).isoformat()
+                            record = {"owner": owner_body, "binding_id": str(uuid.uuid4()), "epoch": str(uuid.uuid4()),
                                       "serial": serial, "lease": expiry, "sequence": 1, "state": "running",
                                       "reason": None, "disconnect": False, "sent": 0, "closed": False}
                             owner.records[body["session_id"]] = record
-                        if record["owner"] != body or record["closed"]:
+                        if record["owner"] != owner_body or record["closed"]:
                             self.send_json({"detail": "unavailable"}, 403)
                             return
                         response = owner.resolve_response(record)
+                        if resolve_schema == "cf-inbound-host-binding/resolve/v2":
+                            response.update(schema=resolve_schema, server_now=server_now.isoformat())
                     if owner.response_transform:
                         owner.response_transform(response)
                     self.send_json(response)
@@ -331,6 +342,11 @@ class HostControlTests(unittest.TestCase):
         with self.assertRaises(inbound.BridgeError):
             host.authorized_remaining_seconds()
 
+    def server_now(self):
+        # Offset the synthetic server's entire absolute clock, never Python's
+        # process clock, monotonic timers or the native worker's local clock.
+        return datetime.now(timezone.utc) + timedelta(seconds=self.server_clock_offset_seconds)
+
     def resolve_response(self, record):
         serial = record["serial"]
         thread_id = "00000000-0000-4000-8000-%012d" % serial
@@ -342,7 +358,7 @@ class HostControlTests(unittest.TestCase):
                 "event_sequence": 1, "attachments": [{"schema": "cf-inbound-read/v1", "message_id": serial,
                     "attachment_id": 5, "thread_id": thread_id, "enterprise_identity_id": identity_id,
                     "url": self.raw["gateway_origin"] + "/inbound-media/7/content", "authorization": READ_SECRET,
-                    "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+                    "expires_at": (self.server_now() + timedelta(hours=1)).isoformat(),
                     "download_policy": {"max_attempts": 4, "total_timeout_seconds": 30,
                                         "retryable_status_codes": [503], "retry_after_seconds": 1},
                     "size": len(self.body), "sha256": hashlib.sha256(self.body).hexdigest(), "mime_type": self.mime,

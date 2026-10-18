@@ -90,7 +90,11 @@ def child_check(source: Path, enabled: bool, commit: str = HERMES_COMMIT) -> Non
         else:
             checks.assertIsNotNone(content_entry, "content opt-in must register a real consumer")
             checks.assertEqual(set(content_entry.schema["parameters"]["properties"]),
-                               {"attachment_id", "question"})
+                               {"attachment_id", "question", "prepare_return"})
+            preparation = content_entry.schema["parameters"]["properties"]["prepare_return"]
+            checks.assertEqual(preparation["type"], "boolean")
+            checks.assertIs(preparation["default"], False)
+            checks.assertNotIn("prepare_return", content_entry.schema["parameters"]["required"])
             unbound = registry.dispatch("filebrowser_read_inbound", {"attachment_id": 1},
                                        scope=manager.scope_key,
                                        task_id="untrusted-test-task", session_id="untrusted-test-session")
