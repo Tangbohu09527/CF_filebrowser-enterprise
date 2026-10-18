@@ -103,7 +103,14 @@ func TestServiceReaderLockedScopeSurvivesDefaults(t *testing.T) {
 func TestServiceReaderCLIProcess(t *testing.T) {
 	if os.Getenv("CF_SERVICE_READER_TEST_HELPER") == "1" {
 		flag.CommandLine = flag.NewFlagSet("filebrowser", flag.ExitOnError)
-		os.Args = []string{"filebrowser", "set", "service-reader", "--username", "cf-export-reader", "--source", "enterprise", "--scope", "/商品资料/品牌", "--password-stdin", "-c", os.Getenv("CF_SERVICE_READER_TEST_CONFIG")}
+		action := os.Getenv("CF_SERVICE_READER_TEST_ACTION")
+		if action == "" {
+			action = "service-reader"
+		}
+		if action != "service-reader" && action != "service-reader-rotate" {
+			os.Exit(92)
+		}
+		os.Args = []string{"filebrowser", "set", action, "--username", "cf-export-reader", "--source", "enterprise", "--scope", "/商品资料/品牌", "--password-stdin", "-c", os.Getenv("CF_SERVICE_READER_TEST_CONFIG")}
 		keepGoing, _ := runCLI()
 		if keepGoing {
 			os.Exit(90)

@@ -143,6 +143,17 @@ func runCLI() (bool, bool) {
 				os.Exit(1)
 			}
 			return false, true
+		case "service-reader-rotate":
+			if user != "" || asAdmin || sourceName != "" || indexPath != "" || ruleCategory != "" || value != "" || allow || setCmd.NArg() != 0 {
+				fmt.Println("error: service-reader-rotate accepts only username/source/scope/password-stdin/config options")
+				os.Exit(1)
+			}
+			err := runServiceReaderRotateCLI(dbConfig, serviceReaderOptions{Username: readerUsername, Source: readerSource, Scope: readerScope, PasswordStdin: passwordStdin}, os.Stdin, os.Stdout)
+			if err != nil {
+				fmt.Printf("error: %v\n", err)
+				os.Exit(1)
+			}
+			return false, true
 		case "rule":
 			dbExists := getStore(storeCfg)
 			sourceInfo, ok := settings.Config.Server.NameToSource[sourceName] // backend source is path
