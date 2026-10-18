@@ -117,13 +117,21 @@ def ensure_active():
 
 
 def capture_return_context(attachment_id):
+    return _capture_context(attachment_id, "filebrowser_read_inbound")
+
+
+def capture_product_inbound_context(attachment_id):
+    return _capture_context(attachment_id, "filebrowser_ingest_product_zip")
+
+
+def _capture_context(attachment_id, allowed_tool):
     """Capture the current reader's identity and original, non-renewable lease.
 
     This is an internal API, never model input. The returned guard remains tied
     to these exact objects when the return plugin checks it in a later tool call.
     """
     active, tool = _active_host.get(), _active_tool.get()
-    if (active is None or tool is None or tool[0] != "filebrowser_read_inbound"
+    if (active is None or tool is None or tool[0] != allowed_tool
             or not _valid_identifier(tool[1]) or type(attachment_id) is not int or attachment_id <= 0):
         raise BridgeError("trusted_context_unavailable")
     adapter, scope = active

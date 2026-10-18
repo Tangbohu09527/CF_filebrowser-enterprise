@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-const maxDownloadBytes int64 = 64 << 20
+const maxDownloadBytes int64 = 128 << 20
 
 var contentPath = regexp.MustCompile(`^/inbound-media/[1-9][0-9]*/content$`)
 var digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -172,7 +172,7 @@ func validateDescriptor(d Descriptor, b Binding) bool {
 	if d.Filename != nil && len(*d.Filename) > 1024 {
 		return false
 	}
-	if d.MIMEType != "application/pdf" && d.MIMEType != "image/jpeg" && d.MIMEType != "image/png" && d.MIMEType != "application/octet-stream" {
+	if d.MIMEType != "application/zip" && d.MIMEType != "application/pdf" && d.MIMEType != "image/jpeg" && d.MIMEType != "image/png" && d.MIMEType != "application/octet-stream" {
 		return false
 	}
 	if !strings.HasPrefix(d.Authorization, "Bearer ") || len(d.Authorization) <= 7 || len(d.Authorization) > 128 {

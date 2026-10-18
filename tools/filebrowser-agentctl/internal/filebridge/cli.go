@@ -24,6 +24,8 @@ type CLIOptions struct {
 }
 
 var supportedCommands = map[string]struct{}{
+	"upload-stream":   {},
+	"product-inspect": {}, "product-preview": {}, "product-import": {}, "product-export": {},
 	"ping": {}, "whoami": {}, "capabilities": {}, "sources": {}, "list": {}, "search": {},
 	"create-text": {}, "approve-create": {}, "create-approved": {}, "create-status": {},
 	"stat": {}, "checksum": {}, "read": {}, "download": {}, "mkdir": {}, "upload-new": {},
@@ -68,7 +70,22 @@ func RunCLI(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		writeResponse(stdout, startupError(options.Command, err))
 		return 2
 	}
-	input, err := readInput(options.InputFile, bufferedStdin)
+	var input Input
+	if options.Command == "upload-stream" {
+		if options.InputFile != "-" || options.TokenFromStdin {
+			writeResponse(stdout, startupError(options.Command, bridgeError("invalid_cli", "stream upload uses configured token and framed stdin")))
+			return 2
+		}
+		var line []byte
+		line, err = bufferedStdin.ReadSlice('\n')
+		if err == nil {
+			decoder := json.NewDecoder(bytes.NewReader(line))
+			decoder.DisallowUnknownFields()
+			err = decoder.Decode(&input)
+		}
+	} else {
+		input, err = readInput(options.InputFile, bufferedStdin)
+	}
 	if err != nil {
 		writeResponse(stdout, startupError(options.Command, err))
 		return 2
@@ -80,6 +97,7 @@ func RunCLI(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	}
 	defer audit.Close()
 	runner := NewRunner(config, NewClient(config, token), audit)
+	runner.inputStream = bufferedStdin
 	response := runner.Run(ctx, options.Command, input, options.Apply)
 	writeResponse(stdout, response)
 	if !response.OK {
@@ -190,7 +208,7 @@ func helpResponse() Response {
 		DryRun:        false,
 		Result: map[string]any{
 			"usage":      "filebrowser-agentctl --config <file> [--input <file|->] [--token-stdin] [--allow-localhost-http] [--apply] <command>",
-			"commands":   []string{"ping", "whoami", "capabilities", "sources", "list", "search", "stat", "checksum", "read", "download", "mkdir", "upload-new", "create-text", "approve-create", "create-approved", "create-status"},
+			"commands":   []string{"ping", "whoami", "capabilities", "sources", "list", "search", "stat", "checksum", "read", "download", "mkdir", "upload-new", "create-text", "approve-create", "create-approved", "create-status", "product-inspect", "product-preview", "product-import", "product-export"},
 			"prohibited": []string{"delete", "share", "token management", "user management", "ACL management", "arbitrary HTTP", "shell", "move", "rename", "overwrite"},
 		},
 	}

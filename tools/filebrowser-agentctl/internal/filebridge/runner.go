@@ -19,6 +19,7 @@ import (
 )
 
 type Runner struct {
+	inputStream io.Reader
 	createClock func() time.Time
 	config      *Config
 	client      *Client
@@ -100,6 +101,10 @@ func (r *Runner) Run(ctx context.Context, command string, input Input, apply boo
 
 func (r *Runner) execute(ctx context.Context, command string, input Input, apply bool, requestID string) (any, int64, error) {
 	switch command {
+	case "upload-stream":
+		return r.uploadStream(ctx, input, apply, requestID)
+	case "product-inspect", "product-preview", "product-import", "product-export":
+		return r.product(ctx, command, input, apply, requestID)
 	case "create-text":
 		result, err := r.planCreateText(ctx, requestID, input)
 		return result, 0, err
@@ -655,11 +660,12 @@ func normalizeIdentifier(value, prefix string) (string, error) {
 }
 
 func isWriteCommand(command string) bool {
-	return command == "mkdir" || command == "upload-new" || command == "create-text" || command == "approve-create" || command == "create-approved"
+	return command == "upload-stream" || command == "product-import" || command == "product-export" || command == "mkdir" || command == "upload-new" || command == "create-text" || command == "approve-create" || command == "create-approved"
 }
 
 func validateCommandInput(command string, input Input) error {
 	used := map[string]bool{
+		"product": input.Product != nil,
 		"content": input.Content != nil, "plan_sha256": input.PlanSHA256 != "",
 		"source":          input.Source != "",
 		"path":            input.Path != "",
@@ -673,6 +679,8 @@ func validateCommandInput(command string, input Input) error {
 	}
 	allowed := map[string]bool{}
 	switch command {
+	case "product-inspect", "product-preview", "product-import", "product-export":
+		allowed["source"], allowed["path"], allowed["product"] = true, true, true
 	case "list", "stat", "read", "mkdir":
 		allowed["source"], allowed["path"] = true, true
 	case "search":
@@ -681,6 +689,8 @@ func validateCommandInput(command string, input Input) error {
 		allowed["source"], allowed["path"], allowed["algorithm"] = true, true, true
 	case "download":
 		allowed["source"], allowed["path"], allowed["output_file"] = true, true, true
+	case "upload-stream":
+		allowed["source"], allowed["path"], allowed["expected_bytes"], allowed["expected_sha256"] = true, true, true, true
 	case "upload-new":
 		allowed["source"], allowed["path"], allowed["local_file"] = true, true, true
 		allowed["expected_bytes"], allowed["expected_sha256"] = true, true
