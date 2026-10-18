@@ -130,7 +130,7 @@ class HostConfig:
             _reject()
         revision = _integer(raw["profile_revision"])
         maximum = _integer(raw.get("max_bytes", 64 * 1024 * 1024))
-        if maximum > 64 * 1024 * 1024:
+        if maximum > 128 * 1024 * 1024:
             _reject()
         root = raw["work_root"]
         if type(root) is not str or not Path(root).is_absolute():
@@ -360,7 +360,7 @@ class ControlClient:
             _reject()
         if _timestamp(item["expires_at"]) < _timestamp(parent["lease_valid_until"]):
             _reject()
-        if item["mime_type"] not in ("application/pdf", "image/jpeg", "image/png", "application/octet-stream"):
+        if item["mime_type"] not in ("application/zip", "application/pdf", "image/jpeg", "image/png", "application/octet-stream"):
             _reject()
         if item["filename"] is not None and (type(item["filename"]) is not str or len(item["filename"]) > 1024):
             _reject()
