@@ -103,7 +103,8 @@ func TestServiceReaderRotationCLIProcess(t *testing.T) {
 	if err = db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	config := map[string]any{"server": map[string]any{"database": database, "cacheDir": filepath.Join(root, "cache"), "sources": []any{map[string]any{"path": source, "name": "enterprise"}}, "logging": []any{map[string]any{"levels": "error"}}}, "auth": map[string]any{"key": strings.Repeat("synthetic", 8), "methods": map[string]any{"password": map[string]any{"enabled": true, "minLength": 12}}}}
+	sourceConfig := map[string]any{"path": source, "name": "enterprise"}
+	config := map[string]any{"server": map[string]any{"database": database, "cacheDir": filepath.Join(root, "cache"), "sources": []any{sourceConfig}, "logging": []any{map[string]any{"levels": "error"}}}, "auth": map[string]any{"key": strings.Repeat("synthetic", 8), "methods": map[string]any{"password": map[string]any{"enabled": true, "minLength": 12}}}}
 	raw, err := json.Marshal(config)
 	if err != nil {
 		t.Fatal(err)
@@ -154,7 +155,6 @@ func TestServiceReaderRotationCLIProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sourceConfig := config["server"].(map[string]any)["sources"].([]any)[0].(map[string]any)
 	sourceConfig["config"] = map[string]any{"createUserDir": true}
 	unsafeConfig, err := json.Marshal(config)
 	if err != nil {
