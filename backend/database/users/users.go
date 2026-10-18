@@ -171,6 +171,7 @@ type PinnedItems map[string]map[string][]string
 // User describes a persisted account. Scopes and source sidebar links store filesystem paths in Name/SourceName;
 // JSON responses use display names only (see http prepForFrontend).
 type User struct {
+	ServiceScopeLocked bool `json:"serviceScopeLocked,omitempty"` // Operator-created service account: never append default sources.
 	NonAdminEditable
 	DisableSettings bool                 `json:"disableSettings"`
 	ID              uint                 `storm:"id,increment" json:"id"`

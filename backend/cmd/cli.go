@@ -60,10 +60,16 @@ func runCLI() (bool, bool) {
 	setCmd := flag.NewFlagSet("set", flag.ExitOnError)
 	var user, dbConfig string
 	var asAdmin bool
+	var readerUsername, readerSource, readerScope string
+	var passwordStdin bool
 	var sourceName, indexPath, ruleCategory, value string
 	var allow bool
 
 	setCmd.StringVar(&user, "u", "", "Comma-separated username and password: \"set -u <username>,<password>\"")
+	setCmd.StringVar(&readerUsername, "username", "", "New service-reader username")
+	setCmd.StringVar(&readerSource, "source", "", "Exact existing source display name for service-reader")
+	setCmd.StringVar(&readerScope, "scope", "", "Existing non-root source-relative scope for service-reader")
+	setCmd.BoolVar(&passwordStdin, "password-stdin", false, "Read new service-reader password from bounded stdin only")
 	setCmd.BoolVar(&asAdmin, "a", false, "Create a user as admin user, used in combination with -u")
 	setCmd.StringVar(&dbConfig, "c", "config.yaml", "Path to the config file, default: config.yaml")
 	setCmd.StringVar(&sourceName, "s", "", "source name to apply the rule to")
@@ -126,6 +132,17 @@ func runCLI() (bool, bool) {
 			return false, dbExists
 		}
 		switch setKind {
+		case "service-reader":
+			if user != "" || asAdmin || sourceName != "" || indexPath != "" || ruleCategory != "" || value != "" || allow || setCmd.NArg() != 0 {
+				fmt.Println("error: service-reader accepts only username/source/scope/password-stdin/config options")
+				os.Exit(1)
+			}
+			err := runServiceReaderCLI(dbConfig, serviceReaderOptions{Username: readerUsername, Source: readerSource, Scope: readerScope, PasswordStdin: passwordStdin}, os.Stdin, os.Stdout)
+			if err != nil {
+				fmt.Printf("error: %v\n", err)
+				os.Exit(1)
+			}
+			return false, true
 		case "rule":
 			dbExists := getStore(storeCfg)
 			sourceInfo, ok := settings.Config.Server.NameToSource[sourceName] // backend source is path

@@ -7636,6 +7636,10 @@ const docTemplate = `{
                         "$ref": "#/definitions/users.SourceScope"
                     }
                 },
+                "serviceScopeLocked": {
+                    "description": "Operator-created service account: never append default sources.",
+                    "type": "boolean"
+                },
                 "showCopyPath": {
                     "description": "show copy path action in the context menu",
                     "type": "boolean"
