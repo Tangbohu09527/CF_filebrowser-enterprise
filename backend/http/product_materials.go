@@ -335,7 +335,8 @@ func productMaterialsHandler(w http.ResponseWriter, r *http.Request, d *requestC
 			return productErrorStatus(err), err
 		}
 	}
-	current, e := resolveCurrentAuthenticatedArchiveTarget(d, req.Source, req.Path)
+	// This resolver accepts a source index path, not a user-relative API path.
+	current, e := resolveCurrentAuthenticatedArchiveTarget(d, req.Source, target.CanonicalPath)
 	if e != nil || !sameAuthenticatedReadTarget(target, current) {
 		return http.StatusConflict, fmt.Errorf("archive or permission changed before completion")
 	}
