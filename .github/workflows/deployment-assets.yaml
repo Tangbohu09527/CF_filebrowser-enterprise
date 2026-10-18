@@ -37,6 +37,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends gettext-base nginx python3-yaml ripgrep shellcheck systemd
 
+      - name: Verify runtime timezone defaults
+        run: python3 -m unittest discover -s deploy/tests -p test_timezone_defaults.py -v
+
       - name: Validate deployment assets
         run: make validate-deployment
 

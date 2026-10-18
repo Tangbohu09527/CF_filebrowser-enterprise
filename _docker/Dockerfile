@@ -40,6 +40,7 @@ LABEL org.opencontainers.image.source="https://github.com/Tangbohu09527/CF_fileb
       org.opencontainers.image.version="${VERSION}"
 COPY --from=ffmpeg [ "/ffmpeg", "/ffprobe", "/usr/local/bin/" ]
 ENV FILEBROWSER_FFMPEG_PATH="/usr/local/bin/"
+ENV TZ=Asia/Shanghai
 ENV FILEBROWSER_DATABASE="/home/filebrowser/data/database.db"
 ENV FILEBROWSER_CONFIG="/home/filebrowser/data/config.yaml"
 ENV PATH="$PATH:/home/filebrowser"

@@ -13,6 +13,7 @@ services:
     entrypoint:
       - /opt/filebrowser-enterprise/scripts/container-entrypoint.sh
     environment:
+      TZ: Asia/Shanghai
       FILEBROWSER_CONFIG: /etc/filebrowser-enterprise/config.yaml
       FILEBROWSER_DATABASE: /var/lib/filebrowser-enterprise/database.db
       FILEBROWSER_JWT_TOKEN_SECRET_FILE: /run/filebrowser-secrets/jwt_token_secret

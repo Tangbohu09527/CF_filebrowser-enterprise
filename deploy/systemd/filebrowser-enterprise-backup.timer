@@ -2,7 +2,7 @@
 Description=Nightly FileBrowser Enterprise local backup schedule
 
 [Timer]
-OnCalendar=*-*-* 02:30:00
+OnCalendar=*-*-* 02:30:00 Asia/Shanghai
 RandomizedDelaySec=30m
 Persistent=true
 Unit=filebrowser-enterprise-backup.service
