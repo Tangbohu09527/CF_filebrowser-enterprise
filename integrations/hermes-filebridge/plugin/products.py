@@ -14,9 +14,9 @@ import contextvars
 from . import checked_file, failure
 
 _LIMIT = 128 * 1024 * 1024
-_ACTIONS = ("list", "search", "stat", "inspect", "preview", "import", "export")
+_ACTIONS = ("list", "search", "stat", "checksum", "mkdir", "inspect", "preview", "import", "export", "copy", "move", "rename", "replace", "delete", "restore")
 _FIELDS = {"action", "path", "query", "sha256", "member", "brand", "product",
-           "specification", "version", "members", "categories", "name"}
+           "specification", "version", "members", "categories", "name", "expected_sha256", "destination", "replacement_path", "recovery_path"}
 _BINDING_FIELDS = ("enterprise_identity_id", "thread_id", "account_id",
                    "conversation_id", "profile_reference", "profile_revision")
 
@@ -141,19 +141,33 @@ def handler_for(ctx):
             action, selected = args["action"], args.get("path", root)
             if not _path(selected, root):
                 return failure("product_path_denied")
+            recovery_root = posixpath.join(root, ".recovery")
+            if action in {"copy", "move", "rename", "replace", "delete", "restore"} and _path(selected, recovery_root):
+                return failure("product_path_denied")
             data = {"source": source, "path": selected, "operation_id": _operation(binding, args)}
-            if action in {"list", "search", "stat"}:
+            if action in {"list", "search", "stat", "checksum", "mkdir"}:
                 if action == "search":
                     data["query"] = args.get("query", "")
-                response = _client(ctx, action, data, active=active)
+                if action == "checksum":
+                    data["algorithm"] = "sha256"
+                response = _client(ctx, action, data, apply=action == "mkdir", active=active)
                 return json.dumps(response, ensure_ascii=False)
             product = {k: v for k, v in args.items() if k not in {"action", "path", "query"}}
+            organize = action in {"copy", "move", "rename", "replace", "delete", "restore"}
+            if organize:
+                for field in ("destination", "replacement_path", "recovery_path"):
+                    if field in product and (not _path(product[field], root) or
+                            (field != "recovery_path" and _path(product[field], recovery_root)) or
+                            (field == "recovery_path" and not _path(product[field], recovery_root))):
+                        return failure("product_path_denied")
+                product["operation"] = action
+                product["recovery_root"] = posixpath.join(root, ".recovery")
             if action == "import":
                 product["destination"] = posixpath.join(root, "products")
             if action == "export":
                 product["destination"] = posixpath.join(root, "exports", str(binding["dispatch_id"]))
             data["product"] = product
-            response = _client(ctx, "product-" + action, data, apply=action in {"import", "export"}, active=active)
+            response = _client(ctx, "product-organize" if organize else "product-" + action, data, apply=organize or action in {"import", "export"}, active=active)
             if response.get("ok") is not True:
                 return json.dumps(response, ensure_ascii=False)
             result = response["result"]
@@ -202,7 +216,7 @@ def ingest_handler(ctx):
             host, filename, host_active = capture_product_inbound_context(args["attachment_id"])
             if any(str(host[k]) != str(binding[k]) for k in ("dispatch_id", "message_id", "enterprise_identity_id", "thread_id", "profile_reference", "profile_revision", "session_id")):
                 return failure("trusted_context_invalid")
-            if not filename.lower().endswith(".zip") or "/" in filename or "\\" in filename or filename in {".", ".."}:
+            if not isinstance(filename, str) or not filename.lower().endswith(".zip") or "/" in filename or "\\" in filename or filename in {".", ".."}:
                 return failure("zip_required")
             def check():
                 active()
@@ -243,12 +257,17 @@ def register_products(ctx):
                 "evidence": {"type": "string", "maxLength": 2000}}}
     fields = {"action": {"type": "string", "enum": list(_ACTIONS)}, "path": {"type": "string"},
               "query": {"type": "string"}, "sha256": {"type": "string"}, "member": {"type": "string"},
-              **{k: {"type": "string"} for k in ("brand", "product", "specification", "version", "name")},
+              **{k: {"type": "string"} for k in ("brand", "product", "specification", "version", "name", "expected_sha256", "destination", "replacement_path", "recovery_path")},
               "members": {"type": "array", "items": member, "maxItems": 2000},
               "categories": {"type": "array", "items": {"type": "string", "enum": ["main", "detail", "other", "pending"]}}}
     ctx.register_tool(name="filebrowser_product_materials", toolset="cf_filebridge_products",
         schema={"name": "filebrowser_product_materials", "description": (
             "Use the authorized enterprise file service for product materials. list/search/stat locate real products and versions. "
+            "checksum reads the actual SHA256; mkdir creates a scoped directory. copy/move/rename/delete require expected_sha256 from checksum; "
+            "replace additionally requires replacement_path and its sha256. Each organizes ONE regular file with immutable backup and recovery mapping; "
+            "restore uses original path, expected_sha256 and the exact prior recovery_path. Never overwrite a differing destination; "
+            "conflicts or unknown outcomes require requery, not blind retry. Moving a file from a frozen product version invalidates that version's export manifest; "
+            "prefer copy to preserve published versions. No recursive deletion. "
             "inspect reads a ZIP manifest; preview reads one actual image member for visual classification. Names or dimensions alone are not sufficient. "
             "import requires inspected ZIP sha256 and complete member classifications with evidence, explicit brand/product/specification/version; "
             "use pending or ask when ambiguous. Preserve original package; never overwrite an old version. "

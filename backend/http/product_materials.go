@@ -48,19 +48,25 @@ type productMember struct {
 	StoredPath string `json:"stored_path,omitempty"`
 }
 type productRequest struct {
-	Action        string          `json:"action"`
-	Source        string          `json:"source"`
-	Path          string          `json:"path"`
-	SHA256        string          `json:"sha256,omitempty"`
-	Destination   string          `json:"destination,omitempty"`
-	Brand         string          `json:"brand,omitempty"`
-	Product       string          `json:"product,omitempty"`
-	Specification string          `json:"specification,omitempty"`
-	Version       string          `json:"version,omitempty"`
-	Members       []productMember `json:"members,omitempty"`
-	Categories    []string        `json:"categories,omitempty"`
-	Name          string          `json:"name,omitempty"`
-	Member        string          `json:"member,omitempty"`
+	Operation       string          `json:"operation,omitempty"`
+	OperationID     string          `json:"operation_id,omitempty"`
+	ExpectedSHA256  string          `json:"expected_sha256,omitempty"`
+	ReplacementPath string          `json:"replacement_path,omitempty"`
+	RecoveryRoot    string          `json:"recovery_root,omitempty"`
+	RecoveryPath    string          `json:"recovery_path,omitempty"`
+	Action          string          `json:"action"`
+	Source          string          `json:"source"`
+	Path            string          `json:"path"`
+	SHA256          string          `json:"sha256,omitempty"`
+	Destination     string          `json:"destination,omitempty"`
+	Brand           string          `json:"brand,omitempty"`
+	Product         string          `json:"product,omitempty"`
+	Specification   string          `json:"specification,omitempty"`
+	Version         string          `json:"version,omitempty"`
+	Members         []productMember `json:"members,omitempty"`
+	Categories      []string        `json:"categories,omitempty"`
+	Name            string          `json:"name,omitempty"`
+	Member          string          `json:"member,omitempty"`
 }
 type productManifest struct {
 	Schema        string          `json:"schema"`
@@ -127,13 +133,16 @@ func productMaterialsHandler(w http.ResponseWriter, r *http.Request, d *requestC
 	if decoder.Decode(&struct{}{}) != io.EOF {
 		return http.StatusBadRequest, fmt.Errorf("invalid trailing JSON")
 	}
-	if req.Action != "inspect" && req.Action != "preview" && req.Action != "import" && req.Action != "export" {
+	if req.Action != "inspect" && req.Action != "preview" && req.Action != "import" && req.Action != "export" && req.Action != "organize" {
 		return http.StatusBadRequest, fmt.Errorf("unsupported product action")
 	}
 	if req.Action == "import" || req.Action == "export" {
 		if !user.Permissions.Create {
 			return http.StatusForbidden, commonerrors.ErrAccessDenied
 		}
+	}
+	if req.Action == "organize" {
+		return productOrganize(w, r, d, req)
 	}
 	if req.Action == "export" {
 		return productExport(w, r, d, req)
@@ -215,7 +224,10 @@ func productMaterialsHandler(w http.ResponseWriter, r *http.Request, d *requestC
 	}
 	destination := path.Join(req.Destination, req.Brand, req.Product, req.Specification, req.Version)
 	muAny, _ := productLocks.LoadOrStore(req.Source+"\x00"+destination, &sync.Mutex{})
-	mu := muAny.(*sync.Mutex)
+	mu, validLock := muAny.(*sync.Mutex)
+	if !validLock {
+		return http.StatusInternalServerError, fmt.Errorf("product lock unavailable")
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	if len(req.Members) != len(members) {
@@ -539,9 +551,9 @@ func productPublishLocal(d *requestContext, source, p, local, expected string) e
 		if !target.Info.Mode().IsRegular() {
 			return errArchiveExtractionConflict
 		}
-		digest, e := checksumAuthenticatedReadTarget(target, "sha256")
-		if e != nil {
-			return e
+		digest, checksumErr := checksumAuthenticatedReadTarget(target, "sha256")
+		if checksumErr != nil {
+			return checksumErr
 		}
 		if digest != expected {
 			return errArchiveExtractionConflict

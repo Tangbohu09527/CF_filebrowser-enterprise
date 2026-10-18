@@ -84,6 +84,19 @@ class ProductToolsTests(unittest.TestCase):
         with patch.object(products,"_client",side_effect=expired):
             self.assertFalse(self.invoke({"action":"export","path":"/materials/p","categories":["main"],"name":"x.zip"})["ok"])
         self.assertFalse(self.calls)
+    def test_organize_uses_current_operation_and_fixed_recovery_scope(self):
+        with patch.object(products,"_client",return_value={"ok":True,"result":{"state":"complete"}}) as run:
+            result=self.invoke({"action":"move","path":"/materials/a.jpg","destination":"/materials/b.jpg","expected_sha256":"a"*64})
+        self.assertTrue(result["ok"])
+        self.assertEqual(run.call_args.args[1],"product-organize")
+        self.assertEqual(run.call_args.args[2]["product"]["recovery_root"],"/materials/.recovery")
+        self.assertTrue(run.call_args.args[2]["operation_id"].startswith("product-12-"))
+        self.assertTrue(run.call_args.kwargs["apply"])
+        for key in ("destination","replacement_path","recovery_path"):
+            with patch.object(products,"_client") as run:
+                result=self.invoke({"action":"copy","path":"/materials/a.jpg",key:"/outside"})
+                self.assertFalse(result["ok"]);run.assert_not_called()
+
     def test_timeout_is_outcome_unknown_not_safe_retry(self):
         import subprocess
         with patch.object(products,"_client",side_effect=subprocess.TimeoutExpired("client",180)):

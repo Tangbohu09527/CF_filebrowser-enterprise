@@ -103,7 +103,7 @@ func (r *Runner) execute(ctx context.Context, command string, input Input, apply
 	switch command {
 	case "upload-stream":
 		return r.uploadStream(ctx, input, apply, requestID)
-	case "product-inspect", "product-preview", "product-import", "product-export":
+	case "product-inspect", "product-preview", "product-import", "product-export", "product-organize":
 		return r.product(ctx, command, input, apply, requestID)
 	case "create-text":
 		result, err := r.planCreateText(ctx, requestID, input)
@@ -660,7 +660,7 @@ func normalizeIdentifier(value, prefix string) (string, error) {
 }
 
 func isWriteCommand(command string) bool {
-	return command == "upload-stream" || command == "product-import" || command == "product-export" || command == "mkdir" || command == "upload-new" || command == "create-text" || command == "approve-create" || command == "create-approved"
+	return command == "upload-stream" || command == "product-import" || command == "product-export" || command == "product-organize" || command == "mkdir" || command == "upload-new" || command == "create-text" || command == "approve-create" || command == "create-approved"
 }
 
 func validateCommandInput(command string, input Input) error {
@@ -679,7 +679,7 @@ func validateCommandInput(command string, input Input) error {
 	}
 	allowed := map[string]bool{}
 	switch command {
-	case "product-inspect", "product-preview", "product-import", "product-export":
+	case "product-inspect", "product-preview", "product-import", "product-export", "product-organize":
 		allowed["source"], allowed["path"], allowed["product"] = true, true, true
 	case "list", "stat", "read", "mkdir":
 		allowed["source"], allowed["path"] = true, true

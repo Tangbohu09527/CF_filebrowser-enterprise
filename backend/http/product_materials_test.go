@@ -26,9 +26,9 @@ func productTestZip(t *testing.T, filename string, entries map[string][]byte) {
 	}
 	z := zip.NewWriter(f)
 	for name, data := range entries {
-		w, e := z.Create(name)
-		if e != nil {
-			t.Fatal(e)
+		w, createErr := z.Create(name)
+		if createErr != nil {
+			t.Fatal(createErr)
 		}
 		if _, e = w.Write(data); e != nil {
 			t.Fatal(e)
@@ -99,9 +99,9 @@ func TestProductMaterialsFullHTTPWorkflow(t *testing.T) {
 		t.Fatal(string(data))
 	}
 	for _, m := range manifest.Members {
-		stored, e := os.ReadFile(filepath.Join(source, filepath.FromSlash(strings.TrimPrefix(m.StoredPath, "/"))))
-		if e != nil {
-			t.Fatal(e)
+		stored, readErr := os.ReadFile(filepath.Join(source, filepath.FromSlash(strings.TrimPrefix(m.StoredPath, "/"))))
+		if readErr != nil {
+			t.Fatal(readErr)
 		}
 		if !bytes.Equal(stored, original[m.Path]) {
 			t.Fatal("member bytes changed")

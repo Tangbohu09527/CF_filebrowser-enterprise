@@ -201,9 +201,9 @@ func TestProductMaterialsSecurityZIPDeclaredBounds(t *testing.T) {
 			for i := 0; i < tc.count; i++ {
 				header := &zip.FileHeader{Name: strings.Repeat("a", i+1) + ".jpg", Method: zip.Store, UncompressedSize64: tc.size, CompressedSize64: tc.size}
 				header.SetMode(0644)
-				entry, err := writer.CreateRaw(header)
-				if err != nil {
-					t.Fatal(err)
+				entry, createErr := writer.CreateRaw(header)
+				if createErr != nil {
+					t.Fatal(createErr)
 				}
 				if _, err = entry.Write([]byte("x")); err != nil {
 					t.Fatal(err)

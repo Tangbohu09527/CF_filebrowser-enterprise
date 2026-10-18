@@ -25,7 +25,7 @@ type CLIOptions struct {
 
 var supportedCommands = map[string]struct{}{
 	"upload-stream":   {},
-	"product-inspect": {}, "product-preview": {}, "product-import": {}, "product-export": {},
+	"product-inspect": {}, "product-preview": {}, "product-import": {}, "product-export": {}, "product-organize": {},
 	"ping": {}, "whoami": {}, "capabilities": {}, "sources": {}, "list": {}, "search": {},
 	"create-text": {}, "approve-create": {}, "create-approved": {}, "create-status": {},
 	"stat": {}, "checksum": {}, "read": {}, "download": {}, "mkdir": {}, "upload-new": {},
@@ -208,7 +208,7 @@ func helpResponse() Response {
 		DryRun:        false,
 		Result: map[string]any{
 			"usage":      "filebrowser-agentctl --config <file> [--input <file|->] [--token-stdin] [--allow-localhost-http] [--apply] <command>",
-			"commands":   []string{"ping", "whoami", "capabilities", "sources", "list", "search", "stat", "checksum", "read", "download", "mkdir", "upload-new", "create-text", "approve-create", "create-approved", "create-status", "product-inspect", "product-preview", "product-import", "product-export"},
+			"commands":   []string{"ping", "whoami", "capabilities", "sources", "list", "search", "stat", "checksum", "read", "download", "mkdir", "upload-new", "create-text", "approve-create", "create-approved", "create-status", "product-inspect", "product-preview", "product-import", "product-export", "product-organize"},
 			"prohibited": []string{"delete", "share", "token management", "user management", "ACL management", "arbitrary HTTP", "shell", "move", "rename", "overwrite"},
 		},
 	}

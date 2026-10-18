@@ -73,3 +73,40 @@ func TestProductCLIRejectsMissingFramingBeforeNetwork(t *testing.T) {
 		t.Fatal("local path accepted")
 	}
 }
+
+func TestProductOrganizeScopeAndApply(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		if body["action"] != "organize" || body["operation"] != "copy" || body["operation_id"] != "op-transfer-test" {
+			t.Error("bad scoped operation", body)
+		}
+		transferTestWriteJSON(t, w, map[string]any{"state": "complete"})
+	}))
+	defer server.Close()
+	runner := transferTestRunner(t, server.URL, nil, nil)
+	input := transferTestInput("/read/image.jpg")
+	input.OperationID = "op-transfer-test"
+	input.Product = &ProductInput{Operation: "copy", Destination: "/write/image.jpg", RecoveryRoot: "/write/recovery", ExpectedSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	result := runner.Run(context.Background(), "product-organize", input, false)
+	if !result.OK || !result.DryRun || calls.Load() != 0 {
+		t.Fatal(result)
+	}
+	result = runner.Run(context.Background(), "product-organize", input, true)
+	if !result.OK || calls.Load() != 1 {
+		t.Fatal(result)
+	}
+	input.Product.Operation = "move"
+	result = runner.Run(context.Background(), "product-organize", input, true)
+	if result.OK || calls.Load() != 1 {
+		t.Fatal("read-only source mutated", result)
+	}
+	input.Product.Operation = "copy"
+	input.Product.RecoveryRoot = "/outside"
+	result = runner.Run(context.Background(), "product-organize", input, true)
+	if result.OK || calls.Load() != 1 {
+		t.Fatal("recovery scope bypass", result)
+	}
+}
