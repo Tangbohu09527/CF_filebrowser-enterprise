@@ -66,6 +66,13 @@ func runServiceReaderRotateCLI(configFile string, options serviceReaderOptions, 
 	if err != nil {
 		return err
 	}
+	// Save invokes MakeUserDirs even when disableScopeChange is true. Refuse
+	// automatic user-directory sources before opening or mutating the store.
+	source := settings.Config.Server.NameToSource[options.Source]
+	backendSource, known := settings.Config.Server.SourceMap[source.Path]
+	if source.Config.CreateUserDir || !known || backendSource == nil || backendSource.Path != source.Path || backendSource.Config.CreateUserDir {
+		return fmt.Errorf("reader rotation requires a fixed source scope without automatic user directories; no changes made")
+	}
 	loaded, existed, err := storage.InitializeDb(settings.Config.Server.Database)
 	if err != nil || !existed {
 		return fmt.Errorf("existing database unavailable")

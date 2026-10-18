@@ -148,6 +148,35 @@ func TestServiceReaderRotationCLIProcess(t *testing.T) {
 	if err = db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// Save normally calls MakeUserDirs, which can change a scope before saving.
+	// The CLI must reject that configuration before any DB or filesystem write.
+	storedBytes, err := os.ReadFile(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceConfig := config["server"].(map[string]any)["sources"].([]any)[0].(map[string]any)
+	sourceConfig["config"] = map[string]any{"createUserDir": true}
+	unsafeConfig, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(configPath, unsafeConfig, 0600); err != nil {
+		t.Fatal(err)
+	}
+	output, err = run("service-reader-rotate", newSecret)
+	if err == nil || !bytes.Contains(output, []byte("without automatic user directories")) || bytes.Contains(output, []byte(newSecret)) {
+		t.Fatal("automatic directory source was not rejected safely")
+	}
+	afterRejected, err := os.ReadFile(database)
+	if err != nil || !bytes.Equal(storedBytes, afterRejected) {
+		t.Fatal("refused rotation mutated database")
+	}
+	if _, err = os.Stat(filepath.Join(scope, "cf-export-reader")); !os.IsNotExist(err) {
+		t.Fatal("refused rotation created a user directory")
+	}
+	if err = os.WriteFile(configPath, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
 	output, err = run("service-reader-rotate", newSecret)
 	if err != nil {
 		t.Fatalf("rotation failed: %v %s", err, output)
