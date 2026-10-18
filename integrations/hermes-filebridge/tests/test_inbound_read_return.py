@@ -395,13 +395,15 @@ class ResolveIdentityTests(unittest.TestCase):
         from datetime import datetime, timedelta, timezone
         import uuid
         session = BINDING["session_id"]
-        owner = {"schema": control.SCHEMA, "session_id": session, "task_id": session,
+        owner = {"schema": control.RESOLVE_SCHEMA, "session_id": session, "task_id": session,
                  "host_instance_id": "synthetic-host", "host_nonce": "n" * 32}
         binding_id = str(uuid.uuid4())
         origin = "https://gateway.invalid"
-        expires = (datetime.now(timezone.utc) + timedelta(seconds=20)).isoformat()
+        now = datetime.now(timezone.utc)
+        expires = (now + timedelta(seconds=20)).isoformat()
         payload = {**owner, **{k: v for k, v in BINDING.items() if k not in {"turn_id", "session_id", "task_id"}},
             "binding_id": binding_id, "claim_epoch": str(uuid.uuid4()), "lease_valid_until": expires,
+            "server_now": now.isoformat(),
             "state": "running", "budget_scope": "message:4308:attachment:2", "event_sequence": 1,
             "attachments": [{"schema": "cf-inbound-read/v1", "message_id": 4308, "attachment_id": 2,
                 "thread_id": BINDING["thread_id"], "enterprise_identity_id": BINDING["enterprise_identity_id"],

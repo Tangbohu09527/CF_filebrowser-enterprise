@@ -1,4 +1,4 @@
-"""Fixed, host-only cf-inbound-host-binding/v1 HTTPS control client.
+"""Host-only resolve/v2 clock handshake with v1 events/closed control.
 
 No control response, credential or local path is a model tool argument. This
 client deliberately has no refresh, redirect, retry or events reconnect path.
@@ -6,7 +6,7 @@ client deliberately has no refresh, redirect, retry or events reconnect path.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import hashlib
 import http.client
 import json
@@ -25,6 +25,7 @@ from .inbound import BridgeError, _client
 from .inbound_directory import create_task_directory
 
 SCHEMA = "cf-inbound-host-binding/v1"
+RESOLVE_SCHEMA = "cf-inbound-host-binding/resolve/v2"
 PREFIX = "/internal/hermes/inbound-bindings"
 MAX_FRAME = 1024 * 1024
 
@@ -284,12 +285,12 @@ class ControlClient:
             _reject()
         _identifier(host_instance_id, r"[A-Za-z0-9_-]{1,128}")
         _identifier(host_nonce, r"[A-Za-z0-9_-]{32,128}")
-        owner = {"schema": SCHEMA, "session_id": session_id, "task_id": task_id,
+        owner = {"schema": RESOLVE_SCHEMA, "session_id": session_id, "task_id": task_id,
                  "host_instance_id": host_instance_id, "host_nonce": host_nonce}
         result = self._post(PREFIX + "/resolve", owner)
         _keys(result, "schema binding_id session_id task_id host_instance_id host_nonce dispatch_id claim_epoch "
               "message_id thread_id enterprise_identity_id profile_reference profile_revision lease_valid_until "
-              "state budget_scope attachments event_sequence")
+              "state budget_scope attachments event_sequence server_now")
         if any(result[k] != v for k, v in owner.items()) or result["state"] != "running":
             _reject()
         for name in ("binding_id", "claim_epoch", "thread_id", "enterprise_identity_id"):
@@ -300,10 +301,13 @@ class ControlClient:
                 or result["profile_revision"] != self.config.profile_revision):
             _reject()
         lease = _timestamp(result["lease_valid_until"])
-        remaining = lease - time.time()
-        if not 0 < remaining <= 30.5:
+        # These two timestamps use the same authenticated server clock. Anchor
+        # their duration at request START, conservatively consuming all transit
+        # and processing time; neither local wall time nor HTTP Date is authority.
+        duration = lease - _timestamp(result["server_now"])
+        if not 0 < duration <= 30:
             _reject()
-        deadline = min(started + 30, time.monotonic() + remaining)
+        deadline = started + duration
         attachments = result["attachments"]
         # Gateway v1 binds exactly one attachment and one immutable budget scope.
         if type(attachments) is not list or len(attachments) != 1:
@@ -313,10 +317,21 @@ class ControlClient:
         if result["budget_scope"] != scope or time.monotonic() >= deadline:
             _reject()
         directory = create_task_directory(self.config.work_root)
+        # The retained native worker accepts absolute wall-clock expiry. Only
+        # shorten its original expiry; the host's monotonic timer and captured
+        # source guard remain authoritative, including across wall-clock jumps.
+        local_wall = time.time()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _reject()
+        # datetime rounds to microseconds; subtract one so serialization cannot
+        # round a valid boundary later than the conservative bound.
+        worker_expiry = (datetime.fromtimestamp(min(lease, local_wall + remaining), timezone.utc)
+                         - timedelta(microseconds=1)).isoformat()
         binding = {"dispatch_id": "gateway:" + result["binding_id"], "task_id": task_id,
                    "thread_id": result["thread_id"], "enterprise_identity_id": result["enterprise_identity_id"],
                    "work_dir": directory, "gateway_origin": self.config.gateway_origin,
-                   "expires_at": result["lease_valid_until"], "max_bytes": self.config.max_bytes,
+                   "expires_at": worker_expiry, "max_bytes": self.config.max_bytes,
                    "attachments": [attachment]}
         if self.config.ca_file:
             binding.update(ca_file=self.config.ca_file, ca_sha256=self.config.ca_sha256)
