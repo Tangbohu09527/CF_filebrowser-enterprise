@@ -325,6 +325,20 @@ source isolation: test allowed and denied clients over the real Docker
 publication path before approval. Do not broaden the allowlist to a gateway
 to make a failing negative test pass.
 
+Server-side Gateway downloads are a separate client from the employee's
+Windows host. Before preparing LAN exposure, verify the TCP peer actually
+seen by FileBrowser through the intended Docker publication/NAT path; neither
+the Gateway container's local address nor the server's advertised address
+alone proves that peer. Include only the explicitly approved consumer peer
+addresses in the existing `--lan-allowed-cidrs` input, keeping protected
+`LAN_ALLOW_CIDRS` and `server.allowedClientCIDRs` consistent. Do not use an empty
+list, guess a Docker subnet, or change the TLS endpoint to bypass this check.
+A shared NAT peer grants network reachability to that peer; it does not prove
+exclusive Gateway/project identity. Retain CA/hostname verification and the
+ordinary account/Token intersection with the exact Source/Scope and operation
+permissions. After a topology change, recheck the actual peer and positive and
+negative connections before updating the reviewed deployment inputs.
+
 ## 5. First start and mandatory bootstrap completion
 
 ```bash

@@ -1,6 +1,6 @@
 # Scoped product ZIP workflows
 
-This candidate builds on FileBridge `8d12d21e` / product `f3a63895e33958dda2bbc4f3413c5619bdfabdff`. The existing FileBrowser server revision observed by the operator was `8ff37ef0da322aa2194d9ef37e26eb7f7035cbb2`; backend and deployment files between that revision and this branch base were identical. These are different component identities. This document is a candidate implementation record, not proof of production deployment.
+This candidate builds on FileBridge `8d12d21e` / product `f3a63895e33958dda2bbc4f3413c5619bdfabdff`. The existing FileBrowser server revision observed by the operator was `8ff37ef0da322aa2194d9ef37e26eb7f7035cbb2`; backend and deployment files between that revision and this branch base were identical. These are different component identities. Implementation and isolated results are separated below from dated production observations. The afcd service deployment, ordinary API organization checks and dedicated reader continuation now have actual receipts; real-model and recipient verification remain separate.
 
 ## Implemented interface
 
@@ -11,7 +11,7 @@ This candidate builds on FileBridge `8d12d21e` / product `f3a63895e33958dda2bbc4
 - `import`: explicit brand/product/specification/version, archive digest and a complete member classification/evidence map. Missing or ambiguous identity is not guessed; `pending` is an explicit category. It retains the original ZIP and creates a new version. It does not overwrite an employee version.
 - `export`: a confirmed complete version and explicit categories. Every selected source is authorized, frozen, checked and packed. The ZIP is reread to compare all members, then sources are rechecked. Stable temporary metadata makes identical export retries byte-identical. Source metadata is unchanged.
 
-Limits are coordinated at 128 MiB compressed/upload/output, 512 MiB expanded, 32 MiB per member and 2,000 entries, with a 200:1 expansion bound. ZIP links, special files, encryption, path traversal, collisions and malformed length/CRC are rejected. Normal Chinese names, spaces and parentheses survive. Product/version/output labels also reject Windows reserved names, control/format characters and illegal filename characters.
+The FileBrowser layer is bounded at 128 MiB compressed/upload/output, 512 MiB expanded, 32 MiB per member and 2,000 entries, with a 200:1 expansion bound. ZIP links, special files, encryption, path traversal, collisions and malformed length/CRC are rejected. Normal Chinese names, spaces and parentheses survive. Product/version/output labels also reject Windows reserved names, control/format characters and illegal filename characters.
 
 Import publishes `product-materials.pending.json` first and `product-materials.json` last. An existing version requires an exact matching pending intent. Retries validate all files, including after process restart. New publication uses exclusive directory reservation and hard-link no-replace publication; unsupported filesystems fail closed. Changed bytes return 409. Partial imports remain accurately pending and are not deleted or advertised complete. This protects normal scoped API activity; it does not claim to defeat an administrator replacing filesystem parents outside the service.
 
@@ -62,7 +62,7 @@ At `80fb038d9a9a35af13fed77d28a33455a178ea01`, the backend race suite, frontend 
 
 The official `official-product-08` chain began with a real native upload to FileBrowser, not a WeChat ZIP. A separate host-control/native-worker component test exposed a missing ZIP MIME entry in trusted inbound control and the old 64 MiB configuration ceiling. Commit `3f356ca703d6c8ca08c54aefbd6ae94283d9581a` accepts ZIP and an explicit limit up to 128 MiB while preserving the old default 64 MiB. The component uses real TLS control, HostAdapter, native worker and protected workcopy streaming, with a FileBrowser API spy; repeat calls download once, wrong identity/attachment and ended scope do not upload. This is neither an official full inbound chain nor live WeChat acceptance. Production configuration must explicitly set the coordinated 128 MiB ceiling.
 
-Live deployment, real-model business classification, official complete ZIP input coverage and actual recipient ZIP verification remain separate operator steps. No FileBrowser database migration is introduced; account provisioning and plugin/client/server rollout must be recorded independently from these candidate results.
+The preceding candidate results alone do not prove deployment, real-model business classification, complete incoming-ZIP coverage or actual recipient verification. Later dated observations below record only the steps actually completed. No FileBrowser database migration is introduced; account provisioning and plugin/client/server rollout must be recorded independently from these candidate results.
 
 ## Dedicated export reader bootstrap
 
@@ -86,7 +86,7 @@ The cache was verified with official Go checks against unchanged `go.mod`/`go.su
 
 The independent successor build started at 13:02:49 UTC and succeeded at 13:03:12 UTC. The resulting image is **`sha256:6352a1640c4be773a80c90331557f4f1deb8cc7ab00fc32c16e36ce3ed0ceb73`**, with the exact afcd revision label. An isolated, network-disabled, read-only verification container confirmed the binary revision, required optional programs and retained build-input inventories (exit 0). This proves a built candidate, not a production switch or real-model/WeChat business acceptance.
 
-The operator retains private source/cache transfer manifests, the original failed build receipt/log, successor build receipt, binary/tool verification, and deployment input evidence. No credentials, business image bytes, production database or complete production logs are published here. The prepared switch helper still requires current image/configuration/mount/queue checks, a stopped-service database snapshot with restored-copy validation, and the official bounded stdin reader creation before switching. Nine isolated helper tests cover normal progression, failed snapshots, partially committed reader creation, changed configuration, unknown start outcomes, token failures and secret-free result metadata; these do not substitute for executing those production checks. Unexplained container-configuration differences remain a deployment stop until reconciled.
+The operator retains private source/cache transfer manifests, the original failed build receipt/log, successor build receipt, binary/tool verification, and deployment input evidence. No credentials, business image bytes, production database or complete production logs are published here. Before actual switching, the helper required current image/configuration/mount/queue checks, a stopped-service database snapshot with restored-copy validation, and the official bounded stdin reader creation before switching. Nine isolated helper tests cover normal progression, failed snapshots, partially committed reader creation, changed configuration, unknown start outcomes, token failures and secret-free result metadata; these do not substitute for executing those production checks. Unexplained container-configuration differences remain a deployment stop until reconciled.
 
 
 ## Reader password continuation tool
@@ -96,3 +96,100 @@ The service image `afcd5c875905a849a7636ccc22057b47da419dfe` does not provide st
 The intended artifact is a fixed one-shot maintenance binary, not a replacement for the running full-feature server. Exclusive service stop, verified snapshot, exact account metadata and normal TLS/API login remain required operator steps. No token is forged and no database record is patched outside normal storage. Isolated tests exercise the actual CLI process against an existing temporary database, preserve an unrelated sentinel, verify that missing accounts are not created, and retain existing OTP and UI fields. A successful local test is not evidence that production rotation or token issuance has happened.
 
 The password-rotation CLI also rejects `createUserDir=true` sources before opening the database. The existing storage `Save` path invokes `MakeUserDirs` even when its scope-change flag is set; a subprocess regression verifies rejection leaves the database bytes and scope directory unchanged. This CLI guard does not alter the running server image.
+
+## Observed production execution on 18 October 2026
+
+The running full-feature FileBrowser application was switched to `afcd5c875905a849a7636ccc22057b47da419dfe`, image `sha256:6352a1640c4be773a80c90331557f4f1deb8cc7ab00fc32c16e36ce3ed0ceb73`, under ordinary service identity `10001:10001`. Its fixed database snapshot was taken with the service stopped, restored separately and opened by the official CLI. The product API allowlist contains only `hermes-agent-test`. This observation is distinct from the later maintenance CLI and documentation/test commits. No FileBrowser schema migration was introduced.
+
+The first activation ended at **14:53:07 UTC with a partial result**, not success: the new service was healthy and the dedicated scope-locked reader existed, but normal HTTPS token issuance stopped with `URLError`; no token was saved and the generated password had not been persisted. The original activation and account-creation receipts remain immutable. The operator did not repeat account creation, replace the database or let the older server take over the new locked-scope account.
+
+The ordinary producer account's official self response established source `enterprise-files` and scope `/wechat-acceptance`. Thus the model/client business root `/商品资料/新谷力` maps to `/wechat-acceptance/商品资料/新谷力` within that source. A separate no-follow host audit confirmed that exact mapped directory and the original archive bytes. The earlier preparation guard had wrongly assumed the producer's user-relative path began at the source root. It was corrected from evidence; no files were moved or new directories created to satisfy the wrong assumption. The reader's scope is the full source-relative `/wechat-acceptance/商品资料/新谷力`, while download requests strip the producer's logical business prefix exactly once.
+
+Windows strict-TLS access and the existing business token continued to work. Anonymous host/Gateway probes instead encountered TLS EOF because FileBrowser's actual-TCP-peer allowlist initially permitted only loopback and the employee Windows host. Bounded packet-header observations and the fixed Docker proxy configuration established the actual host consumer and proxy peer. A separate, reviewed network-only successor preserved the CA, endpoint, service image, mounts, user and account authority while adding only `192.168.1.233/32` and `172.19.0.1/32`, retaining the two existing entries. Protected `LAN_ALLOW_CIDRS` and `server.allowedClientCIDRs` were changed together. The shared proxy peer is not proof of exclusive Gateway identity; application authentication and exact Source/Scope remain mandatory.
+
+The network successor and its **15:56:08 UTC** read-only follow-up proved the new service healthy, full mount/core/host contracts preserved, unchanged queue/gates, and strict anonymous HTTPS health from the host, current Gateway and candidate Gateway. No token values or business file operations participated in that maintenance. The previous reader failure is not relabeled successful by these network checks.
+
+The subsequent one-shot reader maintenance binary is `da17a921a4fba9494fc2e13afff9938d7a6396db`, SHA-256 `7c0c00e06f72e15ac733d0e88faa8aa5d4273444fd4afa2274219cf2552d7b19`; the service image remains afcd. On CFserver at **15:38:38 UTC**, that binary and eight actual CLI tests ran as `10001:10001` in the same full runtime image, with network disabled, temporary databases, read-only root and no production database mounts. All passed. Two preliminary failures are retained: restrictive umask made the newly staged executable `0500` instead of its specified `0555`, then the version guard rejected the existing SQLite initialization debug line. The continuation verified exact binaries/ELF/owner before applying the intended executable mode; the diagnostic guard now accepts only that precise source-confirmed line. No service or business directory permissions were changed.
+
+The final same-reader continuation requires the exact partial activation, existing reader proof, actual LAN successor, successful Linux validation and completed CRUD evidence. It validates a fresh stopped-service snapshot before replacing only the existing reader password via official stdin CLI; it preserves account ID, scopes, permissions, tokens, OTP and other fields. Restart uses the same afcd image. Failure recovery checks current inputs and the complete runtime contract before starting anything. The total HTTPS stage is bounded after service health is restored, leaving at least ten minutes for closeout. Public export CA mode is explicitly verified as `0644`; the operational token file remains root-owned `0600`. Check/start were observed at 15:59:42/16:00:03 UTC. The terminal receipt succeeded at **16:00:37.081576 UTC (00:00:37 on 19 October, Beijing)**: the original reader account ID 3 was retained, no second reader was created, and only its password changed through the official CLI. The fresh snapshot includes the already completed CRUD audit state; its restored copy was successfully exercised before live rotation. The restarted afcd service was healthy under `10001:10001`, and Poll/Delivery remained closed with the queue unchanged.
+
+Normal strict-TLS login issued a full token limited to Browse/Download within source `enterprise-files`, scope `/wechat-acceptance/商品资料/新谷力`. Actual Create, Delete, Modify and token-chaining attempts were denied with HTTP 403; traversal was rejected. A real streamed read of the complete original package matched all 18,166,503 bytes and SHA-256 `0e4456af887684854217dbc3d11d9104fad54dff2df82e3c41bd25e0c036c075`. The saved token is root-owned mode `0600`; the new public CA copy was actually mode `0644`. The random password was not saved. The business token expires on **16 January 2027 at 16:00:36 UTC**, separate from the temporary 12-hour operator SSH/sudo authorization. This makes the scoped file-service reader ready; it does not by itself prove a later Gateway import, model task or recipient delivery.
+
+| Retained private proof | SHA-256 / interpretation |
+| --- | --- |
+| Original partial activation | `7dc736a13a0886b688415339a48ef6f98c3e080a52e22c147ce38eac91db2926`; new service/reader, token stage failed |
+| Official reader creation | `2506852839761f80e1c33bb1b1a96aa3264aa0f3b5f2bb1edbd35fc49c1d5314`; creation is not repeated |
+| Actual source/scope mapping | `f98048c711a7a2c821509fc028b29d13865d1f68396aa6b2b80ed06bdae6c46a` |
+| Linux maintenance verification | `db35384d8c6b7ef4e5f15dc490462d69ec222338f7f79ab01b162ef7a5e3509d`; version + eight CLI tests, no production DB |
+| Completed same-reader continuation | `f123f31ffac58cdb6bf4e1c551067cd0f1c940c45175ade7def5aaba3889b030`; reader ID retained, token issued/saved |
+| Read-only token verification | `671b061ad88010f1dc7c7f9969c15b9079e997b3a17615fc132eb96334f0082f`; safe permissions, five denials, actual original download |
+| Fresh snapshot manifest / restored-copy verification | `658e8aad66974d588352a728292de6e7f6da4fc3116301816ff226aec1247224` / `712e8fd88e02f892324e1d56c418a9c8fe7e155683bc3d6ca95402a463858bc4` |
+| LAN successor activation | `373a998319fd687812e35ca3b6d930783b0484cfab8984785592aa55e5cab26a` |
+| LAN configuration / environment | `d78e4d14a0c1e71c07ab2aa0f89c2a9ae7187bcfade1d2a21fd2c82274cde9ea` / `26194b28fe307b4ff742a30e41c565ce7f2a1cc953af0db74f35d97f3f66d9a0`; contents remain private |
+
+These hashes identify retained originals; this document publishes the relevant execution facts. It does not claim that a reader with access only to this report has accessed those private logs.
+
+### Actual bounded file-service CRUD verification (18 October 2026)
+
+The ordinary Windows Admin client executed the real FileBrowser API from **15:11:28.300326 to 15:11:31.288735 UTC (23:11:28–23:11:31 Beijing)**. No model, WeChat sender, SSH operation, or deployment command participated. This is actual file-service verification, not an isolated substitute and not natural-language/WeChat acceptance.
+
+The service candidate was `afcd5c875905a849a7636ccc22057b47da419dfe`, image `sha256:6352a1640c4be773a80c90331557f4f1deb8cc7ab00fc32c16e36ce3ed0ceb73`. The fixed Windows client was SHA-256 `70e3e4a7d1b47ee6ac472b41aa7cc24e45ec8b6d4882578a60b66b18b674e93f`. Its first live response confirmed account `hermes-agent-test`, source `enterprise-files`, scope `/wechat-acceptance`, `admin=false`, and exact account/token permission intersection with browse, download, create, modify and delete enabled. The test client additionally restricted writes to `/商品资料/新谷力/整理验收-20261018-afcd5c87` and reads to that subtree plus the already archived original package.
+
+Before the first write, strict TLS using the existing pinned CA and direct connection succeeded, and the original package checksum was re-read. Its **18,166,503 bytes** and SHA-256 `0e4456af887684854217dbc3d11d9104fad54dff2df82e3c41bd25e0c036c075` matched the frozen input. This current read was saved at 15:11:28.365232 UTC. No TLS/host validation was disabled and no token value was printed or copied into a command line.
+
+The test created two directories and uploaded two bounded JPG working copies, then completed these six operations under the fixed test root:
+
+| Operation | Actual source and destination, relative to the fixed test root | Result |
+| --- | --- | --- |
+| Copy | `原始图 (1).jpg` → `副本.jpg` | Destination checksum/download matched; source rechecked unchanged. |
+| Move | `副本.jpg` → `移动目录/移动.jpg` | Source absence and destination checksum/download verified. |
+| Rename | `移动目录/移动.jpg` → `移动目录/重命名 中文 (1).jpg` | Chinese, space and parentheses retained; old name absent; new bytes verified. |
+| Replace | `移动目录/重命名 中文 (1).jpg` using `替换图.jpg` | Frozen replacement bytes verified; replacement source remained unchanged. |
+| Recoverable delete | `移动目录/重命名 中文 (1).jpg` | Target absence verified; recoverable before-image retained. |
+| Restore | Same target from this delete operation's recovery path | File restored and downloaded checksum/size verified. |
+
+Each operation returned `state=complete`, `recoverable=true` and its own recovery path. The client separately read back the actual `intent.json` and `complete.json`, checked actor/path/expected hash, and downloaded `before.bin` to verify its bytes. The six retained paths are:
+
+```text
+/商品资料/新谷力/整理验收-20261018-afcd5c87/.recovery/crud-afcd-20261018-copy
+/商品资料/新谷力/整理验收-20261018-afcd5c87/.recovery/crud-afcd-20261018-move
+/商品资料/新谷力/整理验收-20261018-afcd5c87/.recovery/crud-afcd-20261018-rename
+/商品资料/新谷力/整理验收-20261018-afcd5c87/.recovery/crud-afcd-20261018-replace
+/商品资料/新谷力/整理验收-20261018-afcd5c87/.recovery/crud-afcd-20261018-delete
+/商品资料/新谷力/整理验收-20261018-afcd5c87/.recovery/crud-afcd-20261018-restore
+```
+
+The first JPG is 357,387 bytes, SHA-256 `3af20dbbc702e026e8beacad00e62caea13d39f2bb73d9f8a08231ed9ac32c2f`; the replacement is 351,141 bytes, SHA-256 `3717d48cadbea1355e1ab7190c556e362789fcd4540a944d04ffb22f1f445384`. Final ordinary directory listings showed the two retained root JPGs and one restored JPG in `移动目录`; the recovery subtree is retained separately. The original package was checked again at the end, and the local source archive was rehashed unchanged. No permanent deletion or mutation of `D:\新谷力` occurred.
+
+The 61 recorded API operations comprised 1 capabilities, 19 checksums, 4 absence checks, 2 mkdir, 2 upload-new, 13 downloads, 6 product-organize, 12 recovery-record reads and 2 directory lists. All mutations succeeded. The four `stat/not_found` responses were expected checks for absence before creation and after move/rename/delete, not ignored failures.
+
+Two limitations remain explicit:
+
+1. This successful native CRUD run does **not** establish natural-language classification, model-chosen tools, ZIP export/Artifact/Delivery, or WeChat receipt. Those require their own evidence.
+2. At this observation time the service deployment remained **partial**: service healthy, scoped export reader created, but the reader-token issuance stage had failed with `URLError`; token issuance/saving and Gateway export readiness were still false. CRUD success used the existing ordinary business account and did not change that deployment result.
+
+The earlier run at 15:03:17–15:03:18 UTC failed locally with `invalid_trust`, before token loading or any HTTP request. The old probe-generated client config omitted `ca_sha256` while retaining `ca_file`. Its config and failure evidence were preserved. A new independent working directory copied the already frozen small samples, inherited the pinned base configuration's `ca_sha256` and `direct_connection`, and retained the same narrow source/path restrictions. The actual fixed client then passed two credential-free, network-free loading checks (empty stdin token → `token_unavailable`; synthetic token plus malformed request → `invalid_input`) before the new live run. Four targeted successor tests passed. No production configuration, token, TLS policy, service or database was modified to accommodate this client-side mistake.
+
+Private evidence index (full originals remain local; this excerpt exposes execution facts, not credentials or full responses):
+
+| Evidence | SHA-256 / scope |
+| --- | --- |
+| `live-crud-afcd5c87-r2/result.json` | `a0f6523b3834f5cdab6f37abf516b9e0ee855f9372f669890a1bbac527e7fded` |
+| `live-crud-afcd5c87-r2/current-strict-tls-checksum.json` | `8d4fc4013fc655d75ab51548d003e8e8f862f4cd1bdf4e9ab83567b4cb540c39` |
+| `live-crud-afcd5c87-r2/client-config.json` | `650c411ea0e4160143367204fa8e7ca2010c54a40db4606d99afcfb6c3eb85a5`; credential reference only, not published |
+| `live-crud-afcd5c87-r2/001-*.json` through `061-*.json` and requests | Per-operation safe results; original full logs remain private |
+| `live-crud-afcd5c87-r2/configuration-validation.json` | Two actual EXE configuration-loading checks; no credentials/network |
+| `live-crud-partial-continuation-r2.py` | `8ce3ec2383dfbd7096aa2f58e33ac259f9c8e87e2a9a44a1dfc4fd73a295e090` |
+| Original `live-crud-afcd5c87/result.json` | `464f9c842dfce1020a87a35502c9a1ead14548aaeef7c5c28b0b36d6f295a49a`; pre-HTTP failure retained |
+
+### Material stability and capacity boundaries
+
+The initial complete Windows inventory opened all 176 ordinary files in `D:\新谷力`, streamed their hashes and found no unreadable files. Its 31 extensionless `.WeDrive` files are synchronization metadata and were not treated as image content or instructions. The complete representative package was newly derived from all twelve selected product images; no pre-existing ZIP was claimed. At 15:43:56 UTC, a separate complete metadata comparison found all 176 device/inode/size/mtime tuples unchanged, no reparse points and no errors. This later check reused the original hashes; it was not another complete byte scan. The original tree remained read-only. The later metadata proof is `f6972a48d180f75210837700831f46403b624b97aceb66f75e23626914b7a83e`.
+
+The actual native upload, server checksum and independent download/member verification prove the complete 18,166,503-byte package traversed the deployed FileBrowser resource API and strict TLS endpoint. FileBrowser's coordinated 128 MiB cap is a configured product bound, not evidence that a 128 MiB file was tested. Gateway additionally rejects output exceeding its effective minimum of return, enterprise-export and protocol limits before Artifact publication. The current WeChat protocol limit is 25 MiB, so this complete 18 MiB package fits; 128 MiB WeChat delivery has not been established. ZIP members retain image bytes and do not use the image-message compression path.
+
+### Maintenance/test-head CI boundary
+
+The maintenance executable uses fixed product source `da17a921a4fba9494fc2e13afff9938d7a6396db`. A subsequent test-only commit, `b64ac19661b94590c71f70248339973ce8129bfb`, checks a previously unchecked test fixture type assertion; it does not change that executable or the running afcd service. At that exact test head, [regular CI](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/39141680492) passed backend race tests, frontend tests/lint, formatting, generated docs and translations. Backend lint remains red for the same 111 existing findings (8 errcheck, 84 govet, 1 ineffassign, 13 staticcheck, 5 unused); none names the new reader files. The preceding da17 run included one new test errcheck, which this commit corrected. No unrelated lint sweep is claimed.
+
+The dedicated [FileBridge workflow at b64](https://github.com/Tangbohu09527/CF_filebrowser-enterprise/actions/runs/39141680415) completed with Linux client and both Windows/Linux official Hermes compatibility jobs passing. Windows client recovery stopped when its existing artifact fixture download returned HTTP 410 (expired artifact), before that recovery probe could run. The failed check is retained; this is not whole-repository green CI. Later documentation commits are distinct from both application and maintenance product sources.
