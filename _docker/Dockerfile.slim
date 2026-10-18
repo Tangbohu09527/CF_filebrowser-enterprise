@@ -20,6 +20,7 @@ COPY  ./frontend/ ./
 RUN npm run build:docker
 
 FROM alpine:latest
+ENV TZ=Asia/Shanghai
 ENV FILEBROWSER_DATABASE="/home/filebrowser/data/database.db"
 ENV FILEBROWSER_CONFIG="/home/filebrowser/data/config.yaml"
 ENV PATH="$PATH:/home/filebrowser"

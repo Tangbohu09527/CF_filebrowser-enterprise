@@ -406,6 +406,7 @@ def validate_compose(compose: dict[str, Any]) -> None:
         for key, expected in expected_service_values[label].items():
             require_value(service, key, expected, label)
     expected_app_environment = {
+        "TZ": "Asia/Shanghai",
         "FILEBROWSER_CONFIG": "/etc/filebrowser-enterprise/config.yaml",
         "FILEBROWSER_DATABASE": "/var/lib/filebrowser-enterprise/database.db",
         "FILEBROWSER_JWT_TOKEN_SECRET_FILE": "/run/filebrowser-secrets/jwt_token_secret",
@@ -484,6 +485,7 @@ def validate_compose(compose: dict[str, Any]) -> None:
     if nginx_volumes != expected_nginx_volumes:
         fail("Nginx mounts must match the production allowlist")
     expected_nginx_environment = {
+        "TZ": "Asia/Shanghai",
         "PUBLIC_HOST": "${PUBLIC_HOST:?PUBLIC_HOST is required}",
         "MAX_UPLOAD_SIZE": "${MAX_UPLOAD_SIZE:-20g}",
         "CLIENT_BODY_TIMEOUT": "${CLIENT_BODY_TIMEOUT:-3600s}",
