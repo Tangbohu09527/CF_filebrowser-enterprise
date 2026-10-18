@@ -161,6 +161,14 @@ class ResolvedBinding:
     deadline_monotonic: float
     lease_valid_until: str
     worker_binding: dict = field(repr=False)
+    # Preserve validated Gateway identity for an in-process return consumer.
+    # The native worker's dispatch_id is a different, opaque binding key.
+    dispatch_id: int
+    message_id: int
+    enterprise_identity_id: str
+    thread_id: str
+    profile_reference: str
+    profile_revision: int
 
     def owner(self):
         return {"schema": SCHEMA, "session_id": self.session_id, "task_id": self.task_id,
@@ -314,7 +322,9 @@ class ControlClient:
             binding.update(ca_file=self.config.ca_file, ca_sha256=self.config.ca_sha256)
         return ResolvedBinding(result["binding_id"], session_id, task_id, host_instance_id, host_nonce,
                                result["claim_epoch"], result["event_sequence"], scope, deadline,
-                               result["lease_valid_until"], binding)
+                               result["lease_valid_until"], binding, result["dispatch_id"], result["message_id"],
+                               result["enterprise_identity_id"], result["thread_id"],
+                               result["profile_reference"], result["profile_revision"])
 
     def _attachment(self, item, parent):
         _keys(item, "schema message_id attachment_id thread_id enterprise_identity_id url authorization expires_at "

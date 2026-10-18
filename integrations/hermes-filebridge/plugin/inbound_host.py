@@ -25,6 +25,7 @@ _TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _MAX_SCOPES = 4096
 _JOIN_SECONDS = 5.0
 _active_host = ContextVar("cf_filebridge_authorized_host", default=None)
+_active_tool = ContextVar("cf_filebridge_authorized_tool", default=None)
 
 
 def authorized_remaining_seconds():
@@ -52,6 +53,48 @@ def authorized_remaining_seconds():
 def ensure_active():
     """Reject consumer results when authority ended during parsing/vision."""
     authorized_remaining_seconds()
+
+
+def capture_return_context(attachment_id):
+    """Capture the current reader's identity and original, non-renewable lease.
+
+    This is an internal API, never model input. The returned guard remains tied
+    to these exact objects when the return plugin checks it in a later tool call.
+    """
+    active, tool = _active_host.get(), _active_tool.get()
+    if (active is None or tool is None or tool[0] != "filebrowser_read_inbound"
+            or not _valid_identifier(tool[1]) or type(attachment_id) is not int or attachment_id <= 0):
+        raise BridgeError("trusted_context_unavailable")
+    adapter, scope = active
+    with scope.lock:
+        resolved = scope.resolved
+        if resolved is None or scope.stopped.is_set() or not scope.started:
+            raise BridgeError("task_cancelled")
+        deadline = resolved.deadline_monotonic
+        dispatch_id = resolved.worker_binding["dispatch_id"]
+        attachments = resolved.worker_binding["attachments"]
+        if len(attachments) != 1 or attachments[0]["attachment_id"] != attachment_id:
+            raise BridgeError("trusted_context_invalid")
+        filename = attachments[0]["filename"]
+        binding = {name: getattr(resolved, name) for name in (
+            "dispatch_id", "message_id", "enterprise_identity_id", "thread_id",
+            "profile_reference", "profile_revision", "session_id", "task_id")}
+        binding["turn_id"] = tool[1]
+    with adapter.bridge._lock:
+        dispatch = adapter.bridge._dispatches.get(dispatch_id)
+
+    def check_active():
+        with scope.lock:
+            if (scope.stopped.is_set() or not scope.started or scope.resolved is not resolved
+                    or resolved.deadline_monotonic != deadline or time.monotonic() >= deadline):
+                raise BridgeError("task_cancelled")
+        with adapter.bridge._lock:
+            if (dispatch is None or dispatch.stopped.is_set()
+                    or adapter.bridge._dispatches.get(dispatch_id) is not dispatch):
+                raise BridgeError("task_cancelled")
+
+    check_active()
+    return binding, filename, check_active
 
 
 class _Scope:
@@ -303,9 +346,17 @@ class HostAdapter:
         finally:
             scope.finished.set()
 
-    def middleware(self, tool_name, args, next_call, task_id=None, session_id=None, **_context):
+    def middleware(self, tool_name, args, next_call, task_id=None, session_id=None, turn_id=None, **_context):
         if tool_name not in self._tools:
             return next_call(args)
+        if tool_name == "cf_return_current_chat":
+            # Returning an ordinary generated file must not create an inbound
+            # binding. Staged inbound files retain their original guard in the
+            # return plugin; an existing host scope still takes the checks below.
+            with self._lock:
+                existing = self._scopes.get((session_id, task_id))
+            if existing is None:
+                return next_call(args)
         scope = None
         entered = False
         failed = False
@@ -319,12 +370,14 @@ class HostAdapter:
                 entered = True
             with self.bridge.activate(scope.resolved.worker_binding["dispatch_id"]):
                 token = _active_host.set((self, scope))
+                tool_token = _active_tool.set((tool_name, turn_id))
                 try:
                     result = next_call(args)
                     if scope.stopped.is_set():
                         return json.dumps(failure("task_cancelled"))
                     return result
                 finally:
+                    _active_tool.reset(tool_token)
                     _active_host.reset(token)
         except Exception:
             failed = True

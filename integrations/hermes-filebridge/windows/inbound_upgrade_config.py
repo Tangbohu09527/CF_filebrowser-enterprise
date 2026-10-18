@@ -21,6 +21,7 @@ import zipfile
 
 
 TOOL = "filebrowser_read_inbound"
+RETURN_TOOL = "cf_return_current_chat"
 TOOLSET = "cf_filebridge_inbound_content"
 MAX_CONFIG = 2 * 1024 * 1024
 SAFE_STAGES = frozenset({"config_semantic_plan", "runtime_dependencies", "runtime_extract_wheels", "runtime_inventory"})
@@ -36,7 +37,7 @@ SAFE_ERRORS = frozenset({
     "runtime_modified_or_unknown", "candidate_absolute_required", "prepared_candidate_conflict",
     "configuration_plan_failed", "platform_toolsets_invalid", "api_toolsets_invalid",
     "known_plugin_toolsets_invalid", "agent_configuration_invalid", "disabled_toolsets_invalid",
-    "content_toolset_disabled",
+    "content_toolset_disabled", "content_formats_invalid",
 })
 _failure_stage = "config_semantic_plan"
 
@@ -111,7 +112,11 @@ def check_content_selection(document):
          "content_toolset_disabled")
 
 
-def build(config_bytes, installed_manifest, release_manifest, runtime=None, runtime_sha256=None):
+def build(config_bytes, installed_manifest, release_manifest, runtime=None, runtime_sha256=None, *, content_formats=None):
+    if content_formats is not None:
+        need(type(content_formats) is list and bool(content_formats)
+             and all(type(value) is str and value in {"pdf", "png"} for value in content_formats)
+             and len(content_formats) == len(set(content_formats)), "content_formats_invalid")
     # Round-trip YAML preserves comments, quotes and unrelated settings. Never
     # rewrite YAML with a regexp, string replacement, or a Hermes core import.
     from ruamel.yaml import YAML
@@ -150,12 +155,15 @@ def build(config_bytes, installed_manifest, release_manifest, runtime=None, runt
              "consumer_allowlist_missing")
         check_content_selection(document)
         settings["inbound_content_enabled"] = True
+        if content_formats is not None:
+            settings["inbound_content_formats"] = list(content_formats)
         if runtime:
             need(Path(runtime).is_absolute() and re.fullmatch(r"[0-9a-f]{64}", runtime_sha256 or ""), "runtime_pin_invalid")
             settings["inbound_content_python"] = runtime
             settings["inbound_content_python_sha256"] = runtime_sha256
-        if TOOL not in consumers:
-            consumers.append(TOOL)
+        for name in (TOOL, RETURN_TOOL):
+            if name not in consumers:
+                consumers.append(name)
 
     patch(expected)
     candidate = copy.deepcopy(config)
@@ -267,6 +275,7 @@ def main():
     parser.add_argument("--candidate", type=Path)
     parser.add_argument("--runtime-python")
     parser.add_argument("--runtime-sha256")
+    parser.add_argument("--content-formats", nargs="+", choices=("pdf", "png"))
     parser.add_argument("--dependencies-only", action="store_true")
     parser.add_argument("--extract-wheels", action="store_true")
     parser.add_argument("--wheel-archive", type=Path)
@@ -283,7 +292,7 @@ def main():
         return
     raw = read(args.config)
     candidate, worker, worker_hash = build(raw, read(args.installed_manifest), read(args.release_manifest),
-                                          args.runtime_python, args.runtime_sha256)
+                                          args.runtime_python, args.runtime_sha256, content_formats=args.content_formats)
     required = requirements(read(args.requirements))
     if args.candidate:
         need(args.candidate.is_absolute(), "candidate_absolute_required")
@@ -300,6 +309,7 @@ def main():
         "dependency_blockers": [{"name": name, "required_version": version} for name, version in required.items()],
         "dependency_ready": False,
         "changed_settings": ["inbound_content_enabled", "inbound_host.consumer_tools"]
+            + (["inbound_content_formats"] if args.content_formats is not None else [])
             + (["inbound_content_python", "inbound_content_python_sha256"] if args.runtime_python else [])}))
 
 

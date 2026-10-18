@@ -4,6 +4,37 @@
 可选 `question` 最长 512 字符，用于图片分析。模型不能传路径、URL、任务身份、目录或凭据。
 此工具不创建正式归档，不修改、删除、重命名文件，不执行宏、文档指令或外部链接。
 
+
+## PDF/PNG 读取后准备原件返回
+
+显式读取并返回的请求使用
+`filebrowser_read_inbound({"attachment_id": 123, "prepare_return": true})`。
+默认 `prepare_return=false`，原只读调用不产生返回副本。不要先调用 download 再试图以句柄
+运行 `filebrowser_files stat`；read 内部已完成真实下载、校验和读取，句柄不是文件路径。
+
+读取成功后，本工具仍持有同一个已校验流，交由**已加载的** Gateway 返回插件内部 API
+准备副本。传入的 dispatch/message/thread/identity/profile/session/task/turn 仅来自可信
+控制响应与官方 middleware；模型不能补充或覆盖。返回准备仅支持 PDF 与 PNG，仍受首次
+host scope 的原截止时间、撤销事件与 worker 身份约束，不能因解析、准备或下一次工具调用续期。
+准备步骤不发送文件。只有 `return_preparation.ok=true` 时，模型才应立即用其中的
+`file_ref`、`kind`、`filename` 调用正式 `cf_return_current_chat`。PDF 使用 `kind=file`，
+PNG 使用 `kind=image`；不把 PNG 图片投递声称为微信原文件附件投递。
+
+`ok=true` 和 `read_succeeded=true` 表示实际读取成功；`return_preparation.ok` 单独表示
+返回准备结果。准备失败保留读取结果并返回固定失败码，不输出猜测路径，不声称已发送。
+若原租约已经结束，则连读取正文也不再返回。最终 Response/Artifact/Delivery 仍由原 Gateway
+返回协议、任务成功封口和投递流程决定，工具准备成功不能替代这些证据。
+
+本轮部署明确设置 `inbound_content_formats: [pdf, png]`，禁用格式在解析/视觉调用前按字节
+拒绝；不配置此字段时保留此前读取能力。通用规划器默认保留原格式设置，本轮明确传入
+`--content-formats pdf png`；增量配置仅追加该格式限制、内容开关及
+`filebrowser_read_inbound` / `cf_return_current_chat` 两个 consumer；官方工具选择和显式禁用
+仍保留。解析器必须使用独立、已校验的私有 Python 环境及摘要，不向活动 Hermes 环境安装依赖。
+PDF/PNG 专用锁 `requirements-inbound-pdf-png.txt` 只含原版本 anydoc/Pillow 的已知 wheel
+摘要；现有规划器的 `--requirements`、依赖检查和 runtime inventory 接口可直接绑定此锁，
+不修改旧完整锁，也不向本轮私有解析环境安装 Office 依赖。
+下面的 Office/JPEG 表格与旧版验证记录描述既有能力，不表示本轮部署启用这些格式。
+
 ## 实际调用链
 
 官方 Hermes HTTP 请求 → AIAgent → `_execute_tool` 的公开 `tool_execution` middleware
