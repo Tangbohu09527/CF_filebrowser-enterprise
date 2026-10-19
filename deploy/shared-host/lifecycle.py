@@ -8,7 +8,9 @@ No action installs packages, formats disks, creates users or cleans Docker.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
+import hashlib
 import ipaddress
 import json
 import os
@@ -60,6 +62,7 @@ class Paths:
         self.env = self.config / ".env"
         self.metadata = self.config / "deployment.json"
         self.bootstrap = self.config / "secrets" / "bootstrap_admin_password"
+        self.preparation = fixed("/var/lib/cf-filebrowser-enterprise-prepare.json")
         self.assets = self.source / "deploy" / "shared-host"
 
 
@@ -451,6 +454,89 @@ def configure_source(value: dict, exposure: str, allowed_cidrs: list[str], enabl
         value["server"]["allowedClientCIDRs"] = ["127.0.0.1/32"] + allowed_cidrs
 
 
+def preparation_layout(paths: Paths, tls: bool) -> tuple[list, dict]:
+    directories = [(paths.config, 0o750, 0, GID),
+                   (paths.config / "secrets", 0o750, 0, GID),
+                   (paths.data, 0o750, UID, GID), (paths.cache, 0o750, UID, GID),
+                   (paths.storage_project, 0o750, 0, GID),
+                   (paths.files, 0o750, UID, GID), (paths.backups, 0o700, 0, 0)]
+    files = {paths.env: (0o600, 0, 0), paths.config / "config.yaml": (0o640, 0, GID),
+             paths.bootstrap: (0o440, 0, GID), paths.metadata: (0o600, 0, 0)}
+    for name in ("jwt_token_secret", "totp_secret"):
+        files[paths.config / "secrets" / name] = (0o440, 0, GID)
+    for name in (paths.config / "storage.identity", paths.storage_project / ".storage-identity"):
+        files[name] = (0o440, 0, GID)
+    if tls:
+        directories.append((paths.config / "tls", 0o750, 0, GID))
+        for name in ("server.crt", "server.key", "ca.crt"):
+            files[paths.config / "tls" / name] = (0o440, 0, GID)
+    return directories, files
+
+
+def sync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def materialize_preparation(paths: Paths, binding: str, payload: dict | None, tls: bool) -> None:
+    """Resume only our protected, exact preparation; never adopt an unknown partial install.
+
+    The private intent precedes the first managed directory. Each already written
+    byte and numeric permission is checked before any missing file is created.
+    It contains bootstrap/TLS material, so is removed after metadata is durable.
+    """
+    directories, layout = preparation_layout(paths, tls)
+    if paths.preparation.exists() or paths.preparation.is_symlink():
+        assert_safe_path(paths.preparation, owner=0, group=0, mode=0o600)
+        if paths.preparation.stat().st_size > 8 * 1024 * 1024:
+            raise DeploymentError("preparation intent exceeds the size limit")
+        plan = json.loads(paths.preparation.read_bytes())
+        if plan.get("version") != 1 or plan.get("binding") != binding:
+            raise DeploymentError("interrupted preparation inputs differ; existing assets retained")
+    else:
+        assert_empty_install(paths)
+        if payload is None:
+            raise DeploymentError("missing first-install preparation payload")
+        plan = {"version": 1, "binding": binding,
+                "files": {str(path): base64.b64encode(value).decode("ascii") for path, value in payload.items()}}
+        write_new(paths.preparation, (json.dumps(plan, sort_keys=True) + "\n").encode(), 0o600)
+        sync_directory(paths.preparation.parent)
+    if set(plan.get("files", {})) != {str(path) for path in layout}:
+        raise DeploymentError("preparation intent does not have the fixed path allowlist")
+    contents = {path: base64.b64decode(plan["files"][str(path)], validate=True) for path in layout}
+    # Preflight every existing asset before continuing any write. No chmod/chown
+    # repairs, no arbitrary paths from JSON, and no replacement of changed bytes.
+    for path, mode, owner, group in directories:
+        if path.exists() or path.is_symlink():
+            assert_safe_path(path, owner=owner, group=group, mode=mode, directory=True)
+    for path, (mode, owner, group) in layout.items():
+        if path.exists() or path.is_symlink():
+            assert_safe_path(path, owner=owner, group=group, mode=mode)
+            if path.read_bytes() != contents[path]:
+                raise DeploymentError("interrupted preparation file changed; retained without replacement")
+    allowed = set(layout) | {entry[0] for entry in directories}
+    for root in (paths.config, paths.data, paths.cache, paths.storage_project):
+        if root.is_dir():
+            for child in root.rglob("*"):
+                if child not in allowed or child.is_symlink():
+                    raise DeploymentError("unknown partial-install asset; preserve it for inspection")
+    for path, mode, owner, group in directories:
+        if not path.exists():
+            create_directory(path, mode, owner, group)
+    # Metadata is the last file: only its presence denotes a finished prepare.
+    for path in [path for path in layout if path != paths.metadata] + [paths.metadata]:
+        if not path.exists():
+            mode, owner, group = layout[path]
+            write_new(path, contents[path], mode, owner, group)
+    for parent in {path.parent for path in layout}:
+        sync_directory(parent)
+    paths.preparation.unlink()
+    sync_directory(paths.preparation.parent)
+
+
 def prepare(paths: Paths, args) -> None:
     source_checks(paths, args.source_sha)
     validate_image_reference(args.image_ref, args.mode)
@@ -463,9 +549,18 @@ def prepare(paths: Paths, args) -> None:
         if any(existing.get(key) != value for key, value in {"source_sha": args.source_sha, "image_ref": args.image_ref, "mode": args.mode, "exposure": args.exposure}.items()) or existing.get("enable_share_source", False) != args.enable_share_source or existing.get("enable_webdav", False) != args.enable_webdav:
             raise DeploymentError("existing deployment inputs differ; prepare never upgrades or overwrites them")
         validate_deployment(paths, existing)
+        if paths.preparation.exists() or paths.preparation.is_symlink():
+            assert_safe_path(paths.preparation, owner=0, group=0, mode=0o600)
+            saved = json.loads(paths.preparation.read_bytes())
+            if (saved.get("version") != 1 or
+                    base64.b64decode(saved.get("files", {}).get(str(paths.metadata), ""), validate=True) != paths.metadata.read_bytes()):
+                raise DeploymentError("stale preparation intent differs from finished metadata; retained")
+            paths.preparation.unlink()
+            sync_directory(paths.preparation.parent)
         print("[shared-host prepare] existing valid deployment retained; no secrets or data changed")
         return
-    assert_empty_install(paths)
+    if not paths.preparation.exists():
+        assert_empty_install(paths)
     assert_stopped(paths, args.exposure)
     for parent in (paths.config.parent, paths.data.parent, paths.cache.parent, paths.storage):
         assert_safe_path(parent, owner=0, directory=True)
@@ -493,28 +588,21 @@ def prepare(paths: Paths, args) -> None:
     metadata = {"version": 1, "source_sha": args.source_sha, "image_ref": args.image_ref, "image_id": image["Id"], "mode": args.mode, "exposure": args.exposure, "test_disk": args.test_disk, "raid_confirmed": args.raid_confirmed, "bootstrap_complete": False, "admin_username": "admin", "enable_share_source": args.enable_share_source, "enable_webdav": args.enable_webdav}
     if args.exposure == "lan":
         metadata["tls_name"] = args.tls_name
-    # Failures from this point preserve a recognizable partial installation.
-    # A rerun cannot fill it with a different secret or adopt existing data.
-    create_directory(paths.config, 0o750, group=GID)
-    create_directory(paths.config / "secrets", 0o750, group=GID)
-    create_directory(paths.data, 0o750, UID, GID)
-    create_directory(paths.cache, 0o750, UID, GID)
-    create_directory(paths.storage_project, 0o750, group=GID)
-    create_directory(paths.files, 0o750, UID, GID)
-    create_directory(paths.backups, 0o700)
-    write_new(paths.env, ("\n".join(key + "=" + value for key, value in values.items()) + "\n").encode(), 0o600)
-    write_new(paths.config / "config.yaml", config, 0o640, group=GID)
+    binding = hashlib.sha256(json.dumps({"metadata": metadata, "config": base64.b64encode(config).decode(),
+                                       "password": hashlib.sha256(password).hexdigest(),
+                                       "tls": {name: hashlib.sha256(value).hexdigest() for name, value in tls.items()}},
+                                      sort_keys=True).encode()).hexdigest()
+    payload = {paths.env: ("\n".join(key + "=" + value for key, value in values.items()) + "\n").encode(),
+               paths.config / "config.yaml": config, paths.bootstrap: password + b"\n",
+               paths.metadata: (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode()}
     for name in ("jwt_token_secret", "totp_secret"):
-        write_new(paths.config / "secrets" / name, secrets.token_hex(32).encode() + b"\n", 0o440, group=GID)
-    write_new(paths.bootstrap, password + b"\n", 0o440, group=GID)
+        payload[paths.config / "secrets" / name] = secrets.token_hex(32).encode() + b"\n"
     identity = secrets.token_hex(32).encode() + b"\n"
-    write_new(paths.config / "storage.identity", identity, 0o440, group=GID)
-    write_new(paths.storage_project / ".storage-identity", identity, 0o440, group=GID)
-    if tls:
-        create_directory(paths.config / "tls", 0o750, group=GID)
-        for name, value in tls.items():
-            write_new(paths.config / "tls" / name, value, 0o440, group=GID)
-    save_metadata(paths, metadata)
+    payload[paths.config / "storage.identity"] = identity
+    payload[paths.storage_project / ".storage-identity"] = identity
+    for name, value in tls.items():
+        payload[paths.config / "tls" / name] = value
+    materialize_preparation(paths, binding, payload, bool(tls))
     validate_deployment(paths, metadata)
     print("[shared-host prepare] paths, configuration, storage identity and secrets prepared; service remains stopped")
 

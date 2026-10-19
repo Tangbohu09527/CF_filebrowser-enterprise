@@ -420,6 +420,7 @@ expect(raw_service.get("security_opt") == ["no-new-privileges:true"], "raw Compo
 expect(raw_service.get("entrypoint") == ["/opt/filebrowser-enterprise/scripts/container-entrypoint.sh"], "raw entrypoint is invalid")
 expect(
     raw_service.get("environment") == {
+        "TZ": "Asia/Shanghai",
         "FILEBROWSER_CONFIG": "/etc/filebrowser-enterprise/config.yaml",
         "FILEBROWSER_DATABASE": "/var/lib/filebrowser-enterprise/database.db",
         "FILEBROWSER_JWT_TOKEN_SECRET_FILE": "/run/filebrowser-secrets/jwt_token_secret",
@@ -579,6 +580,7 @@ expect(service.get("expose") == ["8080"], "only container port 8080 must be expo
 expect(service.get("tmpfs") == ["/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777"], "the hardened /tmp tmpfs is required")
 
 expected_environment = {
+    "TZ": "Asia/Shanghai",
     "FILEBROWSER_CONFIG": "/etc/filebrowser-enterprise/config.yaml",
     "FILEBROWSER_DATABASE": "/var/lib/filebrowser-enterprise/database.db",
     "FILEBROWSER_JWT_TOKEN_SECRET_FILE": "/run/filebrowser-secrets/jwt_token_secret",

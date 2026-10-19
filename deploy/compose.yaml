@@ -11,6 +11,7 @@ services:
     entrypoint:
       - /opt/filebrowser-enterprise/scripts/container-entrypoint.sh
     environment:
+      TZ: Asia/Shanghai
       FILEBROWSER_CONFIG: /etc/filebrowser-enterprise/config.yaml
       FILEBROWSER_DATABASE: /var/lib/filebrowser-enterprise/database.db
       FILEBROWSER_JWT_TOKEN_SECRET_FILE: /run/filebrowser-secrets/jwt_token_secret
@@ -73,6 +74,7 @@ services:
     entrypoint:
       - /opt/filebrowser-enterprise/scripts/nginx-entrypoint.sh
     environment:
+      TZ: Asia/Shanghai
       PUBLIC_HOST: ${PUBLIC_HOST:?PUBLIC_HOST is required}
       MAX_UPLOAD_SIZE: ${MAX_UPLOAD_SIZE:-20g}
       CLIENT_BODY_TIMEOUT: ${CLIENT_BODY_TIMEOUT:-3600s}
