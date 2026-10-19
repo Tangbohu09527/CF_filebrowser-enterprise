@@ -33,6 +33,10 @@ COPY --from=base --chown=filebrowser:1000 [ "/app/config.yaml", "./data/config.y
 COPY --from=base --chown=filebrowser:1000 [ "/app/config.yaml", "./" ]
 COPY --from=base --chown=filebrowser:1000 [ "/app/reduce-rounded-corners.css", "./" ]
 COPY --from=nbuild --chown=filebrowser:1000 [ "/app/dist/", "./http/dist/" ]
+# Public UI assets must also be readable by the shared-host service identity.
+RUN find ./http/dist -type d -exec chmod 0755 {} + \
+    && find ./http/dist -type f -exec chmod 0644 {} + \
+    && chmod 0644 ./reduce-rounded-corners.css
 ## sanity checks
 RUN [ "filebrowser", "version" ]
 # exposing default port for auto discovery.

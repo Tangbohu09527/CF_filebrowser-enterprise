@@ -2,6 +2,10 @@
 
 The Gateway unified-server candidate composes these existing entry points. It
 does not replace resource/product APIs or copy file operations into Gateway.
+Fixed-source builds normalize only the image's public UI asset files/directories
+and custom CSS, then verify their readability as UID/GID 10001 without network,
+mounts, or write access. This supports protected source checkouts without
+changing the permissions of runtime configuration, credentials, or business data.
 `prepare` now saves a root-only `/var/lib/cf-filebrowser-enterprise-prepare.json`
 intent before creating managed directories. Retrying the same interrupted
 preparation checks all existing bytes, owners and modes, then creates only
