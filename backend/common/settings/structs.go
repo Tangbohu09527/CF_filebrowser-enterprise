@@ -47,6 +47,8 @@ type Environment struct {
 }
 
 type Server struct {
+	ProductMaterialsUsers []string `json:"productMaterialsUsers" yaml:"productMaterialsUsers"` // opt-in exact service usernames; empty disables product materials API
+
 	MinSearchLength              int            `json:"minSearchLength" yaml:"minSearchLength"` // minimum length of search query to begin searching (default: 3)
 	DisableUpdateCheck           bool           `json:"disableUpdateCheck"`                     // disables backend update check service
 	NumImageProcessors           int            `json:"numImageProcessors"`                     // number of concurrent image processing jobs used to create previews, default is 4.

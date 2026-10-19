@@ -18,6 +18,7 @@ func registerCoreFileActionRoutes(api, publicAPI *http.ServeMux) {
 	api.HandleFunc("PATCH /resources", withCoreFileAuditUser("", resourcePatchHandler))
 	api.HandleFunc("DELETE /resources/bulk", withCoreFileAuditUser(auditdb.ActionFileDelete, resourceBulkDeleteHandler))
 	api.HandleFunc("POST /resources/archive", withCoreFileAuditUser(auditdb.ActionArchiveCreate, archiveCreateHandler))
+	api.HandleFunc("POST /resources/products", withCoreFileAuditUser("", productMaterialsHandler))
 	api.HandleFunc("POST /resources/unarchive", withCoreFileAuditUser(auditdb.ActionArchiveExtract, unarchiveHandler))
 	api.HandleFunc("GET /resources/download", withCoreFileAuditRead(auditdb.ActionFileDownload, downloadHandler))
 	api.HandleFunc("GET /resources/preview", withTimeout(30*time.Second,

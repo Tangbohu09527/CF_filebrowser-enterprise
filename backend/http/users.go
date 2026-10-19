@@ -363,6 +363,9 @@ func usersPostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 		return http.StatusBadRequest, err
 	}
 	r.Body.Close()
+	if req.User.ServiceScopeLocked {
+		return http.StatusBadRequest, fmt.Errorf("service scope lock is created only by the operator CLI")
+	}
 	req.User.Permissions = applyNewUserPermissionDefaults(
 		req.User.Permissions,
 		settings.ConvertPermissionsToUsers(config.UserDefaults.Account.Permissions),

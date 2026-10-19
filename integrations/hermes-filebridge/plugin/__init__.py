@@ -140,3 +140,7 @@ def register(ctx):
         if ctx.get_config("inbound_host_enabled", False) is True:
             from .inbound_host import register_host
             register_host(ctx)
+
+    if ctx.get_config("product_enabled", False) is True:
+        from .products import register_products
+        register_products(ctx)

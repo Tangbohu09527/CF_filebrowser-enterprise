@@ -261,7 +261,7 @@ func parseFields(user *users.User, fields []string, actorIsAdmin bool) ([]string
 			field := t.Field(i)
 			// which=all can't update password
 			switch strings.ToLower(field.Name) {
-			case "id", "username", "password", "tokens", "totpsecret", "totpnonce":
+			case "id", "username", "password", "tokens", "totpsecret", "totpnonce", "servicescopelocked":
 				// Skip these fields
 				continue
 			}
@@ -287,6 +287,9 @@ func parseFields(user *users.User, fields []string, actorIsAdmin bool) ([]string
 	newfields := []string{}
 	for _, field := range fields {
 		capitalField := utils.CapitalizeFirst(field)
+		if capitalField == "ServiceScopeLocked" {
+			continue
+		}
 		if capitalField == "Scopes" {
 			if !actorIsAdmin {
 				continue

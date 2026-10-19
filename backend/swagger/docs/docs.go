@@ -6296,6 +6296,13 @@ const docTemplate = `{
                     "description": "port to listen on",
                     "type": "integer"
                 },
+                "productMaterialsUsers": {
+                    "description": "opt-in exact service usernames; empty disables product materials API",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "socket": {
                     "description": "socket to listen on - eg. /var/run/filebrowser.sock",
                     "type": "string"
@@ -7628,6 +7635,10 @@ const docTemplate = `{
                     "items": {
                         "$ref": "#/definitions/users.SourceScope"
                     }
+                },
+                "serviceScopeLocked": {
+                    "description": "Operator-created service account: never append default sources.",
+                    "type": "boolean"
                 },
                 "showCopyPath": {
                     "description": "show copy path action in the context menu",

@@ -97,7 +97,7 @@ func updateUserScopes(user *users.User) bool {
 			if existingScope.Scope == "" {
 				existingScope.Scope = src.Config.DefaultUserScope
 			}
-		} else if src.Config.DefaultEnabled {
+		} else if src.Config.DefaultEnabled && !user.ServiceScopeLocked {
 			existingScope.Scope = src.Config.DefaultUserScope
 		} else {
 			continue

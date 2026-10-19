@@ -263,23 +263,29 @@ async def _run_parser(data, executable=None):
                     operation.cancel()
 
 
-async def _vision(data, mime, question):
+async def _vision(data, mime, question, *, check_active=None, remaining_seconds=None):
     from .inbound import BridgeError
-    from .inbound_host import authorized_remaining_seconds, ensure_active
+    if check_active is None and remaining_seconds is None:
+        from .inbound_host import authorized_remaining_seconds, ensure_active
+        check_active, remaining_seconds = ensure_active, authorized_remaining_seconds
+    elif not callable(check_active) or not callable(remaining_seconds):
+        raise BridgeError("trusted_context_invalid")
     from tools.registry import registry
     entry = registry.get_entry("vision_analyze")
     if (entry is None or not entry.is_async or entry.handler.__module__ != "tools.vision_tools"
             or entry.check_fn is not None and not entry.check_fn()):
         raise BridgeError("vision_unavailable")
-    ensure_active()
+    check_active()
     task = asyncio.create_task(entry.handler({"image_url": "data:" + mime + ";base64," +
         base64.b64encode(data).decode("ascii"), "question": question}))
     try:
         while not task.done():
-            ensure_active()
-            await asyncio.wait({task}, timeout=min(0.05, authorized_remaining_seconds()))
+            check_active()
+            remaining = remaining_seconds()
+            if remaining <= 0: raise BridgeError("vision_timeout")
+            await asyncio.wait({task}, timeout=min(0.05, remaining))
         result = task.result()
-        ensure_active()
+        check_active()
         return result
     finally:
         if not task.done():
