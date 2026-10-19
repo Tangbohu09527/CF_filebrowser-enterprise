@@ -40,6 +40,7 @@ LABEL org.opencontainers.image.source="https://github.com/Tangbohu09527/CF_fileb
       org.opencontainers.image.version="${VERSION}"
 COPY --from=ffmpeg [ "/ffmpeg", "/ffprobe", "/usr/local/bin/" ]
 ENV FILEBROWSER_FFMPEG_PATH="/usr/local/bin/"
+ENV TZ=Asia/Shanghai
 ENV FILEBROWSER_DATABASE="/home/filebrowser/data/database.db"
 ENV FILEBROWSER_CONFIG="/home/filebrowser/data/config.yaml"
 ENV PATH="$PATH:/home/filebrowser"
@@ -57,6 +58,11 @@ COPY --from=base --chown=filebrowser:1000 [ "/app/config.yaml", "./data/config.y
 COPY --from=base --chown=filebrowser:1000 [ "/app/config.yaml", "./" ]
 COPY --from=base --chown=filebrowser:1000 [ "/app/reduce-rounded-corners.css", "./" ]
 COPY --from=nbuild --chown=filebrowser:1000 [ "/app/dist/", "./http/dist/" ]
+# These are public UI assets, also read by the shared-host UID 10001.
+# Protected source checkouts may carry 0600 files; do not widen data/secrets.
+RUN find ./http/dist -type d -exec chmod 0755 {} + \
+    && find ./http/dist -type f -exec chmod 0644 {} + \
+    && chmod 0644 ./reduce-rounded-corners.css
 ## sanity checks
 RUN [ "filebrowser", "version" ]
 RUN [ "ffmpeg", "-version" ]

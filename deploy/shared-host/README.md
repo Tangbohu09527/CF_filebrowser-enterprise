@@ -1,5 +1,21 @@
 # Shared-host: fixed-source installation and recovery
 
+The Gateway unified-server candidate composes these existing entry points. It
+does not replace resource/product APIs or copy file operations into Gateway.
+Fixed-source builds normalize only the image's public UI asset files/directories
+and custom CSS, then verify their readability as UID/GID 10001 without network,
+mounts, or write access. This supports protected source checkouts without
+changing the permissions of runtime configuration, credentials, or business data.
+`prepare` now saves a root-only `/var/lib/cf-filebrowser-enterprise-prepare.json`
+intent before creating managed directories. Retrying the same interrupted
+preparation checks all existing bytes, owners and modes, then creates only
+missing planned files with the original secrets. Changed inputs, unknown files,
+symlinks, or unrecognized old partial installations stop without replacement.
+The intent contains bootstrap/TLS material and is removed when preparation is
+durable; never upload it as evidence. A damaged partial file is retained for
+operator inspection, rather than silently repaired. Normal upgrade/restore
+still uses the separate existing lifecycle and backup procedures.
+
 This is the `cf-filebrowser` project for a clean Debian 13 amd64 host. The base
 Compose has one business service, no published ports, and a project-private
 bridge. Debug adds only `127.0.0.1:18081`. The optional LAN override publishes

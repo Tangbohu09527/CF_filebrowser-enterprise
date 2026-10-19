@@ -152,6 +152,14 @@ def build(args: argparse.Namespace) -> None:
         raise ValueError("built image revision label mismatch")
     if info.get("Architecture") != "amd64" or info.get("Os") != "linux":
         raise ValueError("built image must target linux/amd64")
+    # Exercise the actual image as the ordinary shared-host service identity.
+    # Only public immutable UI assets are inspected, without mounts or network.
+    run("docker", "run", "--rm", "--network", "none", "--read-only",
+        "--user", "10001:10001", "--entrypoint", "/bin/sh", info["Id"], "-ec",
+        'test "$(id -u)" = 10001 && test -r http/dist/img/icons/favicon.png '
+        '&& test -r reduce-rounded-corners.css && test ! -w reduce-rounded-corners.css '
+        '&& test -z "$(find http/dist -type f ! -perm -004 -print -quit)" '
+        '&& test -z "$(find http/dist -type d ! -perm -005 -print -quit)"')
     record.update(image_id=info["Id"], staging_reference=args.image,
                   docker_version=run("docker", "version", "--format", "{{json .}}"),
                   compose_version=run("docker", "compose", "version", "--short"))
