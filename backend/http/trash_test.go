@@ -149,8 +149,12 @@ func TestTrashHTTPPermissionOwnershipScopeAndNoOverwrite(t *testing.T) {
 func TestTrashHTTPReadOnlyInvalidPathsAndCurrentTargetACL(t *testing.T) {
 	source, user, id := createTrashFixture(t)
 	idx := indexing.GetIndex("source1")
+	status, _ := callTrash(t, user, trashPostHandler, http.MethodPost, "/api/trash", "", trashRequest{Source: source, Path: "/public/sample.txt", OperationID: id})
+	if status != http.StatusForbidden {
+		t.Fatalf("physical Source path must not be a public identifier: %d", status)
+	}
 	idx.Config.ReadOnly = true
-	status, _ := callTrash(t, user, trashPostHandler, http.MethodPost, "/api/trash", "", trashRequest{Source: "source1", Path: "/public/sample.txt", OperationID: id})
+	status, _ = callTrash(t, user, trashPostHandler, http.MethodPost, "/api/trash", "", trashRequest{Source: "source1", Path: "/public/sample.txt", OperationID: id})
 	if status != http.StatusForbidden {
 		t.Fatalf("read-only trash: %d", status)
 	}

@@ -79,7 +79,7 @@ func trashScope(user *users.User, source string, mutate bool) (*indexing.Index, 
 		return nil, "", os.ErrPermission
 	}
 	idx := indexing.GetIndex(source)
-	if idx == nil || utils.IsReservedStoragePath(idx.Path) {
+	if idx == nil || idx.Name != source || utils.IsReservedStoragePath(idx.Path) {
 		return nil, "", os.ErrPermission
 	}
 	if utils.CheckUserStoragePath(idx.Path) != nil {
