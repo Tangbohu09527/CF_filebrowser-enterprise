@@ -61,6 +61,7 @@ type Storage struct {
 	shareByHash map[string]*Link             // key: link hash
 	shareByPath map[string]map[string]string // key: pathKey(Source, Path), value: set of hashes (hash -> "")
 	mu          sync.RWMutex
+	mutationMu  sync.Mutex
 	users       *users.Storage
 }
 
@@ -75,6 +76,7 @@ func (s *Storage) setCacheLocked(link *Link) {
 	if link == nil {
 		return
 	}
+	s.deleteFromCacheLocked(link.Hash)
 	adjustedPath := utils.AddTrailingSlashIfNotExists(link.Path)
 	adjustedSource := utils.AddTrailingSlashIfNotExists(link.Source)
 	s.shareByHash[link.Hash] = link
@@ -121,6 +123,7 @@ func (s *Storage) deleteFromCache(hash string) {
 // setCacheAfterMove updates both caches when a link's Source or Path changed. It acquires s.mu.
 func (s *Storage) setCacheAfterMove(link *Link, oldSource, oldPath string) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if link == nil {
 		return
 	}
@@ -134,7 +137,6 @@ func (s *Storage) setCacheAfterMove(link *Link, oldSource, oldPath string) {
 		}
 	}
 	s.setCacheLocked(link)
-	s.mu.Unlock()
 }
 
 // NewStorage creates a share links storage from a backend and populates the
@@ -195,7 +197,7 @@ func (s *Storage) All() ([]*Link, error) {
 			s.deleteFromCacheLocked(l.Hash)
 			continue
 		}
-		result = append(result, l)
+		result = append(result, l.Clone())
 	}
 	s.mu.Unlock()
 	return result, nil
@@ -214,7 +216,7 @@ func (s *Storage) FindByUserID(id uint) ([]*Link, error) {
 			s.deleteFromCacheLocked(l.Hash)
 			continue
 		}
-		result = append(result, l)
+		result = append(result, l.Clone())
 	}
 	s.mu.Unlock()
 	return result, nil
@@ -222,18 +224,17 @@ func (s *Storage) FindByUserID(id uint) ([]*Link, error) {
 
 // GetByHash wraps StorageBackend.GetByHash and handles expiry.
 func (s *Storage) GetByHash(hash string) (*Link, error) {
-	// return stable in-memory pointer if available
-	s.mu.RLock()
+	// Return detached metadata with the stable runtime download state.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if link, ok := s.shareByHash[hash]; ok && link != nil {
-		s.mu.RUnlock()
 		if link.Expire != 0 && link.Expire <= time.Now().Unix() {
 			_ = s.back.Delete(hash)
-			s.deleteFromCache(hash)
+			s.deleteFromCacheLocked(hash)
 			return nil, errors.ErrNotExist
 		}
-		return link, nil
+		return link.Clone(), nil
 	}
-	s.mu.RUnlock()
 
 	link, err := s.back.GetByHash(hash)
 	if err != nil {
@@ -247,15 +248,22 @@ func (s *Storage) GetByHash(hash string) (*Link, error) {
 	// Initialize UserDownloads map
 	link.InitUserDownloads()
 
-	s.setCache(link)
-	return link, nil
+	s.setCacheLocked(link)
+	return link.Clone(), nil
 }
 
 // GetPermanent wraps StorageBackend.GetPermanent
 func (s *Storage) GetPermanent(path, source string, id uint) (*Link, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	l, err := s.back.GetPermanent(path, source, id)
 	if err == nil && l != nil {
-		s.setCache(l)
+		if cached, cachedErr := s.GetByHash(l.Hash); cachedErr == nil {
+			return cached, nil
+		}
+		l.InitUserDownloads()
+		s.setCache(l.Clone())
+		return l.Clone(), nil
 	}
 	return l, err
 }
@@ -278,7 +286,7 @@ func (s *Storage) Gets(sourcePath, source string, id uint) ([]*Link, error) {
 			s.deleteFromCacheLocked(l.Hash)
 			continue
 		}
-		result = append(result, l)
+		result = append(result, l.Clone())
 	}
 	s.mu.Unlock()
 	return result, nil
@@ -302,7 +310,7 @@ func (s *Storage) GetBySourcePath(path, source string) ([]*Link, error) {
 			s.deleteFromCacheLocked(l.Hash)
 			continue
 		}
-		result = append(result, l)
+		result = append(result, l.Clone())
 	}
 	s.mu.Unlock()
 	return result, nil
@@ -322,6 +330,8 @@ func (s *Storage) IsShared(path, source string, id uint) bool {
 // UpdateShares updates all shares that match oldSource and oldPath to point to newSource and newPath.
 // Handles both exact matches and subdirectories, regardless of trailing slashes.
 func (s *Storage) UpdateShares(oldSource, oldPath, newSource, newPath string) (int, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	links, err := s.All()
 	if err != nil && err != errors.ErrNotExist {
 		logger.Error("failed to list shares", "error", err)
@@ -337,22 +347,21 @@ func (s *Storage) UpdateShares(oldSource, oldPath, newSource, newPath string) (i
 		if l == nil || l.Source != oldSource {
 			continue
 		}
-		l.Path = utils.AddTrailingSlashIfNotExists(l.Path)
-
-		pos := strings.Index(l.Path, oldPath)
+		pos := strings.Index(utils.AddTrailingSlashIfNotExists(l.Path), oldPath)
 		if pos < 0 {
 			continue
 		}
 
-		l.Source = newSource
-		l.Path = newPath
+		candidate := l.Clone()
+		candidate.Source = newSource
+		candidate.Path = newPath
 
-		if err := s.back.Save(l); err != nil {
+		if err := s.back.Save(candidate.persistenceSnapshot()); err != nil {
 			logger.Error("failed to save updated share", "hash", l.Hash, "error", err)
 			return updated, err
 		}
 
-		s.setCacheAfterMove(l, oldSource, oldPath)
+		s.setCacheAfterMove(candidate, l.Source, l.Path)
 		updated++
 	}
 	return updated, nil
@@ -360,20 +369,23 @@ func (s *Storage) UpdateShares(oldSource, oldPath, newSource, newPath string) (i
 
 // UpdateSharePath updates the path for a specific share identified by hash
 func (s *Storage) UpdateSharePath(hash, newPath string) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	link, err := s.GetByHash(hash)
 	if err != nil {
 		return err
 	}
 
 	oldPath := link.Path
-	link.Path = newPath
+	candidate := link.Clone()
+	candidate.Path = newPath
 
-	if err := s.back.Save(link); err != nil {
+	if err := s.back.Save(candidate.persistenceSnapshot()); err != nil {
 		logger.Error("failed to save updated share", "hash", hash, "error", err)
 		return err
 	}
 
-	s.setCacheAfterMove(link, link.Source, oldPath)
+	s.setCacheAfterMove(candidate, link.Source, oldPath)
 
 	logger.Debug("share path updated", "hash", hash, "fromPath", oldPath, "toPath", newPath)
 	return nil
@@ -381,15 +393,38 @@ func (s *Storage) UpdateSharePath(hash, newPath string) error {
 
 // Save wraps StorageBackend.Save
 func (s *Storage) Save(l *Link) error {
-	if err := s.back.Save(l); err != nil {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	l.InitUserDownloads()
+	candidate := l.Clone()
+	if err := s.back.Save(candidate.persistenceSnapshot()); err != nil {
 		return err
 	}
-	s.setCache(l)
+	s.setCache(candidate)
 	return nil
+}
+
+// SaveDownloads persists shared runtime counts with the current metadata. An
+// in-flight request may still hold the metadata snapshot from before a move.
+func (s *Storage) SaveDownloads(l *Link) error {
+	if l == nil {
+		return errors.ErrInvalidDataType
+	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	current := s.shareByHash[l.Hash]
+	if current == nil || current.downloadsOwner() != l.downloadsOwner() {
+		return errors.ErrNotExist
+	}
+	return s.back.Save(current.persistenceSnapshot())
 }
 
 // Delete wraps StorageBackend.Delete
 func (s *Storage) Delete(hash string) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	if err := s.back.Delete(hash); err != nil {
 		return err
 	}

@@ -103,6 +103,7 @@ func (l *Link) GetFileName() string {
 
 // InitUserDownloads initializes the user downloads map if needed
 func (l *Link) InitUserDownloads() {
+	l = l.downloadsOwner()
 	l.Mu.Lock()
 	defer l.Mu.Unlock()
 	if l.UserDownloads == nil {
@@ -112,6 +113,7 @@ func (l *Link) InitUserDownloads() {
 
 // IncrementUserDownload increments the download count for a specific user
 func (l *Link) IncrementUserDownload(username string) {
+	l = l.downloadsOwner()
 	l.Mu.Lock()
 	defer l.Mu.Unlock()
 	if l.UserDownloads == nil {
@@ -122,6 +124,7 @@ func (l *Link) IncrementUserDownload(username string) {
 
 // GetUserDownloadCount returns the download count for a specific user
 func (l *Link) GetUserDownloadCount(username string) int {
+	l = l.downloadsOwner()
 	l.Mu.Lock()
 	defer l.Mu.Unlock()
 	if l.UserDownloads == nil {
@@ -132,10 +135,49 @@ func (l *Link) GetUserDownloadCount(username string) int {
 
 // ResetDownloadCounts resets both global and per-user download counts
 func (l *Link) ResetDownloadCounts() {
+	l = l.downloadsOwner()
 	l.Mu.Lock()
 	defer l.Mu.Unlock()
 	l.Downloads = 0
 	l.UserDownloads = make(map[string]int)
+}
+
+func (l *Link) GetDownloadCount() int {
+	l = l.downloadsOwner()
+	l.Mu.Lock()
+	defer l.Mu.Unlock()
+	return l.Downloads
+}
+
+func (l *Link) IncrementDownload() {
+	l = l.downloadsOwner()
+	l.Mu.Lock()
+	defer l.Mu.Unlock()
+	l.Downloads++
+}
+
+// ConsumeDownload checks the current shared count and reserves one download.
+func (l *Link) ConsumeDownload(username string) bool {
+	owner := l.downloadsOwner()
+	owner.Mu.Lock()
+	defer owner.Mu.Unlock()
+	if l.DownloadsLimit > 0 {
+		if l.PerUserDownloadLimit {
+			if owner.UserDownloads[username] >= l.DownloadsLimit {
+				return false
+			}
+		} else if owner.Downloads >= l.DownloadsLimit {
+			return false
+		}
+	}
+	owner.Downloads++
+	if l.PerUserDownloadLimit {
+		if owner.UserDownloads == nil {
+			owner.UserDownloads = make(map[string]int)
+		}
+		owner.UserDownloads[username]++
+	}
+	return true
 }
 
 // HasReachedUserLimit checks if a user has reached their download limit
