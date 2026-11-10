@@ -31,8 +31,8 @@ func TestChunkUploadAuthenticationKeyUsesPersistedSettings(t *testing.T) {
 
 	persisted := *config
 	persisted.Auth.Key = "persisted-chunk-upload-test-key"
-	if err := store.Settings.Save(&persisted); err != nil {
-		t.Fatalf("persist chunk upload authentication key: %v", err)
+	if saveErr := store.Settings.Save(&persisted); saveErr != nil {
+		t.Fatalf("persist chunk upload authentication key: %v", saveErr)
 	}
 	config.Auth.Key = "different-process-config-key"
 

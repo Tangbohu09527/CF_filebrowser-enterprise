@@ -66,8 +66,8 @@ func TestSafeCacheKeyIdentity(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			changed := base
 			test.mutate(&changed)
-			key, err := SafeCacheKey(changed, test.previewSize, test.percentage)
-			require.NoError(t, err)
+			key, keyErr := SafeCacheKey(changed, test.previewSize, test.percentage)
+			require.NoError(t, keyErr)
 			require.NotEqual(t, baseKey, key)
 		})
 	}

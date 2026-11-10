@@ -964,12 +964,12 @@ func WriteFile(source, path string, in io.Reader) (returnErr error) {
 		if err != nil {
 			logger.Debugf("Could not set file permissions for %s (this may be expected in restricted environments): %v", realPath, err)
 		}
-	} else if err := tempFile.Chmod(stat.Mode()); err != nil {
-		return fmt.Errorf("preserve file permissions: %w", err)
+	} else if chmodErr := tempFile.Chmod(stat.Mode()); chmodErr != nil {
+		return fmt.Errorf("preserve file permissions: %w", chmodErr)
 	}
 
-	if err := tempFile.Sync(); err != nil {
-		return fmt.Errorf("sync temporary file: %w", err)
+	if syncErr := tempFile.Sync(); syncErr != nil {
+		return fmt.Errorf("sync temporary file: %w", syncErr)
 	}
 	closeErr := tempFile.Close()
 	tempFile = nil
@@ -977,8 +977,8 @@ func WriteFile(source, path string, in io.Reader) (returnErr error) {
 		return fmt.Errorf("close temporary file: %w", closeErr)
 	}
 
-	if err := os.Rename(tempPath, realPath); err != nil {
-		return fmt.Errorf("replace file: %w", err)
+	if renameErr := os.Rename(tempPath, realPath); renameErr != nil {
+		return fmt.Errorf("replace file: %w", renameErr)
 	}
 	committed = true
 

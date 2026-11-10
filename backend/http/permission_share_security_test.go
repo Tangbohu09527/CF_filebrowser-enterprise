@@ -629,8 +629,8 @@ func TestPermissionShareSecurityFailures(t *testing.T) {
 		var created struct {
 			Hash string `json:"hash"`
 		}
-		if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
-			t.Fatalf("decode upload share response: %v", err)
+		if decodeErr := json.NewDecoder(response.Body).Decode(&created); decodeErr != nil {
+			t.Fatalf("decode upload share response: %v", decodeErr)
 		}
 		if created.Hash == "" {
 			t.Fatal("create upload share returned an empty hash")
@@ -824,8 +824,8 @@ func TestPermissionShareSecurityFailures(t *testing.T) {
 		const existingName = "password-upload-existing.txt"
 		const existingContent = "existing protected upload content"
 		existingPath := filepath.Join(h.sourcePath, "public", existingName)
-		if err := os.WriteFile(existingPath, []byte(existingContent), 0o644); err != nil {
-			t.Fatalf("write existing protected upload: %v", err)
+		if writeErr := os.WriteFile(existingPath, []byte(existingContent), 0o644); writeErr != nil {
+			t.Fatalf("write existing protected upload: %v", writeErr)
 		}
 		replacement := h.request(http.MethodPost, "/public/api/resources", url.Values{
 			"hash":     {link.Hash},

@@ -117,8 +117,8 @@ func (f *FileCache) Store(ctx context.Context, key string, value []byte) (return
 		}
 	}()
 
-	if err := tempFile.Chmod(fileutils.PermFile); err != nil {
-		return fmt.Errorf("set temporary cache file permissions: %w", err)
+	if chmodErr := tempFile.Chmod(fileutils.PermFile); chmodErr != nil {
+		return fmt.Errorf("set temporary cache file permissions: %w", chmodErr)
 	}
 	written, err := tempFile.Write(value)
 	if err != nil {
@@ -134,12 +134,12 @@ func (f *FileCache) Store(ctx context.Context, key string, value []byte) (return
 	if tempInfo.Size() != int64(len(value)) {
 		return fmt.Errorf("write temporary cache file: %w", io.ErrShortWrite)
 	}
-	if err := tempFile.Sync(); err != nil {
-		return fmt.Errorf("sync temporary cache file: %w", err)
+	if syncErr := tempFile.Sync(); syncErr != nil {
+		return fmt.Errorf("sync temporary cache file: %w", syncErr)
 	}
-	if err := tempFile.Close(); err != nil {
+	if closeErr := tempFile.Close(); closeErr != nil {
 		tempFile = nil
-		return fmt.Errorf("close temporary cache file: %w", err)
+		return fmt.Errorf("close temporary cache file: %w", closeErr)
 	}
 	tempFile = nil
 

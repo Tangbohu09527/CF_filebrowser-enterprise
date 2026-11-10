@@ -326,9 +326,7 @@ func cleanPublicShareRelativePath(value string) (string, error) {
 	if strings.HasPrefix(normalized, "//") {
 		return "", fmt.Errorf("invalid public path")
 	}
-	if strings.HasPrefix(normalized, "/") {
-		normalized = strings.TrimPrefix(normalized, "/")
-	}
+	normalized = strings.TrimPrefix(normalized, "/")
 	if strings.HasPrefix(normalized, "/") || publicShareHasDotDotSegment(normalized) || publicShareHasDrivePrefix(normalized) {
 		return "", fmt.Errorf("invalid public path")
 	}

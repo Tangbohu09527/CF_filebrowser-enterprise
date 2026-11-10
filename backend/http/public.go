@@ -169,14 +169,14 @@ func buildPublicShareArchiveManifest(d *requestContext, sourcePath string, targe
 			if walkErr != nil {
 				return walkErr
 			}
-			relativePath, err := filepath.Rel(target.RealPath, filePath)
-			if err != nil || relativePath == "." {
-				return err
+			relativePath, resolveErr := filepath.Rel(target.RealPath, filePath)
+			if resolveErr != nil || relativePath == "." {
+				return resolveErr
 			}
 			logicalPath := normalizePublicShareIndexPath(path.Join(target.LogicalPath, filepath.ToSlash(relativePath)))
-			child, err := resolvePublicShareLogicalTarget(d, sourcePath, logicalPath)
-			if err != nil {
-				return err
+			child, resolveErr := resolvePublicShareLogicalTarget(d, sourcePath, logicalPath)
+			if resolveErr != nil {
+				return resolveErr
 			}
 			manifest = append(manifest, publicShareArchiveEntry{
 				LogicalPath:   child.LogicalPath,

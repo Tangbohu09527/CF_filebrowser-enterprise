@@ -175,14 +175,14 @@ func copyDirectoryForMove(source, dest string, copyFn func(io.Writer, io.Reader)
 		}
 
 		if entry.IsDir() {
-			if err := os.Mkdir(destPath, info.Mode().Perm()|0o700); err != nil {
-				return err
+			if mkdirErr := os.Mkdir(destPath, info.Mode().Perm()|0o700); mkdirErr != nil {
+				return mkdirErr
 			}
-			if err := copyDirectoryForMove(srcPath, destPath, copyFn); err != nil {
-				return err
+			if copyErr := copyDirectoryForMove(srcPath, destPath, copyFn); copyErr != nil {
+				return copyErr
 			}
-			if err := os.Chmod(destPath, info.Mode().Perm()); err != nil {
-				logger.Debugf("Could not set directory permissions for %s: %v", destPath, err)
+			if chmodErr := os.Chmod(destPath, info.Mode().Perm()); chmodErr != nil {
+				logger.Debugf("Could not set directory permissions for %s: %v", destPath, chmodErr)
 			}
 			continue
 		}
