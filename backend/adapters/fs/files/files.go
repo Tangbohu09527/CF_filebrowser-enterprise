@@ -135,7 +135,7 @@ func checkPermissionsImpl(opts utils.FileOptions, access *access.Storage, user *
 	// Resolve user scope
 	userScope, scopeErr := user.GetScopeForSourcePath(idx.Path)
 	if scopeErr != nil || userScope == "" {
-		return "", "", fmt.Errorf("user has no access to source: %v", opts.Source)
+		return "", "", fmt.Errorf("%w: user has no access to source: %v", errors.ErrAccessDenied, opts.Source)
 	}
 
 	safePath, err := utils.SanitizeUserPath(opts.Path)

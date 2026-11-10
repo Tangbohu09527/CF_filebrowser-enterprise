@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	jwt "github.com/golang-jwt/jwt/v4"
+	libErrors "github.com/gtsteffaniak/filebrowser/backend/common/errors"
 )
 
 // CurrentUserMigrationVersion is persisted for newly created accounts and after legacy migrations finish.
@@ -270,7 +271,7 @@ func (u *User) GetScopeForSourcePath(sourcePath string) (string, error) {
 			return scope.Scope, nil
 		}
 	}
-	return "", fmt.Errorf("scope not found for source %v", sourcePath)
+	return "", libErrors.ErrAccessDenied
 }
 
 // GetScopeForSourceName returns the scope for a given source name (frontend-style)
