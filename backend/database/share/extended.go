@@ -135,7 +135,15 @@ func (l *Link) GetUserDownloadCount(username string) int {
 
 // ResetDownloadCounts resets both global and per-user download counts
 func (l *Link) ResetDownloadCounts() {
-	l = l.downloadsOwner()
+	owner := l.downloadsOwner()
+	owner.Mu.Lock()
+	owner.Downloads = 0
+	owner.UserDownloads = make(map[string]int)
+	owner.Mu.Unlock()
+	if l == owner {
+		return
+	}
+	// The initiating snapshot can be serialized directly in an edit response.
 	l.Mu.Lock()
 	defer l.Mu.Unlock()
 	l.Downloads = 0

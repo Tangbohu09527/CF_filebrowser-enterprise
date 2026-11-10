@@ -155,7 +155,11 @@ func TestShareZeroValueAndLegacyJSONCounts(t *testing.T) {
 	if link.GetDownloadCount() != 4 || link.GetUserDownloadCount("alice") != 3 {
 		t.Fatal("legacy counts were not retained")
 	}
-	link.ResetDownloadCounts()
+	editing := link.Clone()
+	editing.ResetDownloadCounts()
+	if editing.Downloads != 0 || len(editing.UserDownloads) != 0 {
+		t.Fatal("reset left stale counts in the initiating edit response")
+	}
 	if link.GetDownloadCount() != 0 || link.GetUserDownloadCount("alice") != 0 {
 		t.Fatal("reset did not update shared runtime counts")
 	}
