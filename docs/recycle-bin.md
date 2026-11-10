@@ -143,8 +143,11 @@ Simplified Chinese is translated. No dependencies or lockfiles are changed.
 
 The fixed baseline also fails the existing Windows Unix-path/executable-bit
 tests. Repository-pinned backend lint reports 18 existing baseline findings;
-these are kept separate from feature findings. Linux CI and production acceptance
-must be reported independently from local targeted checks.
+those were removed in an independent mechanical prerequisite commit using only
+local variable renames and an equivalent `TrimPrefix` simplification. No checks,
+permissions, error bindings or assertions were suppressed. The existing CI linter
+v2.1.6 with Go 1.25.14 reports zero issues after integration. Linux CI and
+production acceptance must be reported independently from local checks.
 
 Create a loopback-only synthetic preview with an explicitly built binary:
 
@@ -174,11 +177,26 @@ tracked fixture SHA-256
 the notes occupant retained its original bytes. No production data or credentials
 were involved. The synthetic startup script parsed and ran successfully.
 
-First Linux CI also passed all new trash HTTP tests and the complete `trash`
-package under the existing `-race` command. The full check remains red because
-of the existing asynchronous `MoveResource` → `UpdateShares` race in chunk-upload
-tests. Existing CI also reports old-linter typechecking errors, stale Swagger
-outputs, and a Docker `npm i` failure. Those are separate from the feature's
-targeted/local verification. The first general Playwright run completed restore,
-hash and occupant checks but failed a Firefox console-count expectation; its
-follow-up uses the actual Firefox behavior and unique restore targets on retries.
+First Linux CI passed all new trash HTTP tests and the complete `trash` package
+under the existing `-race` command, and exposed prerequisites that were repaired
+in separate commits:
+
+- Docker copies the existing lockfile and uses `npm ci`, without dependency
+  upgrades. Go CI uses the module-compatible tested Go 1.25.14; both existing
+  golangci versions remain unchanged.
+- Generated Swagger includes the new recycle routes plus missing existing API
+  fields; generated frontend config includes the existing Browse/Preview defaults.
+  Repeating the established generator produced identical files.
+- Existing traversal tests assert the exact 400 rejection and absence of file
+  content/listing; the screenshot theme fixture is correctly registered as an
+  option. No arbitrary 4xx or skipped checks are accepted.
+- Share metadata is detached from its stable download runtime state, so old
+  in-flight snapshots cannot mutate/revert a moved share path or lose counters.
+  Concurrent global/per-user limits and failed-save cache integrity have dedicated
+  regression tests. The complete Share and HTTP packages pass locally after
+  integration; Linux race checks remain a required PR gate.
+
+The initial general Playwright run completed restore, hash and occupant checks
+but failed an incorrect Firefox console-count expectation. The corrected scenario
+uses actual Firefox behavior and a unique restore path on retries, and passed in
+Linux CI. The current full check verdict is recorded on the independent PR.
