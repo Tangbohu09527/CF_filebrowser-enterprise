@@ -9,6 +9,12 @@ type settingsBackend struct {
 	db *storm.DB
 }
 
+// ReadSettings loads persisted settings without initializing authentication or
+// writing any records. Startup uses it before accepting an existing signing key.
+func ReadSettings(db *storm.DB) (*settings.Settings, error) {
+	return settingsBackend{db: db}.Get()
+}
+
 func (s settingsBackend) Get() (*settings.Settings, error) {
 	set := &settings.Settings{}
 	return set, get(s.db, "settings", set)

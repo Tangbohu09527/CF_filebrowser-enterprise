@@ -1,10 +1,12 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	storm "github.com/asdine/storm/v3"
 	"github.com/gtsteffaniak/filebrowser/backend/adapters/fs/fileutils"
@@ -23,6 +25,9 @@ func InitializeDb(path string) (*bolt.BoltStore, bool, error) {
 	if err != nil {
 		panic(err)
 	}
+	if !exists && !utf8.ValidString(settings.Config.Auth.Key) {
+		return nil, false, errors.New("configured JWT signing key cannot be persisted losslessly")
+	}
 	db, err := storm.Open(path)
 	if err != nil {
 		if strings.Contains(err.Error(), "timeout") {
@@ -30,8 +35,15 @@ func InitializeDb(path string) (*bolt.BoltStore, bool, error) {
 		}
 		logger.Fatalf("could not open database: %v", err)
 	}
+	// Validate the signing key before NewStorage initializes authentication records
+	// or any version/settings write can alter an existing database.
+	if err = restoreSigningKey(db, exists); err != nil {
+		_ = db.Close()
+		return nil, exists, err
+	}
 	store, err := bolt.NewStorage(db)
 	if err != nil {
+		_ = db.Close()
 		return nil, exists, err
 	}
 	// Load access rules from DB on startup
@@ -42,6 +54,7 @@ func InitializeDb(path string) (*bolt.BoltStore, bool, error) {
 	userStore = store.Users
 	err = bolt.Save(db, "version", 2)
 	if err != nil {
+		_ = db.Close()
 		return nil, exists, err
 	}
 	if !exists {
@@ -54,6 +67,32 @@ func InitializeDb(path string) (*bolt.BoltStore, bool, error) {
 	}
 
 	return store, exists, err
+}
+
+func restoreSigningKey(db *storm.DB, exists bool) error {
+	if !exists {
+		return nil
+	}
+	persisted, err := bolt.ReadSettings(db)
+	if err != nil {
+		return errors.New("could not read persisted JWT signing key from existing database")
+	}
+	configured := settings.Config.Auth.Key
+	if persisted.Auth.Key == "" {
+		if configured == "" {
+			return errors.New("existing database has no JWT signing key; restore an explicit trusted key before startup")
+		}
+		// An explicit trusted recovery key is runtime-only. Never rewrite the
+		// old settings or silently invent a replacement credential.
+		return nil
+	}
+	if configured != "" && configured != persisted.Auth.Key {
+		return errors.New("configured JWT signing key conflicts with existing database; restore the matching key before startup")
+	}
+	// File/environment configuration remains authoritative for every other field.
+	// Nonempty legacy values are restored verbatim, without format conversion.
+	settings.Config.Auth.Key = persisted.Auth.Key
+	return nil
 }
 
 func dbExists(path string) (bool, error) {
@@ -77,7 +116,12 @@ func dbExists(path string) (bool, error) {
 }
 
 func quickSetup(store *bolt.BoltStore) {
-	settings.Config.Auth.Key = utils.GenerateKey()
+	if settings.Config.Auth.Key == "" {
+		// Preserve the original 512 bits of entropy as lossless JSON/YAML text.
+		key, err := utils.RandomHex(64)
+		utils.CheckErr("generate JWT signing key", err)
+		settings.Config.Auth.Key = key
+	}
 	err := store.Settings.Save(&settings.Config)
 	utils.CheckErr("store.Settings.Save", err)
 	err = store.Settings.SaveServer(&settings.Config.Server)
@@ -95,7 +139,7 @@ func quickSetup(store *bolt.BoltStore) {
 		user.LockPassword = false
 		user.Permissions = settings.AdminPerms()
 		user.ShowFirstLogin = settings.Env.IsFirstLoad && user.Permissions.Admin
-		logger.Debugf("Creating user as admin: %v %v", user.Username, user.Password)
+		logger.Debugf("Creating user as admin: %v", user.Username)
 		err = store.Users.Save(user, true, true)
 		utils.CheckErr("store.Users.Save", err)
 	}
