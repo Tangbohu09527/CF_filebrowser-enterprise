@@ -1004,11 +1004,9 @@ func (idx *Index) GetDirInfo(dirInfo *os.File, stat os.FileInfo, indexPath strin
 func (idx *Index) GetRealPath(relativePath ...string) (string, bool, error) {
 	combined := append([]string{idx.Path}, relativePath...)
 	joinedPath := filepath.Join(combined...)
-	if utils.IsReservedStoragePath(joinedPath) {
-		return "", false, errors.ErrAccessDenied
-	}
-	resolved, resolveErr := filepath.EvalSymlinks(joinedPath)
-	if resolveErr == nil && utils.IsReservedStoragePath(resolved) {
+	// New leaves cannot be fully evaluated yet; inspect their nearest existing
+	// parent as well so an alias cannot create data inside reserved storage.
+	if utils.CheckUserStoragePath(joinedPath) != nil {
 		return "", false, errors.ErrAccessDenied
 	}
 	isDir, _ := IsDirCache.Get(joinedPath + ":isdir")

@@ -287,3 +287,49 @@ func TestTrashIsolationAcrossOrdinaryAPIsAndRecursiveOperations(t *testing.T) {
 		t.Fatalf("normal sibling directory rejected: %v", err)
 	}
 }
+
+func TestTrashDoesNotBreakPublicSourceRootArchive(t *testing.T) {
+	source := setupResourcePutTestEnv(t)
+	h := newPermissionShareSecurityHarness(t, source)
+	owner := h.newOwner(t, "root-archive-owner", users.Permissions{Browse: true, Download: true, Delete: true, Create: true, Share: true})
+	const hash = "root-archive-trash-isolation"
+	h.saveShare(t, owner, hash, "/", func(share *dbshare.CommonShare) { share.ShowHidden = true })
+	if err := os.WriteFile(filepath.Join(source, "removed.txt"), []byte("synthetic recycled archive bytes"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	assertArchive := func(expectRemoved bool) {
+		response := h.download(hash, "/")
+		if response.Code != http.StatusOK {
+			t.Fatalf("root archive failed (expect removed entry=%v): %d %s", expectRemoved, response.Code, response.Body.String())
+		}
+		archive, err := zip.NewReader(bytes.NewReader(response.Body.Bytes()), int64(response.Body.Len()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		allowed, removed := false, false
+		for _, entry := range archive.File {
+			if strings.Contains(entry.Name, utils.TrashDirectory) {
+				t.Fatalf("reserved archive member: %s", entry.Name)
+			}
+			allowed = allowed || filepath.Base(entry.Name) == "allowed.txt"
+			removed = removed || filepath.Base(entry.Name) == "removed.txt"
+		}
+		if !allowed || removed != expectRemoved {
+			t.Fatalf("ordinary archive contents changed: allowed=%v removed=%v", allowed, removed)
+		}
+	}
+	assertArchive(true)
+	status, body := callTrash(t, owner, trashPostHandler, http.MethodPost, "/api/trash", "", trashRequest{Source: "source1", Path: "/removed.txt", OperationID: "root-archive-recycle-operation"})
+	if status != http.StatusOK {
+		t.Fatalf("trash fixture: %d %s", status, body)
+	}
+	assertArchive(false)
+	// A normal denied child must still reject the entire archive before bytes.
+	if err := store.Access.DenyUser(source, "/public/denied.txt", owner.Username); err != nil {
+		t.Fatal(err)
+	}
+	denied := h.download(hash, "/")
+	if denied.Code != http.StatusForbidden || strings.Contains(denied.Body.String(), permissionShareDeniedChild) {
+		t.Fatalf("ordinary ACL denial weakened: %d", denied.Code)
+	}
+}

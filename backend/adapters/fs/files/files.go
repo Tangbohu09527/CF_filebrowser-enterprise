@@ -857,7 +857,10 @@ func WriteDirectory(opts utils.FileOptions) error {
 	if idx == nil {
 		return fmt.Errorf("could not get index: %v ", opts.Source)
 	}
-	realPath, _, _ := idx.GetRealPath(opts.Path)
+	realPath, _, resolveErr := idx.GetRealPath(opts.Path)
+	if resolveErr == errors.ErrAccessDenied {
+		return resolveErr
+	}
 
 	var stat os.FileInfo
 	var err error
@@ -906,7 +909,10 @@ func WriteFile(source, path string, in io.Reader) (returnErr error) {
 	if idx == nil {
 		return fmt.Errorf("could not get index: %v ", source)
 	}
-	realPath, _, _ := idx.GetRealPath(path)
+	realPath, _, resolveErr := idx.GetRealPath(path)
+	if resolveErr == errors.ErrAccessDenied {
+		return resolveErr
+	}
 	// Strip trailing slash from realPath if it's meant to be a file
 	realPath = strings.TrimRight(realPath, "/")
 	// Ensure the parent directories exist

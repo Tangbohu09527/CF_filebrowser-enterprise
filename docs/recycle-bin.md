@@ -99,6 +99,10 @@ Share archives explicitly skip reserved entries. Extraction cannot write a
 reserved entry or create an alias to it. Recursive copy/move/delete and WebDAV
 mutations refuse a tree containing reserved storage, including nested Sources.
 This guard inspects directory entries and link metadata, not file contents.
+Creation also checks the nearest existing ancestor before consulting path caches,
+so a missing leaf beneath an existing reserved alias cannot be created by PUT,
+POST, directory or chunk uploads. Public Source-root archives skip the reserved
+subtree while continuing to reject ordinary children denied by AccessRules.
 The exact name is reserved case-insensitively on all platforms, including Windows
 trailing-dot/space and ADS aliases. This intentionally also excludes user-created
 directories with that name. Existing general archive ACL behavior is unchanged.

@@ -170,6 +170,17 @@ func buildPublicShareArchiveManifest(d *requestContext, sourcePath string, targe
 			if walkErr != nil {
 				return walkErr
 			}
+			reserved := utils.IsReservedStoragePath(filePath)
+			if !reserved {
+				physical, physicalErr := filepath.EvalSymlinks(filePath)
+				reserved = physicalErr == nil && utils.IsReservedStoragePath(physical)
+			}
+			if reserved {
+				if entry.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
 			relativePath, resolveErr := filepath.Rel(target.RealPath, filePath)
 			if resolveErr != nil || relativePath == "." {
 				return resolveErr
