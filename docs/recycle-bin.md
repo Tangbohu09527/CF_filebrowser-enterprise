@@ -73,6 +73,9 @@ result is retained for manual reconciliation. Payload SHA-256 is streamed, and
 Linux data and containing directories are synced before acknowledging completion.
 Journals are written to the same directory, synced, atomically renamed and synced
 again. One FileBrowser process must be the sole writer for a Source.
+After a move, the inode, size and modification time must still match the hashed
+snapshot. A concurrent source replacement becomes `manual_reconciliation` with
+`source_changed`; the moved bytes remain retained and are not falsely acknowledged.
 
 The durable pending intent precedes any move. Queries reconcile source and
 payload/target existence and hashes without replaying a move. Mismatched bytes,
@@ -122,7 +125,7 @@ Commands (Makefile expansions where Make/Git Bash are unavailable on Windows):
 
 ```text
 cd backend
-go test -mod=readonly -timeout=30s ./http ./trash ./common/utils -run 'TestTrash|TestLifecycle|TestMoveThen|TestRejectedCross|TestPendingIntent|TestIntentNot|TestLargeFile|TestRejectsDirectories|TestSymlinkSource|TestListOnly|TestReservedStorage|TestEveryRestore|TestRestoreIntent'
+go test -mod=readonly -timeout=30s ./http ./trash ./common/utils -run 'TestTrash|TestLifecycle|TestMoveThen|TestRejectedCross|TestPendingIntent|TestIntentNot|TestLargeFile|TestRejectsDirectories|TestSymlinkSource|TestListOnly|TestReservedStorage|TestEveryRestore|TestRestoreIntent|TestSourceReplacement'
 go tool golangci-lint run --path-prefix=backend
 go build -o filebrowser.exe .
 cd ../frontend

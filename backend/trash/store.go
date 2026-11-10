@@ -328,6 +328,23 @@ func (s *Store) matches(filename string, item *Item) bool {
 	return err == nil && info.Size() == item.Size && checksum == item.SHA256
 }
 
+func (s *Store) sameSnapshot(filename string, before os.FileInfo) bool {
+	after, err := s.root.Lstat(filename)
+	return err == nil && before != nil && after.Mode().IsRegular() && os.SameFile(before, after) &&
+		before.Size() == after.Size() && before.ModTime().Equal(after.ModTime())
+}
+
+func (s *Store) requireReconciliation(item *Item, code string) (*Item, error) {
+	item.State, item.ErrorCode = "manual_reconciliation", code
+	if err := s.save(item); err != nil {
+		return nil, ErrUncertain
+	}
+	if err := s.settleRestoreAttempt(item); err != nil {
+		return nil, ErrUncertain
+	}
+	return item, ErrUncertain
+}
+
 // Get reconciles a durable pending intent against both filesystem names. It
 // never replays a move, and never treats a conflicting/unknown result as success.
 func (s *Store) Get(id string) (*Item, error) {
@@ -411,6 +428,9 @@ func (s *Store) Trash(item Item) (*Item, error) {
 	if err = s.syncMove(item.OriginalPath, contentPath(item.OperationID)); err != nil {
 		return nil, ErrUncertain
 	}
+	if !s.sameSnapshot(contentPath(item.OperationID), info) {
+		return s.requireReconciliation(&item, "source_changed")
+	}
 	item.State = "trashed"
 	if err = s.save(&item); err != nil {
 		return nil, ErrUncertain
@@ -462,15 +482,9 @@ func (s *Store) Restore(id, restoreID, destination string, actorID uint, actor s
 		return s.rejectRestore(item, "invalid_destination", err)
 	}
 	parent.Close()
-	if !s.matches(contentPath(id), item) {
-		item.State, item.ErrorCode = "manual_reconciliation", "integrity_conflict"
-		if err = s.save(item); err != nil {
-			return nil, ErrUncertain
-		}
-		if err = s.settleRestoreAttempt(item); err != nil {
-			return nil, ErrUncertain
-		}
-		return nil, ErrUncertain
+	payloadHash, payloadInfo, checksumErr := s.checksum(contentPath(id))
+	if checksumErr != nil || payloadInfo.Size() != item.Size || payloadHash != item.SHA256 {
+		return s.requireReconciliation(item, "integrity_conflict")
 	}
 	item.State = "pending_restore"
 	if err = s.save(item); err != nil {
@@ -487,6 +501,9 @@ func (s *Store) Restore(id, restoreID, destination string, actorID uint, actor s
 	}
 	if err = s.syncMove(contentPath(id), destination); err != nil {
 		return nil, ErrUncertain
+	}
+	if !s.sameSnapshot(destination, payloadInfo) {
+		return s.requireReconciliation(item, "source_changed")
 	}
 	item.State = "restored"
 	if err = s.save(item); err != nil {

@@ -2,6 +2,7 @@ package trash
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -287,6 +288,71 @@ func TestRestoreIntentBeforeItemJournalFailureIsNotReplayed(t *testing.T) {
 	}
 	if _, err = s.Restore(item.OperationID, "restore-new-intent-after-failure", "files/restored.txt", 7, "ordinary-user"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func replaceSourceDuringMove(t *testing.T, root *os.Root, old, destination string) error {
+	t.Helper()
+	f, err := root.OpenFile(old+".replacement", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err = f.WriteString("concurrent synthetic replacement"); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	if err = root.Rename(old+".replacement", old); err != nil {
+		return err
+	}
+	return moveNoReplace(root, old, destination)
+}
+
+func TestSourceReplacementAfterHashRequiresManualReconciliation(t *testing.T) {
+	for _, restoring := range []bool{false, true} {
+		t.Run(map[bool]string{false: "trash", true: "restore"}[restoring], func(t *testing.T) {
+			_, s := fixture(t)
+			if restoring {
+				mustTrash(t, s)
+			}
+			s.move = func(root *os.Root, old, destination string) error {
+				return replaceSourceDuringMove(t, root, old, destination)
+			}
+			var err error
+			if restoring {
+				_, err = s.Restore(sampleItem().OperationID, "restore-source-changed-001", "files/restored.txt", 7, "ordinary-user")
+			} else {
+				_, err = s.Trash(sampleItem())
+			}
+			if !errors.Is(err, ErrUncertain) {
+				t.Fatalf("replacement incorrectly acknowledged: %v", err)
+			}
+			item, err := s.Get(sampleItem().OperationID)
+			if err != nil || item.State != "manual_reconciliation" || item.ErrorCode != "source_changed" {
+				t.Fatalf("missing changed-source outcome: %+v %v", item, err)
+			}
+			kept := contentPath(item.OperationID)
+			if restoring {
+				kept = "files/restored.txt"
+			}
+			f, err := s.root.Open(kept)
+			if err != nil {
+				t.Fatal("moved data was lost")
+			}
+			data, err := io.ReadAll(f)
+			_ = f.Close()
+			if err != nil || string(data) != "concurrent synthetic replacement" {
+				t.Fatalf("replacement bytes not retained: %q %v", data, err)
+			}
+			if restoring {
+				attempt, readErr := s.GetRestoreAttempt(item.OperationID, "restore-source-changed-001")
+				if readErr != nil || attempt.State != "manual_reconciliation" {
+					t.Fatalf("restore attempt misreported: %+v %v", attempt, readErr)
+				}
+			}
+		})
 	}
 }
 
