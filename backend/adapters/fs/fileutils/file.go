@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"syscall"
 
+	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
+
 	"github.com/gtsteffaniak/go-logger/logger"
 )
 
@@ -60,6 +62,12 @@ func unixModeToFileMode(u uint32) os.FileMode {
 // By default, the rename system call is used. If src and dst point to different volumes,
 // the file copy is used as a fallback.
 func MoveFile(src, dst string) error {
+	if err := utils.CheckUserStorageTree(src); err != nil {
+		return err
+	}
+	if err := utils.CheckUserStoragePath(dst); err != nil {
+		return err
+	}
 	return moveFileWithOps(src, dst, moveFileOps{
 		rename:    os.Rename,
 		copy:      io.Copy,
@@ -227,6 +235,12 @@ func cleanupMoveTemp(tempPath string) error {
 
 // CopyFile copies a file or directory from source to dest and returns an error if any.
 func CopyFile(source, dest string) error {
+	if err := utils.CheckUserStorageTree(source); err != nil {
+		return err
+	}
+	if err := utils.CheckUserStoragePath(dest); err != nil {
+		return err
+	}
 	// Check if the source exists and whether it's a file or directory.
 	info, err := os.Stat(source)
 	if err != nil {

@@ -4,6 +4,7 @@ import { globalVars } from '@/utils/constants'
 import { downloadManager } from '@/utils/downloadManager'
 import { getApiPath, getPublicApiPath } from '@/utils/url.js'
 import { adjustedData, fetchURL } from './utils'
+import { trashFiles } from './trash'
 
 export { fetchPreviewImage } from '@/utils/previewRequests'
 
@@ -112,32 +113,7 @@ export async function bulkDelete(items) {
   if (!items || !Array.isArray(items) || items.length === 0) {
     throw new Error('items array is required and must not be empty')
   }
-  try {
-    const apiPath = getApiPath('resources/bulk')
-    const response = await fetchURL(apiPath, {
-      method: 'DELETE',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(items),
-    })
-    const data = await response.json()
-    // 200 = all succeeded, 207 = partial success (some succeeded, some failed)
-    // Both are valid responses that should be returned, not thrown as errors
-    if (response.status === 200 || response.status === 207) {
-      return data
-    }
-    // For other error status codes, throw an error
-    const error = new Error(data.message || response.statusText)
-    error.status = response.status
-    throw error
-  } catch (err) {
-    // Only show notification and re-throw if it's a real error (not 200/207)
-    if (err.status && err.status !== 200 && err.status !== 207) {
-      notify.showError(err.message || 'Error performing bulk delete')
-    }
-    throw err
-  }
+  return trashFiles(items)
 }
 
 export async function put(source, path, content = '') {

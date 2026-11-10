@@ -145,7 +145,6 @@
     "passkeyLogin": "패스키 사용"
   },
   "prompts": {
-    "deleteMessageSingle": "파일 혹은 디렉토리를 삭제하시겠습니까?",
     "deleteTitle": "파일 삭제",
     "displayName": "게시 이름:",
     "download": "파일 다운로드",
@@ -159,7 +158,6 @@
     "replaceMessage": "동일한 파일 이름이 존재합니다. 현재 파일을 덮어쓸까요?\n",
     "deleteUserMessage": "이 사용자를 삭제하시겠습니까?",
     "optionalPassword": "선택적 비밀번호",
-    "deleted": "성공적으로 삭제되었습니다!",
     "destinationSource": "대상 소스:",
     "dragAndDrop": "파일을 여기로 끌어다 놓기",
     "completed": "완료",
@@ -174,7 +172,6 @@
     "shareFavicon": "파비콘 URL 공유",
     "renameMessage": "새 이름을 입력합니다:",
     "renameMessageInvalid": "파일은 \"/\" 또는 \"\\\"를 포함할 수 없습니다.",
-    "deleteMessageMultiple": "{count} 파일을 정말 삭제하시겠습니까?",
     "deleteMessageShare": "이 공유를 삭제하시겠습니까? {path} ?",
     "renameMessageConflict": "\"{filename}\"라는 이름의 항목이 이미 존재합니다!",
     "uploadSettingsChunked": "최대 동시 업로드: {maxConcurrentUpload}, 청크 크기: {uploadChunkSizeMb} MB",
@@ -860,5 +857,33 @@
     "documentDownload": "문서 다운로드 - 완료",
     "editorSuccess": "편집기 초기화 - 성공! 모든 단계가 완료되었습니다.",
     "setupError": "설정 오류"
+  },
+  "trash": {
+    "title": "Recycle bin",
+    "retention": "Recycled files and operation records are retained. No automatic expiry or permanent removal is enabled.",
+    "moveToTrash": "Move to recycle bin",
+    "deleteMessage": "Move the selected files to the recycle bin. They can be restored later. Directories are currently unsupported.",
+    "directoriesUnsupported": "Directories and symlinks cannot be moved to the recycle bin. No files were permanently deleted.",
+    "sharesUnsupported": "Recycle bin actions require an authorized Source. Open the file from your signed-in file list.",
+    "reviewOperation": "Check operation {operation} before retrying. Current state: {state}.",
+    "searchHint": "Original path, file name or operation ID",
+    "empty": "No visible recycle bin records.",
+    "restore": "Restore",
+    "bytes": "bytes",
+    "operation": "Operation and integrity",
+    "checkOperation": "Check operation",
+    "restoreHint": "Enter a complete destination path in this Source. The parent folder must exist. Existing files are never overwritten.",
+    "destination": "Destination path including file name",
+    "pendingTrash": "Checking recycle result",
+    "trashed": "In recycle bin",
+    "pendingRestore": "Checking restore result",
+    "restored": "Restored",
+    "failed": "Move rejected",
+    "needsReview": "Manual reconciliation required",
+    "unknownResult": "The result is unknown. Check the operation before retrying.",
+    "restoreConflict": "The destination already exists or the operation conflicts. Check the operation, then choose an unused path.",
+    "restoreFile": "Restore: {name}",
+    "pageCount": "Showing {shown} of {total}"
   }
+
 }

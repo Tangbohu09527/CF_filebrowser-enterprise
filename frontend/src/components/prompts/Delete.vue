@@ -7,10 +7,10 @@
       </div>
       <div v-show="!deleting">
         <p class="card-message" v-if="itemsToDelete.length === 1">
-          {{ $t("prompts.deleteMessageSingle") }}
+          {{ $t("trash.deleteMessage") }}
         </p>
         <p class="card-message" v-else>
-          {{ $t("prompts.deleteMessageMultiple", { count: itemsToDelete.length }) }}
+          {{ $t("trash.deleteMessage") }}
         </p>
         <div class="delete-items-list">
         <div
@@ -40,6 +40,7 @@
           <div v-if="getItemError(item)" class="error-banner">
             {{ getItemError(item) }}
           </div>
+          <p v-if="isItemDone(item)" role="status">{{ $t('trash.trashed') }}</p>
         </div>
       </div>
       </div>
@@ -58,8 +59,8 @@
         @click="submit"
         class="button button--flat button--red"
         aria-label="Confirm-Delete"
-        :title="$t('general.delete')">
-        {{ $t("general.delete") }}
+        :title="$t('trash.moveToTrash')">
+        {{ $t("trash.moveToTrash") }}
       </button>
     </div>
 </template>
@@ -90,6 +91,7 @@ export default {
   data() {
     return {
       failedItems: [], // Array of failed items with source, path, and message
+	  succeededItems: [],
       deleting: false,
     };
   },
@@ -187,6 +189,9 @@ export default {
       }
       return null;
     },
+    isItemDone(item) {
+      return this.succeededItems.some(done => done.source === item.source && done.path === item.path);
+    },
     getPreviewUrl(source, path, modified, type) {
       if (!source || !path) return null;
 
@@ -221,9 +226,11 @@ export default {
 
       try {
         // Extract source and path from items (ignore previewUrl)
-        const itemsForDelete = this.itemsToDelete.map(item => ({
+        const itemsForDelete = this.itemsToDelete.filter(item => !this.isItemDone(item)).map(item => ({
           source: item.source,
-          path: item.path
+          path: item.path,
+          type: item.type,
+          isDir: item.isDir,
         }));
 
         if (itemsForDelete.length === 0) {
@@ -232,10 +239,14 @@ export default {
           return;
         }
 
-        // Use bulk delete API for both regular files and shares
+        // Public shares have no trusted Source identity for the authenticated
+        // trash API. Refuse explicitly instead of falling back to permanent delete.
         const response = getters.isShare()
-          ? await resourcesApi.bulkDeletePublic(itemsForDelete)
+          ? { succeeded: [], failed: itemsForDelete.map(item => ({ ...item, message: this.$t('trash.sharesUnsupported') })) }
           : await resourcesApi.bulkDelete(itemsForDelete);
+
+        this.succeededItems.push(...(response.succeeded || []));
+        response.succeeded = this.succeededItems;
 
         // Store failed items directly from response
         if (response.failed && response.failed.length > 0) {
@@ -250,7 +261,7 @@ export default {
         if (failedCount === 0) {
           // All succeeded - close prompt and handle navigation
           buttons.success("delete");
-          notify.showSuccessToast(this.$t('prompts.deleted'));
+          notify.showSuccessToast(this.$t('trash.trashed'));
 
           if (this.items && this.items.length > 0) {
             eventBus.emit("itemsDeleted", {

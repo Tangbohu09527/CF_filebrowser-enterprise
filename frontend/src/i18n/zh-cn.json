@@ -145,7 +145,6 @@
     "passkeyLogin": "使用通行密钥"
   },
   "prompts": {
-    "deleteMessageSingle": "你确定要删除这个文件/文件夹吗？",
     "deleteTitle": "删除文件",
     "displayName": "名称：",
     "download": "下载文件",
@@ -159,7 +158,6 @@
     "replaceMessage": "您尝试上传的文件中有一个与现有文件的名称存在冲突。是否替换现有的同名文件？\n",
     "optionalPassword": "密码（选填，不填即无密码）",
     "deleteUserMessage": "您确定要删除该用户吗？",
-    "deleted": "已成功删除！",
     "destinationSource": "目的地来源：",
     "dragAndDrop": "在此处拖放文件",
     "completed": "已完成",
@@ -174,7 +172,6 @@
     "shareFavicon": "共享图标 URL",
     "renameMessage": "输入新名称：",
     "renameMessageInvalid": "文件不能包含\"/\"或\"\\\"。",
-    "deleteMessageMultiple": "您确定要删除{count} 文件吗？",
     "deleteMessageShare": "您确定要删除此共享？ {path} ?",
     "renameMessageConflict": "名为 \"{filename}\" 的项目已经存在！",
     "uploadSettingsChunked": "最大并发上传：{maxConcurrentUpload}块大小 {uploadChunkSizeMb} MB",
@@ -860,5 +857,33 @@
     "documentDownload": "文件下载 - 完成",
     "editorSuccess": "编辑器初始化 - 成功！所有步骤已完成。",
     "setupError": "设置错误"
+  },
+  "trash": {
+    "title": "回收站",
+    "retention": "回收文件及操作记录持续保留，未启用自动到期清理或彻底删除。",
+    "moveToTrash": "移至回收站",
+    "deleteMessage": "将所选文件移至回收站，之后可恢复。目前不支持目录。",
+    "directoriesUnsupported": "回收站暂不支持目录和符号链接，未执行彻底删除。",
+    "sharesUnsupported": "回收操作需要已授权的 Source，请在登录后的文件列表中操作。",
+    "reviewOperation": "请先查询操作 {operation} 再重试，当前状态：{state}。",
+    "searchHint": "原路径、文件名或操作 ID",
+    "empty": "暂无当前权限可见的回收记录。",
+    "restore": "恢复",
+    "bytes": "字节",
+    "operation": "操作与完整性",
+    "checkOperation": "查询操作结果",
+    "restoreHint": "请输入当前 Source 内包含文件名的完整目标路径。上级目录须已存在，已有同名文件不会被覆盖。",
+    "destination": "恢复目标路径（含文件名）",
+    "pendingTrash": "回收结果待核对",
+    "trashed": "已移至回收站",
+    "pendingRestore": "恢复结果待核对",
+    "restored": "已恢复",
+    "failed": "移动已拒绝",
+    "needsReview": "需要人工核对",
+    "unknownResult": "操作结果尚未确认，请先查询操作结果再重试。",
+    "restoreConflict": "目标已存在或操作发生冲突，请先查询结果，再选择未占用的路径。",
+    "restoreFile": "恢复：{name}",
+    "pageCount": "已显示 {shown} / {total}"
   }
+
 }

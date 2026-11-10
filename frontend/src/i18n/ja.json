@@ -145,7 +145,6 @@
     "passkeyLogin": "パスキーを使用"
   },
   "prompts": {
-    "deleteMessageSingle": "このファイル/フォルダを本当に削除してよろしいですか。",
     "deleteTitle": "ファイルを削除",
     "displayName": "名前：",
     "download": "ファイルをダウンロード",
@@ -159,7 +158,6 @@
     "replaceMessage": "アップロードするファイルの中に競合する名前があります。既存のファイルを置き換えますか？\n",
     "deleteUserMessage": "本当にこのユーザーを削除しますか？",
     "optionalPassword": "任意のパスワード",
-    "deleted": "正常に削除されました！",
     "destinationSource": "移動先",
     "dragAndDrop": "ここにファイルをドラッグ＆ドロップしてください",
     "completed": "完了",
@@ -174,7 +172,6 @@
     "shareFavicon": "共有ファビコンのURL",
     "renameMessage": "新しい名前を入力してください：",
     "renameMessageInvalid": "ファイル名に\"/\"や\"\\\"を含めることはできません。",
-    "deleteMessageMultiple": "本当に{count}個のファイルを削除しますか？",
     "deleteMessageShare": "この共有を削除してもよろしいですか？ {path}",
     "quickJump": "他のファイルに素早くジャンプ",
     "moveSuccess": "ファイルは正常に移動しました！",
@@ -860,5 +857,33 @@
     "documentDownload": "資料ダウンロード - 完",
     "editorSuccess": "エディターの初期化 - 成功！すべてのステップが完了しました。",
     "setupError": "セットアップエラー"
+  },
+  "trash": {
+    "title": "Recycle bin",
+    "retention": "Recycled files and operation records are retained. No automatic expiry or permanent removal is enabled.",
+    "moveToTrash": "Move to recycle bin",
+    "deleteMessage": "Move the selected files to the recycle bin. They can be restored later. Directories are currently unsupported.",
+    "directoriesUnsupported": "Directories and symlinks cannot be moved to the recycle bin. No files were permanently deleted.",
+    "sharesUnsupported": "Recycle bin actions require an authorized Source. Open the file from your signed-in file list.",
+    "reviewOperation": "Check operation {operation} before retrying. Current state: {state}.",
+    "searchHint": "Original path, file name or operation ID",
+    "empty": "No visible recycle bin records.",
+    "restore": "Restore",
+    "bytes": "bytes",
+    "operation": "Operation and integrity",
+    "checkOperation": "Check operation",
+    "restoreHint": "Enter a complete destination path in this Source. The parent folder must exist. Existing files are never overwritten.",
+    "destination": "Destination path including file name",
+    "pendingTrash": "Checking recycle result",
+    "trashed": "In recycle bin",
+    "pendingRestore": "Checking restore result",
+    "restored": "Restored",
+    "failed": "Move rejected",
+    "needsReview": "Manual reconciliation required",
+    "unknownResult": "The result is unknown. Check the operation before retrying.",
+    "restoreConflict": "The destination already exists or the operation conflicts. Check the operation, then choose an unused path.",
+    "restoreFile": "Restore: {name}",
+    "pageCount": "Showing {shown} of {total}"
   }
+
 }

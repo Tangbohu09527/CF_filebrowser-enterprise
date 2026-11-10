@@ -150,7 +150,7 @@ test("copy 'text-files' to 'folder#hash' verify folder size is updated", async({
   checkForErrors();
 })
 
-test("delete file", async({ page, checkForErrors }) => {
+test("delete file moves to recycle bin and restores without overwriting", async({ page, checkForErrors }) => {
   await page.goto("/files/");
   await expect(page).toHaveTitle("Graham's Filebrowser - Files - playwright-files");
   await page.locator('a[aria-label="deleteme.txt"]').waitFor({ state: 'visible' });
@@ -159,8 +159,51 @@ test("delete file", async({ page, checkForErrors }) => {
   await expect(page.locator('.selected-count-header')).toHaveText('1');
   await page.locator('button[aria-label="Delete"]').click();
   await expect( page.locator('.card-content')).toContainText('/deleteme.txt');
+  const trashResponse = page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname.endsWith('/api/trash'));
   await page.locator('button[aria-label="Confirm-Delete"]').click();
-  await checkForNotification(page, "Deleted successfully!");
+  await checkForNotification(page, "In recycle bin");
+  const moved = await (await trashResponse).json();
+  expect(moved.state).toBe('trashed');
+  await expect(page.locator('a[aria-label="deleteme.txt"]')).toHaveCount(0);
+
+  // Seed a different occupant through the normal authenticated upload API.
+  const occupant = await page.request.post(`/api/resources?${new URLSearchParams({ source: moved.source, path: '/deleteme.txt' })}`, { data: 'new synthetic occupant' });
+  expect(occupant.status()).toBe(200);
+  await page.getByRole('link', { name: 'Recycle bin', exact: true }).click();
+  const row = page.getByRole('row').filter({ hasText: moved.operation_id });
+  await expect(row).toContainText('In recycle bin');
+  await row.getByRole('button', { name: 'Restore', exact: true }).click();
+  const form = page.locator('.trash-restore');
+  const conflictResponse = page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname.endsWith('/restore'));
+  await form.getByRole('button', { name: 'Confirm', exact: true }).click();
+  expect((await conflictResponse).status()).toBe(409);
+  await expect(page.locator('.trash-message')).toContainText('destination already exists');
+  await form.getByRole('button', { name: 'Check operation', exact: true }).click();
+  await expect(form).toHaveCount(0);
+  await row.getByRole('button', { name: 'Restore', exact: true }).click();
+  await page.getByLabel('Destination path including file name').fill('/restored-deleteme.txt');
+  await page.locator('.trash-restore').getByRole('button', { name: 'Confirm', exact: true }).click();
+  await expect(row).toContainText('Restored');
+  const restored = await page.request.get(`/api/resources?${new URLSearchParams({ source: moved.source, path: '/restored-deleteme.txt', checksum: 'sha256' })}`);
+  expect(restored.status()).toBe(200);
+  expect((await restored.json()).checksums.sha256).toBe(moved.sha256);
+  const protectedOccupant = await page.request.get(`/api/resources?${new URLSearchParams({ source: moved.source, path: '/deleteme.txt', content: 'true' })}`);
+  expect((await protectedOccupant.json()).content).toBe('new synthetic occupant');
+  // The deliberately rejected restore produces exactly one browser/API 409.
+  checkForErrors(1, 1);
+})
+
+test("directory delete is explicitly refused without permanent deletion", async({ page, checkForErrors }) => {
+  await page.goto('/files/');
+  await page.locator('a[aria-label="folder#hash"]').click({ button: 'right' });
+  await page.locator('button[aria-label="Delete"]').click();
+  const mutations: string[] = [];
+  page.on('request', request => { if (request.method() === 'DELETE' || (request.method() === 'POST' && new URL(request.url()).pathname.endsWith('/api/trash'))) mutations.push(request.method()); });
+  await page.locator('button[aria-label="Confirm-Delete"]').click();
+  await expect(page.locator('.error-banner')).toContainText('Directories and symlinks cannot be moved');
+  expect(mutations).toEqual([]);
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await expect(page.locator('a[aria-label="folder#hash"]')).toBeVisible();
   checkForErrors();
 })
 

@@ -145,7 +145,6 @@
     "passkeyLogin": "Usar chave de acesso"
   },
   "prompts": {
-    "deleteMessageSingle": "Quer eliminar esta pasta/ficheiro?",
     "deleteTitle": "Eliminar ficheiros",
     "displayName": "Nome:",
     "download": "Descarregar ficheiros",
@@ -159,7 +158,6 @@
     "replaceMessage": "Já existe um ficheiro com nome igual a um dos que está a tentar enviar. Quer substituí-lo?\n",
     "deleteUserMessage": "Tem a certeza de que pretende apagar este utilizador?",
     "optionalPassword": "Palavra-passe opcional",
-    "deleted": "Eliminado com êxito!",
     "destinationSource": "Fonte de destino:",
     "dragAndDrop": "Arrastar e largar ficheiros aqui",
     "completed": "Concluído",
@@ -174,7 +172,6 @@
     "shareFavicon": "Partilhar URL do favicon",
     "renameMessage": "Introduzir um novo nome:",
     "renameMessageInvalid": "Um ficheiro não pode conter \"/\" ou \"\\\"",
-    "deleteMessageMultiple": "Tem a certeza de que pretende apagar o(s) ficheiro(s) {count}?",
     "deleteMessageShare": "Tem a certeza de que pretende apagar esta partilha: {path} ?",
     "renameMessageConflict": "Já existe um item com o nome \"{filename}\"!",
     "uploadSettingsChunked": "Máximo de carregamentos simultâneos: {maxConcurrentUpload}, tamanho do pedaço: {uploadChunkSizeMb} MB",
@@ -860,5 +857,33 @@
     "documentDownload": "Descarregamento de documentos - Completo",
     "editorSuccess": "Inicialização do editor - Sucesso! Todas as etapas foram concluídas.",
     "setupError": "Erro de configuração"
+  },
+  "trash": {
+    "title": "Recycle bin",
+    "retention": "Recycled files and operation records are retained. No automatic expiry or permanent removal is enabled.",
+    "moveToTrash": "Move to recycle bin",
+    "deleteMessage": "Move the selected files to the recycle bin. They can be restored later. Directories are currently unsupported.",
+    "directoriesUnsupported": "Directories and symlinks cannot be moved to the recycle bin. No files were permanently deleted.",
+    "sharesUnsupported": "Recycle bin actions require an authorized Source. Open the file from your signed-in file list.",
+    "reviewOperation": "Check operation {operation} before retrying. Current state: {state}.",
+    "searchHint": "Original path, file name or operation ID",
+    "empty": "No visible recycle bin records.",
+    "restore": "Restore",
+    "bytes": "bytes",
+    "operation": "Operation and integrity",
+    "checkOperation": "Check operation",
+    "restoreHint": "Enter a complete destination path in this Source. The parent folder must exist. Existing files are never overwritten.",
+    "destination": "Destination path including file name",
+    "pendingTrash": "Checking recycle result",
+    "trashed": "In recycle bin",
+    "pendingRestore": "Checking restore result",
+    "restored": "Restored",
+    "failed": "Move rejected",
+    "needsReview": "Manual reconciliation required",
+    "unknownResult": "The result is unknown. Check the operation before retrying.",
+    "restoreConflict": "The destination already exists or the operation conflicts. Check the operation, then choose an unused path.",
+    "restoreFile": "Restore: {name}",
+    "pageCount": "Showing {shown} of {total}"
   }
+
 }

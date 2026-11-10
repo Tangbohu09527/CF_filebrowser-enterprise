@@ -215,7 +215,6 @@
     "readOnlySourceNotice": "Tento zdroj je určen pouze pro čtení. Sdílení nahrávání a oprávnění, která upravují soubory, jsou zakázána."
   },
   "prompts": {
-    "deleteMessageSingle": "Opravdu chcete smazat tento soubor/složku?",
     "deleteUserMessage": "Opravdu chcete tohoto uživatele smazat?",
     "deleteTitle": "Smazat soubory",
     "displayName": "Zobrazované jméno:",
@@ -229,7 +228,6 @@
     "newFileMessage": "Zadejte název nového souboru.",
     "replaceMessage": "Jeden ze souborů, které se snažíte nahrát, má konflikt kvůli stejnému názvu. Chcete pokračovat v nahrávání nebo nahradit existující?",
     "optionalPassword": "Volitelné heslo",
-    "deleted": "Úspěšně smazáno!",
     "destinationSource": "Zdroj určení:",
     "dragAndDrop": "Přetáhněte sem soubory",
     "completed": "Dokončeno",
@@ -244,7 +242,6 @@
     "shareFavicon": "Sdílet adresu URL favicon",
     "renameMessage": "Zadejte nový název:",
     "renameMessageInvalid": "Soubor nemůže obsahovat \"/\" nebo \"\\\".",
-    "deleteMessageMultiple": "Opravdu chcete odstranit soubor(y) {count}?",
     "deleteMessageShare": "Jste si jisti, že chcete tuto sdílenou složku odstranit: {path} ?",
     "renameMessageConflict": "Položka s názvem \"{filename}\" již existuje!",
     "uploadSettingsChunked": "Maximální souběžné nahrávání: {maxConcurrentUpload}, velikost chunků: {uploadChunkSizeMb} MB",
@@ -860,5 +857,33 @@
     "documentDownload": "Dokument ke stažení - kompletní",
     "editorSuccess": "Inicializace editoru - úspěch! Všechny kroky byly dokončeny.",
     "setupError": "Chyba nastavení"
+  },
+  "trash": {
+    "title": "Recycle bin",
+    "retention": "Recycled files and operation records are retained. No automatic expiry or permanent removal is enabled.",
+    "moveToTrash": "Move to recycle bin",
+    "deleteMessage": "Move the selected files to the recycle bin. They can be restored later. Directories are currently unsupported.",
+    "directoriesUnsupported": "Directories and symlinks cannot be moved to the recycle bin. No files were permanently deleted.",
+    "sharesUnsupported": "Recycle bin actions require an authorized Source. Open the file from your signed-in file list.",
+    "reviewOperation": "Check operation {operation} before retrying. Current state: {state}.",
+    "searchHint": "Original path, file name or operation ID",
+    "empty": "No visible recycle bin records.",
+    "restore": "Restore",
+    "bytes": "bytes",
+    "operation": "Operation and integrity",
+    "checkOperation": "Check operation",
+    "restoreHint": "Enter a complete destination path in this Source. The parent folder must exist. Existing files are never overwritten.",
+    "destination": "Destination path including file name",
+    "pendingTrash": "Checking recycle result",
+    "trashed": "In recycle bin",
+    "pendingRestore": "Checking restore result",
+    "restored": "Restored",
+    "failed": "Move rejected",
+    "needsReview": "Manual reconciliation required",
+    "unknownResult": "The result is unknown. Check the operation before retrying.",
+    "restoreConflict": "The destination already exists or the operation conflicts. Check the operation, then choose an unused path.",
+    "restoreFile": "Restore: {name}",
+    "pageCount": "Showing {shown} of {total}"
   }
+
 }

@@ -586,6 +586,9 @@ func extractVideoMetadata(ctx context.Context, item *iteminfo.ExtendedItemInfo, 
 }
 
 func DeleteFiles(source, absPath string, isDir bool) error {
+	if err := utils.CheckUserStorageTree(absPath); err != nil {
+		return err
+	}
 	index := indexing.GetIndex(source)
 	if index == nil {
 		return fmt.Errorf("could not get index: %v ", source)

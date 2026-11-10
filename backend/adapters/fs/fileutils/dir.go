@@ -4,12 +4,24 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+
+	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 )
 
 // CopyDir copies a directory from source to dest and all
 // of its sub-directories. It doesn't stop if it finds an error
 // during the copy. Returns an error if any.
 func CopyDir(source, dest string) error {
+	if err := utils.CheckUserStorageTree(source); err != nil {
+		return err
+	}
+	if err := utils.CheckUserStoragePath(dest); err != nil {
+		return err
+	}
+	return copyDir(source, dest)
+}
+
+func copyDir(source, dest string) error {
 	// Get properties of source.
 	srcinfo, err := os.Stat(source)
 	if err != nil {
@@ -41,7 +53,7 @@ func CopyDir(source, dest string) error {
 
 		if obj.IsDir() {
 			// Create sub-directories, recursively.
-			err = CopyDir(fsource, fdest)
+			err = copyDir(fsource, fdest)
 			if err != nil {
 				errs = append(errs, err)
 			}

@@ -443,6 +443,13 @@ type FileInfoRequest struct {
 // This eliminates duplicate stat/lstat calls and redundant isHidden/isSymlink checks
 func (idx *Index) resolvePathContext(indexPath string, followSymlinks bool) (*PathContext, error) {
 	realPath := filepath.Join(idx.Path, indexPath)
+	if utils.IsReservedStoragePath(realPath) {
+		return nil, errors.ErrAccessDenied
+	}
+	resolvedPath, resolveErr := filepath.EvalSymlinks(realPath)
+	if resolveErr == nil && utils.IsReservedStoragePath(resolvedPath) {
+		return nil, errors.ErrAccessDenied
+	}
 
 	// ONE filesystem stat call
 	fileInfo, err := os.Lstat(realPath)
@@ -997,6 +1004,13 @@ func (idx *Index) GetDirInfo(dirInfo *os.File, stat os.FileInfo, indexPath strin
 func (idx *Index) GetRealPath(relativePath ...string) (string, bool, error) {
 	combined := append([]string{idx.Path}, relativePath...)
 	joinedPath := filepath.Join(combined...)
+	if utils.IsReservedStoragePath(joinedPath) {
+		return "", false, errors.ErrAccessDenied
+	}
+	resolved, resolveErr := filepath.EvalSymlinks(joinedPath)
+	if resolveErr == nil && utils.IsReservedStoragePath(resolved) {
+		return "", false, errors.ErrAccessDenied
+	}
 	isDir, _ := IsDirCache.Get(joinedPath + ":isdir")
 	cached, ok := RealPathCache.Get(joinedPath)
 	if ok && cached != "" {
@@ -1294,6 +1308,12 @@ func setFilePreviewFlags(fileInfo *iteminfo.ItemInfo, realPath string) {
 // IsViewable checks if a path is viewable (allows FS access)
 // Only checks the item itself, not parent paths
 func (idx *Index) IsViewable(isDir bool, indexPath string, isSymlink bool, isHidden bool) bool {
+	if utils.IsReservedStoragePath(indexPath) || utils.IsReservedStoragePath(idx.Path) {
+		return false
+	}
+	if utils.CheckUserStoragePath(filepath.Join(idx.Path, indexPath)) != nil {
+		return false
+	}
 	if indexPath == "/" || idx.Config.ResolvedRules.NoRules {
 		return true
 	}
@@ -1379,6 +1399,12 @@ func (idx *Index) IsViewableWithParentCheck(isDir bool, indexPath string, isSyml
 // ShouldSkip checks if a path should be skipped from indexing
 // isRoutineScan: true for scanner (no parent checks), false for API (check parents)
 func (idx *Index) ShouldSkip(isDir bool, adjustedPath string, isHidden bool, isSymlink bool, isRoutineScan bool) bool {
+	if utils.IsReservedStoragePath(adjustedPath) || utils.IsReservedStoragePath(idx.Path) {
+		return true
+	}
+	if utils.CheckUserStoragePath(filepath.Join(idx.Path, adjustedPath)) != nil {
+		return true
+	}
 	if idx.Config.ResolvedRules.IndexingDisabled {
 		return true
 	}

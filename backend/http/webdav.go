@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -301,6 +302,13 @@ func (ffs *filteredFileSystem) OpenFile(ctx context.Context, requestPath string,
 }
 
 func (ffs *filteredFileSystem) RemoveAll(ctx context.Context, requestPath string) error {
+	idx := indexing.GetIndex(ffs.source)
+	if idx == nil {
+		return os.ErrPermission
+	}
+	if err := utils.CheckUserStorageTree(filepath.Join(idx.Path, ffs.userScope, requestPath)); err != nil {
+		return err
+	}
 	if !ffs.user.Permissions.Delete {
 		return fmt.Errorf("delete permission required")
 	}
@@ -315,6 +323,16 @@ func (ffs *filteredFileSystem) RemoveAll(ctx context.Context, requestPath string
 }
 
 func (ffs *filteredFileSystem) Rename(ctx context.Context, oldPath, newPath string) error {
+	idx := indexing.GetIndex(ffs.source)
+	if idx == nil {
+		return os.ErrPermission
+	}
+	if err := utils.CheckUserStorageTree(filepath.Join(idx.Path, ffs.userScope, oldPath)); err != nil {
+		return err
+	}
+	if err := utils.CheckUserStoragePath(filepath.Join(idx.Path, ffs.userScope, newPath)); err != nil {
+		return err
+	}
 	if !ffs.user.Permissions.Modify {
 		return fmt.Errorf("modify permission required")
 	}

@@ -100,7 +100,7 @@ test("delete file", async({ page, checkForErrors }) => {
   await page.locator('button[aria-label="Delete"]').click();
   await expect( page.locator('.card-content')).toContainText('/deleteme.txt');
   await page.locator('button[aria-label="Confirm-Delete"]').click();
-  await checkForNotification(page, "Deleted successfully!");
+  await checkForNotification(page, "In recycle bin");
 
   // verify its no longer in index via search
   await page.locator('#search-bar-input').click()
@@ -157,7 +157,7 @@ test("create a file with the same name as a directory", async({ page, checkForEr
   await page.locator('button[aria-label="Delete"]').click();
   await expect(page.locator('.card-content')).toContainText('/mytest');
   await page.locator('button[aria-label="Confirm-Delete"]').click();
-  await checkForNotification(page, "Deleted successfully!");
+  await checkForNotification(page, "In recycle bin");
   await openContextMenu();
   await page.locator('button[aria-label="New folder"]').click();
   await page.locator('input[aria-label="New Folder Name"]').waitFor({ state: 'visible' });

@@ -145,7 +145,6 @@
     "passkeyLogin": "Використати ключ доступу"
   },
   "prompts": {
-    "deleteMessageSingle": "Видалити цей файл/каталог?",
     "deleteTitle": "Видалити файлы",
     "displayName": "Відображене ім'я:",
     "download": "Завантажити файлы",
@@ -159,7 +158,6 @@
     "replaceMessage": "Ім'я одного з файлів, що завантажуються, збігається з вже існуючим файлом. Ви бажаєте замінити існуючий?\n",
     "optionalPassword": "Необов'язковий пароль",
     "deleteUserMessage": "Ви впевнені, що хочете видалити цього користувача?",
-    "deleted": "Видалено успішно!",
     "destinationSource": "Місце призначення Джерело:",
     "dragAndDrop": "Перетягніть файли сюди",
     "completed": "Завершено",
@@ -174,7 +172,6 @@
     "shareFavicon": "Поділитися URL-адресою іконки",
     "renameMessage": "Введіть нове ім'я:",
     "renameMessageInvalid": "Файл не може містити символи \"/\" або \"\\\"",
-    "deleteMessageMultiple": "Ви дійсно хочете видалити файл(и) {count}?",
     "deleteMessageShare": "Ви впевнені, що хочете видалити цей ресурс? {path} ?",
     "renameMessageConflict": "Елемент з назвою \"{filename}\" вже існує!",
     "uploadSettingsChunked": "Максимальна кількість одночасних завантажень: {maxConcurrentUpload}, розмір фрагмента: {uploadChunkSizeMb} МБ",
@@ -860,5 +857,33 @@
     "documentDownload": "Завантаження документа - Повне",
     "editorSuccess": "Ініціалізація редактора - успіх! Всі кроки виконано.",
     "setupError": "Помилка встановлення"
+  },
+  "trash": {
+    "title": "Recycle bin",
+    "retention": "Recycled files and operation records are retained. No automatic expiry or permanent removal is enabled.",
+    "moveToTrash": "Move to recycle bin",
+    "deleteMessage": "Move the selected files to the recycle bin. They can be restored later. Directories are currently unsupported.",
+    "directoriesUnsupported": "Directories and symlinks cannot be moved to the recycle bin. No files were permanently deleted.",
+    "sharesUnsupported": "Recycle bin actions require an authorized Source. Open the file from your signed-in file list.",
+    "reviewOperation": "Check operation {operation} before retrying. Current state: {state}.",
+    "searchHint": "Original path, file name or operation ID",
+    "empty": "No visible recycle bin records.",
+    "restore": "Restore",
+    "bytes": "bytes",
+    "operation": "Operation and integrity",
+    "checkOperation": "Check operation",
+    "restoreHint": "Enter a complete destination path in this Source. The parent folder must exist. Existing files are never overwritten.",
+    "destination": "Destination path including file name",
+    "pendingTrash": "Checking recycle result",
+    "trashed": "In recycle bin",
+    "pendingRestore": "Checking restore result",
+    "restored": "Restored",
+    "failed": "Move rejected",
+    "needsReview": "Manual reconciliation required",
+    "unknownResult": "The result is unknown. Check the operation before retrying.",
+    "restoreConflict": "The destination already exists or the operation conflicts. Check the operation, then choose an unused path.",
+    "restoreFile": "Restore: {name}",
+    "pageCount": "Showing {shown} of {total}"
   }
+
 }

@@ -136,7 +136,7 @@ test("delete file", async ({ page, theme }) => {
   await page.locator('.selected-count-header').waitFor({ state: 'visible' });
   await expect(page.locator('.selected-count-header')).toHaveText('1');
   await page.locator('button[aria-label="Delete"]').click();
-  await expect(page.locator('.card-message')).toHaveText('Are you sure you want to delete this file/folder?');
+  await expect(page.locator('.card-message')).toHaveText('Move the selected files to the recycle bin. They can be restored later. Directories are currently unsupported.');
   await expect(page.locator('.delete-item-wrapper > .listing-item > .text > .name')).toContainText('/deleteme.txt');
   await page.waitForTimeout(500);
   await page.screenshot({ path: `./generated/prompts/delete-deleteme.txt-${theme}.jpg`, quality: jpgQuality });
