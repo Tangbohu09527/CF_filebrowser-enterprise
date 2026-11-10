@@ -73,4 +73,60 @@ type Link struct {
 	Mu            sync.Mutex     `json:"-"`
 	UserDownloads map[string]int `json:"userDownloads,omitempty"` // Track downloads per username
 	Version       int            `json:"version,omitempty"`
+
+	// Metadata snapshots share one stable owner for runtime download counts.
+	// The owner keeps the existing persisted fields and mutex; neither is copied.
+	downloadState *downloadState
+}
+
+type downloadState struct {
+	owner *Link
+}
+
+func (link *Link) downloadsOwner() *Link {
+	link.Mu.Lock()
+	defer link.Mu.Unlock()
+	if link.downloadState == nil {
+		link.downloadState = &downloadState{owner: link}
+	}
+	return link.downloadState.owner
+}
+
+// Clone returns detached metadata and count snapshots while retaining the
+// stable runtime download state used by active requests for this share.
+func (link *Link) Clone() *Link {
+	if link == nil {
+		return nil
+	}
+	owner := link.downloadsOwner()
+	owner.Mu.Lock()
+	defer owner.Mu.Unlock()
+	common := link.CommonShare
+	if common.AllowedUsernames != nil {
+		common.AllowedUsernames = append([]string{}, common.AllowedUsernames...)
+	}
+	if common.SidebarLinks != nil {
+		common.SidebarLinks = append([]users.SidebarLink{}, common.SidebarLinks...)
+	}
+	var userDownloads map[string]int
+	if owner.UserDownloads != nil {
+		userDownloads = make(map[string]int, len(owner.UserDownloads))
+		for username, downloads := range owner.UserDownloads {
+			userDownloads[username] = downloads
+		}
+	}
+	return &Link{
+		CommonShare: common, Downloads: owner.Downloads, Hash: link.Hash,
+		UserID: link.UserID, Expire: link.Expire, PasswordHash: link.PasswordHash,
+		Token: link.Token, UserDownloads: userDownloads, Version: link.Version,
+		downloadState: link.downloadState,
+	}
+}
+
+// persistenceSnapshot has no runtime aliases, so backend serialization cannot
+// race with a download that starts after this snapshot was taken.
+func (link *Link) persistenceSnapshot() *Link {
+	snapshot := link.Clone()
+	snapshot.downloadState = nil
+	return snapshot
 }

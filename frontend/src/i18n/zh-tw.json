@@ -145,7 +145,6 @@
     "passkeyLogin": "使用通行密鑰"
   },
   "prompts": {
-    "deleteMessageSingle": "確定要刪除此檔案或資料夾嗎？",
     "deleteTitle": "刪除檔案",
     "displayName": "名稱：",
     "download": "下載檔案",
@@ -162,7 +161,6 @@
     "dragAndDrop": "將檔案拖放至此",
     "completed": "已完成",
     "optionalPassword": "選填密碼",
-    "deleted": "已成功刪除！",
     "conflictsDetected": "偵測到衝突",
     "downloadsLimit": "下載次數上限",
     "maxBandwidth": "最大下載頻寬 (kbps)",
@@ -174,7 +172,6 @@
     "shareFavicon": "分享圖示網址",
     "renameMessage": "輸入新名稱：",
     "renameMessageInvalid": "檔案名稱不能包含 \"/\" 或 \"\\\"",
-    "deleteMessageMultiple": "您確定要刪除 {count} 個檔案嗎？",
     "deleteMessageShare": "您確定要刪除此分享嗎？{path}",
     "renameMessageConflict": "名稱為 \"{filename}\" 的項目已存在！",
     "uploadSettingsChunked": "最大同時上傳數：{maxConcurrentUpload}，分塊大小：{uploadChunkSizeMb} MB",
@@ -860,5 +857,33 @@
     "documentDownload": "文件下載 - 完成",
     "editorSuccess": "編輯器初始化 - 成功！所有步驟完成。",
     "setupError": "設定錯誤"
+  },
+  "trash": {
+    "title": "Recycle bin",
+    "retention": "Recycled files and operation records are retained. No automatic expiry or permanent removal is enabled.",
+    "moveToTrash": "Move to recycle bin",
+    "deleteMessage": "Move the selected files to the recycle bin. They can be restored later. Directories are currently unsupported.",
+    "directoriesUnsupported": "Directories and symlinks cannot be moved to the recycle bin. No files were permanently deleted.",
+    "sharesUnsupported": "Recycle bin actions require an authorized Source. Open the file from your signed-in file list.",
+    "reviewOperation": "Check operation {operation} before retrying. Current state: {state}.",
+    "searchHint": "Original path, file name or operation ID",
+    "empty": "No visible recycle bin records.",
+    "restore": "Restore",
+    "bytes": "bytes",
+    "operation": "Operation and integrity",
+    "checkOperation": "Check operation",
+    "restoreHint": "Enter a complete destination path in this Source. The parent folder must exist. Existing files are never overwritten.",
+    "destination": "Destination path including file name",
+    "pendingTrash": "Checking recycle result",
+    "trashed": "In recycle bin",
+    "pendingRestore": "Checking restore result",
+    "restored": "Restored",
+    "failed": "Move rejected",
+    "needsReview": "Manual reconciliation required",
+    "unknownResult": "The result is unknown. Check the operation before retrying.",
+    "restoreConflict": "The destination already exists or the operation conflicts. Check the operation, then choose an unused path.",
+    "restoreFile": "Restore: {name}",
+    "pageCount": "Showing {shown} of {total}"
   }
+
 }

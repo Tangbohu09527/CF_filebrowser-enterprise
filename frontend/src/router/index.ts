@@ -11,10 +11,12 @@ import Layout from "@/views/Layout.vue";
 import Login from "@/views/Login.vue";
 import Settings from "@/views/Settings.vue";
 import Tools from "@/views/Tools.vue";
+import Trash from "@/views/Trash.vue";
 
 const translate = (key: string): string => i18n.global.t(key) as string;
 
 const titles: Record<string, string> = {
+	Trash: translate("trash.title"),
   Login: translate("general.login"),
   Share: translate("general.share"),
   /** Same component as Share; name differs for /public optional-auth routes. */
@@ -35,6 +37,7 @@ const titles: Record<string, string> = {
 };
 
 const routes: RouteRecordRaw[] = [
+  { path: "/trash", component: Layout, meta: { requiresAuth: true }, children: [{ path: "", name: "Trash", component: Trash }] },
   {
     path: "/login",
     name: "Login",

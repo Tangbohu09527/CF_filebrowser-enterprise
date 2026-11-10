@@ -145,7 +145,6 @@
     "passkeyLogin": "Použiť Passkey"
   },
   "prompts": {
-    "deleteMessageSingle": "Naozaj chcete odstrániť tento súbor/priečinok?",
     "deleteTitle": "Odstránenie súborov",
     "displayName": "Zobrazený názov:",
     "download": "Stiahnuť súbory",
@@ -159,7 +158,6 @@
     "replaceMessage": "Niektorý nahrávaný súbor je v konflikte názvov. Chcete nahradiť existujúci súbor?\n",
     "optionalPassword": "Voliteľné heslo",
     "deleteUserMessage": "Ste si istí, že chcete odstrániť tohto používateľa?",
-    "deleted": "Úspešne vymazané!",
     "destinationSource": "Cieľový zdroj:",
     "dragAndDrop": "Presuňte sem súbory",
     "completed": "Dokončené",
@@ -174,7 +172,6 @@
     "shareFavicon": "Zdieľanie adresy URL favicon",
     "renameMessage": "Zadajte nový názov:",
     "renameMessageInvalid": "Súbor nemôže obsahovať \"/\" alebo \"\\\"",
-    "deleteMessageMultiple": "Ste si istí, že chcete odstrániť súbor(y) {count}?",
     "deleteMessageShare": "Ste si istí, že chcete odstrániť toto zdieľanie: {path} ?",
     "renameMessageConflict": "Položka s názvom \"{filename}\" už existuje!",
     "uploadSettingsChunked": "Maximálne súbežné nahrávanie: {maxConcurrentUpload}, veľkosť chunk: {uploadChunkSizeMb} MB",
@@ -860,5 +857,33 @@
     "documentDownload": "Stiahnutie dokumentu - Kompletné",
     "editorSuccess": "Inicializácia editora - úspech! Všetky kroky boli dokončené.",
     "setupError": "Chyba nastavenia"
+  },
+  "trash": {
+    "title": "Recycle bin",
+    "retention": "Recycled files and operation records are retained. No automatic expiry or permanent removal is enabled.",
+    "moveToTrash": "Move to recycle bin",
+    "deleteMessage": "Move the selected files to the recycle bin. They can be restored later. Directories are currently unsupported.",
+    "directoriesUnsupported": "Directories and symlinks cannot be moved to the recycle bin. No files were permanently deleted.",
+    "sharesUnsupported": "Recycle bin actions require an authorized Source. Open the file from your signed-in file list.",
+    "reviewOperation": "Check operation {operation} before retrying. Current state: {state}.",
+    "searchHint": "Original path, file name or operation ID",
+    "empty": "No visible recycle bin records.",
+    "restore": "Restore",
+    "bytes": "bytes",
+    "operation": "Operation and integrity",
+    "checkOperation": "Check operation",
+    "restoreHint": "Enter a complete destination path in this Source. The parent folder must exist. Existing files are never overwritten.",
+    "destination": "Destination path including file name",
+    "pendingTrash": "Checking recycle result",
+    "trashed": "In recycle bin",
+    "pendingRestore": "Checking restore result",
+    "restored": "Restored",
+    "failed": "Move rejected",
+    "needsReview": "Manual reconciliation required",
+    "unknownResult": "The result is unknown. Check the operation before retrying.",
+    "restoreConflict": "The destination already exists or the operation conflicts. Check the operation, then choose an unused path.",
+    "restoreFile": "Restore: {name}",
+    "pageCount": "Showing {shown} of {total}"
   }
+
 }

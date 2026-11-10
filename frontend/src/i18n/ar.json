@@ -145,7 +145,6 @@
     "passkeyLogin": "استخدام مفتاح المرور"
   },
   "prompts": {
-    "deleteMessageSingle": "هل تريد بالتأكيد حذف هذا الملف/المجلد؟",
     "deleteTitle": "حذف الملفات",
     "displayName": "الإسم:",
     "download": "تحميل الملفات",
@@ -159,7 +158,6 @@
     "replaceMessage": "أحد الملفات التي تحاول رفعها يتعارض مع ملف موجود بنفس الإسم. هل تريد إستبدال الملف الموجود؟\n",
     "deleteUserMessage": "هل أنت متأكد من رغبتك في حذف هذا المستخدم؟",
     "optionalPassword": "كلمة مرور اختيارية",
-    "deleted": "تم الحذف بنجاح!",
     "destinationSource": "مصدر الوجهة:",
     "dragAndDrop": "سحب الملفات وإفلاتها هنا",
     "completed": "مكتمل",
@@ -174,7 +172,6 @@
     "shareFavicon": "مشاركة عنوان URL المفضل",
     "renameMessage": "أدخل اسماً جديداً:",
     "renameMessageInvalid": "لا يمكن أن يحتوي الملف على \"/\" أو \"\\\"",
-    "deleteMessageMultiple": "هل تريد بالتأكيد حذف الملف (الملفات) {count} ؟",
     "deleteMessageShare": "هل أنت متأكد أنك تريد حذف هذه المشاركة؟ {path} ?",
     "renameMessageConflict": "عنصر باسم \"{filename}\" موجود بالفعل!",
     "uploadSettingsChunked": "الحد الأقصى للتحميلات المتزامنة: {maxConcurrentUpload} ، حجم القطعة: {uploadChunkSizeMb} ميغابايت",
@@ -860,5 +857,33 @@
     "documentDownload": "تنزيل المستند - مكتمل",
     "editorSuccess": "تهيئة المحرر - نجاح! اكتملت جميع الخطوات.",
     "setupError": "خطأ في الإعداد"
+  },
+  "trash": {
+    "title": "Recycle bin",
+    "retention": "Recycled files and operation records are retained. No automatic expiry or permanent removal is enabled.",
+    "moveToTrash": "Move to recycle bin",
+    "deleteMessage": "Move the selected files to the recycle bin. They can be restored later. Directories are currently unsupported.",
+    "directoriesUnsupported": "Directories and symlinks cannot be moved to the recycle bin. No files were permanently deleted.",
+    "sharesUnsupported": "Recycle bin actions require an authorized Source. Open the file from your signed-in file list.",
+    "reviewOperation": "Check operation {operation} before retrying. Current state: {state}.",
+    "searchHint": "Original path, file name or operation ID",
+    "empty": "No visible recycle bin records.",
+    "restore": "Restore",
+    "bytes": "bytes",
+    "operation": "Operation and integrity",
+    "checkOperation": "Check operation",
+    "restoreHint": "Enter a complete destination path in this Source. The parent folder must exist. Existing files are never overwritten.",
+    "destination": "Destination path including file name",
+    "pendingTrash": "Checking recycle result",
+    "trashed": "In recycle bin",
+    "pendingRestore": "Checking restore result",
+    "restored": "Restored",
+    "failed": "Move rejected",
+    "needsReview": "Manual reconciliation required",
+    "unknownResult": "The result is unknown. Check the operation before retrying.",
+    "restoreConflict": "The destination already exists or the operation conflicts. Check the operation, then choose an unused path.",
+    "restoreFile": "Restore: {name}",
+    "pageCount": "Showing {shown} of {total}"
   }
+
 }

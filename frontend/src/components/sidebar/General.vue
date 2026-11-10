@@ -69,6 +69,9 @@
 
   <!-- Sidebar Links Component (replaces sources) -->
   <SidebarLinks />
+  <div v-if="!isShare && user?.permissions?.delete && user?.permissions?.browse" class="card">
+    <router-link class="button" to="/trash" :aria-label="$t('trash.title')"><i class="material-symbols">recycling</i>{{ $t('trash.title') }}</router-link>
+  </div>
 </template>
 
 <script>

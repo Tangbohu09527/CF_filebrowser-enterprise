@@ -578,7 +578,10 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 	fullIndexPath := utils.JoinPathAsUnix(userscope, path)
 
 	// get scoped path
-	realPath, _, _ := idx.GetRealPath(fullIndexPath)
+	realPath, _, resolveErr := idx.GetRealPath(fullIndexPath)
+	if resolveErr == errors.ErrAccessDenied {
+		return http.StatusForbidden, resolveErr
+	}
 
 	// Check access control for the target path
 	if !store.Access.Permitted(idx.Path, path, filePermUser.Username) {

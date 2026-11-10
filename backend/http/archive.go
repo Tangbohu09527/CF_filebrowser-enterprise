@@ -721,6 +721,12 @@ func addFile(source string, path string, d *requestContext, tarWriter *tar.Write
 			if err != nil {
 				return err
 			}
+			if utils.CheckUserStoragePath(filePath) != nil {
+				if fileInfo.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
 
 			// Calculate the relative path
 			relPath, err := filepath.Rel(realPath, filePath)
@@ -785,6 +791,9 @@ func addFile(source string, path string, d *requestContext, tarWriter *tar.Write
 
 // addSingleFile writes one file into the given zip or tar writer.
 func addSingleFile(realPath, archivePath string, zipWriter *zip.Writer, tarWriter *tar.Writer) error {
+	if err := utils.CheckUserStoragePath(realPath); err != nil {
+		return err
+	}
 	file, err := os.Open(realPath)
 	if err != nil {
 		if strings.Contains(err.Error(), "is a directory") {
@@ -1368,6 +1377,9 @@ func safeExtractPath(destDir, name string) (string, error) {
 	}
 	// Convert to platform separators so filepath.Join and os.Mkdir work correctly
 	abs := filepath.Join(destDir, filepath.FromSlash(relSlash))
+	if err = utils.CheckUserStoragePath(abs); err != nil {
+		return "", err
+	}
 	destAbs, err := filepath.Abs(destDir)
 	if err != nil {
 		return "", err
@@ -1432,6 +1444,9 @@ func symlinkTargetStaysUnderDest(destRoot, destPath, linkname string) error {
 		return err
 	}
 	resolved := filepath.Clean(filepath.Join(filepath.Dir(destPath), linkname))
+	if err = utils.CheckUserStoragePath(resolved); err != nil {
+		return err
+	}
 	resAbs, err := filepath.Abs(resolved)
 	if err != nil {
 		return err

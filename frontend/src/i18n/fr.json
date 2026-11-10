@@ -145,7 +145,6 @@
     "passkeyLogin": "Utiliser une clé d'accès"
   },
   "prompts": {
-    "deleteMessageSingle": "Êtes-vous sûr de vouloir supprimer cet élément ?",
     "deleteTitle": "Supprimer",
     "displayName": "Nom :",
     "download": "Télécharger",
@@ -159,7 +158,6 @@
     "replaceMessage": "Un des fichiers que vous êtes en train d'importer a le même nom qu'un autre déjà présent. Voulez-vous remplacer le fichier actuel par le nouveau ?\n",
     "optionalPassword": "Mot de passe optionnel",
     "deleteUserMessage": "Êtes-vous sûr de vouloir supprimer cet utilisateur ?",
-    "deleted": "Supprimé avec succès !",
     "destinationSource": "Destination Source :",
     "dragAndDrop": "Glisser-déposer des fichiers ici",
     "completed": "Terminé",
@@ -174,7 +172,6 @@
     "shareFavicon": "Partager l'URL de la favicon",
     "renameMessage": "Saisissez un nouveau nom :",
     "renameMessageInvalid": "Un fichier ne peut pas contenir \"/\" ou \"\\\"",
-    "deleteMessageMultiple": "Êtes-vous sûr de vouloir supprimer le(s) fichier(s) {count}?",
     "deleteMessageShare": "Êtes-vous sûr de vouloir supprimer ce partage : {path} ?",
     "renameMessageConflict": "Un article nommé \"{filename}\" existe déjà !",
     "uploadSettingsChunked": "Nombre maximum d'importations simultanées : {maxConcurrentUpload}, taille de chunk : {uploadChunkSizeMb} Mo",
@@ -860,5 +857,33 @@
     "documentDownload": "Téléchargement du document - Complet",
     "editorSuccess": "Initialisation de l'éditeur - Succès ! Toutes les étapes sont terminées.",
     "setupError": "Erreur de configuration"
+  },
+  "trash": {
+    "title": "Recycle bin",
+    "retention": "Recycled files and operation records are retained. No automatic expiry or permanent removal is enabled.",
+    "moveToTrash": "Move to recycle bin",
+    "deleteMessage": "Move the selected files to the recycle bin. They can be restored later. Directories are currently unsupported.",
+    "directoriesUnsupported": "Directories and symlinks cannot be moved to the recycle bin. No files were permanently deleted.",
+    "sharesUnsupported": "Recycle bin actions require an authorized Source. Open the file from your signed-in file list.",
+    "reviewOperation": "Check operation {operation} before retrying. Current state: {state}.",
+    "searchHint": "Original path, file name or operation ID",
+    "empty": "No visible recycle bin records.",
+    "restore": "Restore",
+    "bytes": "bytes",
+    "operation": "Operation and integrity",
+    "checkOperation": "Check operation",
+    "restoreHint": "Enter a complete destination path in this Source. The parent folder must exist. Existing files are never overwritten.",
+    "destination": "Destination path including file name",
+    "pendingTrash": "Checking recycle result",
+    "trashed": "In recycle bin",
+    "pendingRestore": "Checking restore result",
+    "restored": "Restored",
+    "failed": "Move rejected",
+    "needsReview": "Manual reconciliation required",
+    "unknownResult": "The result is unknown. Check the operation before retrying.",
+    "restoreConflict": "The destination already exists or the operation conflicts. Check the operation, then choose an unused path.",
+    "restoreFile": "Restore: {name}",
+    "pageCount": "Showing {shown} of {total}"
   }
+
 }

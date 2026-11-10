@@ -279,11 +279,11 @@ func TestPermissionPreviewSecurity(t *testing.T) {
 			t.Fatal("first preview did not populate the expected safe cache entry")
 		}
 
-		if err := os.WriteFile(file.realPath, contentB, 0644); err != nil {
-			t.Fatal(err)
+		if writeErr := os.WriteFile(file.realPath, contentB, 0644); writeErr != nil {
+			t.Fatal(writeErr)
 		}
-		if err := os.Chtimes(file.realPath, originalStat.ModTime(), originalStat.ModTime()); err != nil {
-			t.Fatal(err)
+		if timesErr := os.Chtimes(file.realPath, originalStat.ModTime(), originalStat.ModTime()); timesErr != nil {
+			t.Fatal(timesErr)
 		}
 		replacementStat, err := os.Stat(file.realPath)
 		if err != nil {
@@ -1073,8 +1073,8 @@ func (fixture *previewSecurityFixture) storeCacheEntry(t *testing.T, key string,
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cache.Store(context.Background(), key, content); err != nil {
-		t.Fatal(err)
+	if storeErr := cache.Store(context.Background(), key, content); storeErr != nil {
+		t.Fatal(storeErr)
 	}
 	stored, found, err := cache.Load(context.Background(), key)
 	if err != nil {

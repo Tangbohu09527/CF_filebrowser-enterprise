@@ -582,6 +582,9 @@ func TestPermissionShareSecurityFailures(t *testing.T) {
 
 		traversal := h.saveShare(t, owner, "traversal-share-root", "/public", nil)
 		traversal.Path = "/public/../"
+		if err := store.Share.Save(traversal); err != nil {
+			t.Fatal(err)
+		}
 		traversalRoot := h.download("traversal-share-root", "/secret.txt")
 		assertPermissionShareReadDenied(t, "traversal stored share root", traversalRoot)
 	})
@@ -629,8 +632,8 @@ func TestPermissionShareSecurityFailures(t *testing.T) {
 		var created struct {
 			Hash string `json:"hash"`
 		}
-		if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
-			t.Fatalf("decode upload share response: %v", err)
+		if decodeErr := json.NewDecoder(response.Body).Decode(&created); decodeErr != nil {
+			t.Fatalf("decode upload share response: %v", decodeErr)
 		}
 		if created.Hash == "" {
 			t.Fatal("create upload share returned an empty hash")
@@ -824,8 +827,8 @@ func TestPermissionShareSecurityFailures(t *testing.T) {
 		const existingName = "password-upload-existing.txt"
 		const existingContent = "existing protected upload content"
 		existingPath := filepath.Join(h.sourcePath, "public", existingName)
-		if err := os.WriteFile(existingPath, []byte(existingContent), 0o644); err != nil {
-			t.Fatalf("write existing protected upload: %v", err)
+		if writeErr := os.WriteFile(existingPath, []byte(existingContent), 0o644); writeErr != nil {
+			t.Fatalf("write existing protected upload: %v", writeErr)
 		}
 		replacement := h.request(http.MethodPost, "/public/api/resources", url.Values{
 			"hash":     {link.Hash},
@@ -1196,6 +1199,8 @@ func TestPermissionShareSecurityFailures(t *testing.T) {
 		if err != nil {
 			t.Fatalf("prime share cache: %v", err)
 		}
+		// Metadata is detached; an unpersisted count proves runtime cache reuse.
+		cachedBefore.IncrementUserDownload("cache-fixture-probe")
 
 		setPermissionSharePermissionIfPresent(&owner.Permissions, "Download", false)
 		h.updateOwnerPermissions(t, owner)
@@ -1203,8 +1208,8 @@ func TestPermissionShareSecurityFailures(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read cached share after owner update: %v", err)
 		}
-		if cachedBefore != cachedAfter {
-			t.Fatal("share cache fixture did not return the cached Link instance")
+		if cachedAfter.GetUserDownloadCount("cache-fixture-probe") != 1 {
+			t.Fatal("share cache fixture did not retain cached runtime state")
 		}
 
 		denied := h.download("cache-permission-share", "/secret.txt")

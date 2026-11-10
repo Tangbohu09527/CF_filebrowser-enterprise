@@ -315,6 +315,9 @@ func (s *Storage) DenyAll(sourcePath, indexPath string) error {
 
 // Permitted checks if a username is permitted for a given sourcePath and indexPath, recursively checking parent directories.
 func (s *Storage) Permitted(sourcePath, indexPath, username string) bool {
+	if utils.IsReservedStoragePath(sourcePath) || utils.IsReservedStoragePath(indexPath) {
+		return false
+	}
 	// Ensure leading slash
 	if !strings.HasPrefix(indexPath, "/") {
 		indexPath = "/" + indexPath
@@ -345,6 +348,9 @@ func (s *Storage) Permitted(sourcePath, indexPath, username string) bool {
 // Public share authorization uses this path so a concurrent cache fill cannot
 // reintroduce a permission result computed before a completed revocation.
 func (s *Storage) PermittedFresh(sourcePath, indexPath, username string) bool {
+	if utils.IsReservedStoragePath(sourcePath) || utils.IsReservedStoragePath(indexPath) {
+		return false
+	}
 	if !strings.HasPrefix(indexPath, "/") {
 		indexPath = "/" + indexPath
 	}

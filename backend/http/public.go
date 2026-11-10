@@ -73,7 +73,7 @@ func publicDownloadHandler(w http.ResponseWriter, r *http.Request, d *requestCon
 	d.shareArchive = manifest
 
 	// Check global download limit (if not using per-user limits)
-	if !d.share.PerUserDownloadLimit && d.share.DownloadsLimit > 0 && d.share.Downloads >= d.share.DownloadsLimit {
+	if !d.share.PerUserDownloadLimit && d.share.DownloadsLimit > 0 && d.share.GetDownloadCount() >= d.share.DownloadsLimit {
 		return http.StatusForbidden, fmt.Errorf("share downloads limit reached")
 	}
 
@@ -89,13 +89,14 @@ func publicDownloadHandler(w http.ResponseWriter, r *http.Request, d *requestCon
 		}
 	}
 
-	d.share.Mu.Lock()
-	d.share.Downloads++
-	d.share.Mu.Unlock()
+	d.share.IncrementDownload()
 
 	// Track per-user download if enabled
 	if d.share.PerUserDownloadLimit {
 		d.share.IncrementUserDownload(d.user.Username)
+	}
+	if err = store.Share.SaveDownloads(d.share); err != nil {
+		return http.StatusInternalServerError, err
 	}
 
 	var status int
@@ -169,14 +170,25 @@ func buildPublicShareArchiveManifest(d *requestContext, sourcePath string, targe
 			if walkErr != nil {
 				return walkErr
 			}
-			relativePath, err := filepath.Rel(target.RealPath, filePath)
-			if err != nil || relativePath == "." {
-				return err
+			reserved := utils.IsReservedStoragePath(filePath)
+			if !reserved {
+				physical, physicalErr := filepath.EvalSymlinks(filePath)
+				reserved = physicalErr == nil && utils.IsReservedStoragePath(physical)
+			}
+			if reserved {
+				if entry.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			relativePath, resolveErr := filepath.Rel(target.RealPath, filePath)
+			if resolveErr != nil || relativePath == "." {
+				return resolveErr
 			}
 			logicalPath := normalizePublicShareIndexPath(path.Join(target.LogicalPath, filepath.ToSlash(relativePath)))
-			child, err := resolvePublicShareLogicalTarget(d, sourcePath, logicalPath)
-			if err != nil {
-				return err
+			child, resolveErr := resolvePublicShareLogicalTarget(d, sourcePath, logicalPath)
+			if resolveErr != nil {
+				return resolveErr
 			}
 			manifest = append(manifest, publicShareArchiveEntry{
 				LogicalPath:   child.LogicalPath,
@@ -469,25 +481,10 @@ func publicPreviewHandler(w http.ResponseWriter, r *http.Request, d *requestCont
 }
 
 func consumePublicShareOriginalRead(d *requestContext) bool {
-	d.share.Mu.Lock()
-	defer d.share.Mu.Unlock()
-	if d.share.DownloadsLimit > 0 {
-		if d.share.PerUserDownloadLimit {
-			if d.share.UserDownloads[d.user.Username] >= d.share.DownloadsLimit {
-				return false
-			}
-		} else if d.share.Downloads >= d.share.DownloadsLimit {
-			return false
-		}
+	if !d.share.ConsumeDownload(d.user.Username) {
+		return false
 	}
-	d.share.Downloads++
-	if d.share.PerUserDownloadLimit {
-		if d.share.UserDownloads == nil {
-			d.share.UserDownloads = make(map[string]int)
-		}
-		d.share.UserDownloads[d.user.Username]++
-	}
-	return true
+	return store.Share.SaveDownloads(d.share) == nil
 }
 
 func publicShareDirectoryPreviewFile(r *http.Request, d *requestContext) (*iteminfo.ExtendedFileInfo, error) {

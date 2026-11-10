@@ -68,10 +68,7 @@ export const test = base.extend<{
       await openContextMenuHelper(page);
     });
   },
-  theme: async ({}, use, testInfo) => {
-    const theme = (testInfo.project.use as { theme?: 'light' | 'dark' }).theme || 'dark';
-    await use(theme);
-  },
+  theme: ['dark', { option: true }],
   checkForNotification: async ({ page }, use) => {
     await use(async (message: string | RegExp) => {
       return await checkForNotification(page, message);

@@ -326,9 +326,7 @@ func cleanPublicShareRelativePath(value string) (string, error) {
 	if strings.HasPrefix(normalized, "//") {
 		return "", fmt.Errorf("invalid public path")
 	}
-	if strings.HasPrefix(normalized, "/") {
-		normalized = strings.TrimPrefix(normalized, "/")
-	}
+	normalized = strings.TrimPrefix(normalized, "/")
 	if strings.HasPrefix(normalized, "/") || publicShareHasDotDotSegment(normalized) || publicShareHasDrivePrefix(normalized) {
 		return "", fmt.Errorf("invalid public path")
 	}
@@ -580,7 +578,7 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 			return http.StatusForbidden, fmt.Errorf("public share access denied")
 		}
 
-		reachedDownloadsLimit := !link.PerUserDownloadLimit && link.Downloads >= link.DownloadsLimit && link.DownloadsLimit > 0
+		reachedDownloadsLimit := !link.PerUserDownloadLimit && link.GetDownloadCount() >= link.DownloadsLimit && link.DownloadsLimit > 0
 		if route.read && reachedDownloadsLimit && publicShareRequirementUsesDownload(route.requirement) {
 			invalidatePublicShareArchiveToken(query.Get("archiveToken"), link.Hash)
 			return http.StatusForbidden, fmt.Errorf("public share access denied")
@@ -681,12 +679,13 @@ func withHashFileHelper(fn handleFunc) handleFunc {
 			file.OnlyOfficeId = ""
 		}
 		if getContent && file.Content != "" {
-			link.Mu.Lock()
-			link.Downloads++
-			link.Mu.Unlock()
+			link.IncrementDownload()
 			// Track per-user download if enabled
 			if link.PerUserDownloadLimit {
 				link.IncrementUserDownload(data.user.Username)
+			}
+			if err := store.Share.SaveDownloads(link); err != nil {
+				return http.StatusInternalServerError, err
 			}
 		}
 		file.Path = utils.AddTrailingSlashIfNotExists(inputPath)
