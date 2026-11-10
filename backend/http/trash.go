@@ -33,6 +33,16 @@ type trashRequest struct {
 	RestoreOperationID string `json:"restore_operation_id"`
 }
 
+type trashItemResponse struct {
+	trash.Item
+	RestoreAttempt *trash.RestoreAttempt `json:"restore_attempt,omitempty"`
+}
+
+type trashListResponse struct {
+	Items []trash.Item `json:"items"`
+	Total int          `json:"total"`
+}
+
 func decodeTrashRequest(w http.ResponseWriter, r *http.Request) (trashRequest, error) {
 	var request trashRequest
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024))
@@ -142,12 +152,22 @@ func renderTrashItem(w http.ResponseWriter, r *http.Request, user *users.User, i
 	}
 	copy := *attempt
 	copy.Path = "/" + strings.TrimPrefix(strings.TrimPrefix(attempt.Path, scope), "/")
-	return renderJSON(w, r, struct {
-		trash.Item
-		RestoreAttempt *trash.RestoreAttempt `json:"restore_attempt"`
-	}{client, &copy})
+	return renderJSON(w, r, trashItemResponse{client, &copy})
 }
 
+// trashPostHandler explicitly recycles one regular file.
+// @Summary Move one file into the filesystem recycle bin
+// @Description Requires current Delete, SourceScope and AccessRules. Directories and symlinks are rejected. Reuse operation_id to query an unknown outcome without moving again.
+// @Tags Trash
+// @Accept json
+// @Produce json
+// @Param body body trashRequest true "source, scoped path and persistent operation_id"
+// @Success 200 {object} trash.Item
+// @Failure 400 {object} HttpResponse
+// @Failure 403 {object} HttpResponse
+// @Failure 409 {object} HttpResponse
+// @Failure 503 {object} HttpResponse
+// @Router /api/trash [post]
 func trashPostHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
 	request, err := decodeTrashRequest(w, r)
 	if err != nil || !trash.ValidID(request.OperationID) {
@@ -176,6 +196,18 @@ func trashPostHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	return renderTrashItem(w, r, d.user, idx, scope, item, s, "")
 }
 
+// trashGetHandler returns an authorized item's durable outcome.
+// @Summary Query a recycle operation or a historical restore attempt
+// @Tags Trash
+// @Produce json
+// @Param id path string true "Trash operation ID"
+// @Param source query string true "Configured Source display name"
+// @Param restore_operation_id query string false "Include the specified historical restore attempt"
+// @Success 200 {object} trashItemResponse
+// @Failure 403 {object} HttpResponse
+// @Failure 404 {object} HttpResponse
+// @Failure 503 {object} HttpResponse
+// @Router /api/trash/{id} [get]
 func trashGetHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
 	if d.user == nil || !d.user.Permissions.Browse {
 		return http.StatusForbidden, os.ErrPermission
@@ -203,6 +235,20 @@ func trashGetHandler(w http.ResponseWriter, r *http.Request, d *requestContext) 
 	return renderTrashItem(w, r, d.user, idx, scope, item, s, r.URL.Query().Get("restore_operation_id"))
 }
 
+// trashRestoreHandler restores to an explicit, authorized, unused target.
+// @Summary Restore a recycled file without overwriting an existing target
+// @Description Requires current Delete and Create, original ownership, SourceScope and AccessRules. A rejected restore retains its journal and the recycled bytes; retry with a new restore_operation_id only after querying the outcome.
+// @Tags Trash
+// @Accept json
+// @Produce json
+// @Param id path string true "Trash operation ID"
+// @Param body body trashRequest true "source, explicit scoped target path and persistent restore_operation_id"
+// @Success 200 {object} trashItemResponse
+// @Failure 400 {object} HttpResponse
+// @Failure 403 {object} HttpResponse
+// @Failure 409 {object} HttpResponse
+// @Failure 503 {object} HttpResponse
+// @Router /api/trash/{id}/restore [post]
 func trashRestoreHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
 	request, err := decodeTrashRequest(w, r)
 	if err != nil || !trash.ValidID(request.RestoreOperationID) {
@@ -246,6 +292,17 @@ func trashRestoreHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 	return renderTrashItem(w, r, d.user, idx, scope, item, s, request.RestoreOperationID)
 }
 
+// trashListHandler searches only the recycle journal and current authorization.
+// @Summary List and search authorized recycle records, including restored items
+// @Tags Trash
+// @Produce json
+// @Param source query string true "Configured Source display name"
+// @Param query query string false "Original path, file name or operation ID substring"
+// @Param offset query int false "Record offset"
+// @Param limit query int false "Page size, 1 to 200, default 50"
+// @Success 200 {object} trashListResponse
+// @Failure 403 {object} HttpResponse
+// @Router /api/trash [get]
 func trashListHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
 	if d.user == nil || !d.user.Permissions.Browse {
 		return http.StatusForbidden, os.ErrPermission
@@ -304,8 +361,5 @@ func trashListHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	if end > total {
 		end = total
 	}
-	return renderJSON(w, r, struct {
-		Items []trash.Item `json:"items"`
-		Total int          `json:"total"`
-	}{items[offset:end], total})
+	return renderJSON(w, r, trashListResponse{items[offset:end], total})
 }

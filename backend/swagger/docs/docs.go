@@ -952,6 +952,12 @@ const docTemplate = `{
                         "name": "permissions",
                         "in": "query",
                         "required": true
+                    },
+                    {
+                        "type": "boolean",
+                        "description": "Create a stateful token that uses current user permissions",
+                        "name": "minimal",
+                        "in": "query"
                     }
                 ],
                 "responses": {
@@ -2496,6 +2502,15 @@ const docTemplate = `{
                             }
                         }
                     },
+                    "403": {
+                        "description": "Browse, preview, or download permission required",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
                     "404": {
                         "description": "File not found",
                         "schema": {
@@ -3332,6 +3347,238 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/trash": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Trash"
+                ],
+                "summary": "List and search authorized recycle records, including restored items",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Configured Source display name",
+                        "name": "source",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Original path, file name or operation ID substring",
+                        "name": "query",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Record offset",
+                        "name": "offset",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page size, 1 to 200, default 50",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/http.trashListResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Requires current Delete, SourceScope and AccessRules. Directories and symlinks are rejected. Reuse operation_id to query an unknown outcome without moving again.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Trash"
+                ],
+                "summary": "Move one file into the filesystem recycle bin",
+                "parameters": [
+                    {
+                        "description": "source, scoped path and persistent operation_id",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/http.trashRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/trash.Item"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/trash/{id}": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Trash"
+                ],
+                "summary": "Query a recycle operation or a historical restore attempt",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Trash operation ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Configured Source display name",
+                        "name": "source",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Include the specified historical restore attempt",
+                        "name": "restore_operation_id",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/http.trashItemResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/trash/{id}/restore": {
+            "post": {
+                "description": "Requires current Delete and Create, original ownership, SourceScope and AccessRules. A rejected restore retains its journal and the recycled bytes; retry with a new restore_operation_id only after querying the outcome.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Trash"
+                ],
+                "summary": "Restore a recycled file without overwriting an existing target",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Trash operation ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "source, explicit scoped target path and persistent restore_operation_id",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/http.trashRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/http.trashItemResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
                         }
                     }
                 }
@@ -4665,6 +4912,9 @@ const docTemplate = `{
                 "name": {
                     "type": "string"
                 },
+                "permissionsVersion": {
+                    "type": "integer"
+                },
                 "token": {
                     "type": "string"
                 }
@@ -5112,6 +5362,93 @@ const docTemplate = `{
                 },
                 "path": {
                     "description": "scope-relative parent directory",
+                    "type": "string"
+                },
+                "source": {
+                    "type": "string"
+                }
+            }
+        },
+        "http.trashItemResponse": {
+            "type": "object",
+            "properties": {
+                "actor": {
+                    "type": "string"
+                },
+                "actor_id": {
+                    "type": "integer"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "error_code": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "operation_id": {
+                    "type": "string"
+                },
+                "path": {
+                    "type": "string"
+                },
+                "restore_actor": {
+                    "type": "string"
+                },
+                "restore_actor_id": {
+                    "type": "integer"
+                },
+                "restore_attempt": {
+                    "$ref": "#/definitions/trash.RestoreAttempt"
+                },
+                "restore_operation_id": {
+                    "type": "string"
+                },
+                "restored_path": {
+                    "type": "string"
+                },
+                "sha256": {
+                    "type": "string"
+                },
+                "size": {
+                    "type": "integer"
+                },
+                "source": {
+                    "type": "string"
+                },
+                "state": {
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "http.trashListResponse": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/trash.Item"
+                    }
+                },
+                "total": {
+                    "type": "integer"
+                }
+            }
+        },
+        "http.trashRequest": {
+            "type": "object",
+            "properties": {
+                "operation_id": {
+                    "type": "string"
+                },
+                "path": {
+                    "type": "string"
+                },
+                "restore_operation_id": {
                     "type": "string"
                 },
                 "source": {
@@ -6597,6 +6934,10 @@ const docTemplate = `{
                     "description": "allow api access",
                     "type": "boolean"
                 },
+                "browse": {
+                    "description": "allow browsing files and directories",
+                    "type": "boolean"
+                },
                 "create": {
                     "description": "allow creating or uploading files",
                     "type": "boolean"
@@ -6611,6 +6952,10 @@ const docTemplate = `{
                 },
                 "modify": {
                     "description": "allow modifying files",
+                    "type": "boolean"
+                },
+                "preview": {
+                    "description": "allow previewing file contents",
                     "type": "boolean"
                 },
                 "realtime": {
@@ -7343,6 +7688,91 @@ const docTemplate = `{
                 }
             }
         },
+        "trash.Item": {
+            "type": "object",
+            "properties": {
+                "actor": {
+                    "type": "string"
+                },
+                "actor_id": {
+                    "type": "integer"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "error_code": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "operation_id": {
+                    "type": "string"
+                },
+                "path": {
+                    "type": "string"
+                },
+                "restore_actor": {
+                    "type": "string"
+                },
+                "restore_actor_id": {
+                    "type": "integer"
+                },
+                "restore_operation_id": {
+                    "type": "string"
+                },
+                "restored_path": {
+                    "type": "string"
+                },
+                "sha256": {
+                    "type": "string"
+                },
+                "size": {
+                    "type": "integer"
+                },
+                "source": {
+                    "type": "string"
+                },
+                "state": {
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "trash.RestoreAttempt": {
+            "type": "object",
+            "properties": {
+                "actor": {
+                    "type": "string"
+                },
+                "actor_id": {
+                    "type": "integer"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "error_code": {
+                    "type": "string"
+                },
+                "operation_id": {
+                    "type": "string"
+                },
+                "path": {
+                    "type": "string"
+                },
+                "state": {
+                    "type": "string"
+                },
+                "trash_operation_id": {
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
         "users.AuthToken": {
             "type": "object",
             "properties": {
@@ -7364,6 +7794,9 @@ const docTemplate = `{
                 },
                 "name": {
                     "type": "string"
+                },
+                "permissionsVersion": {
+                    "type": "integer"
                 },
                 "token": {
                     "type": "string"
@@ -7415,6 +7848,10 @@ const docTemplate = `{
                     "description": "allow api access",
                     "type": "boolean"
                 },
+                "browse": {
+                    "description": "allow browsing files and directories",
+                    "type": "boolean"
+                },
                 "create": {
                     "description": "allow creating or uploading files",
                     "type": "boolean"
@@ -7429,6 +7866,10 @@ const docTemplate = `{
                 },
                 "modify": {
                     "description": "allow modifying files",
+                    "type": "boolean"
+                },
+                "preview": {
+                    "description": "allow previewing file contents",
                     "type": "boolean"
                 },
                 "realtime": {

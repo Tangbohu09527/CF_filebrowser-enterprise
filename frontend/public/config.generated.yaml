@@ -219,6 +219,8 @@ userDefaults:
       realtime: false                     # allow realtime updates
       delete: false                       # allow deleting files
       create: false                       # allow creating or uploading files
+      browse: true                        # allow browsing files and directories
+      preview: true                       # allow previewing file contents
       download: true                      # allow downloading files
     lockPassword: false                   # disable the user from changing their password
     disableSettings: false                # disable the user from viewing the settings page

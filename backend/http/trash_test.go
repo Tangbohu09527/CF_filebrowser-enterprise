@@ -165,6 +165,12 @@ func TestTrashHTTPReadOnlyInvalidPathsAndCurrentTargetACL(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("trash: %d", status)
 	}
+	idx.Config.ReadOnly = true
+	status, _ = callTrash(t, user, trashRestoreHandler, http.MethodPost, "/api/trash/"+id+"/restore", id, trashRequest{Source: "source1", Path: "/public/restored.txt", RestoreOperationID: "restore-readonly-0001"})
+	if status != http.StatusForbidden {
+		t.Fatalf("read-only restore: %d", status)
+	}
+	idx.Config.ReadOnly = false
 	if err := store.Access.DenyUser(source, "/public/restored.txt", user.Username); err != nil {
 		t.Fatal(err)
 	}
