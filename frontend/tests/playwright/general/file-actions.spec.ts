@@ -163,6 +163,7 @@ test("delete file moves to recycle bin and restores without overwriting", async(
   await page.locator('button[aria-label="Confirm-Delete"]').click();
   await checkForNotification(page, "In recycle bin");
   const moved = await (await trashResponse).json();
+  const restoredPath = `/restored-${moved.operation_id}.txt`;
   expect(moved.state).toBe('trashed');
   await expect(page.locator('a[aria-label="deleteme.txt"]')).toHaveCount(0);
 
@@ -181,16 +182,17 @@ test("delete file moves to recycle bin and restores without overwriting", async(
   await form.getByRole('button', { name: 'Check operation', exact: true }).click();
   await expect(form).toHaveCount(0);
   await row.getByRole('button', { name: 'Restore', exact: true }).click();
-  await page.getByLabel('Destination path including file name').fill('/restored-deleteme.txt');
+  await page.getByLabel('Destination path including file name').fill(restoredPath);
   await page.locator('.trash-restore').getByRole('button', { name: 'Confirm', exact: true }).click();
   await expect(row).toContainText('Restored');
-  const restored = await page.request.get(`/api/resources?${new URLSearchParams({ source: moved.source, path: '/restored-deleteme.txt', checksum: 'sha256' })}`);
+  const restored = await page.request.get(`/api/resources?${new URLSearchParams({ source: moved.source, path: restoredPath, checksum: 'sha256' })}`);
   expect(restored.status()).toBe(200);
   expect((await restored.json()).checksums.sha256).toBe(moved.sha256);
   const protectedOccupant = await page.request.get(`/api/resources?${new URLSearchParams({ source: moved.source, path: '/deleteme.txt', content: 'true' })}`);
   expect((await protectedOccupant.json()).content).toBe('new synthetic occupant');
-  // The deliberately rejected restore produces exactly one browser/API 409.
-  checkForErrors(1, 1);
+  // This suite runs Firefox: its deliberate 409 produces one failed response,
+  // without Chromium's additional network console error.
+  checkForErrors(0, 1);
 })
 
 test("directory delete is explicitly refused without permanent deletion", async({ page, checkForErrors }) => {

@@ -155,7 +155,27 @@ environment, and prints its helper PID. It never selects a production Source,
 opens a browser, or removes files. Stop only that displayed helper PID when done.
 
 Browser access to **http://127.0.0.1:18089** requires the exact origin to be
-authorized. On November 10, 2026, auto-review rejected that origin, so the manual
-browser menu flow remains **unverified**. The isolated preview returned health
-200 before that rejection and was stopped afterward. No alternate browser,
-origin, CDP session or indirect browser channel was used to bypass the gate.
+authorized. On November 10, 2026, auto-review initially rejected it. The human
+user then explicitly approved that exact origin in the main chat; normal Chrome
+approval subsequently succeeded. No alternate browser, origin, CDP session or
+indirect channel was used to bypass the gate.
+
+Chrome acceptance at feature commit `48ff1478` completed through the original
+Delete menu: confirmation moved the synthetic PNG out of its ordinary listing,
+the recycle table showed it, restoration to the existing `synthetic-notes.txt`
+was rejected as `target_exists`, operation query kept the item in the bin, and
+restoration to its original free path showed `Restored`. The persisted failed and
+successful restore attempts both remain present. The recovered PNG matches the
+tracked fixture SHA-256
+`722ecd86ab3547c3e8c35b9c579cfdf113913e4977b7a9561791209df6916c03`;
+the notes occupant retained its original bytes. No production data or credentials
+were involved. The synthetic startup script parsed and ran successfully.
+
+First Linux CI also passed all new trash HTTP tests and the complete `trash`
+package under the existing `-race` command. The full check remains red because
+of the existing asynchronous `MoveResource` → `UpdateShares` race in chunk-upload
+tests. Existing CI also reports old-linter typechecking errors, stale Swagger
+outputs, and a Docker `npm i` failure. Those are separate from the feature's
+targeted/local verification. The first general Playwright run completed restore,
+hash and occupant checks but failed a Firefox console-count expectation; its
+follow-up uses the actual Firefox behavior and unique restore targets on retries.

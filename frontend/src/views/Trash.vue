@@ -1,9 +1,9 @@
 <template>
   <section class="trash-page" aria-labelledby="trash-title">
-    <header>
+    <div class="trash-heading">
       <h1 id="trash-title">{{ $t('trash.title') }}</h1>
       <p>{{ $t('trash.retention') }}</p>
-    </header>
+    </div>
     <form class="trash-filters" @submit.prevent="refresh(0)">
       <label>{{ $t('general.source') }}
         <select v-model="source" :disabled="busy" @change="refresh(0)">
