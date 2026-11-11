@@ -8182,6 +8182,10 @@ const docTemplate = `{
                     "description": "keep sidebar open when navigating",
                     "type": "boolean"
                 },
+                "strictScopes": {
+                    "description": "StrictScopes disables automatic default Sources. Administrators must select it explicitly to change it.",
+                    "type": "boolean"
+                },
                 "themeColor": {
                     "description": "theme color to use: eg. #ff0000, or var(--red), var(--purple), etc",
                     "type": "string"

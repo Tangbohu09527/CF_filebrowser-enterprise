@@ -157,7 +157,7 @@ func ApplyUserDefaults(u *users.User) {
 		u.LoginMethod = users.LoginMethod(d.Account.LoginMethod)
 	}
 
-	if len(u.Scopes) == 0 {
+	if len(u.Scopes) == 0 && !u.StrictScopes {
 		for _, source := range Config.Server.Sources {
 			if source.Config.DefaultEnabled {
 				u.Scopes = append(u.Scopes, users.SourceScope{

@@ -147,6 +147,8 @@ type User struct {
 	LoginMethod     LoginMethod          `json:"loginMethod"`
 	OtpEnabled      bool                 `json:"otpEnabled"` // true if TOTP is enabled, false otherwise
 	Version         int                  `json:"version"`
+	// StrictScopes disables automatic default Sources. Administrators must select it explicitly to change it.
+	StrictScopes bool `json:"strictScopes"`
 	// legacy for migration purposes... og filebrowser has perm attribute
 	Perm Permissions `json:"perm,omitzero"` // deprecated: use Permissions instead
 }
