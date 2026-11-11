@@ -259,9 +259,9 @@ func parseFields(user *users.User, fields []string, actorIsAdmin bool) ([]string
 		// Dynamically populate fields to update
 		for i := 0; i < t.NumField(); i++ {
 			field := t.Field(i)
-			// which=all can't update password
+			// Broad updates must not alter credentials or the explicit scope policy.
 			switch strings.ToLower(field.Name) {
-			case "id", "username", "password", "tokens", "totpsecret", "totpnonce":
+			case "id", "username", "password", "tokens", "totpsecret", "totpnonce", "strictscopes":
 				// Skip these fields
 				continue
 			}

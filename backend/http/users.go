@@ -22,9 +22,10 @@ import (
 )
 
 type UserRequest struct {
-	Which              []string   `json:"which"`
-	User               users.User `json:"data"`
-	permissionPresence userPermissionPresence
+	Which                []string   `json:"which"`
+	User                 users.User `json:"data"`
+	permissionPresence   userPermissionPresence
+	strictScopesPresence *bool
 }
 
 type userPermissionPresence struct {
@@ -45,7 +46,8 @@ func (request *UserRequest) UnmarshalJSON(data []byte) error {
 
 	var presencePayload struct {
 		User struct {
-			Permissions userPermissionPresence `json:"permissions"`
+			Permissions  userPermissionPresence `json:"permissions"`
+			StrictScopes *bool                  `json:"strictScopes"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(data, &presencePayload); err != nil {
@@ -55,6 +57,7 @@ func (request *UserRequest) UnmarshalJSON(data []byte) error {
 	request.Which = payload.Which
 	request.User = payload.User
 	request.permissionPresence = presencePayload.User.Permissions
+	request.strictScopesPresence = presencePayload.User.StrictScopes
 	return nil
 }
 
@@ -506,6 +509,14 @@ func userPutHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (
 	oldUser, err := store.Users.Get(req.User.ID)
 	if err != nil {
 		return http.StatusBadRequest, fmt.Errorf("failed to get user: %w", err)
+	}
+	if req.strictScopesPresence == nil {
+		for _, field := range req.Which {
+			if utils.CapitalizeFirst(field) == "StrictScopes" {
+				return http.StatusBadRequest, fmt.Errorf("strictScopes must be explicitly provided when updating StrictScopes")
+			}
+		}
+		req.User.StrictScopes = oldUser.StrictScopes
 	}
 	req.User.Permissions = applyPermissionPresence(req.User.Permissions, oldUser.Permissions, req.permissionPresence)
 
