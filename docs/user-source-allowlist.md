@@ -25,7 +25,8 @@ Changing an existing user's policy requires an explicit `StrictScopes` entry in
 the `which` list and a non-null JSON boolean. The existing actor password
 confirmation and administrator checks continue to apply. For example, an
 administrator can correct one previously broadened account's allowlist and
-enable the policy in the same request:
+enable the policy in the same request. Send this body to
+`PUT /api/users?id=123`; the query selects the target account:
 
 ```json
 {
