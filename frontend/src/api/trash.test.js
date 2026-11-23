@@ -55,6 +55,15 @@ describe('durable Web recycle actions', () => {
     expect(fetchJSON.mock.calls[1][1]).toBeUndefined();
   });
 
+  it('can move a file over LAN HTTP without randomUUID', async () => {
+    vi.stubGlobal('crypto', { getRandomValues: (bytes) => bytes.fill(255) });
+    fetchJSON.mockResolvedValue({ state: 'trashed' });
+    const result = await trashFiles([file]);
+    expect(result.failed).toEqual([]);
+    expect(JSON.parse(fetchJSON.mock.calls[0][1].body).operation_id)
+      .toBe('ffffffff-ffff-4fff-bfff-ffffffffffff');
+  });
+
   it('reuses the original ID only after the status query confirms no record', async () => {
     localStorage.setItem(key, 'previous-unknown-operation');
     fetchJSON.mockRejectedValueOnce(Object.assign(new Error('not recorded'), { status: 404 }));

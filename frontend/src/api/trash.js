@@ -1,6 +1,7 @@
 import i18n from '@/i18n';
 import { state } from '@/store';
 import { getApiPath } from '@/utils/url';
+import { randomUuid } from '@/utils/randomUuid';
 import { fetchJSON } from './utils';
 
 export function listTrash(source, query = '', offset = 0) {
@@ -33,7 +34,7 @@ export async function trashFiles(items) {
         try { entry = await getTrash(item.source, operationId); }
         catch (error) { if (error.status !== 404) throw error; }
       } else {
-        operationId = crypto.randomUUID();
+        operationId = randomUuid();
         localStorage.setItem(key, operationId);
       }
       if (!entry) {

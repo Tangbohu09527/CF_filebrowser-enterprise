@@ -55,6 +55,7 @@ import { computed, onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { state } from '@/store';
 import { getTrash, listTrash, restoreTrash } from '@/api/trash';
+import { randomUuid } from '@/utils/randomUuid';
 
 const { t } = useI18n();
 const sources = computed(() => (state.user?.scopes || []).map(scope => scope.name));
@@ -111,8 +112,8 @@ async function check(item) {
 async function restore() {
   if (busy.value || uncertain.value || !selected.value) return;
   busy.value = true;
-  restoreId ||= crypto.randomUUID();
   try {
+    restoreId ||= randomUuid();
     const result = await restoreTrash(source.value, selected.value.operation_id, destination.value, restoreId);
     if (result.state !== 'restored') { uncertain.value = true; message.value = t('trash.unknownResult'); }
     else { selected.value = null; message.value = t('trash.restored'); }
