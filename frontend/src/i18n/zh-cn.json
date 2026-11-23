@@ -145,6 +145,10 @@
     "passkeyLogin": "使用通行密钥"
   },
   "prompts": {
+    "cancelling": "正在取消上传…",
+    "cancelPending": "取消待确认，恢复连接后重试。",
+    "retryUploadCancel": "重试取消",
+    "uploadStatusUnknown": "暂时无法确认上传状态。",
     "deleteTitle": "删除文件",
     "displayName": "名称：",
     "download": "下载文件",

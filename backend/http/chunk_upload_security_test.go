@@ -335,8 +335,10 @@ func newChunkUploadSecurityHarness(t *testing.T) *chunkUploadSecurityHarness {
 
 	api := http.NewServeMux()
 	api.HandleFunc("POST /resources", withUser(resourcePostHandler))
+	api.HandleFunc("POST /resources/upload-session", withUser(resourceUploadSessionHandler))
 	publicAPI := http.NewServeMux()
 	publicAPI.HandleFunc("POST /resources", withHashFile(publicUploadHandler))
+	publicAPI.HandleFunc("POST /resources/upload-session", withHashFile(publicUploadSessionHandler))
 	root := http.NewServeMux()
 	root.Handle("/api/", http.StripPrefix("/api", api))
 	root.Handle("/public/api/", http.StripPrefix("/public/api", publicAPI))

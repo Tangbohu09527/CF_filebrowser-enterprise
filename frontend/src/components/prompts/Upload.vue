@@ -82,7 +82,7 @@
           <i class="material-symbols file-icon">{{ file.type === "directory" ? "folder" : "insert_drive_file" }}</i> <!-- eslint-disable-line @intlify/vue-i18n/no-raw-text -->
           <div class="file-info">
             <p class="file-name">{{ file.name }}</p>
-            <progress-bar v-if="file.type !== 'directory'" :val="file.status === 'completed'
+            <progress-bar v-if="file.type !== 'directory' && !['cancelling', 'cancelPending'].includes(file.status)" :val="file.status === 'completed'
                 ? $t('prompts.completed')
                 : file.status === 'error'
                   ? $t('prompts.error')
@@ -141,9 +141,10 @@
             <button
               type="button"
               @click="cancelUpload(file.id)"
+              :disabled="file.status === 'cancelling'"
               class="action"
-              :aria-label="$t('general.cancel')"
-              :title="$t('general.cancel')"
+              :aria-label="file.status === 'cancelPending' ? $t('prompts.retryUploadCancel') : $t('general.cancel')"
+              :title="file.status === 'cancelPending' ? $t('prompts.retryUploadCancel') : $t('general.cancel')"
             >
               <i class="material-symbols">close</i>
             </button>
@@ -608,6 +609,10 @@ export default {
       switch (status) {
         case 'uploading':
           return i18n.global.t('general.uploading', { suffix: '...' });
+        case 'cancelling':
+          return i18n.global.t('prompts.cancelling');
+        case 'cancelPending':
+          return i18n.global.t('prompts.cancelPending');
         case 'completed':
           return i18n.global.t('prompts.completed');
         case 'error':

@@ -189,13 +189,12 @@ func newChunkUploadTempToken(targetPath, sessionKey string) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(token), nil
 }
 
-func openChunkUploadFile(targetPath, principal string, offset, totalSize int64) (*os.File, string, bool, int, error) {
+func openChunkUploadFile(targetPath, sessionKey string, offset int64) (*os.File, string, bool, int, error) {
 	temps, err := chunkUploadTempsForTarget(targetPath)
 	if err != nil {
 		return nil, "", false, http.StatusInternalServerError, fmt.Errorf("could not inspect chunk upload state: %v", err)
 	}
 
-	sessionKey := chunkUploadSessionKey(principal, targetPath, totalSize)
 	created := false
 	tempFilePath := ""
 	var outFile *os.File

@@ -334,6 +334,10 @@
     "deleteFailed": "Failed to delete share"
   },
   "prompts": {
+    "cancelling": "Cancelling upload…",
+    "cancelPending": "Cancellation pending. Retry when connected.",
+    "retryUploadCancel": "Retry cancellation",
+    "uploadStatusUnknown": "Upload status could not be confirmed.",
     "operationInProgress": "Operation in progress, please wait...",
     "quickJump": "Quickly jump to other files",
     "downloadsLimit": "Number of downloads limit",

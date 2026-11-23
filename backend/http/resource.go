@@ -582,6 +582,9 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 	if resolveErr == errors.ErrAccessDenied {
 		return http.StatusForbidden, resolveErr
 	}
+	if realPath == "" {
+		return http.StatusBadRequest, fmt.Errorf("could not resolve upload target")
+	}
 
 	// Check access control for the target path
 	if !store.Access.Permitted(idx.Path, path, filePermUser.Username) {
@@ -683,12 +686,20 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 			}
 		}
 
-		outFile, tempFilePath, created, status, openErr := openChunkUploadFile(
-			realPath,
-			chunkUploadPrincipal(d),
-			offset,
-			totalSize,
-		)
+		sessionKey, tracked, sessionErr := requestChunkUploadKey(r, d, realPath, totalSize)
+		if sessionErr != nil {
+			return http.StatusBadRequest, sessionErr
+		}
+		if tracked {
+			state, stateErr := store.ChunkUploads.State(sessionKey)
+			if stateErr != nil {
+				return http.StatusInternalServerError, stateErr
+			}
+			if state != "" {
+				return http.StatusConflict, fmt.Errorf("upload is %s", state)
+			}
+		}
+		outFile, tempFilePath, created, status, openErr := openChunkUploadFile(realPath, sessionKey, offset)
 		if openErr != nil {
 			return status, openErr
 		}
@@ -739,7 +750,11 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 				}
 				return 499, nil
 			}
-			removeChunkUploadTemp(tempFilePath)
+			if offset > 0 {
+				scheduleChunkUploadTempCleanup(realPath, tempFilePath)
+			} else {
+				removeChunkUploadTemp(tempFilePath)
+			}
 			return http.StatusInternalServerError, fmt.Errorf("could not write chunk to temp file: %v", copyErr)
 		}
 
@@ -823,13 +838,28 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 			return errToStatus(statErr), statErr
 		}
 
+		if tracked {
+			if err := store.ChunkUploads.SetState(sessionKey, uploadCommitting, chunkUploadTempTTL); err != nil {
+				return http.StatusInternalServerError, err
+			}
+		}
 		err = files.MoveResource(false, source, source, tempFilePath, realPath, store.Share, store.Access)
 		if err != nil {
+			if tracked {
+				if resultErr := store.ChunkUploads.SetState(sessionKey, uploadFailed, chunkUploadTempTTL); resultErr != nil {
+					logger.Errorf("could not record failed upload: %v", resultErr)
+				}
+			}
 			logger.Debugf("could not move file from %v to %v: %v", tempFilePath, realPath, err)
 			removeChunkUploadTemp(tempFilePath)
 			return http.StatusInternalServerError, fmt.Errorf("could not move file from chunked folder to destination: %v", err)
 		}
 		stopChunkUploadTempCleanup(tempFilePath)
+		if tracked {
+			if err := store.ChunkUploads.SetState(sessionKey, uploadCompleted, chunkUploadTempTTL); err != nil {
+				return http.StatusInternalServerError, err
+			}
+		}
 		return http.StatusOK, nil
 	}
 

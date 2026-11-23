@@ -5,8 +5,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -246,4 +248,54 @@ func TestChunkUploadProtocolValidation(t *testing.T) {
 			t.Fatalf("forged temporary name content changed: got %q", data)
 		}
 	})
+}
+
+func TestChunkUploadSessionControl(t *testing.T) {
+	h := newChunkUploadSecurityHarness(t)
+	const oldID = "d491fbf4-c49d-4ac0-a511-4fd1cc398aa1"
+	const newID = "be7c49b3-7bef-4103-a903-ad29fd0ec8f4"
+	const path = "/public/session-control.bin"
+	call := func(path, id, offset, action string, body io.Reader) *httptest.ResponseRecorder {
+		query := url.Values{"source": {"source1"}, "path": {path}, "action": {action}}
+		route := "/api/resources"
+		if action != "" {
+			route += "/upload-session"
+		}
+		req := httptest.NewRequest(http.MethodPost, route+"?"+query.Encode(), body)
+		req.Header.Set("X-File-Upload-ID", id)
+		req.Header.Set("X-File-Total-Size", strconv.Itoa(8))
+		req.Header.Set("X-File-Chunk-Offset", offset)
+		res := httptest.NewRecorder()
+		h.router.ServeHTTP(res, req)
+		return res
+	}
+	expect := func(res *httptest.ResponseRecorder, code int, body string) {
+		t.Helper()
+		if res.Code != code || !strings.Contains(res.Body.String(), body) {
+			t.Fatalf("expected %d with %q, got %d %s", code, body, res.Code, res.Body.String())
+		}
+	}
+	expect(call(path, oldID, "0", "", strings.NewReader("ABCD")), http.StatusOK, "")
+	interrupted := io.MultiReader(strings.NewReader("W"), interruptedChunkReader{})
+	expect(call(path, oldID, "4", "", interrupted), http.StatusInternalServerError, "")
+	expect(call(path, oldID, "", "status", nil), http.StatusOK, `"offset":4`)
+	expect(call(path, oldID, "", "cancel", nil), http.StatusOK, `"state":"cancelled"`)
+	if temps := snapshotChunkTemps(t, h.realPath(path)); len(temps) != 0 {
+		t.Fatalf("cancel retained %d temporary files", len(temps))
+	}
+	expect(call(path, newID, "0", "", strings.NewReader("1234")), http.StatusOK, "")
+	expect(call(path, oldID, "", "cancel", nil), http.StatusOK, `"state":"cancelled"`)
+	expect(call(path, oldID, "0", "", strings.NewReader("ABCD")), http.StatusConflict, "")
+	expect(call(path, newID, "4", "", strings.NewReader("5678")), http.StatusOK, "")
+	expect(call(path, newID, "", "cancel", nil), http.StatusOK, `"state":"completed"`)
+	got, err := os.ReadFile(h.realPath(path))
+	if err != nil || string(got) != "12345678" {
+		t.Fatalf("downloaded final file %q, %v", got, err)
+	}
+}
+
+type interruptedChunkReader struct{}
+
+func (interruptedChunkReader) Read([]byte) (int, error) {
+	return 0, io.ErrUnexpectedEOF
 }

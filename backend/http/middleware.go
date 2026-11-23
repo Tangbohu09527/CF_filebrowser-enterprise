@@ -197,7 +197,7 @@ func publicShareRouteForRequest(method, routePath string, query url.Values) (pub
 	switch {
 	case method == http.MethodPost && routePath == "/resources":
 		return publicShareRoute{recognized: true, targetMode: publicShareTargetPath, skipFileInfo: true}, nil
-	case method == http.MethodPost && routePath == "/resources/pause":
+	case method == http.MethodPost && (routePath == "/resources/pause" || routePath == "/resources/upload-session"):
 		return publicShareRoute{recognized: true, targetMode: publicShareTargetPath, skipFileInfo: true}, nil
 	case (method == http.MethodPut || method == http.MethodPatch || method == http.MethodDelete) && routePath == "/resources":
 		return publicShareRoute{recognized: true, targetMode: publicShareTargetPath}, nil

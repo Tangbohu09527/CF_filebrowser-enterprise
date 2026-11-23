@@ -3,7 +3,7 @@ import { mutations, state } from '@/store'
 import { globalVars } from '@/utils/constants'
 import { downloadManager } from '@/utils/downloadManager'
 import { getApiPath, getPublicApiPath } from '@/utils/url.js'
-import { adjustedData, fetchURL } from './utils'
+import { adjustedData, fetchJSON, fetchURL } from './utils'
 import { trashFiles } from './trash'
 
 export { fetchPreviewImage } from '@/utils/previewRequests'
@@ -73,6 +73,23 @@ export async function signalUploadPause(source, path, shareHash = null) {
   }
   const apiPath = getApiPath('resources/pause', { path, source })
   await fetchURL(apiPath, { method: 'POST' })
+}
+
+export async function manageUploadSession(upload, action) {
+  const { source, path, shareHash, uploadId, size } = upload
+  const headers = {
+    'X-File-Upload-ID': uploadId,
+    'X-File-Total-Size': size,
+  }
+  let apiPath
+  if (shareHash) {
+    apiPath = getPublicApiPath('resources/upload-session', { hash: shareHash, path, action })
+    const sharePassword = localStorage.getItem(`sharepass:${shareHash}`)
+    if (sharePassword) headers['X-SHARE-PASSWORD'] = sharePassword
+  } else {
+    apiPath = getApiPath('resources/upload-session', { source, path, action })
+  }
+  return fetchJSON(apiPath, { method: 'POST', headers, signal: AbortSignal.timeout(5000) })
 }
 
 async function resourceAction(source, path, method, content) {
