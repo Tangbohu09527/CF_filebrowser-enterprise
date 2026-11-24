@@ -145,6 +145,10 @@
     "passkeyLogin": "Passkey gebruiken"
   },
   "prompts": {
+    "cancelling": "Upload wordt geannuleerd…",
+    "cancelPending": "Annulering in behandeling. Probeer het opnieuw zodra er verbinding is.",
+    "retryUploadCancel": "Annulering opnieuw proberen",
+    "uploadStatusUnknown": "De uploadstatus kon niet worden bevestigd.",
     "deleteTitle": "Bestanden verwijderen",
     "displayName": "Weergavenaam: ",
     "download": "Bestanden downloaden",

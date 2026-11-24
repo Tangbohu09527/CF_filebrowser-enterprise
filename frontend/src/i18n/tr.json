@@ -145,6 +145,10 @@
     "passkeyLogin": "Geçiş Anahtarını Kullan"
   },
   "prompts": {
+    "cancelling": "Yükleme iptal ediliyor…",
+    "cancelPending": "İptal beklemede. Bağlantı kurulduğunda tekrar deneyin.",
+    "retryUploadCancel": "İptali yeniden deneyin",
+    "uploadStatusUnknown": "Yükleme durumu doğrulanamadı.",
     "deleteTitle": "Dosyaları sil",
     "displayName": "Görünen Ad:",
     "download": "Dosyaları indirŞ",

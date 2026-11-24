@@ -145,6 +145,10 @@
     "passkeyLogin": "パスキーを使用"
   },
   "prompts": {
+    "cancelling": "アップロードをキャンセルしています…",
+    "cancelPending": "キャンセルを保留しています。接続後に再試行してください。",
+    "retryUploadCancel": "キャンセルを再試行",
+    "uploadStatusUnknown": "アップロードの状態を確認できませんでした。",
     "deleteTitle": "ファイルを削除",
     "displayName": "名前：",
     "download": "ファイルをダウンロード",

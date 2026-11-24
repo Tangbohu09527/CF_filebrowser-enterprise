@@ -145,6 +145,10 @@
     "passkeyLogin": "Použiť Passkey"
   },
   "prompts": {
+    "cancelling": "Ruší sa nahrávanie…",
+    "cancelPending": "Zrušenie čaká. Skúste znova po pripojení.",
+    "retryUploadCancel": "Znova skúsiť zrušenie",
+    "uploadStatusUnknown": "Stav nahrávania sa nepodarilo potvrdiť.",
     "deleteTitle": "Odstránenie súborov",
     "displayName": "Zobrazený názov:",
     "download": "Stiahnuť súbory",

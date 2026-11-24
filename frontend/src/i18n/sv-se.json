@@ -145,6 +145,10 @@
     "passkeyLogin": "Använd Passkey"
   },
   "prompts": {
+    "cancelling": "Avbryter uppladdningen…",
+    "cancelPending": "Avbrottet väntar. Försök igen när du är ansluten.",
+    "retryUploadCancel": "Försök avbryta igen",
+    "uploadStatusUnknown": "Uppladdningens status kunde inte bekräftas.",
     "deleteTitle": "Ta bort filer",
     "displayName": "Visningsnamn:",
     "download": "Ladda ner filer",

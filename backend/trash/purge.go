@@ -85,7 +85,7 @@ func (s *Store) purge(item *Item, actorID uint, actor, method string) (*Item, er
 
 	item.State = "pending_purge"
 	item.PurgeActorID, item.PurgeActor, item.PurgeMethod = actorID, actor, method
-	if err := s.save(item); err != nil {
+	if err = s.save(item); err != nil {
 		return nil, ErrUncertain
 	}
 	// The dedicated Source lock keeps all FileBrowser writers out of the
@@ -95,7 +95,7 @@ func (s *Store) purge(item *Item, actorID uint, actor, method string) (*Item, er
 		snapshot.Size() != info.Size() || !snapshot.ModTime().Equal(info.ModTime()) {
 		return s.requireReconciliation(item, "purge_payload_changed")
 	}
-	if err := directory.Remove(name); err != nil {
+	if err = directory.Remove(name); err != nil {
 		return nil, ErrUncertain
 	}
 	return s.finishPurge(directory, item)

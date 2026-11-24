@@ -839,8 +839,8 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 		}
 
 		if tracked {
-			if err := store.ChunkUploads.SetState(sessionKey, uploadCommitting, chunkUploadTempTTL); err != nil {
-				return http.StatusInternalServerError, err
+			if stateErr := store.ChunkUploads.SetState(sessionKey, uploadCommitting, chunkUploadTempTTL); stateErr != nil {
+				return http.StatusInternalServerError, stateErr
 			}
 		}
 		err = files.MoveResource(false, source, source, tempFilePath, realPath, store.Share, store.Access)
@@ -856,8 +856,8 @@ func resourcePostHandler(w http.ResponseWriter, r *http.Request, d *requestConte
 		}
 		stopChunkUploadTempCleanup(tempFilePath)
 		if tracked {
-			if err := store.ChunkUploads.SetState(sessionKey, uploadCompleted, chunkUploadTempTTL); err != nil {
-				return http.StatusInternalServerError, err
+			if stateErr := store.ChunkUploads.SetState(sessionKey, uploadCompleted, chunkUploadTempTTL); stateErr != nil {
+				return http.StatusInternalServerError, stateErr
 			}
 		}
 		return http.StatusOK, nil

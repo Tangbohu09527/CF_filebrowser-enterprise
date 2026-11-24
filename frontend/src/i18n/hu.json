@@ -145,6 +145,10 @@
     "passkeyLogin": "Jelszókulcs használata"
   },
   "prompts": {
+    "cancelling": "Feltöltés megszakítása…",
+    "cancelPending": "A megszakítás függőben van. Próbálja újra, ha van kapcsolat.",
+    "retryUploadCancel": "Megszakítás újrapróbálása",
+    "uploadStatusUnknown": "A feltöltés állapota nem volt megerősíthető.",
     "deleteTitle": "Fájlok törlése",
     "displayName": "Megjelenített név:",
     "download": "Fájlok letöltése",

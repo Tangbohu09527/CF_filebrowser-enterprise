@@ -44,6 +44,16 @@ type trashPurgePreview struct {
 	Snapshot string             `json:"snapshot"`
 }
 
+type trashRetentionRequest struct {
+	Source  string `json:"source"`
+	Days    int    `json:"days"`
+	Enabled *bool  `json:"enabled"`
+}
+
+type trashPurgeResponse struct {
+	Items []trashPurgeResult `json:"items"`
+}
+
 func trashAdminScope(d *requestContext, source string) (*indexing.Index, string, error) {
 	if d.user == nil || !d.user.Permissions.Admin || !d.user.Permissions.Browse {
 		return nil, "", os.ErrPermission
@@ -55,6 +65,15 @@ func trashAdminScope(d *requestContext, source string) (*indexing.Index, string,
 	return idx, scope, err
 }
 
+// @Summary Preview the recycled files eligible for permanent removal in one Source
+// @Tags Trash
+// @Produce json
+// @Param source query string true "Configured Source name"
+// @Param offset query int false "Record offset"
+// @Param limit query int false "Page size"
+// @Success 200 {object} trashPurgePreview
+// @Failure 403 {object} HttpResponse
+// @Router /api/trash/purge-preview [get]
 func trashPurgePreviewHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
 	idx, scope, err := trashAdminScope(d, r.URL.Query().Get("source"))
 	if err != nil {
@@ -95,6 +114,17 @@ func trashPurgePreviewHandler(w http.ResponseWriter, r *http.Request, d *request
 	return renderJSON(w, r, result)
 }
 
+// @Summary Permanently remove recycled files by operation ID
+// @Description Requires current Admin, Browse and Delete on the Source. Accepts up to 50 operation IDs. Each result reports its own outcome.
+// @Tags Trash
+// @Accept json
+// @Produce json
+// @Param body body trashPurgeRequest true "Source and confirmed recycle operation IDs"
+// @Success 200 {object} trashPurgeResponse
+// @Failure 400 {object} HttpResponse
+// @Failure 403 {object} HttpResponse
+// @Failure 503 {object} HttpResponse
+// @Router /api/trash/purge [post]
 func trashPurgeHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
 	var request trashPurgeRequest
 	if err := decodeTrashBody(w, r, &request); err != nil || len(request.IDs) == 0 || len(request.IDs) > trashPurgeBatchLimit {
@@ -111,9 +141,7 @@ func trashPurgeHandler(w http.ResponseWriter, r *http.Request, d *requestContext
 	if err != nil {
 		return trashStatus(err)
 	}
-	result := struct {
-		Items []trashPurgeResult `json:"items"`
-	}{Items: make([]trashPurgeResult, 0, len(request.IDs))}
+	result := trashPurgeResponse{Items: make([]trashPurgeResult, 0, len(request.IDs))}
 	for _, id := range request.IDs {
 		if r.Context().Err() != nil {
 			return trashStatus(trash.ErrUncertain)
@@ -156,12 +184,18 @@ func purgeTrashItem(idx *indexing.Index, scope string, d *requestContext, id str
 	return item.State, nil
 }
 
+// @Summary Set the retention policy for one Source
+// @Description Requires current Admin, Browse and Delete with full access to the Source root. The first enablement date is preserved.
+// @Tags Trash
+// @Accept json
+// @Produce json
+// @Param body body trashRetentionRequest true "Source, retention period in days, and optional enabled flag"
+// @Success 200 {object} trash.RetentionPolicy
+// @Failure 400 {object} HttpResponse
+// @Failure 403 {object} HttpResponse
+// @Router /api/trash/retention [put]
 func trashRetentionHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
-	var request struct {
-		Source  string `json:"source"`
-		Days    int    `json:"days"`
-		Enabled *bool  `json:"enabled"`
-	}
+	var request trashRetentionRequest
 	if err := decodeTrashBody(w, r, &request); err != nil {
 		return http.StatusBadRequest, trash.ErrInvalid
 	}

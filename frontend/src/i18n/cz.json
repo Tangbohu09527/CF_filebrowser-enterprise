@@ -215,6 +215,10 @@
     "readOnlySourceNotice": "Tento zdroj je určen pouze pro čtení. Sdílení nahrávání a oprávnění, která upravují soubory, jsou zakázána."
   },
   "prompts": {
+    "cancelling": "Rušení nahrávání…",
+    "cancelPending": "Zrušení čeká. Zkuste to znovu po připojení.",
+    "retryUploadCancel": "Zkusit zrušení znovu",
+    "uploadStatusUnknown": "Stav nahrávání se nepodařilo ověřit.",
     "deleteUserMessage": "Opravdu chcete tohoto uživatele smazat?",
     "deleteTitle": "Smazat soubory",
     "displayName": "Zobrazované jméno:",

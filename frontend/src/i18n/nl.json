@@ -334,6 +334,10 @@
     "readOnlySourceNotice": "Deze bron is alleen-lezen. Upload shares en rechten om bestanden te wijzigen zijn uitgeschakeld."
   },
   "prompts": {
+    "cancelling": "Upload wordt geannuleerd…",
+    "cancelPending": "Annulering in behandeling. Probeer het opnieuw zodra er verbinding is.",
+    "retryUploadCancel": "Annulering opnieuw proberen",
+    "uploadStatusUnknown": "De uploadstatus kon niet worden bevestigd.",
     "operationInProgress": "Werk in uitvoering, even geduld...",
     "quickJump": "Snel navigeren naar andere bestanden",
     "downloadsLimit": "Max. aantal downloads",

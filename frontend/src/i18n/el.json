@@ -145,6 +145,10 @@
     "passkeyLogin": "Χρήση Passkey"
   },
   "prompts": {
+    "cancelling": "Ακύρωση μεταφόρτωσης…",
+    "cancelPending": "Εκκρεμεί η ακύρωση. Δοκιμάστε ξανά όταν συνδεθείτε.",
+    "retryUploadCancel": "Επανάληψη ακύρωσης",
+    "uploadStatusUnknown": "Δεν ήταν δυνατή η επιβεβαίωση της κατάστασης μεταφόρτωσης.",
     "deleteTitle": "Διαγραφή αρχείων",
     "displayName": "Εμφάνιση ονόματος:",
     "download": "Λήψη αρχείων",

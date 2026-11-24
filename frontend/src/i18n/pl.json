@@ -145,6 +145,10 @@
     "passkeyLogin": "Użyj klucza dostępu"
   },
   "prompts": {
+    "cancelling": "Anulowanie przesyłania…",
+    "cancelPending": "Anulowanie oczekuje. Spróbuj ponownie po nawiązaniu połączenia.",
+    "retryUploadCancel": "Ponów anulowanie",
+    "uploadStatusUnknown": "Nie udało się potwierdzić stanu przesyłania.",
     "deleteTitle": "Usuń pliki",
     "displayName": "Wyświetlana Nazwa:",
     "download": "Pobierz pliki",

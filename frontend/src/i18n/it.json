@@ -334,6 +334,10 @@
     "readOnlySourceNotice": "Questa sorgente è di sola lettura. Le azioni di caricamento e le autorizzazioni che modificano i file sono disabilitate."
   },
   "prompts": {
+    "cancelling": "Annullamento del caricamento…",
+    "cancelPending": "Annullamento in sospeso. Riprova quando sei connesso.",
+    "retryUploadCancel": "Riprova ad annullare",
+    "uploadStatusUnknown": "Impossibile confermare lo stato del caricamento.",
     "operationInProgress": "Operazione in corso, attendere...",
     "quickJump": "Passa rapidamente ad altri file",
     "downloadsLimit": "Limite numero di download",

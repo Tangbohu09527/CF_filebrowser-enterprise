@@ -145,6 +145,10 @@
     "passkeyLogin": "Utiliser une clé d'accès"
   },
   "prompts": {
+    "cancelling": "Annulation du téléversement…",
+    "cancelPending": "Annulation en attente. Réessayez une fois connecté.",
+    "retryUploadCancel": "Réessayer l’annulation",
+    "uploadStatusUnknown": "Impossible de confirmer l’état du téléversement.",
     "deleteTitle": "Supprimer",
     "displayName": "Nom :",
     "download": "Télécharger",

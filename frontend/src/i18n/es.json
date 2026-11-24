@@ -145,6 +145,10 @@
     "passkeyLogin": "Usar clave de acceso"
   },
   "prompts": {
+    "cancelling": "Cancelando la subida…",
+    "cancelPending": "Cancelación pendiente. Vuelve a intentarlo cuando tengas conexión.",
+    "retryUploadCancel": "Reintentar la cancelación",
+    "uploadStatusUnknown": "No se pudo confirmar el estado de la subida.",
     "deleteTitle": "Borrar archivos",
     "displayName": "Nombre:",
     "download": "Descargar archivos",

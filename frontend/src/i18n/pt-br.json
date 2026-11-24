@@ -145,6 +145,10 @@
     "passkeyLogin": "Usar chave de acesso"
   },
   "prompts": {
+    "cancelling": "Cancelando o envio…",
+    "cancelPending": "Cancelamento pendente. Tente novamente quando estiver conectado.",
+    "retryUploadCancel": "Tentar cancelar novamente",
+    "uploadStatusUnknown": "Não foi possível confirmar o status do envio.",
     "deleteTitle": "Apagar arquivos",
     "displayName": "Nome:",
     "download": "Baixar arquivos",

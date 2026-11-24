@@ -131,8 +131,8 @@ func TestTrashDailyCleanupCatchesUpAfterRestart(t *testing.T) {
 	}
 	expiry := policy.Deadline(item)
 	before, next := trashCleanupWindow(expiry.Add(-time.Second))
-	if err := cleanTrashSource(context.Background(), source, before); err != nil {
-		t.Fatal(err)
+	if cleanupErr := cleanTrashSource(context.Background(), source, before); cleanupErr != nil {
+		t.Fatal(cleanupErr)
 	}
 	s, err = trash.Open(source)
 	if err != nil {
@@ -144,8 +144,8 @@ func TestTrashDailyCleanupCatchesUpAfterRestart(t *testing.T) {
 		t.Fatalf("removed before cutoff: %+v %v", item, err)
 	}
 	cutoff, _ = trashCleanupWindow(next.Add(time.Hour))
-	if err := cleanTrashSource(context.Background(), source, cutoff); err != nil {
-		t.Fatal(err)
+	if cleanupErr := cleanTrashSource(context.Background(), source, cutoff); cleanupErr != nil {
+		t.Fatal(cleanupErr)
 	}
 	s, err = trash.Open(source)
 	if err != nil {

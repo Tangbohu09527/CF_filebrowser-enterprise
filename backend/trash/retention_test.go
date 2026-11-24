@@ -21,10 +21,10 @@ func TestRetentionProtectsExistingFilesAndPersistsAcrossOpen(t *testing.T) {
 	if err != nil || policy.Enabled || policy.Days != 30 || policy.EnabledAt != nil {
 		t.Fatalf("new Source default: %+v, %v", policy, err)
 	}
-	if _, err := store.SetRetentionPolicy(true, MaxRetentionDays+1, time.Now()); !errors.Is(err, ErrInvalid) {
+	if _, err = store.SetRetentionPolicy(true, MaxRetentionDays+1, time.Now()); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("accepted invalid duration: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "large.txt"), bytes.Repeat([]byte("0123456789"), 1<<19), 0600); err != nil {
+	if err = os.WriteFile(filepath.Join(dir, "large.txt"), bytes.Repeat([]byte("0123456789"), 1<<19), 0600); err != nil {
 		t.Fatal(err)
 	}
 	item, err := store.Trash(Item{OperationID: "retention-old-file", OriginalPath: "large.txt", Source: "data"})
@@ -45,7 +45,7 @@ func TestRetentionProtectsExistingFilesAndPersistsAcrossOpen(t *testing.T) {
 	if got := policy.Deadline(item); got == nil || !got.Equal(deadline) {
 		t.Fatalf("old file deadline: %v, want %v", got, deadline)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "new.txt"), []byte("synthetic newer payload"), 0600); err != nil {
+	if err = os.WriteFile(filepath.Join(dir, "new.txt"), []byte("synthetic newer payload"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	newer, err := store.Trash(Item{OperationID: "retention-new-file", OriginalPath: "new.txt", Source: "data"})
@@ -78,7 +78,7 @@ func TestRetentionProtectsExistingFilesAndPersistsAcrossOpen(t *testing.T) {
 	if _, err = store.SetRetentionPolicy(true, 40, updateAt); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Close(); err != nil {
+	if err = store.Close(); err != nil {
 		t.Fatal(err)
 	}
 	store, err = Open(dir)
@@ -89,8 +89,8 @@ func TestRetentionProtectsExistingFilesAndPersistsAcrossOpen(t *testing.T) {
 	if err != nil || got.State != "purged" || got.PurgeMethod != PurgeAutomatic || got.PurgedAt == nil {
 		t.Fatalf("automatic purge after reopen: %+v, %v", got, err)
 	}
-	if after, err := store.OccupiedBytes(got); err != nil || after != 0 {
-		t.Fatalf("expired payload still occupies space: %d, %v", after, err)
+	if after, sizeErr := store.OccupiedBytes(got); sizeErr != nil || after != 0 {
+		t.Fatalf("expired payload still occupies space: %d, %v", after, sizeErr)
 	}
 	newer, err = store.PurgeExpired(newer.OperationID, deadline)
 	if err != nil || newer.State != "trashed" {
@@ -155,8 +155,8 @@ func TestPurgeReconciliationDoesNotReplayRemoval(t *testing.T) {
 				if err != nil || got.State != "trashed" {
 					t.Fatalf("missing intent changed payload state: %+v, %v", got, err)
 				}
-				if size, err := store.OccupiedBytes(got); err != nil || size != item.Size {
-					t.Fatalf("missing intent altered payload: %d, %v", size, err)
+				if size, sizeErr := store.OccupiedBytes(got); sizeErr != nil || size != item.Size {
+					t.Fatalf("missing intent altered payload: %d, %v", size, sizeErr)
 				}
 				return
 			}
@@ -225,18 +225,18 @@ func TestPermanentRemovalAndRestoreSerializePerSource(t *testing.T) {
 		go func() {
 			defer done.Done()
 			<-start
-			view, err := Open(dir)
-			if err != nil {
-				results <- err
+			view, requestErr := Open(dir)
+			if requestErr != nil {
+				results <- requestErr
 				return
 			}
 			defer view.Close()
 			if restore {
-				_, err = view.Restore(item.OperationID, "restore-race-attempt", item.OriginalPath, 7, "ordinary-user")
+				_, requestErr = view.Restore(item.OperationID, "restore-race-attempt", item.OriginalPath, 7, "ordinary-user")
 			} else {
-				_, err = view.Purge(item.OperationID, 12, "administrator", PurgeManual)
+				_, requestErr = view.Purge(item.OperationID, 12, "administrator", PurgeManual)
 			}
-			results <- err
+			results <- requestErr
 		}()
 	}
 	close(start)

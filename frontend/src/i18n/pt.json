@@ -145,6 +145,10 @@
     "passkeyLogin": "Usar chave de acesso"
   },
   "prompts": {
+    "cancelling": "A cancelar o carregamento…",
+    "cancelPending": "Cancelamento pendente. Tente novamente quando estiver ligado.",
+    "retryUploadCancel": "Tentar cancelar novamente",
+    "uploadStatusUnknown": "Não foi possível confirmar o estado do carregamento.",
     "deleteTitle": "Eliminar ficheiros",
     "displayName": "Nome:",
     "download": "Descarregar ficheiros",

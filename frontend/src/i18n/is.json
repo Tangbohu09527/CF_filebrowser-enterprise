@@ -281,6 +281,10 @@
     "deleteFailed": "__NOT_TRANSLATED__"
   },
   "prompts": {
+    "cancelling": "Hætt við upphleðslu…",
+    "cancelPending": "Beðið eftir að hætt sé við. Reyndu aftur þegar tenging er komin á.",
+    "retryUploadCancel": "Reyna aftur að hætta við",
+    "uploadStatusUnknown": "Ekki tókst að staðfesta stöðu upphleðslunnar.",
     "operationInProgress": "Aðgerð í gangi, vinsamlega bíðið...",
     "quickJump": "Stökkva fljótil yfir í aðrar skrár",
     "downloadsLimit": "Takmörkun á fjölda niðurhala",

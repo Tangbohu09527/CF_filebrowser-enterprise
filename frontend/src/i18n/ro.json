@@ -145,6 +145,10 @@
     "passkeyLogin": "Folosește cheie de acces"
   },
   "prompts": {
+    "cancelling": "Se anulează încărcarea…",
+    "cancelPending": "Anularea este în așteptare. Încercați din nou după conectare.",
+    "retryUploadCancel": "Reîncercați anularea",
+    "uploadStatusUnknown": "Starea încărcării nu a putut fi confirmată.",
     "deleteTitle": "Șterge fișiere",
     "displayName": "Nume afișat:",
     "download": "Descarcă fișiere",

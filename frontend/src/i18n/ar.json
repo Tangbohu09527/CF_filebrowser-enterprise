@@ -145,6 +145,10 @@
     "passkeyLogin": "استخدام مفتاح المرور"
   },
   "prompts": {
+    "cancelling": "جارٍ إلغاء الرفع…",
+    "cancelPending": "الإلغاء معلّق. أعد المحاولة عند الاتصال.",
+    "retryUploadCancel": "إعادة محاولة الإلغاء",
+    "uploadStatusUnknown": "تعذّر تأكيد حالة الرفع.",
     "deleteTitle": "حذف الملفات",
     "displayName": "الإسم:",
     "download": "تحميل الملفات",

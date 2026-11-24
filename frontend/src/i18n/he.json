@@ -145,6 +145,10 @@
     "passkeyLogin": "השתמש במפתח גישה"
   },
   "prompts": {
+    "cancelling": "מבטל העלאה…",
+    "cancelPending": "הביטול בהמתנה. יש לנסות שוב לאחר ההתחברות.",
+    "retryUploadCancel": "לנסות שוב לבטל",
+    "uploadStatusUnknown": "לא ניתן היה לאמת את מצב ההעלאה.",
     "deleteTitle": "מחק קבצים",
     "displayName": "שם:",
     "download": "הורד קבצים",

@@ -145,6 +145,10 @@
     "passkeyLogin": "Passkey verwenden"
   },
   "prompts": {
+    "cancelling": "Upload wird abgebrochen …",
+    "cancelPending": "Abbruch ausstehend. Bei bestehender Verbindung erneut versuchen.",
+    "retryUploadCancel": "Abbruch erneut versuchen",
+    "uploadStatusUnknown": "Der Uploadstatus konnte nicht bestätigt werden.",
     "deleteTitle": "Dateien löschen",
     "displayName": "Anzeigename:",
     "download": "Dateien herunterladen",
