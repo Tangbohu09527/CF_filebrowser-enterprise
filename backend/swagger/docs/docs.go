@@ -3460,6 +3460,150 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/trash/purge": {
+            "post": {
+                "description": "Requires current Admin, Browse and Delete on the Source. Accepts up to 50 operation IDs. Each result reports its own outcome.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Trash"
+                ],
+                "summary": "Permanently remove recycled files by operation ID",
+                "parameters": [
+                    {
+                        "description": "Source and confirmed recycle operation IDs",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/http.trashPurgeRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/http.trashPurgeResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/trash/purge-preview": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Trash"
+                ],
+                "summary": "Preview the recycled files eligible for permanent removal in one Source",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Configured Source name",
+                        "name": "source",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Record offset",
+                        "name": "offset",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page size",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/http.trashPurgePreview"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/trash/retention": {
+            "put": {
+                "description": "Requires current Admin, Browse and Delete with full access to the Source root. The first enablement date is preserved.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Trash"
+                ],
+                "summary": "Set the retention policy for one Source",
+                "parameters": [
+                    {
+                        "description": "Source, retention period in days, and optional enabled flag",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/http.trashRetentionRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/trash.RetentionPolicy"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/http.HttpResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/api/trash/{id}": {
             "get": {
                 "produces": [
@@ -5393,6 +5537,18 @@ const docTemplate = `{
                 "path": {
                     "type": "string"
                 },
+                "purge_actor": {
+                    "type": "string"
+                },
+                "purge_actor_id": {
+                    "type": "integer"
+                },
+                "purge_method": {
+                    "type": "string"
+                },
+                "purged_at": {
+                    "type": "string"
+                },
                 "restore_actor": {
                     "type": "string"
                 },
@@ -5425,17 +5581,176 @@ const docTemplate = `{
                 }
             }
         },
+        "http.trashListItem": {
+            "type": "object",
+            "properties": {
+                "actor": {
+                    "type": "string"
+                },
+                "actor_id": {
+                    "type": "integer"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "error_code": {
+                    "type": "string"
+                },
+                "expires_at": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "operation_id": {
+                    "type": "string"
+                },
+                "path": {
+                    "type": "string"
+                },
+                "purge_actor": {
+                    "type": "string"
+                },
+                "purge_actor_id": {
+                    "type": "integer"
+                },
+                "purge_method": {
+                    "type": "string"
+                },
+                "purged_at": {
+                    "type": "string"
+                },
+                "restore_actor": {
+                    "type": "string"
+                },
+                "restore_actor_id": {
+                    "type": "integer"
+                },
+                "restore_operation_id": {
+                    "type": "string"
+                },
+                "restored_path": {
+                    "type": "string"
+                },
+                "sha256": {
+                    "type": "string"
+                },
+                "size": {
+                    "type": "integer"
+                },
+                "source": {
+                    "type": "string"
+                },
+                "state": {
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
         "http.trashListResponse": {
+            "type": "object",
+            "properties": {
+                "can_manage_retention": {
+                    "type": "boolean"
+                },
+                "can_purge": {
+                    "type": "boolean"
+                },
+                "due_bytes": {
+                    "type": "integer"
+                },
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/http.trashListItem"
+                    }
+                },
+                "next_cleanup_at": {
+                    "type": "string"
+                },
+                "retention": {
+                    "$ref": "#/definitions/trash.RetentionPolicy"
+                },
+                "total": {
+                    "type": "integer"
+                },
+                "usage_bytes": {
+                    "type": "integer"
+                }
+            }
+        },
+        "http.trashPreviewItem": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string"
+                },
+                "operation_id": {
+                    "type": "string"
+                },
+                "size": {
+                    "type": "integer"
+                }
+            }
+        },
+        "http.trashPurgePreview": {
             "type": "object",
             "properties": {
                 "items": {
                     "type": "array",
                     "items": {
-                        "$ref": "#/definitions/trash.Item"
+                        "$ref": "#/definitions/http.trashPreviewItem"
                     }
+                },
+                "size": {
+                    "type": "integer"
+                },
+                "snapshot": {
+                    "type": "string"
                 },
                 "total": {
                     "type": "integer"
+                }
+            }
+        },
+        "http.trashPurgeRequest": {
+            "type": "object",
+            "properties": {
+                "operation_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "source": {
+                    "type": "string"
+                }
+            }
+        },
+        "http.trashPurgeResponse": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/http.trashPurgeResult"
+                    }
+                }
+            }
+        },
+        "http.trashPurgeResult": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string"
+                },
+                "operation_id": {
+                    "type": "string"
+                },
+                "state": {
+                    "type": "string"
                 }
             }
         },
@@ -5450,6 +5765,20 @@ const docTemplate = `{
                 },
                 "restore_operation_id": {
                     "type": "string"
+                },
+                "source": {
+                    "type": "string"
+                }
+            }
+        },
+        "http.trashRetentionRequest": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer"
+                },
+                "enabled": {
+                    "type": "boolean"
                 },
                 "source": {
                     "type": "string"
@@ -7712,6 +8041,18 @@ const docTemplate = `{
                 "path": {
                     "type": "string"
                 },
+                "purge_actor": {
+                    "type": "string"
+                },
+                "purge_actor_id": {
+                    "type": "integer"
+                },
+                "purge_method": {
+                    "type": "string"
+                },
+                "purged_at": {
+                    "type": "string"
+                },
                 "restore_actor": {
                     "type": "string"
                 },
@@ -7769,6 +8110,20 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "trash.RetentionPolicy": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer"
+                },
+                "enabled": {
+                    "type": "boolean"
+                },
+                "enabled_since": {
                     "type": "string"
                 }
             }

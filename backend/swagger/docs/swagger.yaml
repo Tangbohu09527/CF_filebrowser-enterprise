@@ -357,6 +357,14 @@ definitions:
         type: string
       path:
         type: string
+      purge_actor:
+        type: string
+      purge_actor_id:
+        type: integer
+      purge_method:
+        type: string
+      purged_at:
+        type: string
       restore_actor:
         type: string
       restore_actor_id:
@@ -378,14 +386,118 @@ definitions:
       updated_at:
         type: string
     type: object
+  http.trashListItem:
+    properties:
+      actor:
+        type: string
+      actor_id:
+        type: integer
+      created_at:
+        type: string
+      error_code:
+        type: string
+      expires_at:
+        type: string
+      name:
+        type: string
+      operation_id:
+        type: string
+      path:
+        type: string
+      purge_actor:
+        type: string
+      purge_actor_id:
+        type: integer
+      purge_method:
+        type: string
+      purged_at:
+        type: string
+      restore_actor:
+        type: string
+      restore_actor_id:
+        type: integer
+      restore_operation_id:
+        type: string
+      restored_path:
+        type: string
+      sha256:
+        type: string
+      size:
+        type: integer
+      source:
+        type: string
+      state:
+        type: string
+      updated_at:
+        type: string
+    type: object
   http.trashListResponse:
+    properties:
+      can_manage_retention:
+        type: boolean
+      can_purge:
+        type: boolean
+      due_bytes:
+        type: integer
+      items:
+        items:
+          $ref: '#/definitions/http.trashListItem'
+        type: array
+      next_cleanup_at:
+        type: string
+      retention:
+        $ref: '#/definitions/trash.RetentionPolicy'
+      total:
+        type: integer
+      usage_bytes:
+        type: integer
+    type: object
+  http.trashPreviewItem:
+    properties:
+      name:
+        type: string
+      operation_id:
+        type: string
+      size:
+        type: integer
+    type: object
+  http.trashPurgePreview:
     properties:
       items:
         items:
-          $ref: '#/definitions/trash.Item'
+          $ref: '#/definitions/http.trashPreviewItem'
         type: array
+      size:
+        type: integer
+      snapshot:
+        type: string
       total:
         type: integer
+    type: object
+  http.trashPurgeRequest:
+    properties:
+      operation_ids:
+        items:
+          type: string
+        type: array
+      source:
+        type: string
+    type: object
+  http.trashPurgeResponse:
+    properties:
+      items:
+        items:
+          $ref: '#/definitions/http.trashPurgeResult'
+        type: array
+    type: object
+  http.trashPurgeResult:
+    properties:
+      error:
+        type: string
+      operation_id:
+        type: string
+      state:
+        type: string
     type: object
   http.trashRequest:
     properties:
@@ -395,6 +507,15 @@ definitions:
         type: string
       restore_operation_id:
         type: string
+      source:
+        type: string
+    type: object
+  http.trashRetentionRequest:
+    properties:
+      days:
+        type: integer
+      enabled:
+        type: boolean
       source:
         type: string
     type: object
@@ -2094,6 +2215,14 @@ definitions:
         type: string
       path:
         type: string
+      purge_actor:
+        type: string
+      purge_actor_id:
+        type: integer
+      purge_method:
+        type: string
+      purged_at:
+        type: string
       restore_actor:
         type: string
       restore_actor_id:
@@ -2132,6 +2261,15 @@ definitions:
       trash_operation_id:
         type: string
       updated_at:
+        type: string
+    type: object
+  trash.RetentionPolicy:
+    properties:
+      days:
+        type: integer
+      enabled:
+        type: boolean
+      enabled_since:
         type: string
     type: object
   users.AuthToken:
@@ -4989,6 +5127,102 @@ paths:
           schema:
             $ref: '#/definitions/http.HttpResponse'
       summary: Restore a recycled file without overwriting an existing target
+      tags:
+      - Trash
+  /api/trash/purge:
+    post:
+      consumes:
+      - application/json
+      description: Requires current Admin, Browse and Delete on the Source. Accepts
+        up to 50 operation IDs. Each result reports its own outcome.
+      parameters:
+      - description: Source and confirmed recycle operation IDs
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/http.trashPurgeRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/http.trashPurgeResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/http.HttpResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/http.HttpResponse'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/http.HttpResponse'
+      summary: Permanently remove recycled files by operation ID
+      tags:
+      - Trash
+  /api/trash/purge-preview:
+    get:
+      parameters:
+      - description: Configured Source name
+        in: query
+        name: source
+        required: true
+        type: string
+      - description: Record offset
+        in: query
+        name: offset
+        type: integer
+      - description: Page size
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/http.trashPurgePreview'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/http.HttpResponse'
+      summary: Preview the recycled files eligible for permanent removal in one Source
+      tags:
+      - Trash
+  /api/trash/retention:
+    put:
+      consumes:
+      - application/json
+      description: Requires current Admin, Browse and Delete with full access to the
+        Source root. The first enablement date is preserved.
+      parameters:
+      - description: Source, retention period in days, and optional enabled flag
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/http.trashRetentionRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/trash.RetentionPolicy'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/http.HttpResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/http.HttpResponse'
+      summary: Set the retention policy for one Source
       tags:
       - Trash
   /api/users:

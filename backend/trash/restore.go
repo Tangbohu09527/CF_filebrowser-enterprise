@@ -67,7 +67,8 @@ func (s *Store) saveRestoreAttempt(attempt *RestoreAttempt) error {
 }
 
 func (s *Store) settleRestoreAttempt(item *Item) error {
-	if item.RestoreOperationID == "" {
+	// A later purge does not change the outcome of an earlier restore attempt.
+	if item.RestoreOperationID == "" || item.PurgeMethod != "" {
 		return nil
 	}
 	attempt, err := s.loadRestoreAttempt(item.OperationID, item.RestoreOperationID)
