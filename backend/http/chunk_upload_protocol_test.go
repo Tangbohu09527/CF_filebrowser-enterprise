@@ -248,6 +248,40 @@ func TestChunkUploadProtocolValidation(t *testing.T) {
 			t.Fatalf("forged temporary name content changed: got %q", data)
 		}
 	})
+
+	t.Run("next upload clears expired fragments without in-memory timers", func(t *testing.T) {
+		const expired = "/public/expired-before-restart.bin"
+		const resumable = "/public/resumable-after-restart.bin"
+		for _, target := range []string{expired, resumable} {
+			first := h.authenticatedChunk(target, 0, 8, strings.NewReader("ABCD"), false)
+			if first.Code != http.StatusOK {
+				t.Fatalf("first chunk status for %s: %d, body=%s", target, first.Code, first.Body.String())
+			}
+			temps := snapshotChunkTemps(t, h.realPath(target))
+			if len(temps) != 1 {
+				t.Fatalf("expected one temporary file for %s, got %d", target, len(temps))
+			}
+			// Simulate loss of the in-memory cleanup timer. The previously
+			// accepted fragment and persistent authentication key survive.
+			stopChunkUploadTempCleanup(temps[0].path)
+			if target == expired {
+				stale := time.Now().Add(-chunkUploadTempTTL - time.Hour)
+				if err := os.Chtimes(temps[0].path, stale, stale); err != nil {
+					t.Fatalf("age temporary file: %v", err)
+				}
+			}
+		}
+		resumed := h.authenticatedChunk(resumable, 4, 8, strings.NewReader("EFGH"), false)
+		if resumed.Code != http.StatusOK {
+			t.Fatalf("resumed upload: %d, body=%s", resumed.Code, resumed.Body.String())
+		}
+		if data, err := os.ReadFile(h.realPath(resumable)); err != nil || string(data) != "ABCDEFGH" {
+			t.Fatalf("resumed payload: %q, %v", data, err)
+		}
+		if temps := snapshotChunkTemps(t, h.realPath(expired)); len(temps) != 0 {
+			t.Fatalf("next upload retained %d expired fragments", len(temps))
+		}
+	})
 }
 
 func TestChunkUploadSessionControl(t *testing.T) {

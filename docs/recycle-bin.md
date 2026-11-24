@@ -22,6 +22,9 @@ accepted. Operation IDs contain 8–128 ASCII letters, digits, `_`, or `-`.
 | `GET /api/trash` | `source`, optional `query`, `offset`, `limit` (1–200; default 50) | `{items,total}`, newest first, including restored records |
 | `POST /api/trash/{operation_id}/restore` | JSON `{source,path,restore_operation_id}` | Item plus `restore_attempt` |
 | `GET /api/trash/{operation_id}` | `source`, `restore_operation_id` | Item plus the specified historical `restore_attempt` |
+| `GET /api/trash/purge/preview` | `source`, optional `offset` and `limit` | Authorized purge candidates, count, bytes and ordered-ID snapshot |
+| `POST /api/trash/purge` | JSON `{source,operation_ids}`, up to 50 IDs | Per-item purge result |
+| `PUT /api/trash/retention` | JSON `{source,days,enabled}` | Persisted retention policy for the Source |
 
 Items include `operation_id`, `state`, original `source`, scoped `path`, `name`,
 `size`, streaming `sha256`, `actor_id`, `actor`, `created_at`, `updated_at`, and
@@ -107,8 +110,29 @@ The exact name is reserved case-insensitively on all platforms, including Window
 trailing-dot/space and ADS aliases. This intentionally also excludes user-created
 directories with that name. Existing general archive ACL behavior is unchanged.
 
-There is no expiry task, cleanup job, empty-bin action, or permanent removal UI.
-Restored item and attempt journals remain queryable for platform reconciliation.
+## Retention and permanent removal
+
+The recycle-bin page reports the logical byte total of visible recycled files,
+the next cleanup time and estimated bytes due, and each file's expiry time.
+Administrators can sort by size, select files, or preview and confirm the
+eligible files in the current Source. Confirmation shows the Source, file
+count, and total bytes. The browser submits only the confirmed operation IDs.
+Manual purge requires effective Admin, Browse and Delete permissions and the
+current Source scope and AccessRules. A source-wide policy change also requires
+root scope and access to the Source root. Read-only Sources reject changes.
+
+The initial retention setting is 30 days. An administrator enables it in each
+Source. Files already in the bin get the full retention period from that first
+enablement, and new files age from the time they entered the bin. Changing
+days, pausing, and resuming preserve the first enablement date. The service
+checks for expired items at 03:00 China time and catches up on the last elapsed
+cleanup window at startup.
+
+Purge and restore are serialized. A purge intent is recorded before the private
+payload is unlinked. After an interruption, the journal reconciles with that
+payload. The original path stays outside the purge operation. A successful
+purge records the actor, method and time. The journal and prior restore attempts
+remain available through the same operation ID.
 
 ## Verification and synthetic preview
 

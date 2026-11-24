@@ -366,12 +366,19 @@ func StartHttp(ctx context.Context, storage *bolt.BoltStore, shutdownComplete ch
 		}
 	}()
 
+	retentionDone := make(chan struct{})
+	go func() {
+		defer close(retentionDone)
+		runTrashRetention(ctx, config.Server.Sources)
+	}()
+
 	// Wait for context cancellation to shut down the server
 	<-ctx.Done()
 	logger.Info("Shutting down HTTP server...")
 
 	// Close all SSE sessions
 	events.Shutdown()
+	<-retentionDone
 
 	// Persist in-memory state before shutting down the HTTP server
 	if store != nil {

@@ -6,7 +6,7 @@ vi.mock('@/utils/url', () => ({ getApiPath: (endpoint, params) => `/api/${endpoi
 vi.mock('./utils', () => ({ fetchJSON: vi.fn() }));
 
 import { fetchJSON } from './utils';
-import { trashFiles, restoreTrash, listTrash } from './trash';
+import { listTrash, previewTrashPurge, purgeTrash, restoreTrash, setTrashRetention, trashFiles } from './trash';
 
 const file = { source: 'source1', path: '/images/synthetic.jpg', type: 'image/jpeg' };
 const key = `filebrowser-trash:71:${file.source}:${file.path}`;
@@ -83,6 +83,17 @@ describe('durable Web recycle actions', () => {
     expect(fetchJSON.mock.calls[0][1]).toBeUndefined();
   });
 
+  it('treats a purged recycle operation as final and never deletes a same-path replacement', async () => {
+    localStorage.setItem(key, 'previous-unknown-operation');
+    fetchJSON.mockResolvedValue({ state: 'purged' });
+    const result = await trashFiles([file]);
+    expect(result.succeeded).toHaveLength(0);
+    expect(result.failed).toHaveLength(1);
+    expect(fetchJSON).toHaveBeenCalledTimes(1);
+    expect(fetchJSON.mock.calls[0][1]).toBeUndefined();
+    expect(localStorage.getItem(key)).toBeNull();
+  });
+
   it('restores to the explicit target with its persistent restore operation ID', async () => {
     fetchJSON.mockResolvedValue({ state: 'restored' });
     await restoreTrash('source1', 'trash-operation-001', '/images/restored.jpg', 'restore-operation-001');
@@ -91,5 +102,41 @@ describe('durable Web recycle actions', () => {
     expect(JSON.parse(options.body)).toEqual({ source: 'source1', path: '/images/restored.jpg', restore_operation_id: 'restore-operation-001' });
     await listTrash('source1', 'synthetic', 50);
     expect(fetchJSON.mock.calls[1][0]).toContain('offset=50&limit=50');
+  });
+
+  it('uses server-side size sorting and saves retention for the selected Source', async () => {
+    fetchJSON.mockResolvedValue({});
+    await listTrash('source1', '', 0, 'size');
+    expect(fetchJSON.mock.calls[0][0]).toBe('/api/trash?source=source1&query=&offset=0&limit=50&sort=size');
+    await setTrashRetention('source1', 30, false);
+    const [url, options] = fetchJSON.mock.calls[1];
+    expect(url).toBe('/api/trash/retention');
+    expect(options.method).toBe('PUT');
+    expect(JSON.parse(options.body)).toEqual({ source: 'source1', days: 30, enabled: false });
+  });
+
+  it('uses only the previewed IDs when permanently deleting files from a Source', async () => {
+    const first = { operation_id: 'first-operation', size: 7 };
+    const second = { operation_id: 'second-operation', size: 9 };
+    const summary = { total: 2, size: 16, snapshot: 'same-id-set' };
+    fetchJSON.mockResolvedValueOnce({ ...summary, items: [first] });
+    fetchJSON.mockResolvedValueOnce({ ...summary, items: [second] });
+    fetchJSON.mockResolvedValueOnce({ items: [] });
+    const preview = await previewTrashPurge('source1');
+    expect(preview).toEqual([first, second]);
+    expect(fetchJSON.mock.calls[0][0]).toBe('/api/trash/purge/preview?source=source1&offset=0&limit=200');
+    expect(fetchJSON.mock.calls[1][0]).toBe('/api/trash/purge/preview?source=source1&offset=1&limit=200');
+    await purgeTrash('source1', preview.map(item => item.operation_id));
+    const [url, options] = fetchJSON.mock.calls[2];
+    expect(url).toBe('/api/trash/purge');
+    expect(options.method).toBe('POST');
+    expect(JSON.parse(options.body)).toEqual({ source: 'source1', operation_ids: ['first-operation', 'second-operation'] });
+  });
+
+  it('rejects a clear preview when the file set changes between pages despite identical count and size', async () => {
+    fetchJSON.mockResolvedValueOnce({ total: 2, size: 16, snapshot: 'old-id-set', items: [{ operation_id: 'first-operation', size: 7 }] });
+    fetchJSON.mockResolvedValueOnce({ total: 2, size: 16, snapshot: 'new-id-set', items: [{ operation_id: 'second-operation', size: 9 }] });
+    await expect(previewTrashPurge('source1')).rejects.toThrow('trash.purgePreviewChanged');
+    expect(fetchJSON).toHaveBeenCalledTimes(2);
   });
 });

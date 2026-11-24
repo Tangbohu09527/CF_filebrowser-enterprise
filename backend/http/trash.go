@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gtsteffaniak/filebrowser/backend/common/utils"
 	"github.com/gtsteffaniak/filebrowser/backend/database/users"
@@ -24,6 +25,9 @@ func registerTrashRoutes(api *http.ServeMux) {
 	api.HandleFunc("GET /trash", withUser(trashListHandler))
 	api.HandleFunc("GET /trash/{id}", withUser(trashGetHandler))
 	api.HandleFunc("POST /trash/{id}/restore", withUser(trashRestoreHandler))
+	api.HandleFunc("GET /trash/purge/preview", withUser(trashPurgePreviewHandler))
+	api.HandleFunc("POST /trash/purge", withUser(trashPurgeHandler))
+	api.HandleFunc("PUT /trash/retention", withUser(trashRetentionHandler))
 }
 
 type trashRequest struct {
@@ -39,21 +43,37 @@ type trashItemResponse struct {
 }
 
 type trashListResponse struct {
-	Items []trash.Item `json:"items"`
-	Total int          `json:"total"`
+	Items              []trashListItem       `json:"items"`
+	Total              int                   `json:"total"`
+	Retention          trash.RetentionPolicy `json:"retention"`
+	UsageBytes         int64                 `json:"usage_bytes"`
+	DueBytes           int64                 `json:"due_bytes"`
+	NextCleanupAt      *time.Time            `json:"next_cleanup_at,omitempty"`
+	CanPurge           bool                  `json:"can_purge"`
+	CanManageRetention bool                  `json:"can_manage_retention"`
+}
+
+type trashListItem struct {
+	trash.Item
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 func decodeTrashRequest(w http.ResponseWriter, r *http.Request) (trashRequest, error) {
 	var request trashRequest
+	err := decodeTrashBody(w, r, &request)
+	return request, err
+}
+
+func decodeTrashBody(w http.ResponseWriter, r *http.Request, request any) error {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&request); err != nil {
-		return request, err
+	if err := decoder.Decode(request); err != nil {
+		return err
 	}
 	if err := decoder.Decode(new(any)); err != io.EOF {
-		return request, trash.ErrInvalid
+		return trash.ErrInvalid
 	}
-	return request, nil
+	return nil
 }
 
 func trashStatus(err error) (int, error) {
@@ -311,20 +331,36 @@ func trashListHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	if err != nil {
 		return trashStatus(err)
 	}
-	limit, offset := 50, 0
+	limit, offset, err := trashPage(r)
+	if err != nil {
+		return http.StatusBadRequest, err
+	}
+	query := strings.ToLower(r.URL.Query().Get("query"))
+	order := r.URL.Query().Get("sort")
+	if order != "" && order != "size" {
+		return http.StatusBadRequest, trash.ErrInvalid
+	}
+	return renderTrashList(w, r, d.user, idx, scope, query, order, limit, offset)
+}
+
+func trashPage(r *http.Request) (limit, offset int, err error) {
+	limit = 50
 	if value := r.URL.Query().Get("limit"); value != "" {
 		limit, err = strconv.Atoi(value)
 		if err != nil || limit < 1 || limit > 200 {
-			return http.StatusBadRequest, trash.ErrInvalid
+			return 0, 0, trash.ErrInvalid
 		}
 	}
 	if value := r.URL.Query().Get("offset"); value != "" {
 		offset, err = strconv.Atoi(value)
 		if err != nil || offset < 0 {
-			return http.StatusBadRequest, trash.ErrInvalid
+			return 0, 0, trash.ErrInvalid
 		}
 	}
-	query := strings.ToLower(r.URL.Query().Get("query"))
+	return limit, offset, nil
+}
+
+func renderTrashList(w http.ResponseWriter, r *http.Request, user *users.User, idx *indexing.Index, scope, query, order string, limit, offset int) (int, error) {
 	s, err := trash.Open(idx.Path)
 	if err != nil {
 		return trashStatus(err)
@@ -334,25 +370,53 @@ func trashListHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	if err != nil {
 		return trashStatus(err)
 	}
-	items := []trash.Item{}
+	policy, err := s.RetentionPolicy()
+	if err != nil {
+		return trashStatus(err)
+	}
+	result := trashListResponse{
+		Retention: policy, CanPurge: user.Permissions.Admin && !idx.Config.ReadOnly && !idx.Config.Disabled,
+	}
+	result.CanManageRetention = result.CanPurge && scope == "" && store.Access.PermittedFresh(idx.Path, "/", user.Username)
+	if policy.Enabled {
+		_, next := trashCleanupWindow(time.Now())
+		result.NextCleanupAt = &next
+	}
+	items := []trashListItem{}
 	for _, id := range ids {
 		item, loadErr := s.Peek(id)
 		if loadErr != nil {
 			return trashStatus(loadErr)
 		}
-		if trashAuthorizeItem(d.user, idx, scope, item) != nil {
-			continue
-		}
-		if query != "" && !strings.Contains(strings.ToLower(item.OriginalPath+" "+item.OperationID), query) {
+		if trashAuthorizeItem(user, idx, scope, item) != nil {
 			continue
 		}
 		item, loadErr = s.Get(id)
 		if loadErr != nil {
 			return trashStatus(loadErr)
 		}
-		items = append(items, trashClientItem(item, scope, idx, d.user))
+		occupied, loadErr := s.OccupiedBytes(item)
+		if loadErr != nil {
+			return trashStatus(loadErr)
+		}
+		result.UsageBytes += occupied
+		deadline := policy.Deadline(item)
+		if deadline != nil && result.NextCleanupAt != nil && !deadline.After(*result.NextCleanupAt) {
+			result.DueBytes += occupied
+		}
+		if query == "" || strings.Contains(strings.ToLower(item.OriginalPath+" "+item.OperationID), query) {
+			items = append(items, trashListItem{Item: trashClientItem(item, scope, idx, user), ExpiresAt: deadline})
+		}
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAt.After(items[j].CreatedAt) })
+	sort.Slice(items, func(i, j int) bool {
+		if order == "size" && items[i].Size != items[j].Size {
+			return items[i].Size > items[j].Size
+		}
+		if items[i].CreatedAt.Equal(items[j].CreatedAt) {
+			return items[i].OperationID < items[j].OperationID
+		}
+		return items[i].CreatedAt.After(items[j].CreatedAt)
+	})
 	total := len(items)
 	if offset > total {
 		offset = total
@@ -361,5 +425,6 @@ func trashListHandler(w http.ResponseWriter, r *http.Request, d *requestContext)
 	if end > total {
 		end = total
 	}
-	return renderJSON(w, r, trashListResponse{items[offset:end], total})
+	result.Items, result.Total = items[offset:end], total
+	return renderJSON(w, r, result)
 }

@@ -33,23 +33,27 @@ const marker = "filebrowser-trash-v1\n"
 // Item records Source-relative paths. HTTP clients receive paths relative to
 // their current scope only after fresh authorization against the original path.
 type Item struct {
-	OperationID        string    `json:"operation_id"`
-	State              string    `json:"state"`
-	Source             string    `json:"source"`
-	SourceKey          string    `json:"-"`
-	OriginalPath       string    `json:"path"`
-	Name               string    `json:"name"`
-	Size               int64     `json:"size"`
-	SHA256             string    `json:"sha256"`
-	ActorID            uint      `json:"actor_id"`
-	Actor              string    `json:"actor"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
-	RestoreOperationID string    `json:"restore_operation_id,omitempty"`
-	RestoredPath       string    `json:"restored_path,omitempty"`
-	RestoreActorID     uint      `json:"restore_actor_id,omitempty"`
-	RestoreActor       string    `json:"restore_actor,omitempty"`
-	ErrorCode          string    `json:"error_code,omitempty"`
+	OperationID        string     `json:"operation_id"`
+	State              string     `json:"state"`
+	Source             string     `json:"source"`
+	SourceKey          string     `json:"-"`
+	OriginalPath       string     `json:"path"`
+	Name               string     `json:"name"`
+	Size               int64      `json:"size"`
+	SHA256             string     `json:"sha256"`
+	ActorID            uint       `json:"actor_id"`
+	Actor              string     `json:"actor"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+	RestoreOperationID string     `json:"restore_operation_id,omitempty"`
+	RestoredPath       string     `json:"restored_path,omitempty"`
+	RestoreActorID     uint       `json:"restore_actor_id,omitempty"`
+	RestoreActor       string     `json:"restore_actor,omitempty"`
+	PurgedAt           *time.Time `json:"purged_at,omitempty"`
+	PurgeActorID       uint       `json:"purge_actor_id,omitempty"`
+	PurgeActor         string     `json:"purge_actor,omitempty"`
+	PurgeMethod        string     `json:"purge_method,omitempty"`
+	ErrorCode          string     `json:"error_code,omitempty"`
 }
 
 // diskRecord preserves the trusted source identity without exposing disk paths.
@@ -345,12 +349,14 @@ func (s *Store) requireReconciliation(item *Item, code string) (*Item, error) {
 	return item, ErrUncertain
 }
 
-// Get reconciles a durable pending intent against both filesystem names. It
-// never replays a move, and never treats a conflicting/unknown result as success.
+// Get reconciles a durable pending intent without replaying filesystem changes.
 func (s *Store) Get(id string) (*Item, error) {
 	item, err := s.load(id)
 	if err != nil {
 		return nil, err
+	}
+	if item.State == "pending_purge" {
+		return s.reconcilePurge(item)
 	}
 	if item.State != "pending_trash" && item.State != "pending_restore" {
 		return item, s.settleRestoreAttempt(item)
